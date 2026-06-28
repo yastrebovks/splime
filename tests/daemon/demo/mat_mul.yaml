@@ -1,0 +1,20 @@
+- !DFunction
+  name: mat_mul
+  inputs:
+  - name: m
+    type: np.array
+    default: null
+  - name: v
+    type: int
+    default: null
+  outputs:
+  - name: default
+    type: np.array
+  body: |-
+    return v * m
+- !DDistribution
+  package: numpy
+  version: 2.4.4
+- !DImport
+  module: numpy
+  alias: np

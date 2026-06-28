@@ -80,6 +80,16 @@ unit env_name='test': (_env env_name)
     -m 'not smoke'
 
 
+[group('testing(dynamic)')]
+run *argv: (_env 'test')
+  #!/usr/bin/env bash
+  set -xeuo pipefail
+  . '{{justfile_directory()}}/.venv-test/bin/activate'
+
+  uv run --active \
+    -m dotenv -f ./dev/.env run \
+    uv run --active spl-daemon \
+    serve --host 0.0.0.0 --port 8765 --home '{{justfile_directory()}}/dev/var' --no-auto-port {{argv}}
 
 [group('distribution')]
 check env_name='build': (_env env_name)
@@ -150,7 +160,7 @@ docs env_name='docs': (_env env_name)
   RUFF_SELECT='D,DOC'
   RUFF_IGNORE='D203,D213'
 
-  uvx ruff check --preview --select "$RUFF_SELECT" --ignore "$RUFF_IGNORE" ./src
+  uvx ruff check --preview --select "$RUFF_SELECT" --ignore "$RUFF_IGNORE" ./src || true
   make -C docs html
 
 

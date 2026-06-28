@@ -173,9 +173,7 @@ def test_object_decomposition_persists_functions_nodes_and_links(tmp_path) -> No
         assert function_decomposition["links"] == []
 
         bundle_path = (
-            Path(__file__).resolve().parents[2]
-            / "spl-core"
-            / "spl"
+            Path(__file__).resolve().parent
             / "demo"
             / "_bundle.yaml"
         )

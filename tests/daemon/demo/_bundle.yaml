@@ -1,0 +1,449 @@
+- !DPipeline
+  name: test_pipeline
+  nodes:
+  - !DNodeFunction
+    uuid: 01010a04-c457-4ec3-8084-0b2ab0eafb6c
+    func: fit_xgboost_model
+  - !DNodeFunction
+    uuid: 0439e483-d127-4118-a8b1-7ae428748464
+    func: mk_report
+  - !DNodeFunction
+    uuid: 2ce7565d-5bc1-44aa-b19a-62eb03c1f84b
+    func: mk_target
+  - !DNodeFunction
+    uuid: e9fabeca-f6fe-47ef-821e-016e3406d7fa
+    func: mk_random_data
+  - !DNodeFunction
+    uuid: e8a0db82-c8ca-4f0e-8885-18505c9fb3a3
+    func: mk_random_formula
+  - !DNodeFunction
+    uuid: f9bb3a00-7e20-4536-ba8f-97504cb04ddf
+    func: plot_errors
+  - !DNodeFunction
+    uuid: 44aa7d5c-f2ca-4b4d-a3fb-29f3c10ae737
+    func: run_model
+  - !DNodeFunction
+    uuid: 194d5dce-ed1c-40f5-a012-e5f951c305ec
+    func: mk_metrics
+  links:
+  - - !DNodeInputRef
+      uuid: f9bb3a00-7e20-4536-ba8f-97504cb04ddf
+      port: xs
+    - !DNodeOutputRef
+      uuid: e9fabeca-f6fe-47ef-821e-016e3406d7fa
+      port: default
+  - - !DNodeInputRef
+      uuid: e9fabeca-f6fe-47ef-821e-016e3406d7fa
+      port: n_samples
+    - !DScalar
+      value: 100
+  - - !DNodeInputRef
+      uuid: e8a0db82-c8ca-4f0e-8885-18505c9fb3a3
+      port: depth
+    - !DScalar
+      value: 3
+  - - !DNodeInputRef
+      uuid: 2ce7565d-5bc1-44aa-b19a-62eb03c1f84b
+      port: xs
+    - !DNodeOutputRef
+      uuid: e9fabeca-f6fe-47ef-821e-016e3406d7fa
+      port: default
+  - - !DNodeInputRef
+      uuid: f9bb3a00-7e20-4536-ba8f-97504cb04ddf
+      port: ys_fact
+    - !DNodeOutputRef
+      uuid: 2ce7565d-5bc1-44aa-b19a-62eb03c1f84b
+      port: default
+  - - !DNodeInputRef
+      uuid: 01010a04-c457-4ec3-8084-0b2ab0eafb6c
+      port: xs
+    - !DNodeOutputRef
+      uuid: e9fabeca-f6fe-47ef-821e-016e3406d7fa
+      port: default
+  - - !DNodeInputRef
+      uuid: 44aa7d5c-f2ca-4b4d-a3fb-29f3c10ae737
+      port: xs
+    - !DNodeOutputRef
+      uuid: e9fabeca-f6fe-47ef-821e-016e3406d7fa
+      port: default
+  - - !DNodeInputRef
+      uuid: 194d5dce-ed1c-40f5-a012-e5f951c305ec
+      port: ys_fact
+    - !DNodeOutputRef
+      uuid: 2ce7565d-5bc1-44aa-b19a-62eb03c1f84b
+      port: default
+  - - !DNodeInputRef
+      uuid: e9fabeca-f6fe-47ef-821e-016e3406d7fa
+      port: n_features
+    - !DScalar
+      value: 4
+  - - !DNodeInputRef
+      uuid: 194d5dce-ed1c-40f5-a012-e5f951c305ec
+      port: ys_pred
+    - !DNodeOutputRef
+      uuid: 44aa7d5c-f2ca-4b4d-a3fb-29f3c10ae737
+      port: default
+  - - !DNodeInputRef
+      uuid: 2ce7565d-5bc1-44aa-b19a-62eb03c1f84b
+      port: formula
+    - !DNodeOutputRef
+      uuid: e8a0db82-c8ca-4f0e-8885-18505c9fb3a3
+      port: default
+  - - !DNodeInputRef
+      uuid: f9bb3a00-7e20-4536-ba8f-97504cb04ddf
+      port: ys_pred
+    - !DNodeOutputRef
+      uuid: 44aa7d5c-f2ca-4b4d-a3fb-29f3c10ae737
+      port: default
+  - - !DNodeInputRef
+      uuid: e8a0db82-c8ca-4f0e-8885-18505c9fb3a3
+      port: n_features
+    - !DScalar
+      value: 4
+  - - !DNodeInputRef
+      uuid: 0439e483-d127-4118-a8b1-7ae428748464
+      port: img_errors
+    - !DNodeOutputRef
+      uuid: f9bb3a00-7e20-4536-ba8f-97504cb04ddf
+      port: default
+  - - !DNodeInputRef
+      uuid: 01010a04-c457-4ec3-8084-0b2ab0eafb6c
+      port: ys
+    - !DNodeOutputRef
+      uuid: 2ce7565d-5bc1-44aa-b19a-62eb03c1f84b
+      port: default
+  - - !DNodeInputRef
+      uuid: 0439e483-d127-4118-a8b1-7ae428748464
+      port: metrics
+    - !DNodeOutputRef
+      uuid: 194d5dce-ed1c-40f5-a012-e5f951c305ec
+      port: default
+  - - !DNodeInputRef
+      uuid: 44aa7d5c-f2ca-4b4d-a3fb-29f3c10ae737
+      port: model
+    - !DNodeOutputRef
+      uuid: 01010a04-c457-4ec3-8084-0b2ab0eafb6c
+      port: default
+  aliases:
+  - - report
+    - 0439e483-d127-4118-a8b1-7ae428748464
+  - - metrics
+    - 194d5dce-ed1c-40f5-a012-e5f951c305ec
+  - - formula
+    - e8a0db82-c8ca-4f0e-8885-18505c9fb3a3
+- !DSPLSelfImport
+  name: mk_metrics
+- !DSPLSelfImport
+  name: run_model
+- !DSPLSelfImport
+  name: plot_errors
+- !DSPLSelfImport
+  name: mk_random_formula
+- !DSPLSelfImport
+  name: mk_random_data
+- !DSPLSelfImport
+  name: mk_target
+- !DSPLSelfImport
+  name: mk_report
+- !DSPLSelfImport
+  name: fit_xgboost_model
+---
+- !DFunction
+  name: mk_metrics
+  inputs:
+  - name: ys_fact
+    type: null
+    default: null
+  - name: ys_pred
+    type: null
+    default: null
+  outputs:
+  - name: default
+    type: null
+  body: |-
+    return dict(r2=r2_score(ys_fact, ys_pred), rmse=np.sqrt(mean_squared_error(ys_fact, ys_pred)))
+- !DDistribution
+  package: scikit-learn
+  version: 1.8.0
+- !DImportFrom
+  module: sklearn.metrics._regression
+  target: r2_score
+  alias: null
+- !DDistribution
+  package: numpy
+  version: 2.4.4
+- !DImport
+  module: numpy
+  alias: np
+- !DDistribution
+  package: scikit-learn
+  version: 1.8.0
+- !DImportFrom
+  module: sklearn.metrics._regression
+  target: mean_squared_error
+  alias: null
+---
+- !DFunction
+  name: run_model
+  inputs:
+  - name: model
+    type: XGBRegressor | Ridge
+    default: null
+  - name: xs
+    type: np.ndarray
+    default: null
+  outputs:
+  - name: default
+    type: np.ndarray
+  body: |-
+    return model.predict(xs)
+- !DDistribution
+  package: numpy
+  version: 2.4.4
+- !DImport
+  module: numpy
+  alias: np
+- !DDistribution
+  package: xgboost-cpu
+  version: 3.2.0
+- !DImportFrom
+  module: xgboost.sklearn
+  target: XGBRegressor
+  alias: null
+- !DDistribution
+  package: scikit-learn
+  version: 1.8.0
+- !DImportFrom
+  module: sklearn.linear_model._ridge
+  target: Ridge
+  alias: null
+---
+- !DFunction
+  name: plot_errors
+  inputs:
+  - name: xs
+    type: null
+    default: null
+  - name: ys_fact
+    type: null
+    default: null
+  - name: ys_pred
+    type: null
+    default: null
+  outputs:
+  - name: default
+    type: null
+  body: |-
+    x = xs[:, 0]
+    roc_auc
+    df = pd.DataFrame(dict(x=x, y_fact=ys_fact, y_pred=ys_pred)).assign(error=lambda df: df['y_fact'] - df['y_pred'], bin=lambda df: np.searchsorted(np.quantile(df['x'], np.linspace(0, 1, 1 + 10)[1:-1]), df['x']))
+    dfg = df.groupby('bin')
+    df = pd.concat([dfg['x'].agg(['min', 'max']).rename(lambda c: 'x_' + c, axis=1), *[dfg['error'].quantile(q).rename('y_q{:02.0f}'.format(q * 100)) for q in [0.25, 0.75]]], axis=1).reset_index()
+    with BytesIO() as buf:
+        fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 5))
+        fig.tight_layout()
+        height = 0.5
+        ax.plot([0, 0], [df['bin'].min() - height, df['bin'].max() + height], color='k', linestyle=':')
+        ax.barh(df['bin'] - height / 2.0, height=height, width=df['y_q75'] - df['y_q25'], left=df['y_q25'])
+        ax.set_yticks(df['bin'])
+        ax.set_yticklabels(list(df[['x_min', 'x_max']].apply(lambda xs: '[{:>5.2f}; {:>5.2f}]'.format(*xs), axis=1)))
+        ax.set_title('error IQR by x0')
+        fig.savefig(buf, format='png')
+        plt.close()
+        return buf.getvalue()
+- !DDistribution
+  package: scikit-learn
+  version: 1.8.0
+- !DImportFrom
+  module: sklearn.metrics._ranking
+  target: roc_auc_score
+  alias: roc_auc
+- !DDistribution
+  package: matplotlib
+  version: 3.10.9
+- !DImport
+  module: matplotlib.pyplot
+  alias: plt
+- !DDistribution
+  package: pandas
+  version: 3.0.2
+- !DImport
+  module: pandas
+  alias: pd
+- !DDistribution
+  package: numpy
+  version: 2.4.4
+- !DImport
+  module: numpy
+  alias: np
+- !DImportFrom
+  module: _io
+  target: BytesIO
+  alias: null
+---
+- !DFunction
+  name: mk_random_formula
+  inputs:
+  - name: n_features
+    type: null
+    default: null
+  - name: depth
+    type: null
+    default: null
+  - name: seed
+    type: null
+    default: None
+  outputs:
+  - name: default
+    type: null
+  body: |-
+    _ops = [op.add, op.sub, op.mul, op.truediv]
+    rng = np.random.default_rng(seed=seed)
+
+    def step(depth):
+        xs = symbols(list(map('x{}'.format, range(n_features))))
+        if depth == 0:
+            return rng.choice(xs)
+        else:
+            result = rng.choice(_ops)(step(depth - 1), step(depth - 1))
+            if result == sympy.zoo or result == 0:
+                result = 1
+            return result
+    return step(depth)
+- !DDistribution
+  package: sympy
+  version: 1.14.0
+- !DImport
+  module: sympy
+  alias: null
+- !DDistribution
+  package: sympy
+  version: 1.14.0
+- !DImportFrom
+  module: sympy.core.symbol
+  target: symbols
+  alias: null
+- !DImport
+  module: operator
+  alias: op
+- !DDistribution
+  package: numpy
+  version: 2.4.4
+- !DImport
+  module: numpy
+  alias: np
+---
+- !DFunction
+  name: mk_random_data
+  inputs:
+  - name: n_features
+    type: int
+    default: null
+  - name: n_samples
+    type: int
+    default: null
+  - name: seed
+    type: int
+    default: None
+  outputs:
+  - name: default
+    type: np.ndarray
+  body: |-
+    rng = np.random.default_rng(seed=seed)
+    return rng.standard_normal(size=(n_samples, n_features))
+- !DDistribution
+  package: numpy
+  version: 2.4.4
+- !DImport
+  module: numpy
+  alias: np
+---
+- !DFunction
+  name: mk_target
+  inputs:
+  - name: xs
+    type: null
+    default: null
+  - name: formula
+    type: null
+    default: null
+  outputs:
+  - name: default
+    type: null
+  body: |-
+    n_features = xs.shape[1]
+    return lambdify(symbols(list(map('x{}'.format, range(n_features)))), formula, modules='numpy')(*[xs[:, i] for i in range(n_features)])
+- !DDistribution
+  package: sympy
+  version: 1.14.0
+- !DImportFrom
+  module: sympy.core.symbol
+  target: symbols
+  alias: null
+- !DDistribution
+  package: sympy
+  version: 1.14.0
+- !DImportFrom
+  module: sympy.utilities.lambdify
+  target: lambdify
+  alias: null
+---
+- !DFunction
+  name: mk_report
+  inputs:
+  - name: metrics
+    type: null
+    default: null
+  - name: img_errors
+    type: null
+    default: null
+  outputs:
+  - name: default
+    type: null
+  body: |-
+    page = dom.html(dom.body(dom.h1('Model report'), dom.h2('Metrics'), dom.table(dom.thead(dom.tr(dom.th('name'), dom.th('value'))), dom.tbody(*[dom.tr(dom.td(k), dom.td(str(v))) for k, v in metrics.items()])), dom.h2('Errors'), dom.div(dom.img(src='data:image/png;base64,{}'.format(base64.b64encode(img_errors).decode('utf8'))))))
+    return page.render()
+- !DDistribution
+  package: dominate
+  version: 2.9.1
+- !DImport
+  module: dominate.tags
+  alias: dom
+- !DImport
+  module: base64
+  alias: null
+---
+- !DFunction
+  name: fit_xgboost_model
+  inputs:
+  - name: xs
+    type: null
+    default: null
+  - name: ys
+    type: null
+    default: null
+  outputs:
+  - name: default
+    type: null
+  body: |-
+    m = XGBRegressor(n_estimators=outer_func(), max_depth=2, learning_rate=0.5, gamma=0.5)
+    m.fit(xs, ys)
+    return m
+- !DSPLSelfImport
+  name: outer_func
+- !DDistribution
+  package: xgboost-cpu
+  version: 3.2.0
+- !DImportFrom
+  module: xgboost.sklearn
+  target: XGBRegressor
+  alias: null
+---
+- !DFunction
+  name: outer_func
+  inputs: []
+  outputs:
+  - name: default
+    type: null
+  body: |-
+    return 10

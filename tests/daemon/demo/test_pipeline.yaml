@@ -1,0 +1,72 @@
+- !DPipeline
+  name: test_pipeline
+  nodes:
+  - !DNodeFunction
+    uuid: ff1dec6d-dcb5-4a6f-8678-3d71673622fa
+    func: mat_mul
+  - !DNodeFunction
+    uuid: e7411198-fbe5-4ae4-bebb-15a8a1a84f6b
+    func: mat_det
+  - !DNodeFunction
+    uuid: 19265c10-1acb-483a-aa33-36be123f9b3f
+    func: mat_identity
+  - !DNodeFunction
+    uuid: ad89d8dc-f8fc-41bb-b74a-b116ac9ce2c4
+    func: mat_add
+  - !DNodeRemote
+    uuid: a747bdd0-870e-44ea-85a8-de50a608b9f1
+    url: http://localhost:8080
+    name: fancy_message_remote
+    version: TODO
+  links:
+  - - !DNodeInputRef
+      uuid: ad89d8dc-f8fc-41bb-b74a-b116ac9ce2c4
+      port: v
+    - !DScalar
+      value: 1
+  - - !DNodeInputRef
+      uuid: e7411198-fbe5-4ae4-bebb-15a8a1a84f6b
+      port: m
+    - !DNodeOutputRef
+      uuid: ff1dec6d-dcb5-4a6f-8678-3d71673622fa
+      port: default
+  - - !DNodeInputRef
+      uuid: ad89d8dc-f8fc-41bb-b74a-b116ac9ce2c4
+      port: m
+    - !DNodeOutputRef
+      uuid: 19265c10-1acb-483a-aa33-36be123f9b3f
+      port: default
+  - - !DNodeInputRef
+      uuid: a747bdd0-870e-44ea-85a8-de50a608b9f1
+      port: x
+    - !DNodeOutputRef
+      uuid: e7411198-fbe5-4ae4-bebb-15a8a1a84f6b
+      port: default
+  - - !DNodeInputRef
+      uuid: ff1dec6d-dcb5-4a6f-8678-3d71673622fa
+      port: m
+    - !DNodeOutputRef
+      uuid: ad89d8dc-f8fc-41bb-b74a-b116ac9ce2c4
+      port: default
+  - - !DNodeInputRef
+      uuid: ff1dec6d-dcb5-4a6f-8678-3d71673622fa
+      port: v
+    - !DScalar
+      value: 10
+  aliases:
+  - - det
+    - e7411198-fbe5-4ae4-bebb-15a8a1a84f6b
+  - - message
+    - a747bdd0-870e-44ea-85a8-de50a608b9f1
+- !DSPLImport
+  path: ./mat_add.yaml
+  name: mat_add
+- !DSPLImport
+  path: ./mat_identity.yaml
+  name: mat_identity
+- !DSPLImport
+  path: ./mat_det.yaml
+  name: mat_det
+- !DSPLImport
+  path: ./mat_mul.yaml
+  name: mat_mul

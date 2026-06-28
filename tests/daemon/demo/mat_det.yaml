@@ -1,0 +1,23 @@
+- !DFunction
+  name: mat_det
+  inputs:
+  - name: m
+    type: np.array
+    default: null
+  outputs:
+  - name: default
+    type: int
+  body: |-
+    return round(np.linalg.det(m))
+- !DDistribution
+  package: numpy
+  version: 2.4.4
+- !DImport
+  module: numpy
+  alias: np
+- !DDistribution
+  package: numpy
+  version: 2.4.4
+- !DImport
+  module: numpy
+  alias: np
