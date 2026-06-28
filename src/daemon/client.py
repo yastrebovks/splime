@@ -1,0 +1,43 @@
+"""Compatibility imports for the framework-side local daemon HTTP client."""
+
+from spl.daemon_client import (
+    DAEMON_ENDPOINT_FILENAME,
+    DAEMON_API_TOKEN_ENV,
+    DEFAULT_DAEMON_HOST,
+    DEFAULT_DAEMON_PORT,
+    DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    DEFAULT_SERVER_URL,
+    DEFAULT_URL,
+    Client,
+    ClientError,
+    clear_daemon_endpoint,
+    daemon_endpoint_file,
+    daemon_url,
+    default_daemon_home,
+    generate_daemon_api_token,
+    read_daemon_endpoint,
+    resolve_api_token,
+    resolve_base_url,
+    write_daemon_endpoint,
+)
+
+__all__ = [
+    "DAEMON_ENDPOINT_FILENAME",
+    "DAEMON_API_TOKEN_ENV",
+    "DEFAULT_DAEMON_HOST",
+    "DEFAULT_DAEMON_PORT",
+    "DEFAULT_HEARTBEAT_INTERVAL_SECONDS",
+    "DEFAULT_SERVER_URL",
+    "DEFAULT_URL",
+    "Client",
+    "ClientError",
+    "clear_daemon_endpoint",
+    "daemon_endpoint_file",
+    "daemon_url",
+    "default_daemon_home",
+    "generate_daemon_api_token",
+    "read_daemon_endpoint",
+    "resolve_api_token",
+    "resolve_base_url",
+    "write_daemon_endpoint",
+]
