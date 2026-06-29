@@ -1,7 +1,7 @@
 import ast
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generator
+from typing import Any, Generator
 from uuid import UUID, uuid4
 
 import yaml
@@ -11,6 +11,14 @@ from spl.core.ir.parse import _branch, ir_parse
 from spl.core.ir.unparse import ir_unparse
 
 DEFAULT_PORT = 'default'
+
+
+def _validate_formatted_output_ref_string(name: str, value: str) -> None:
+    if not isinstance(value, str):
+        raise TypeError('formatted output ref {} must be a string'.format(name))
+    if not value:
+        raise ValueError(
+            'formatted output ref {} must be a non-empty string'.format(name))
 
 
 @dataclass(frozen = True)
@@ -180,3 +188,99 @@ def _ir_unparse__node_output_ref(x: DNodeOutputRef, source: Path) -> Generator[a
                             attr = 'get_output_port',
                             ctx = ast.Load()),
                         args = [ast.Constant(value = x.port)]))]))
+
+
+@dataclass(frozen = True)
+class FormattedOutputRef:
+    """Output reference with an edge-local artifact format override."""
+
+    out_ref: NodeOutputRef
+    format: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.out_ref, NodeOutputRef):
+            raise TypeError('formatted output ref out_ref must be NodeOutputRef')
+        _validate_formatted_output_ref_string('format', self.format)
+
+
+@dataclass(frozen = True)
+class DFormattedOutputRef(DBase):
+    """Serialized FormattedOutputRef value for pipeline YAML."""
+
+    uuid: str
+    port: str
+    format: str
+
+    def __post_init__(self) -> None:
+        _validate_formatted_output_ref_string('uuid', self.uuid)
+        _validate_formatted_output_ref_string('port', self.port)
+        _validate_formatted_output_ref_string('format', self.format)
+
+yaml.add_representer(
+    DFormattedOutputRef,
+    lambda dumper, data: dumper.represent_mapping('!DFormattedOutputRef', data.__dict__))
+
+def _construct_dformatted_output_ref(loader: Any, node: Any) -> DFormattedOutputRef:
+    return DFormattedOutputRef(**loader.construct_mapping(node))
+
+
+yaml.add_constructor(
+    '!DFormattedOutputRef',
+    _construct_dformatted_output_ref)
+
+@ir_parse.register(
+    lambda x: isinstance(x, FormattedOutputRef))
+def _ir_parse__formatted_output_ref(
+        x: FormattedOutputRef,
+        name: str | None = None) -> _branch:
+    def mk_dependencies(frame_offset: int) -> Generator[Any]:
+        yield from []
+
+    return _branch(
+        x,
+        lambda: DFormattedOutputRef(
+            uuid = str(x.out_ref.node.uuid),
+            port = str(x.out_ref.port.name),
+            format = x.format),
+        mk_dependencies)
+
+
+@ir_unparse.register(
+    lambda x: isinstance(x, DFormattedOutputRef))
+def _ir_unparse__formatted_output_ref(
+        x: DFormattedOutputRef,
+        source: Path) -> Generator[ast.stmt]:
+    yield ast.Assign(
+        targets = [ast.Name(id = '_link_to', ctx = ast.Store())],
+        value = ast.Call(
+            func = ast.Name(id = 'FormattedOutputRef', ctx = ast.Load()),
+            keywords = [
+                ast.keyword(
+                    arg = 'out_ref',
+                    value = ast.Call(
+                        func = ast.Name(id = 'NodeOutputRef', ctx = ast.Load()),
+                        keywords = [
+                            ast.keyword(
+                                arg = 'node',
+                                value = ast.Subscript(
+                                    value = ast.Name(id = '_nodes', ctx = ast.Load()),
+                                    slice = ast.Call(
+                                        func = ast.Name(id = 'UUID', ctx = ast.Load()),
+                                        args = [ast.Constant(value = x.uuid)]),
+                                    ctx = ast.Load())),
+                            ast.keyword(
+                                arg = 'port',
+                                value = ast.Call(
+                                    func = ast.Attribute(
+                                        value = ast.Subscript(
+                                            value = ast.Name(id = '_nodes', ctx = ast.Load()),
+                                            slice = ast.Call(
+                                                func = ast.Name(id = 'UUID', ctx = ast.Load()),
+                                                args = [ast.Constant(value = x.uuid)]),
+                                            ctx = ast.Load()),
+                                        attr = 'get_output_port',
+                                        ctx = ast.Load()),
+                                    args = [ast.Constant(value = x.port)]))])),
+                ast.keyword(
+                    arg = 'format',
+                    value = ast.Constant(value = x.format))]))

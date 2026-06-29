@@ -1,4 +1,4 @@
-project_name := 'spl'
+project_name := 'splime'
 python_version := '3.13'
 
 default:
@@ -139,13 +139,14 @@ docs env_name='docs': (_env env_name)
        --makefile --no-batchfile \
        '{{justfile_directory()}}/docs'
 
-    sed -i '{{justfile_directory()}}/docs/source/conf.py' -e "s/^html_theme =.*/html_theme = 'sphinx_rtd_theme'/"
+    conf='{{justfile_directory()}}/docs/source/conf.py'
+    sed -e "s/^html_theme =.*/html_theme = 'sphinx_rtd_theme'/" "$conf" > "$conf.tmp" && mv "$conf.tmp" "$conf"
     {
         echo "apidoc_modules = ["
         for module in '{{justfile_directory()}}/src'/*; do
             case $module in
                 *.egg-info) true ;;
-                *) echo "    {'path': '../../src/${module}', 'destination': 'api'}," ;;
+                *) echo "    {'path': '../../src/$(basename "$module")', 'destination': 'api'}," ;;
             esac
         done
         echo "]"
@@ -181,4 +182,3 @@ _env name:
 
   VIRTUAL_ENV='{{justfile_directory()}}/.venv-{{name}}' \
   uv pip install -e '.[{{name}}]'
-

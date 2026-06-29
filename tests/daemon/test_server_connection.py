@@ -1,0 +1,352 @@
+from __future__ import annotations
+
+import hashlib
+import threading
+from pathlib import Path
+from typing import Any, Iterator
+
+import pytest
+
+from spl.daemon.heartbeat_service import HeartbeatService
+from spl.daemon.remote_client import ServerClientError
+from spl.daemon.server import DaemonRuntime
+from spl.daemon.server_connection import (
+    SERVER_OFFLINE_MESSAGE,
+    ServerConnectionManager,
+    ServerOfflineError,
+)
+from spl.daemon.store import RegistryStore
+
+
+class OfflineClient:
+    def connect_machine(self, **kwargs: Any) -> dict[str, Any]:
+        raise ServerClientError(503, "server offline")
+
+
+class ConnectedClient:
+    def __init__(self):
+        self.connect_calls = 0
+        self.disconnect_calls = 0
+
+    def connect_machine(self, **kwargs: Any) -> dict[str, Any]:
+        self.connect_calls += 1
+        machine_id = kwargs.get("machine_id") or "machine-1"
+        return _remote_connection(machine_id=machine_id)
+
+    def disconnect_machine(self) -> dict[str, Any]:
+        self.disconnect_calls += 1
+        return {
+            **_remote_connection(machine_id="machine-1"),
+            "status": "disconnected",
+        }
+
+
+class ClientFactory:
+    def __init__(self, client: Any):
+        self.client = client
+        self.calls: list[tuple[str, str, str | None]] = []
+
+    def __call__(
+        self,
+        base_url: str,
+        machine_token: str,
+        *,
+        user_token: str | None = None,
+    ) -> Any:
+        self.calls.append((base_url, machine_token, user_token))
+        return self.client
+
+
+class FakeServerConnections:
+    def __init__(self):
+        self.connected = False
+        self.disconnected_with: dict[str, Any] | None = None
+
+    def server_client(
+        self,
+        server_url: str,
+        token: str,
+        *,
+        user_token: str | None,
+    ) -> Any:
+        raise NotImplementedError
+
+    def server_client_for_credentials(self, credentials: dict[str, Any]) -> Any:
+        raise NotImplementedError
+
+    def connect_server(self, **kwargs: Any) -> dict[str, Any]:
+        self.connected = True
+        return {
+            "connected": True,
+            "connection": {"id": "local-connection-1"},
+            "remote_connection": {"id": "remote-connection-1"},
+        }
+
+    def disconnect_server(
+        self,
+        credentials: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.disconnected_with = credentials
+        return {
+            "connected": False,
+            "connection": {"id": credentials["id"] if credentials else "missing"},
+            "remote_connection": {"id": "remote-connection-1"},
+        }
+
+    def matching_server_connection(self, **kwargs: Any) -> dict[str, Any] | None:
+        return None
+
+    def restore_pending_server_connection(
+        self,
+        credentials: dict[str, Any],
+    ) -> dict[str, Any]:
+        return credentials
+
+    def require_connected_server_credentials(
+        self,
+        credentials: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if credentials is None:
+            raise KeyError("active server connection is not found")
+        return credentials
+
+    def remote_connection_snapshot(
+        self,
+        connection: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {"id": connection["remote_connection_id"]}
+
+
+class FakeHeartbeatService:
+    def __init__(self):
+        self.restored = False
+        self.started: list[tuple[str, str]] = []
+        self.stopped: list[str] = []
+        self.shutdown_called = False
+
+    def restore_server_heartbeat(self) -> None:
+        self.restored = True
+
+    def start_server_heartbeat(
+        self,
+        connection: dict[str, Any],
+        *,
+        token: str,
+    ) -> None:
+        self.started.append((connection["id"], token))
+
+    def stop_server_heartbeat(self, connection_id: str) -> None:
+        self.stopped.append(connection_id)
+
+    def shutdown(self) -> None:
+        self.shutdown_called = True
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> Iterator[RegistryStore]:
+    registry = RegistryStore(tmp_path)
+    try:
+        yield registry
+    finally:
+        registry.close()
+
+
+def _remote_connection(*, machine_id: str) -> dict[str, Any]:
+    return {
+        "id": "remote-connection-1",
+        "owner_id": "admin1",
+        "subject_type": "machine",
+        "subject_id": machine_id,
+        "machine_id": machine_id,
+        "display_name": machine_id,
+        "capabilities": {"python": "3.13"},
+        "status": "connected",
+        "last_seen_at": "2026-01-01T00:00:00+00:00",
+        "expires_at": "2026-01-01T00:01:00+00:00",
+    }
+
+
+def test_server_connection_manager_persists_pending_connection_when_offline(
+    store: RegistryStore,
+) -> None:
+    machine_token = "machine-token-secret"
+    manager = ServerConnectionManager(store, ClientFactory(OfflineClient()))
+
+    result = manager.connect_server(
+        server_url="https://splime.io/api",
+        machine_token=machine_token,
+        user_token="user-token-secret",
+        machine_id=None,
+        display_name=None,
+        capabilities={},
+        heartbeat_interval_seconds=60,
+    )
+
+    connection = result["connection"]
+    expected_machine_id = (
+        f"machine-{hashlib.sha256(machine_token.encode('utf-8')).hexdigest()[:12]}"
+    )
+    assert result == {
+        "connected": False,
+        "offline": True,
+        "connection": connection,
+        "remote_connection": None,
+        "error": SERVER_OFFLINE_MESSAGE,
+        "detail": "server offline",
+    }
+    assert connection["status"] == "connect_failed"
+    assert connection["remote_connection_id"] is None
+    assert connection["machine_id"] == expected_machine_id
+    with pytest.raises(ServerOfflineError, match="central SPL daemon server is offline"):
+        manager.require_connected_server_credentials()
+
+
+def test_server_connection_manager_reuses_matching_connection(
+    store: RegistryStore,
+) -> None:
+    client = ConnectedClient()
+    manager = ServerConnectionManager(store, ClientFactory(client))
+
+    first = manager.connect_server(
+        server_url="https://splime.io/api/",
+        machine_token="machine-token-secret",
+        user_token="user-token-secret",
+        machine_id="machine-1",
+        display_name=None,
+        capabilities={},
+        heartbeat_interval_seconds=60,
+    )
+    second = manager.connect_server(
+        server_url="https://splime.io/api",
+        machine_token="machine-token-secret",
+        user_token="user-token-secret",
+        machine_id="machine-1",
+        display_name=None,
+        capabilities={},
+        heartbeat_interval_seconds=60,
+    )
+
+    assert first["connected"] is True
+    assert second["reused"] is True
+    assert second["remote_connection"]["id"] == "remote-connection-1"
+    assert second["remote_connection"]["machine_id"] == "machine-1"
+    assert client.connect_calls == 1
+
+
+def test_server_connection_manager_disconnects_pending_connection(
+    store: RegistryStore,
+) -> None:
+    client = ConnectedClient()
+    manager = ServerConnectionManager(store, ClientFactory(client))
+    pending = store.save_pending_server_connection(
+        server_url="https://splime.io/api",
+        token="machine-token-secret",
+        user_token="user-token-secret",
+        machine_id="machine-1",
+    )
+
+    result = manager.disconnect_server()
+
+    assert result["connected"] is False
+    assert result["offline"] is True
+    assert result["connection"]["id"] == pending["id"]
+    assert result["connection"]["status"] == "disconnected"
+    assert result["remote_connection"] is None
+    assert client.disconnect_calls == 0
+
+
+def test_heartbeat_service_records_stale_and_stops(
+    store: RegistryStore,
+) -> None:
+    connection = store.save_server_connection(
+        server_url="https://splime.io/api",
+        token="machine-token-secret",
+        user_token="user-token-secret",
+        connection=_remote_connection(machine_id="machine-1"),
+        heartbeat_interval_seconds=60,
+    )
+
+    def sync_once(**kwargs: Any) -> dict[str, Any]:
+        raise ServerClientError(401, "stale lease")
+
+    service = HeartbeatService(store, sync_once)
+
+    service._server_heartbeat_loop(
+        connection["id"],
+        "machine-token-secret",
+        threading.Event(),
+    )
+
+    updated = store.get_server_connection(connection["id"])
+    assert updated["status"] == "stale"
+    assert updated["error"] == "stale lease"
+
+
+def test_heartbeat_service_records_transient_failure(
+    store: RegistryStore,
+) -> None:
+    connection = store.save_server_connection(
+        server_url="https://splime.io/api",
+        token="machine-token-secret",
+        user_token="user-token-secret",
+        connection=_remote_connection(machine_id="machine-1"),
+        heartbeat_interval_seconds=60,
+    )
+    stop_event = threading.Event()
+
+    def sync_once(**kwargs: Any) -> dict[str, Any]:
+        stop_event.set()
+        raise RuntimeError("temporary failure")
+
+    service = HeartbeatService(store, sync_once)
+
+    service._server_heartbeat_loop(
+        connection["id"],
+        "machine-token-secret",
+        stop_event,
+    )
+
+    updated = store.get_server_connection(connection["id"])
+    assert updated["status"] == "heartbeat_failed"
+    assert updated["error"] == "RuntimeError('temporary failure')"
+
+
+def test_daemon_runtime_delegates_connection_and_heartbeat(
+    store: RegistryStore,
+) -> None:
+    server_connections = FakeServerConnections()
+    heartbeats = FakeHeartbeatService()
+    existing = store.save_server_connection(
+        server_url="https://splime.io/api",
+        token="machine-token-secret",
+        user_token="user-token-secret",
+        connection=_remote_connection(machine_id="machine-1"),
+        heartbeat_interval_seconds=60,
+    )
+    runtime = DaemonRuntime(
+        store,
+        server_connections=server_connections,
+        heartbeat_service=heartbeats,
+    )
+
+    connect_result = runtime.connect_server(
+        server_url="https://splime.io/api",
+        machine_token="machine-token-secret",
+        user_token="user-token-secret",
+        machine_id="machine-1",
+        display_name=None,
+        capabilities={},
+        heartbeat_interval_seconds=60,
+    )
+    disconnect_result = runtime.disconnect_server()
+    runtime.shutdown()
+
+    assert heartbeats.restored is True
+    assert connect_result["connected"] is True
+    assert heartbeats.started == [("local-connection-1", "machine-token-secret")]
+    assert heartbeats.stopped == [existing["id"]]
+    assert server_connections.disconnected_with is not None
+    assert server_connections.disconnected_with["id"] == existing["id"]
+    assert disconnect_result["connected"] is False
+    assert heartbeats.shutdown_called is True
+    assert not hasattr(runtime, "_server_heartbeat_threads")

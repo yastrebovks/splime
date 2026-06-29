@@ -23,7 +23,7 @@ class SecretStoreError(RuntimeError):
     """Raised when a daemon secret cannot be read or written."""
 
 
-class SecretBackend(Protocol):
+class SecretBackendProtocol(Protocol):
     name: str
 
     def get(self, key: str) -> str | None:
@@ -129,20 +129,20 @@ class SecretStore:
         self._fallback = FileSecretBackend(home)
         backend = os.environ.get(SECRET_BACKEND_ENV, "auto").strip().lower()
         if backend == FILE_BACKEND_NAME:
-            self._write_backends: list[SecretBackend] = [self._fallback]
+            self._write_backends: list[SecretBackendProtocol] = [self._fallback]
         elif backend in {"keyring", "os", "keychain"}:
             self._write_backends = [KeyringSecretBackend(home)]
         elif backend in {"", "auto"}:
             self._write_backends = self._auto_backends(home)
         else:
             raise SecretStoreError(f"unknown daemon secret backend: {backend}")
-        self._read_backends: dict[str, SecretBackend] = {
+        self._read_backends: dict[str, SecretBackendProtocol] = {
             FILE_BACKEND_NAME: self._fallback,
         }
         for candidate in self._write_backends:
             self._read_backends[candidate.name] = candidate
 
-    def _auto_backends(self, home: Path) -> list[SecretBackend]:
+    def _auto_backends(self, home: Path) -> list[SecretBackendProtocol]:
         try:
             return [KeyringSecretBackend(home), self._fallback]
         except SecretStoreError:

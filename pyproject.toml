@@ -3,12 +3,14 @@ requires = ["setuptools==82.0.1", "wheel==0.47.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "spl"
+name = "splime"
 version = "0.1.0"
 
-description = "Smart PipeLime project"
+description = "Reuse Python functions across projects without rewriting or redeploying them."
 readme = "README.md"
-keywords = ["spl", "framework", "pipeline", "daemon-client"]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+keywords = ["splime", "spl", "python", "functions", "reuse", "nodes", "pipeline", "remote-execution", "registry"]
 
 authors = [
   {name = "Yastrebov Kirill", email = "yastrebovks@gmail.com"}]
@@ -19,6 +21,17 @@ dependencies = [
   "pyyaml==6.0.3",
   "keyring==25.7.0",
   "quart==0.20.0",
+]
+
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: OS Independent",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: System :: Distributed Computing",
+  "Typing :: Typed",
 ]
 
 [project.optional-dependencies]
@@ -55,6 +68,13 @@ build = [
 
 [project.scripts]
 spl-daemon = "spl.daemon.cli:main"
+
+
+[project.urls]
+Homepage = "https://splime.io"
+Documentation = "https://splime.io"
+Repository = "https://github.com/yastrebovks/splime"
+Issues = "https://github.com/yastrebovks/splime/issues"
 
 
 [tool.setuptools.packages.find]

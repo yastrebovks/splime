@@ -1,4 +1,5 @@
 import ast
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from itertools import chain
 from operator import itemgetter
@@ -7,13 +8,30 @@ from typing import Any, Generator
 
 import yaml
 
+import spl.core.entities.adapter as m_adapter
+import spl.core.entities.artifact as m_artifact
+import spl.core.entities.distribution as m_distribution
 import spl.core.entities.node as m_node
 import spl.core.entities.node_function as m_node_function
 import spl.core.entities.scalar as m_scalar
-from spl.core.entities.node import Node, NodeInputRef, NodeOutputRef
+from spl.core.entities.adapter import Adapter, make_key
+from spl.core.entities.node import (
+    FormattedOutputRef,
+    Node,
+    NodeInputRef,
+    NodeOutputRef,
+)
 from spl.core.ir.common import DBase
 from spl.core.ir.parse import _branch, ir_parse
 from spl.core.ir.unparse import ir_unparse
+
+
+def _as_node_output_ref(value: Any) -> NodeOutputRef | None:
+    if isinstance(value, FormattedOutputRef):
+        return value.out_ref
+    if isinstance(value, NodeOutputRef):
+        return value
+    return None
 
 
 @dataclass(frozen = True)
@@ -22,20 +40,26 @@ class Pipeline:
     nodes: set[Node] = field(default_factory = set)
     links: set[tuple[NodeInputRef, Any]] = field(default_factory = set)
     aliases: dict[str, Node] = field(default_factory = dict)
+    adapters: dict[str, Adapter] = field(default_factory = dict)
 
     def __hash__(self):
         return hash((
             tuple(sorted(map(hash, self.nodes))),
-            tuple(sorted(map(hash, self.links)))))
+            tuple(sorted(map(hash, self.links))),
+            tuple(sorted([
+                (key, hash(adapter))
+                for key, adapter in self.adapters.items()]))))
 
     def __or__(self, other):
         nodes = set.union(self.nodes, other.nodes)
         links = set.union(self.links, other.links)
         aliases = self._merge_aliases(other)
+        adapters = self._merge_adapters(other)
         return Pipeline(
             nodes = nodes,
             links = links,
-            aliases = aliases)._validate_consistency()
+            aliases = aliases,
+            adapters = adapters)._validate_consistency()
 
     def add_link(self, node_input_ref, value):
         if (node := node_input_ref.node) not in self.nodes:
@@ -43,11 +67,11 @@ class Pipeline:
         if node_input_ref.port not in node.inputs:
             raise ValueError('pipeline input ref does not belong to node ({})'.format(node_input_ref))
 
-        if isinstance(value, NodeOutputRef):
-            if (node := value.node) not in self.nodes:
+        if (output_ref := _as_node_output_ref(value)) is not None:
+            if (node := output_ref.node) not in self.nodes:
                 raise ValueError('pipeline does not contain output node ({})'.format(node))
-            if value.port not in node.outputs:
-                raise ValueError('pipeline output ref does not belong to node ({})'.format(value))
+            if output_ref.port not in node.outputs:
+                raise ValueError('pipeline output ref does not belong to node ({})'.format(output_ref))
 
         for existing_ref, existing_value in self.links:
             if existing_ref == node_input_ref and existing_value != value:
@@ -57,7 +81,8 @@ class Pipeline:
         return Pipeline(
             nodes = self.nodes,
             links = {*self.links, (node_input_ref, value)},
-            aliases = self.aliases)._validate_consistency()
+            aliases = self.aliases,
+            adapters = self.adapters)._validate_consistency()
 
 
     def add_alias(self, node, name):
@@ -69,6 +94,56 @@ class Pipeline:
             raise ValueError('pipeline alias `{}` already points to another node'.format(name))
         return replace(self, aliases = {**self.aliases, name: node})._validate_consistency()
 
+
+    def add_adapter(
+            self,
+            py_type: type[Any],
+            format: str,
+            *,
+            save: Callable[..., Any],
+            load: Callable[..., Any],
+            distributions: tuple[Any, ...] = ()) -> 'Pipeline':
+        key = make_key(py_type, format)
+        adapter = Adapter(
+            key = key,
+            save = save,
+            load = load,
+            py_type = py_type,
+            format = format,
+            distributions = distributions)
+        if key in self.adapters and self.adapters[key] != adapter:
+            raise ValueError('pipeline adapter conflict: `{}`'.format(key))
+        return replace(self, adapters = {**self.adapters, key: adapter})._validate_consistency()
+
+    def resolve_adapter(
+            self,
+            *,
+            py_type: type[Any] | None = None,
+            format: str | None = None,
+            key: str | None = None) -> Adapter | None:
+        if key is not None and (py_type is not None or format is not None):
+            raise ValueError('pipeline adapter lookup accepts key or python type and format')
+        if key is None:
+            if py_type is None:
+                raise ValueError('pipeline adapter lookup requires key or python type')
+            if format is not None:
+                key = make_key(py_type, format)
+            else:
+                prefix = '{}.{}@'.format(py_type.__module__, py_type.__qualname__)
+                adapters = [
+                    adapter
+                    for key, adapter in sorted(self.adapters.items())
+                    if key.startswith(prefix)]
+                if len(adapters) > 1:
+                    raise ValueError(
+                        'pipeline adapter lookup is ambiguous for python type ({})'.format(
+                            py_type))
+                return adapters[0] if adapters else None
+        if not isinstance(key, str):
+            raise TypeError('pipeline adapter key must be a string')
+        if not key:
+            raise ValueError('pipeline adapter key must be a non-empty string')
+        return self.adapters.get(key)
 
     def get_free_inputs(self) -> list[NodeInputRef]:
         return ({
@@ -100,6 +175,14 @@ class Pipeline:
             aliases[name] = node
         return aliases
 
+    def _merge_adapters(self, other):
+        adapters = dict(self.adapters)
+        for key, adapter in other.adapters.items():
+            if key in adapters and adapters[key] != adapter:
+                raise ValueError('pipeline adapter conflict: `{}`'.format(key))
+            adapters[key] = adapter
+        return adapters
+
     def _validate_consistency(self):
         linked_inputs = set()
         for node_input_ref, value in self.links:
@@ -115,19 +198,26 @@ class Pipeline:
                 raise ValueError('pipeline input `{}` is linked more than once'.format(node_input_ref))
             linked_inputs.add(node_input_ref)
 
-            if isinstance(value, NodeOutputRef):
-                if value.node not in self.nodes:
+            if (output_ref := _as_node_output_ref(value)) is not None:
+                if output_ref.node not in self.nodes:
                     raise ValueError(
                         'pipeline link source node is not in pipeline ({})'.format(
-                            value.node))
-                if value.port not in value.node.outputs:
+                            output_ref.node))
+                if output_ref.port not in output_ref.node.outputs:
                     raise ValueError(
                         'pipeline link source port is not on node ({})'.format(
-                            value))
+                            output_ref))
 
         for name, node in self.aliases.items():
             if node not in self.nodes:
                 raise ValueError('pipeline alias `{}` points to unknown node'.format(name))
+        for key, adapter in self.adapters.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError('pipeline adapter key must be a non-empty string')
+            if not isinstance(adapter, Adapter):
+                raise TypeError('pipeline adapter `{}` must be Adapter'.format(key))
+            if key != adapter.key:
+                raise ValueError('pipeline adapter key mismatch: `{}`'.format(key))
         return self
 
 
@@ -137,11 +227,13 @@ class DPipeline(DBase):
     nodes: list[Any]
     links: list[Any]
     aliases: list[list[str]]
+    adapters: list[Any] = field(default_factory = list)
 
     def __hash__(self):
         return hash((
             tuple(sorted(map(hash, self.nodes))),
-            tuple(sorted(map(hash, chain.from_iterable(self.links))))))
+            tuple(sorted(map(hash, chain.from_iterable(self.links)))),
+            tuple(sorted(map(hash, self.adapters)))))
 
 yaml.add_representer(
     DPipeline,
@@ -165,11 +257,19 @@ def _ir_parse__pipeline(
             links = [
                 [ir_parse(l_from).mk_root(), ir_parse(l_to).mk_root()]
                 for (l_from, l_to) in x.links],
-            aliases = [[k, str(v.uuid)] for k, v in x.aliases.items()])
+            aliases = [[k, str(v.uuid)] for k, v in x.aliases.items()],
+            adapters = [
+                ir_parse(adapter).mk_root()
+                for _, adapter in sorted(x.adapters.items())])
 
     def mk_dependencies(frame_offset):
         return chain.from_iterable([
-            ir_parse(n, name = name).mk_dependencies(frame_offset) for n in x.nodes])
+            *[
+                ir_parse(n, name = name).mk_dependencies(frame_offset)
+                for n in x.nodes],
+            *[
+                ir_parse(adapter).mk_dependencies(frame_offset)
+                for _, adapter in sorted(x.adapters.items())]])
 
     return _branch(
         x,
@@ -192,6 +292,7 @@ def _ir_unparse__pipeline(x: DPipeline, source: Path) -> Generator[ast.stmt]:
     yield ast.ImportFrom(
         module = m_node.__name__,
         names = [
+            ast.alias(name = 'FormattedOutputRef'),
             ast.alias(name = 'NodeInputRef'),
             ast.alias(name = 'NodeOutputRef')])
 
@@ -199,6 +300,21 @@ def _ir_unparse__pipeline(x: DPipeline, source: Path) -> Generator[ast.stmt]:
         module = m_scalar.__name__,
         names = [
             ast.alias(name = 'Scalar')])
+
+    yield ast.ImportFrom(
+        module = m_artifact.__name__,
+        names = [
+            ast.alias(name = 'ArtifactRef')])
+
+    yield ast.ImportFrom(
+        module = m_adapter.__name__,
+        names = [
+            ast.alias(name = 'Adapter')])
+
+    yield ast.ImportFrom(
+        module = m_distribution.__name__,
+        names = [
+            ast.alias(name = 'DDistribution')])
 
     yield ast.ImportFrom(
         module = m_node_function.__name__,
@@ -256,6 +372,27 @@ def _ir_unparse__pipeline(x: DPipeline, source: Path) -> Generator[ast.stmt]:
                       ast.Name(id = '_link_to', ctx = ast.Load())],
                     ctx = ast.Load())]))
 
+    # _adapters = {}
+    yield ast.Assign(
+        targets = [ast.Name(id = '_adapters', ctx = ast.Store())],
+        value = ast.Dict())
+
+    for adapter in x.adapters:
+        # _adapter = ...
+        yield from ir_unparse(adapter, source = source)
+
+        # _adapters[_adapter.key] = _adapter
+        yield ast.Assign(
+            targets = [
+                ast.Subscript(
+                    value = ast.Name(id = '_adapters', ctx = ast.Load()),
+                    slice = ast.Attribute(
+                        value = ast.Name(id = '_adapter', ctx = ast.Load()),
+                        attr = 'key',
+                        ctx = ast.Load()),
+                    ctx = ast.Store())],
+            value = ast.Name(id = '_adapter', ctx = ast.Load()))
+
     # pipeline = Pipeline(...)
     yield ast.Assign(
         targets = [ast.Name(id = x.name, ctx = ast.Store())],
@@ -292,4 +429,8 @@ def _ir_unparse__pipeline(x: DPipeline, source: Path) -> Generator[ast.stmt]:
                                     func = ast.Name(id = 'UUID', ctx = ast.Load()),
                                     args = [ast.Constant(value = v)]),
                                 ctx = ast.Load())
-                            for [_, v] in x.aliases]))]))
+                            for [_, v] in x.aliases])),
+
+                ast.keyword(
+                    arg = 'adapters',
+                    value = ast.Name(id = '_adapters', ctx = ast.Load()))]))

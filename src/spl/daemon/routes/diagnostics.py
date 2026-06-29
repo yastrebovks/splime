@@ -68,10 +68,10 @@ def register_diagnostics_routes(
                     "by_status": build_statuses,
                     "auto_build_envs": runtime.auto_build_envs,
                     "build_timeout_seconds": (
-                        runtime.environment_manager.build_timeout_seconds
+                        getattr(runtime.environment_manager, "build_timeout_seconds", None)
                     ),
                     "stale_lock_seconds": (
-                        runtime.environment_manager.stale_lock_seconds
+                        getattr(runtime.environment_manager, "stale_lock_seconds", None)
                     ),
                 },
             }

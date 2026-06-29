@@ -1,24 +1,46 @@
-_attic
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+.hypothesis/
+.venv*/
+.ipynb_checkpoints/
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+htmlcov/
 .coverage
-.hypothesis
-.ipynb_checkpoints
-.tox
-.venv*
-__pycache__
-*.egg-info
-.mypy_cache
-.pytest_cache
-.ruff_cache
-build
-dist
-dev
+.coverage.*
+
+# Local-only project files
+_attic/
+dev/
 dev.ipynb
-docs/build
-stubs
+stubs/
 uv.lock
 *.pwd
-*.swp
+.env
+.env.*
+!.env.example
+
+# Daemon runtime state and generated docs
 .spl-daemon/
+daemon-endpoint.json
+daemon-secrets.json
+docs/build/
+
+# Codex/workspace scratch
 .codex-*/
 landing_page/
 frontend/

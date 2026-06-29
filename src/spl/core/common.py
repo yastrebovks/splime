@@ -1,20 +1,38 @@
+import os
+import shutil
+import tempfile
+import weakref
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from functools import reduce
 from itertools import groupby
 from operator import itemgetter
+from pathlib import Path
 from types import FunctionType
+from typing import Any
 
-from spl.core.entities.node import DEFAULT_PORT, Node, NodeInputRef, NodeOutputRef
+from spl.core.entities.adapter import Adapter
+from spl.core.entities.artifact import ArtifactRef, compute_sha256
+from spl.core.entities.node import (
+    DEFAULT_PORT,
+    FormattedOutputRef,
+    Node,
+    NodeInputRef,
+    NodeOutputRef,
+)
 from spl.core.entities.node_function import NodeFunction
 from spl.core.entities.node_remote import NodeRemote
 from spl.core.entities.pipeline import Pipeline
 from spl.core.entities.scalar import Scalar
+
+_JSON_NATIVE_TYPES = {str, int, float, bool, dict, list}
 
 
 @dataclass(frozen = True)
 class PipelineBuilder:
     pipeline: Pipeline
     root: Node
+    format: str | None = None
 
     @staticmethod
     def lift(x):
@@ -82,18 +100,37 @@ class PipelineBuilder:
                         lambda acc, ref: self._update_pipeline(acc, ref, v),
                         refs,
                         pipeline)
-        return PipelineBuilder(pipeline = pipeline, root = self.root)
+        return PipelineBuilder(
+            pipeline = pipeline,
+            root = self.root,
+            format = self.format)
 
     def alias(self, name):
         return replace(self, pipeline = self.pipeline.add_alias(self.root, name))
+
+    def as_format(self, format: str) -> 'PipelineBuilder':
+        """Return a builder whose output edge uses an artifact format."""
+
+        if not isinstance(format, str):
+            raise TypeError('pipeline builder format must be a string')
+        if not format:
+            raise ValueError('pipeline builder format must be a non-empty string')
+        return replace(self, format = format)
 
     @staticmethod
     def _update_pipeline(pipeline, ref, v):
         match v:
             case PipelineBuilder():
+                output_ref = NodeOutputRef(
+                    v.root,
+                    v.root.get_output_port(DEFAULT_PORT))
+                link_value = (
+                    output_ref
+                    if v.format is None
+                    else FormattedOutputRef(output_ref, v.format))
                 return (pipeline | v.pipeline).add_link(
                     ref,
-                    NodeOutputRef(v.root, v.root.get_output_port(DEFAULT_PORT)))
+                    link_value)
             case _:
                 return pipeline.add_link(
                     ref,
@@ -104,6 +141,44 @@ class PipelineBuilder:
 
 
 lift = PipelineBuilder.lift
+
+
+def encode(value: Any, adapter: Adapter, artifacts_dir: Path) -> ArtifactRef:
+    """Materialize a value with an adapter and return its artifact reference."""
+
+    fd, artifact_path_value = tempfile.mkstemp(
+        prefix = 'artifact-',
+        dir = artifacts_dir)
+    os.close(fd)
+    artifact_path = Path(artifact_path_value)
+
+    try:
+        adapter.save(str(artifact_path), value)
+    except BaseException:
+        artifact_path.unlink(missing_ok = True)
+        raise
+
+    size = artifact_path.stat().st_size
+    sha256 = compute_sha256(artifact_path)
+    return ArtifactRef(
+        key = adapter.key,
+        uri = str(artifact_path),
+        sha256 = sha256,
+        size = size)
+
+
+def decode(ref: ArtifactRef, adapter: Adapter) -> Any:
+    """Load an artifact reference with an adapter after validating its digest."""
+
+    if ref.key != adapter.key:
+        raise ValueError('artifact ref key does not match adapter')
+
+    artifact_path = Path(ref.uri)
+    if artifact_path.stat().st_size != ref.size:
+        raise ValueError('artifact ref size does not match file')
+    if compute_sha256(artifact_path) != ref.sha256:
+        raise ValueError('artifact ref sha256 does not match file')
+    return adapter.load(str(artifact_path))
 
 
 class Deployment:
@@ -152,32 +227,110 @@ class Deployment:
 
 
 class Run:
-    def __init__(self, callback, pipeline, **kwargs):
+    def __init__(
+            self,
+            callback: Callable[..., dict[str, Any]],
+            pipeline: Pipeline,
+            **kwargs: Any) -> None:
         self._callback = callback
+        self._pipeline = pipeline
         self._kwargs = kwargs
-        self._deps = {
+        self._deps: dict[Node, dict[Any, Any]] = {
             k: dict(map(itemgetter(slice(1, None)), vs))
             for k, vs in groupby(
                 sorted(
                     [(x.node, x.port, y) for (x, y) in pipeline.links],
                     key = lambda x: hash(x[0])),
                 itemgetter(0))}
-        self._results = dict()
+        self._results: dict[Node, dict[str, Any]] = dict()
+        self._artifact_refs: dict[tuple[Node, str, str], ArtifactRef] = dict()
+        self._artifacts_dir: Path | None = None
+        self._artifacts_finalizer: Any = None
+        self._closed = False
 
-    def _get_input(self, x):
+    def __enter__(self) -> 'Run':
+        self._ensure_open()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if not self._closed:
+            if self._artifacts_finalizer is not None:
+                self._artifacts_finalizer()
+            self._closed = True
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError('run is closed')
+
+    def _get_artifacts_dir(self) -> Path:
+        self._ensure_open()
+        if self._artifacts_dir is None:
+            artifacts_dir = Path(tempfile.mkdtemp(prefix = 'spl-run-'))
+            self._artifacts_dir = artifacts_dir
+            self._artifacts_finalizer = weakref.finalize(
+                self,
+                shutil.rmtree,
+                artifacts_dir,
+                ignore_errors = True)
+        return self._artifacts_dir
+
+    def _round_trip_artifact(
+            self,
+            value: Any,
+            source_ref: NodeOutputRef | None = None,
+            adapter_format: str | None = None) -> Any:
+        if adapter_format is None and type(value) in _JSON_NATIVE_TYPES:
+            return value
+
+        adapter = self._pipeline.resolve_adapter(
+            py_type = type(value),
+            format = adapter_format)
+        if adapter is None:
+            if adapter_format is not None:
+                raise ValueError(
+                    'pipeline adapter is not found for python type ({}) '
+                    'and format `{}`'.format(type(value), adapter_format))
+            return value
+
+        self._ensure_open()
+        if source_ref is None:
+            ref = encode(value, adapter, self._get_artifacts_dir())
+        else:
+            cache_key = (source_ref.node, source_ref.port.name, adapter.key)
+            if cache_key not in self._artifact_refs:
+                self._artifact_refs[cache_key] = encode(
+                    value,
+                    adapter,
+                    self._get_artifacts_dir())
+            ref = self._artifact_refs[cache_key]
+        return decode(ref, adapter)
+
+    def _get_input(self, x: Any) -> Any:
         match x:
             case Scalar():
-                return x.value
+                return self._round_trip_artifact(x.value)
 
             case NodeOutputRef():
-                return (self._get_result(x.node))[x.port.name]
+                return self._round_trip_artifact(
+                    (self._get_result(x.node))[x.port.name],
+                    x)
+
+            case FormattedOutputRef():
+                return self._round_trip_artifact(
+                    (self._get_result(x.out_ref.node))[x.out_ref.port.name],
+                    source_ref = x.out_ref,
+                    adapter_format = x.format)
 
             case _: raise ValueError(x)
 
-    def _get_result(self, node):
+    def _get_result(self, node: Node) -> dict[str, Any]:
         if node not in self._results:
+            self._ensure_open()
             kwargs = {
-                port: self._kwargs[port.name]
+                port: self._round_trip_artifact(self._kwargs[port.name])
                 for port in node.inputs
                 if port.name in self._kwargs}
 
@@ -189,5 +342,9 @@ class Run:
             self._results[node] = self._callback(node, kwargs)
         return self._results[node]
 
-    def __getitem__(self, node):
-        return self._get_result(node)
+    def __getitem__(self, node: Node) -> dict[str, Any]:
+        try:
+            return self._get_result(node)
+        except BaseException:
+            self.close()
+            raise

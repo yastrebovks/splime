@@ -1,3 +1,5 @@
+import spl.core.entities.adapter
+import spl.core.entities.artifact
 import spl.core.entities.distribution
 import spl.core.entities.function
 # Registered before `module` so local user functions are inlined instead of

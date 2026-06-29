@@ -48,19 +48,14 @@ from __future__ import annotations
 import json
 import hashlib
 import os
-import platform
-import secrets
-import shutil
 import socket
 import subprocess
 import sys
 import threading
 import time
 import base64
-from functools import wraps
-from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 from urllib.parse import urlparse, urlunparse
 from uuid import uuid4
 
@@ -71,15 +66,44 @@ from spl.daemon_client import (
     write_daemon_endpoint,
 )
 from spl.daemon.docker_environment import DockerEnvironmentManager
-from spl.daemon.environment import EnvironmentBuildError, EnvironmentManager
+from spl.daemon.docker_pool import DockerPool
+from spl.daemon.environment import EnvironmentBuildError
+from spl.daemon.environment import EnvironmentManager as VenvEnvironmentManager
+from spl.daemon.environment_base import EnvironmentManagerProtocol
+from spl.daemon.heartbeat_service import HeartbeatService
 from spl.daemon.remote_client import (
-    DEFAULT_SERVER_URL,
     ServerClient,
     ServerClientError,
 )
+from spl.daemon.runtime_dependencies import (
+    DockerEnvironmentManagerProtocol,
+    DockerPoolRunnerProtocol,
+    HeartbeatsProtocol,
+    ServerClientFactoryProtocol,
+    ServerClientProtocol,
+    ServerConnectionsProtocol,
+    SyncVisibilityProtocol,
+)
+from spl.daemon.runtime_backend import (
+    RunContext,
+    RuntimeBackendRegistry,
+    RuntimeBackendServices,
+)
+from spl.daemon.routes._helpers import RouteContext
+from spl.daemon.routes.artifacts import register_artifact_routes
 from spl.daemon.routes.diagnostics import register_diagnostics_routes
+from spl.daemon.routes.envs import register_env_routes
+from spl.daemon.routes.libraries import register_library_routes
+from spl.daemon.routes.objects import register_object_routes
+from spl.daemon.routes.remote import register_remote_routes
+from spl.daemon.routes.runs import register_run_routes
+from spl.daemon.routes.server_connections import register_server_connection_routes
+from spl.daemon.server_connection import (
+    SERVER_OFFLINE_MESSAGE,
+    ServerConnectionManager,
+    ServerOfflineError,
+)
 from spl.daemon.services.sync import SyncVisibilityService
-from spl.daemon.signature import build_signature, summarize_object
 from spl.daemon.store import (
     RegistryStore,
     split_object_function_ref,
@@ -113,16 +137,88 @@ DEFAULT_INLINE_REMOTE_ARTIFACT_TOTAL_MAX_BYTES = int(
 )
 
 
-class ServerOfflineError(RuntimeError):
-    """Raised when a server-backed operation is requested while offline."""
+EnvironmentManagerFactory = Callable[..., EnvironmentManagerProtocol]
+DockerEnvironmentManagerFactory = Callable[..., DockerEnvironmentManagerProtocol]
+DockerPoolFactory = Callable[..., DockerPoolRunnerProtocol]
+RuntimeBackendRegistryFactory = Callable[
+    [RuntimeBackendServices],
+    RuntimeBackendRegistry,
+]
+SyncVisibilityFactory = Callable[[RegistryStore], SyncVisibilityProtocol]
+ServerConnectionManagerFactory = Callable[
+    [RegistryStore, ServerClientFactoryProtocol],
+    ServerConnectionsProtocol,
+]
+HeartbeatServiceFactory = Callable[
+    [RegistryStore, Callable[..., dict[str, Any]]],
+    HeartbeatsProtocol,
+]
 
 
-SERVER_OFFLINE_MESSAGE = (
-    "central SPL daemon server is offline or unreachable. Local registry, "
-    "local runs, and pending sync events remain available; server-backed "
-    "operations require connectivity and should be retried after the daemon "
-    "reconnects."
-)
+def _default_environment_manager_factory(
+    store: RegistryStore,
+    **kwargs: Any,
+) -> EnvironmentManagerProtocol:
+    return VenvEnvironmentManager(store, **kwargs)
+
+
+def _default_docker_environment_manager_factory(
+    store: RegistryStore,
+    **kwargs: Any,
+) -> DockerEnvironmentManagerProtocol:
+    return DockerEnvironmentManager(store, **kwargs)
+
+
+def _default_docker_pool_factory(
+    store: RegistryStore,
+    docker_environment_manager: DockerEnvironmentManagerProtocol,
+    *,
+    daemon_base_url: str,
+    pool_size: int,
+    idle_timeout_seconds: float,
+    prewarm: bool,
+) -> DockerPoolRunnerProtocol:
+    return DockerPool(
+        store,
+        docker_environment_manager,
+        daemon_base_url=daemon_base_url,
+        pool_size=pool_size,
+        idle_timeout_seconds=idle_timeout_seconds,
+        prewarm=prewarm,
+    )
+
+
+def _default_runtime_backend_registry_factory(
+    services: RuntimeBackendServices,
+) -> RuntimeBackendRegistry:
+    return RuntimeBackendRegistry(services)
+
+
+def _default_sync_visibility_factory(store: RegistryStore) -> SyncVisibilityProtocol:
+    return SyncVisibilityService(store)
+
+
+def _default_server_client_factory(
+    base_url: str,
+    machine_token: str,
+    *,
+    user_token: str | None = None,
+) -> ServerClientProtocol:
+    return ServerClient(base_url, machine_token, user_token=user_token)
+
+
+def _default_server_connection_manager_factory(
+    store: RegistryStore,
+    server_client_factory: ServerClientFactoryProtocol,
+) -> ServerConnectionManager:
+    return ServerConnectionManager(store, server_client_factory)
+
+
+def _default_heartbeat_service_factory(
+    store: RegistryStore,
+    sync_once: Callable[..., dict[str, Any]],
+) -> HeartbeatService:
+    return HeartbeatService(store, sync_once)
 
 
 class DaemonRuntime:
@@ -139,29 +235,100 @@ class DaemonRuntime:
         docker_pool_size: int = 0,
         docker_idle_timeout_seconds: float = 300.0,
         docker_prewarm: bool = False,
+        environment_manager: EnvironmentManagerProtocol | None = None,
+        docker_environment_manager: DockerEnvironmentManagerProtocol | None = None,
+        docker_pool: DockerPoolRunnerProtocol | None = None,
+        runtime_backends: RuntimeBackendRegistry | None = None,
+        sync_visibility: SyncVisibilityProtocol | None = None,
+        server_connections: ServerConnectionsProtocol | None = None,
+        heartbeat_service: HeartbeatsProtocol | None = None,
+        server_client_factory: ServerClientFactoryProtocol = (
+            _default_server_client_factory
+        ),
+        environment_manager_factory: EnvironmentManagerFactory = (
+            _default_environment_manager_factory
+        ),
+        docker_environment_manager_factory: DockerEnvironmentManagerFactory = (
+            _default_docker_environment_manager_factory
+        ),
+        docker_pool_factory: DockerPoolFactory = _default_docker_pool_factory,
+        runtime_backend_registry_factory: RuntimeBackendRegistryFactory = (
+            _default_runtime_backend_registry_factory
+        ),
+        sync_visibility_factory: SyncVisibilityFactory = (
+            _default_sync_visibility_factory
+        ),
+        server_connection_manager_factory: ServerConnectionManagerFactory = (
+            _default_server_connection_manager_factory
+        ),
+        heartbeat_service_factory: HeartbeatServiceFactory = (
+            _default_heartbeat_service_factory
+        ),
     ):
         self.store = store
         self.auto_build_envs = auto_build_envs
         self.daemon_base_url = daemon_base_url.rstrip("/")
-        self.docker_pool_size = max(0, int(docker_pool_size))
-        self.docker_idle_timeout_seconds = float(docker_idle_timeout_seconds)
-        self.docker_prewarm = bool(docker_prewarm)
-        self._docker_pool_lock = threading.RLock()
-        self._docker_pool: dict[str, dict[str, Any]] = {}
+        self.server_client_factory = server_client_factory
         manager_kwargs = {}
         if env_build_timeout_seconds is not None:
             manager_kwargs["build_timeout_seconds"] = env_build_timeout_seconds
         if env_stale_lock_seconds is not None:
             manager_kwargs["stale_lock_seconds"] = env_stale_lock_seconds
-        self.environment_manager = EnvironmentManager(store, **manager_kwargs)
-        self.docker_environment_manager = DockerEnvironmentManager(store, **manager_kwargs)
-        self.sync_visibility = SyncVisibilityService(store)
-        self._server_heartbeat_lock = threading.Lock()
-        self._server_heartbeat_stops: dict[str, threading.Event] = {}
-        self._server_heartbeat_threads: dict[str, threading.Thread] = {}
+        self.environment_manager = environment_manager or environment_manager_factory(
+            store,
+            **manager_kwargs,
+        )
+        self.docker_environment_manager = (
+            docker_environment_manager
+            or docker_environment_manager_factory(store, **manager_kwargs)
+        )
+        self.docker_pool = docker_pool or docker_pool_factory(
+            store,
+            self.docker_environment_manager,
+            daemon_base_url=self.daemon_base_url,
+            pool_size=docker_pool_size,
+            idle_timeout_seconds=docker_idle_timeout_seconds,
+            prewarm=docker_prewarm,
+        )
+        backend_services = RuntimeBackendServices(
+            environment_manager=self.environment_manager,
+            docker_environment_manager=self.docker_environment_manager,
+            docker_pool=self.docker_pool,
+        )
+        self.runtime_backends = runtime_backends or runtime_backend_registry_factory(
+            backend_services
+        )
+        self.sync_visibility = sync_visibility or sync_visibility_factory(store)
         self._server_sync_lock = threading.Lock()
-        self._cleanup_stale_docker_pool_containers()
+        self.server_connections = (
+            server_connections
+            or server_connection_manager_factory(store, server_client_factory)
+        )
+        self.heartbeat_service = heartbeat_service or heartbeat_service_factory(
+            store,
+            self.sync_once,
+        )
+        self.docker_pool.cleanup_stale_containers()
         self.restore_server_heartbeat()
+
+    def _server_client(
+        self,
+        server_url: str,
+        token: str,
+        *,
+        user_token: str | None,
+    ) -> ServerClientProtocol:
+        return self.server_connections.server_client(
+            server_url,
+            token,
+            user_token=user_token,
+        )
+
+    def _server_client_for_credentials(
+        self,
+        credentials: dict[str, Any],
+    ) -> ServerClientProtocol:
+        return self.server_connections.server_client_for_credentials(credentials)
 
     def connect_server(
         self,
@@ -176,81 +343,18 @@ class DaemonRuntime:
     ) -> dict[str, Any]:
         """Connect to the central daemon server and start lease heartbeats."""
 
-        existing = self._matching_server_connection(
+        result = self.server_connections.connect_server(
             server_url=server_url,
             machine_token=machine_token,
             user_token=user_token,
             machine_id=machine_id,
+            display_name=display_name,
+            capabilities=capabilities,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
         )
-        if (
-            existing is not None
-            and existing.get("remote_connection_id")
-        ):
-            local_connection = self.store.get_server_connection(existing["id"])
-            return {
-                "connected": local_connection["status"] == "connected",
-                "offline": local_connection["status"] == "heartbeat_failed",
-                "reused": True,
-                "connection": local_connection,
-                "remote_connection": self._remote_connection_snapshot(local_connection),
-            }
-
-        server = ServerClient(server_url, machine_token, user_token=user_token)
-        try:
-            remote_connection = server.connect_machine(
-                machine_id=machine_id,
-                display_name=display_name,
-                capabilities=capabilities,
-                heartbeat_interval_seconds=heartbeat_interval_seconds,
-            )
-        except ServerClientError as exc:
-            if not self._is_server_connectivity_error(exc):
-                raise
-            pending_machine_id = self._offline_machine_id(
-                machine_token,
-                machine_id=machine_id,
-                display_name=display_name,
-            )
-            local_connection = self.store.save_pending_server_connection(
-                server_url=server_url,
-                token=machine_token,
-                user_token=user_token,
-                machine_id=pending_machine_id,
-                display_name=display_name or pending_machine_id,
-                capabilities=capabilities,
-                heartbeat_interval_seconds=heartbeat_interval_seconds,
-                error=exc.message,
-            )
-            self.start_server_heartbeat(local_connection, token=machine_token)
-            return {
-                "connected": False,
-                "offline": True,
-                "connection": local_connection,
-                "remote_connection": None,
-                "error": SERVER_OFFLINE_MESSAGE,
-                "detail": exc.message,
-            }
-
-        if existing is not None:
-            local_connection = self.store.complete_server_connection(
-                existing["id"],
-                remote_connection=remote_connection,
-                heartbeat_interval_seconds=heartbeat_interval_seconds,
-            )
-        else:
-            local_connection = self.store.save_server_connection(
-                server_url=server_url,
-                token=machine_token,
-                user_token=user_token,
-                connection=remote_connection,
-                heartbeat_interval_seconds=heartbeat_interval_seconds,
-            )
-        self.start_server_heartbeat(local_connection, token=machine_token)
-        return {
-            "connected": True,
-            "connection": local_connection,
-            "remote_connection": remote_connection,
-        }
+        if not result.get("reused") and result.get("connection") is not None:
+            self.start_server_heartbeat(result["connection"], token=machine_token)
+        return result
 
     def _matching_server_connection(
         self,
@@ -267,22 +371,16 @@ class DaemonRuntime:
         lease instead of asking the server to connect the same token again.
         """
 
-        credentials = self.store.current_server_connection_credentials()
-        if credentials is None:
-            return None
-        if credentials["server_url"].rstrip("/") != server_url.rstrip("/"):
-            return None
-        if credentials["token"] != machine_token:
-            return None
-        if credentials["user_token"] != user_token:
-            return None
-        if machine_id is not None and credentials["machine_id"] != machine_id:
-            return None
-        return credentials
+        return self.server_connections.matching_server_connection(
+            server_url=server_url,
+            machine_token=machine_token,
+            user_token=user_token,
+            machine_id=machine_id,
+        )
 
     @staticmethod
     def _is_server_connectivity_error(exc: ServerClientError) -> bool:
-        return exc.status_code in {502, 503, 504}
+        return ServerConnectionManager._is_server_connectivity_error(exc)
 
     @staticmethod
     def _offline_machine_id(
@@ -291,61 +389,30 @@ class DaemonRuntime:
         machine_id: str | None,
         display_name: str | None,
     ) -> str:
-        if machine_id:
-            return validate_name(machine_id)
-        digest = hashlib.sha256(machine_token.encode("utf-8")).hexdigest()[:12]
-        return f"machine-{digest}"
+        return ServerConnectionManager._offline_machine_id(
+            machine_token,
+            machine_id=machine_id,
+            display_name=display_name,
+        )
 
     def _restore_pending_server_connection(
         self,
         credentials: dict[str, Any],
     ) -> dict[str, Any]:
-        if credentials.get("remote_connection_id"):
-            return credentials
-        server = ServerClient(
-            credentials["server_url"],
-            credentials["token"],
-            user_token=credentials["user_token"],
-        )
-        remote_connection = server.connect_machine(
-            machine_id=credentials["machine_id"],
-            display_name=credentials.get("display_name"),
-            capabilities=credentials.get("capabilities") or {},
-            heartbeat_interval_seconds=float(credentials["heartbeat_interval_seconds"]),
-        )
-        return self.store.complete_server_connection(
-            credentials["id"],
-            remote_connection=remote_connection,
-            heartbeat_interval_seconds=float(credentials["heartbeat_interval_seconds"]),
-        )
+        return self.server_connections.restore_pending_server_connection(credentials)
 
     def _require_connected_server_credentials(
         self,
         credentials: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        credentials = credentials or self.store.current_server_connection_credentials()
-        if credentials is None:
-            raise KeyError("active server connection is not found")
-        if not credentials.get("remote_connection_id"):
-            raise ServerOfflineError(SERVER_OFFLINE_MESSAGE)
-        return credentials
+        return self.server_connections.require_connected_server_credentials(
+            credentials
+        )
 
     def _remote_connection_snapshot(self, connection: dict[str, Any]) -> dict[str, Any]:
         """Build a server-like connection payload from the local cached row."""
 
-        return {
-            "id": connection["remote_connection_id"],
-            "owner_id": connection["owner_id"],
-            "subject_type": connection["subject_type"],
-            "subject_id": connection["subject_id"],
-            "machine_id": connection["machine_id"],
-            "display_name": connection["display_name"],
-            "capabilities": connection.get("capabilities") or {},
-            "status": connection["status"],
-            "heartbeat_interval_seconds": connection["heartbeat_interval_seconds"],
-            "last_seen_at": connection["last_heartbeat_at"],
-            "expires_at": connection["lease_expires_at"],
-        }
+        return self.server_connections.remote_connection_snapshot(connection)
 
     def disconnect_server(self) -> dict[str, Any]:
         """Gracefully disconnect the current central-server lease."""
@@ -355,38 +422,12 @@ class DaemonRuntime:
             raise KeyError("active server connection is not found")
 
         self.stop_server_heartbeat(credentials["id"])
-        if not credentials.get("remote_connection_id"):
-            local_connection = self.store.mark_server_connection_disconnected(
-                credentials["id"],
-                remote_connection=None,
-            )
-            return {
-                "connected": False,
-                "offline": True,
-                "connection": local_connection,
-                "remote_connection": None,
-            }
-        remote_connection = ServerClient(
-            credentials["server_url"],
-            credentials["token"],
-            user_token=credentials["user_token"],
-        ).disconnect_machine()
-        local_connection = self.store.mark_server_connection_disconnected(
-            credentials["id"],
-            remote_connection=remote_connection,
-        )
-        return {
-            "connected": False,
-            "connection": local_connection,
-            "remote_connection": remote_connection,
-        }
+        return self.server_connections.disconnect_server(credentials)
 
     def restore_server_heartbeat(self) -> None:
         """Resume heartbeat loop for a persisted active connection, if present."""
 
-        credentials = self.store.current_server_connection_credentials()
-        if credentials is not None:
-            self.start_server_heartbeat(credentials, token=credentials["token"])
+        self.heartbeat_service.restore_server_heartbeat()
 
     def start_server_heartbeat(
         self,
@@ -396,70 +437,12 @@ class DaemonRuntime:
     ) -> None:
         """Start one background heartbeat loop and stop older loops."""
 
-        stop_event = threading.Event()
-        with self._server_heartbeat_lock:
-            for event in self._server_heartbeat_stops.values():
-                event.set()
-            self._server_heartbeat_stops.clear()
-            self._server_heartbeat_threads.clear()
-            self._server_heartbeat_stops[connection["id"]] = stop_event
-
-        thread = threading.Thread(
-            target=self._server_heartbeat_loop,
-            args=(connection["id"], token, stop_event),
-            name=f"spl-server-heartbeat-{connection['id']}",
-            daemon=True,
-        )
-        with self._server_heartbeat_lock:
-            self._server_heartbeat_threads[connection["id"]] = thread
-        thread.start()
+        self.heartbeat_service.start_server_heartbeat(connection, token=token)
 
     def stop_server_heartbeat(self, connection_id: str) -> None:
         """Stop the heartbeat loop for one local connection."""
 
-        with self._server_heartbeat_lock:
-            event = self._server_heartbeat_stops.pop(connection_id, None)
-            self._server_heartbeat_threads.pop(connection_id, None)
-        if event is not None:
-            event.set()
-
-    def _server_heartbeat_loop(
-        self,
-        connection_id: str,
-        token: str,
-        stop_event: threading.Event,
-    ) -> None:
-        """Keep the central-server connection lease alive while daemon runs."""
-
-        first_tick = True
-        while not stop_event.is_set():
-            credentials = self.store.get_server_connection_credentials(connection_id)
-            interval = float(credentials["heartbeat_interval_seconds"])
-            if not first_tick and stop_event.wait(interval):
-                return
-            first_tick = False
-
-            try:
-                self.sync_once(connection_id=connection_id)
-            except ServerClientError as exc:
-                status = (
-                    "stale"
-                    if exc.status_code in {401, 403, 404, 409}
-                    else "heartbeat_failed"
-                )
-                self.store.record_server_connection_error(
-                    connection_id,
-                    status=status,
-                    error=exc.message,
-                )
-                if status == "stale":
-                    return
-            except Exception as exc:  # noqa: BLE001 - heartbeat must not kill daemon.
-                self.store.record_server_connection_error(
-                    connection_id,
-                    status="heartbeat_failed",
-                    error=repr(exc),
-                )
+        self.heartbeat_service.stop_server_heartbeat(connection_id)
 
     def enqueue_object_sync(
         self,
@@ -610,11 +593,7 @@ class DaemonRuntime:
 
         try:
             credentials = self._credentials_for_remote_ref(normalized)
-            server = ServerClient(
-                credentials["server_url"],
-                credentials["token"],
-                user_token=credentials["user_token"],
-            )
+            server = self._server_client_for_credentials(credentials)
             signature = server.object_signature(
                 normalized["object_name"],
                 version=self._remote_ref_version(normalized),
@@ -648,11 +627,7 @@ class DaemonRuntime:
 
         normalized = self._normalize_remote_ref(ref)
         credentials = self._credentials_for_remote_ref(normalized)
-        server = ServerClient(
-            credentials["server_url"],
-            credentials["token"],
-            user_token=credentials["user_token"],
-        )
+        server = self._server_client_for_credentials(credentials)
         record = server.get_object(
             normalized["object_name"],
             version=self._remote_ref_version(normalized),
@@ -858,11 +833,7 @@ class DaemonRuntime:
     ) -> None:
         """Fail before queueing when the caller expects an immediate remote result."""
 
-        server = ServerClient(
-            credentials["server_url"],
-            credentials["token"],
-            user_token=credentials["user_token"],
-        )
+        server = self._server_client_for_credentials(credentials)
         machines = server.list_machines()
         machine = next((item for item in machines if item.get("id") == target_machine), None)
         if machine is None:
@@ -899,11 +870,7 @@ class DaemonRuntime:
             )
         credentials = self._require_connected_server_credentials(credentials)
 
-        server = ServerClient(
-            credentials["server_url"],
-            credentials["token"],
-            user_token=credentials["user_token"],
-        )
+        server = self._server_client_for_credentials(credentials)
 
         remote_current = server.get_object(
             object_name,
@@ -1099,11 +1066,7 @@ class DaemonRuntime:
         snapshot_event = None
 
         with self._server_sync_lock:
-            server = ServerClient(
-                credentials["server_url"],
-                credentials["token"],
-                user_token=credentials["user_token"],
-            )
+            server = self._server_client_for_credentials(credentials)
             if snapshot_hash != credentials.get("last_library_snapshot_hash"):
                 remote_snapshot_hash = self._server_latest_library_snapshot_hash(
                     server,
@@ -1176,7 +1139,7 @@ class DaemonRuntime:
 
     def _server_latest_library_snapshot_hash(
         self,
-        server: ServerClient,
+        server: ServerClientProtocol,
         machine_id: str,
     ) -> str | None:
         """Return the server's latest snapshot hash when it can be checked cheaply."""
@@ -1292,7 +1255,7 @@ class DaemonRuntime:
         payload: dict[str, Any] | None = None,
         artifacts: list[dict[str, Any]] | None = None,
     ) -> None:
-        event = {
+        event: dict[str, Any] = {
             "id": uuid4().hex,
             "kind": "run_update",
             "payload": {
@@ -1330,11 +1293,7 @@ class DaemonRuntime:
         timeout_seconds: float | None,
     ) -> dict[str, Any]:
         credentials = self._require_connected_server_credentials()
-        server = ServerClient(
-            credentials["server_url"],
-            credentials["token"],
-            user_token=credentials["user_token"],
-        )
+        server = self._server_client_for_credentials(credentials)
         started = time.monotonic()
         while True:
             state = server.get_remote_run(run_id)
@@ -1493,11 +1452,7 @@ class DaemonRuntime:
         credentials = self.store.get_server_connection_credentials(connection_id)
         if credentials is None:
             raise ServerOfflineError(SERVER_OFFLINE_MESSAGE)
-        server = ServerClient(
-            credentials["server_url"],
-            credentials["token"],
-            user_token=credentials["user_token"],
-        )
+        server = self._server_client_for_credentials(credentials)
 
         prepared: list[dict[str, Any]] = []
         inline_bytes = 0
@@ -1570,29 +1525,19 @@ class DaemonRuntime:
     def prepare_object_environment(self, object_record: dict[str, Any]) -> dict[str, Any]:
         """Start a cached runtime build for an object version when configured."""
 
-        manager = self._environment_manager_for(object_record)
+        backend = self.runtime_backends.backend_for(object_record)
         if not self.auto_build_envs:
-            return manager.status_for_object(object_record)
+            return backend.status_for_object(object_record)
         if object_record.get("origin") == "server":
-            status = manager.status_for_object(object_record)
+            status = backend.status_for_object(object_record)
             status["auto_build_skipped"] = "server_imported_object"
             return status
         try:
-            status = manager.ensure_ready(object_record, wait=False)
-            if (
-                object_record.get("runtime_mode") == "docker"
-                or (object_record.get("runtime_config") or {}).get("mode") == "docker"
-            ) and self.docker_prewarm and self.docker_pool_size > 0:
-                self._prewarm_docker_object(object_record)
+            status = backend.ensure_ready(object_record, wait=False)
+            backend.after_prepare(object_record)
             return status
         except EnvironmentBuildError:
-            return manager.status_for_object(object_record)
-
-    def _environment_manager_for(self, object_record: dict[str, Any]) -> Any:
-        runtime_config = object_record.get("runtime_config") or {"mode": "venv"}
-        if runtime_config.get("mode") == "docker":
-            return self.docker_environment_manager
-        return self.environment_manager
+            return backend.status_for_object(object_record)
 
     def start_run(
         self,
@@ -1699,27 +1644,6 @@ class DaemonRuntime:
             },
         )
 
-        command = [
-            object_record["env_python"],
-            str(worker_path),
-            "--object-yaml",
-            str(object_yaml_path),
-            "--entrypoint",
-            state["entrypoint"],
-            "--input",
-            str(input_path),
-            "--result",
-            str(result_path),
-            "--artifacts-dir",
-            str(artifacts_dir),
-            "--env-spec",
-            str(env_spec_path),
-            "--remote-signatures",
-            str(remote_signatures_path),
-            "--daemon-url",
-            self.daemon_base_url,
-        ]
-
         self._update_local_run(
             run_id,
             report_local_run=report_local_run,
@@ -1732,98 +1656,41 @@ class DaemonRuntime:
         env["PYTHONPATH"] = self._worker_pythonpath(env)
 
         timeout = self._read_timeout(input_path)
-        workdir = object_record.get("workdir") or str(run_dir)
-        Path(workdir).mkdir(parents=True, exist_ok=True)
-        runtime_config = object_record.get("runtime_config") or {"mode": "venv"}
-        docker_runtime = runtime_config.get("mode") == "docker"
-        container_name: str | None = None
-        container_id: str | None = None
-        cleanup_container = False
-        pool_record: dict[str, Any] | None = None
+        workdir = Path(object_record.get("workdir") or str(run_dir))
+        workdir.mkdir(parents=True, exist_ok=True)
+        ctx = RunContext(
+            object_record=object_record,
+            run_id=run_id,
+            run_dir=run_dir,
+            workdir=workdir,
+            input_path=input_path,
+            object_yaml_path=object_yaml_path,
+            result_path=result_path,
+            artifacts_dir=artifacts_dir,
+            env_spec_path=env_spec_path,
+            remote_signatures_path=remote_signatures_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            worker_path=worker_path,
+            entrypoint=state["entrypoint"],
+            daemon_base_url=self.daemon_base_url,
+        )
 
         try:
-            if docker_runtime:
-                self._assert_docker_available_for_run()
-                environment_record = self.docker_environment_manager.ensure_ready(
-                    object_record,
-                    wait=True,
+            backend = self.runtime_backends.backend_for(object_record)
+            with backend:
+                environment_record = backend.ensure_ready(object_record)
+                command = backend.build_command(ctx)
+                self._update_local_run(
+                    run_id,
+                    report_local_run=report_local_run,
+                    status="running",
+                    started_at=utc_now(),
+                    command=command,
+                    env_build_hash=environment_record["spec_hash"],
+                    runtime_build_hash=environment_record["spec_hash"],
+                    **backend.run_state_fields(),
                 )
-                if self._can_use_docker_pool(run_dir, Path(workdir)):
-                    pool_record = self._ensure_docker_pool_container(
-                        object_record=object_record,
-                        image_tag=environment_record["image_tag"],
-                        runtime_config=runtime_config,
-                    )
-                    container_name = pool_record["name"]
-                    container_id = pool_record.get("container_id")
-                    command = self._docker_exec_worker_command(
-                        object_record=object_record,
-                        entrypoint=state["entrypoint"],
-                        run_id=run_id,
-                        container_name=container_name,
-                        runtime_config=runtime_config,
-                    )
-                else:
-                    container_name = self._docker_container_name(run_id)
-                    cleanup_container = True
-                    command = self._docker_worker_command(
-                        object_record=object_record,
-                        entrypoint=state["entrypoint"],
-                        run_id=run_id,
-                        run_dir=run_dir,
-                        workdir=Path(workdir),
-                        image_tag=environment_record["image_tag"],
-                        container_name=container_name,
-                        runtime_config=runtime_config,
-                    )
-                resolved_runtime = environment_record["image_tag"]
-                resolved_python = None
-                runtime_backend = "docker"
-                image_tag = environment_record["image_tag"]
-            else:
-                environment_record = self.environment_manager.ensure_ready(
-                    object_record,
-                    wait=True,
-                )
-                resolved_python = environment_record["python_path"]
-                command = [resolved_python, *command[1:]]
-                resolved_runtime = resolved_python
-                runtime_backend = "venv"
-                image_tag = None
-
-            self._update_local_run(
-                run_id,
-                report_local_run=report_local_run,
-                status="running",
-                started_at=utc_now(),
-                command=command,
-                env_build_hash=environment_record["spec_hash"],
-                runtime_build_hash=environment_record["spec_hash"],
-                resolved_runtime=resolved_runtime,
-                runtime_backend=runtime_backend,
-                image_tag=image_tag,
-                container_id=container_id,
-                resolved_python=resolved_python,
-            )
-
-            if pool_record is not None:
-                exec_lock = pool_record["exec_lock"]
-                with exec_lock:
-                    pool_record["in_use"] = True
-                    try:
-                        completed = subprocess.run(
-                            command,
-                            cwd=workdir,
-                            env=env,
-                            text=True,
-                            capture_output=True,
-                            timeout=timeout,
-                            check=False,
-                        )
-                    finally:
-                        pool_record["in_use"] = False
-                        pool_record["last_used"] = time.monotonic()
-            else:
                 completed = subprocess.run(
                     command,
                     cwd=workdir,
@@ -1833,47 +1700,45 @@ class DaemonRuntime:
                     timeout=timeout,
                     check=False,
                 )
-            stdout_path.write_text(completed.stdout, encoding="utf-8")
-            stderr_path.write_text(completed.stderr, encoding="utf-8")
-            if docker_runtime and cleanup_container:
-                self._update_local_run(
-                    run_id,
-                    report_local_run=report_local_run,
-                    container_id=self._read_docker_container_id(run_dir),
-                )
+                stdout_path.write_text(completed.stdout, encoding="utf-8")
+                stderr_path.write_text(completed.stderr, encoding="utf-8")
+                after_run = backend.after_run(ctx)
+                if after_run:
+                    self._update_local_run(
+                        run_id,
+                        report_local_run=report_local_run,
+                        **after_run,
+                    )
 
-            if completed.returncode == 0 and result_path.exists():
-                result_payload = json.loads(result_path.read_text(encoding="utf-8"))
-                if docker_runtime:
-                    self._rewrite_docker_artifact_paths(result_payload, artifacts_dir)
-                    write_json(result_path, result_payload)
-                self._update_local_run(
-                    run_id,
-                    report_local_run=report_local_run,
-                    status="succeeded",
-                    finished_at=utc_now(),
-                    returncode=completed.returncode,
-                    result=result_payload,
-                    stdout_text=completed.stdout,
-                    stderr_text=completed.stderr,
-                )
-            else:
-                error = completed.stderr.strip() or completed.stdout.strip()
-                if completed.returncode == 0:
-                    error = "worker finished without writing result.json"
-                self._update_local_run(
-                    run_id,
-                    report_local_run=report_local_run,
-                    status="failed",
-                    finished_at=utc_now(),
-                    returncode=completed.returncode,
-                    error=error,
-                    stdout_text=completed.stdout,
-                    stderr_text=completed.stderr,
-                )
+                if completed.returncode == 0 and result_path.exists():
+                    result_payload = json.loads(result_path.read_text(encoding="utf-8"))
+                    if backend.process_result(ctx, result_payload):
+                        write_json(result_path, result_payload)
+                    self._update_local_run(
+                        run_id,
+                        report_local_run=report_local_run,
+                        status="succeeded",
+                        finished_at=utc_now(),
+                        returncode=completed.returncode,
+                        result=result_payload,
+                        stdout_text=completed.stdout,
+                        stderr_text=completed.stderr,
+                    )
+                else:
+                    error = completed.stderr.strip() or completed.stdout.strip()
+                    if completed.returncode == 0:
+                        error = "worker finished without writing result.json"
+                    self._update_local_run(
+                        run_id,
+                        report_local_run=report_local_run,
+                        status="failed",
+                        finished_at=utc_now(),
+                        returncode=completed.returncode,
+                        error=error,
+                        stdout_text=completed.stdout,
+                        stderr_text=completed.stderr,
+                    )
         except subprocess.TimeoutExpired as exc:
-            if container_name is not None and cleanup_container:
-                self._remove_docker_container(container_name)
             stdout = self._subprocess_text(exc.stdout)
             stderr = self._subprocess_text(exc.stderr)
             stdout_path.write_text(stdout, encoding="utf-8")
@@ -1895,9 +1760,6 @@ class DaemonRuntime:
                 finished_at=utc_now(),
                 error=repr(exc),
             )
-        finally:
-            if container_name is not None and cleanup_container:
-                self._remove_docker_container(container_name)
 
     def _update_local_run(
         self,
@@ -2119,523 +1981,9 @@ class DaemonRuntime:
             return os.pathsep.join([str(src_dir), current])
         return str(src_dir)
 
-    def _docker_worker_command(
-        self,
-        *,
-        object_record: dict[str, Any],
-        entrypoint: str,
-        run_id: str,
-        run_dir: Path,
-        workdir: Path,
-        image_tag: str,
-        container_name: str,
-        runtime_config: dict[str, Any],
-    ) -> list[str]:
-        """Build a Docker CLI command that runs the normal worker protocol."""
-
-        source_roots = self._docker_source_roots()
-        daemon_source = source_roots[0][1]
-        container_run_dir = "/work"
-        container_workdir = container_run_dir
-        mounts = [
-            "-v",
-            f"{run_dir.resolve()}:{container_run_dir}",
-        ]
-        if workdir.resolve() != run_dir.resolve():
-            container_workdir = "/workspace"
-            mounts.extend(["-v", f"{workdir.resolve()}:{container_workdir}"])
-
-        pythonpath_entries = []
-        for index, (_, source_root) in enumerate(source_roots):
-            container_path = f"/opt/splime/src{index}"
-            mounts.extend(["-v", f"{source_root}:{container_path}:ro"])
-            pythonpath_entries.append(container_path)
-
-        network_args, daemon_url = self._docker_network_args(
-            object_record,
-            runtime_config,
-        )
-        command = [
-            "docker",
-            "run",
-            "--rm",
-            "--name",
-            container_name,
-            "--cidfile",
-            str(run_dir.resolve() / "container.cid"),
-            *network_args,
-            *self._docker_hardening_args(runtime_config),
-            *self._docker_user_args(),
-            *mounts,
-            "-w",
-            container_workdir,
-            "-e",
-            f"PYTHONPATH={':'.join(pythonpath_entries)}",
-            *self._docker_env_args(runtime_config),
-            image_tag,
-            "python",
-            f"/opt/splime/src0/spl/daemon/worker.py",
-            "--object-yaml",
-            f"{container_run_dir}/object.yaml",
-            "--entrypoint",
-            entrypoint,
-            "--input",
-            f"{container_run_dir}/input.json",
-            "--result",
-            f"{container_run_dir}/result.json",
-            "--artifacts-dir",
-            f"{container_run_dir}/artifacts",
-            "--env-spec",
-            f"{container_run_dir}/env-spec.json",
-            "--remote-signatures",
-            f"{container_run_dir}/remote-signatures.json",
-            "--daemon-url",
-            daemon_url,
-        ]
-        if not (daemon_source / "spl" / "daemon" / "worker.py").exists():
-            raise RuntimeError(f"Docker worker source is not found: {daemon_source}")
-        return command
-
-    def _docker_exec_worker_command(
-        self,
-        *,
-        object_record: dict[str, Any],
-        entrypoint: str,
-        run_id: str,
-        container_name: str,
-        runtime_config: dict[str, Any],
-    ) -> list[str]:
-        run_path = f"/runs/{validate_name(run_id)}"
-        _, daemon_url = self._docker_network_args(object_record, runtime_config)
-        return [
-            "docker",
-            "exec",
-            "-w",
-            run_path,
-            container_name,
-            "python",
-            "/opt/splime/src0/spl/daemon/worker.py",
-            "--object-yaml",
-            f"{run_path}/object.yaml",
-            "--entrypoint",
-            entrypoint,
-            "--input",
-            f"{run_path}/input.json",
-            "--result",
-            f"{run_path}/result.json",
-            "--artifacts-dir",
-            f"{run_path}/artifacts",
-            "--env-spec",
-            f"{run_path}/env-spec.json",
-            "--remote-signatures",
-            f"{run_path}/remote-signatures.json",
-            "--daemon-url",
-            daemon_url,
-        ]
-
-    def _can_use_docker_pool(self, run_dir: Path, workdir: Path) -> bool:
-        return self.docker_pool_size > 0 and run_dir.resolve() == workdir.resolve()
-
-    def _prewarm_docker_object(self, object_record: dict[str, Any]) -> None:
-        def prewarm() -> None:
-            try:
-                environment_record = self.docker_environment_manager.ensure_ready(
-                    object_record,
-                    wait=True,
-                )
-                self._ensure_docker_pool_container(
-                    object_record=object_record,
-                    image_tag=environment_record["image_tag"],
-                    runtime_config=object_record.get("runtime_config") or {"mode": "venv"},
-                )
-            except Exception:
-                return
-
-        thread = threading.Thread(
-            target=prewarm,
-            name=f"spl-docker-prewarm-{object_record['version_id']}",
-            daemon=True,
-        )
-        thread.start()
-
-    def _ensure_docker_pool_container(
-        self,
-        *,
-        object_record: dict[str, Any],
-        image_tag: str,
-        runtime_config: dict[str, Any],
-    ) -> dict[str, Any]:
-        key = self._docker_pool_key(image_tag, runtime_config, object_record)
-        now = time.monotonic()
-        with self._docker_pool_lock:
-            self._evict_idle_docker_pool_locked(now)
-            existing = self._docker_pool.get(key)
-            if existing is not None and self._docker_container_running(existing["name"]):
-                existing["last_used"] = now
-                return existing
-            if existing is not None:
-                self._remove_docker_container(existing["name"])
-                self._docker_pool.pop(key, None)
-
-            self._evict_excess_docker_pool_locked(reserve=1)
-
-        record = self._start_docker_pool_container(
-            key=key,
-            object_record=object_record,
-            image_tag=image_tag,
-            runtime_config=runtime_config,
-        )
-        record["last_used"] = time.monotonic()
-        record["exec_lock"] = threading.Lock()
-        with self._docker_pool_lock:
-            existing = self._docker_pool.get(key)
-            if existing is not None and self._docker_container_running(existing["name"]):
-                self._remove_docker_container(record["name"])
-                existing["last_used"] = time.monotonic()
-                return existing
-            if existing is not None:
-                self._remove_docker_container(existing["name"])
-            self._evict_excess_docker_pool_locked(reserve=1)
-            self._docker_pool[key] = record
-            return record
-
-    def _start_docker_pool_container(
-        self,
-        *,
-        key: str,
-        object_record: dict[str, Any],
-        image_tag: str,
-        runtime_config: dict[str, Any],
-    ) -> dict[str, Any]:
-        source_roots = self._docker_source_roots()
-        daemon_source = source_roots[0][1]
-        if not (daemon_source / "spl" / "daemon" / "worker.py").exists():
-            raise RuntimeError(f"Docker worker source is not found: {daemon_source}")
-
-        name = f"splime-pool-{key[:24]}"
-        self._remove_docker_container(name)
-        pool_dir = self.store.home / "docker-pool"
-        pool_dir.mkdir(parents=True, exist_ok=True)
-        cidfile = pool_dir / f"{name}.cid"
-        try:
-            cidfile.unlink()
-        except FileNotFoundError:
-            pass
-
-        mounts = ["-v", f"{self.store.runs_dir.resolve()}:/runs"]
-        pythonpath_entries = []
-        for index, (_, source_root) in enumerate(source_roots):
-            container_path = f"/opt/splime/src{index}"
-            mounts.extend(["-v", f"{source_root}:{container_path}:ro"])
-            pythonpath_entries.append(container_path)
-
-        network_args, _ = self._docker_network_args(object_record, runtime_config)
-        command = [
-            "docker",
-            "run",
-            "-d",
-            "--name",
-            name,
-            "--cidfile",
-            str(cidfile),
-            *network_args,
-            *self._docker_hardening_args(runtime_config),
-            *self._docker_user_args(),
-            *mounts,
-            "-w",
-            "/runs",
-            "-e",
-            f"PYTHONPATH={':'.join(pythonpath_entries)}",
-            *self._docker_env_args(runtime_config),
-            image_tag,
-            "python",
-            "-c",
-            "import time; time.sleep(10**9)",
-        ]
-        completed = subprocess.run(
-            command,
-            text=True,
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(
-                "failed to start warm Docker runtime container: "
-                + (completed.stderr.strip() or completed.stdout.strip())
-            )
-        container_id = None
-        try:
-            container_id = cidfile.read_text(encoding="utf-8").strip() or None
-        except OSError:
-            pass
-        return {
-            "key": key,
-            "name": name,
-            "container_id": container_id,
-            "image_tag": image_tag,
-            "started_at": utc_now(),
-            "in_use": False,
-        }
-
-    def _docker_pool_key(
-        self,
-        image_tag: str,
-        runtime_config: dict[str, Any],
-        object_record: dict[str, Any],
-    ) -> str:
-        payload = json.dumps(
-            {
-                "image_tag": image_tag,
-                "runtime_config": runtime_config,
-                "network_args": self._docker_network_args(object_record, runtime_config)[0],
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-    def _evict_idle_docker_pool_locked(self, now: float) -> None:
-        if self.docker_idle_timeout_seconds <= 0:
-            return
-        for key, record in list(self._docker_pool.items()):
-            if record.get("in_use"):
-                continue
-            if now - float(record.get("last_used") or now) > self.docker_idle_timeout_seconds:
-                self._remove_docker_container(record["name"])
-                self._docker_pool.pop(key, None)
-
-    def _evict_excess_docker_pool_locked(self, *, reserve: int = 0) -> None:
-        while len(self._docker_pool) + reserve > self.docker_pool_size and self._docker_pool:
-            candidates = {
-                key: record
-                for key, record in self._docker_pool.items()
-                if not record.get("in_use")
-            }
-            if not candidates:
-                return
-            key, record = min(
-                candidates.items(),
-                key=lambda item: float(item[1].get("last_used") or 0.0),
-            )
-            self._remove_docker_container(record["name"])
-            self._docker_pool.pop(key, None)
-
-    def _docker_container_running(self, name: str) -> bool:
-        completed = subprocess.run(
-            ["docker", "inspect", "-f", "{{.State.Running}}", name],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-        return completed.returncode == 0 and completed.stdout.strip() == "true"
-
-    def _cleanup_stale_docker_pool_containers(self) -> None:
-        if shutil.which("docker") is None:
-            return
-        completed = subprocess.run(
-            [
-                "docker",
-                "ps",
-                "-aq",
-                "--filter",
-                "name=^/splime-pool-",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-        if completed.returncode != 0:
-            return
-        container_ids = [
-            item.strip()
-            for item in completed.stdout.splitlines()
-            if item.strip()
-        ]
-        if not container_ids:
-            return
-        subprocess.run(
-            ["docker", "rm", "-f", *container_ids],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-
     def shutdown(self) -> None:
-        with self._server_heartbeat_lock:
-            stop_events = list(self._server_heartbeat_stops.values())
-            threads = list(self._server_heartbeat_threads.values())
-            self._server_heartbeat_stops.clear()
-            self._server_heartbeat_threads.clear()
-        for event in stop_events:
-            event.set()
-        current_thread = threading.current_thread()
-        for thread in threads:
-            if thread is not current_thread:
-                thread.join(timeout=2)
-
-        with self._docker_pool_lock:
-            for record in list(self._docker_pool.values()):
-                self._remove_docker_container(record["name"])
-            self._docker_pool.clear()
-
-    def _docker_hardening_args(self, runtime_config: dict[str, Any]) -> list[str]:
-        args: list[str] = []
-        if runtime_config.get("init", True):
-            args.append("--init")
-        cap_drop = runtime_config.get("cap_drop")
-        if cap_drop:
-            args.extend(["--cap-drop", str(cap_drop)])
-        if runtime_config.get("no_new_privileges", True):
-            args.extend(["--security-opt", "no-new-privileges"])
-        limits = runtime_config.get("limits") or {}
-        if limits.get("memory"):
-            args.extend(["--memory", str(limits["memory"])])
-        if limits.get("cpus"):
-            args.extend(["--cpus", str(limits["cpus"])])
-        if limits.get("pids_limit"):
-            args.extend(["--pids-limit", str(limits["pids_limit"])])
-        if runtime_config.get("read_only", True):
-            args.append("--read-only")
-        tmpfs = runtime_config.get("tmpfs")
-        if tmpfs:
-            args.extend(["--tmpfs", str(tmpfs)])
-        return args
-
-    def _docker_env_args(self, runtime_config: dict[str, Any]) -> list[str]:
-        env_values = {
-            "HOME": "/tmp",
-            "XDG_CACHE_HOME": "/tmp/.cache",
-            "MPLCONFIGDIR": "/tmp/.cache/matplotlib",
-            **(runtime_config.get("env") or {}),
-        }
-        args: list[str] = []
-        for key, value in sorted(env_values.items()):
-            args.extend(["-e", f"{key}={value}"])
-        return args
-
-    def _assert_docker_available_for_run(self) -> None:
-        if shutil.which("docker") is None:
-            raise RuntimeError(
-                "Docker runtime is selected, but the docker executable is not "
-                "available on PATH"
-            )
-        try:
-            completed = subprocess.run(
-                ["docker", "info"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                "Docker runtime is selected, but `docker info` did not respond "
-                "within 15 seconds"
-            ) from exc
-        if completed.returncode != 0:
-            detail = (completed.stderr or "").strip()
-            message = "Docker runtime is selected, but the Docker daemon is not reachable"
-            if detail:
-                message = f"{message}: {detail}"
-            raise RuntimeError(message)
-
-    def _docker_source_roots(self) -> list[tuple[str, Path]]:
-        roots = [("daemon", Path(__file__).parents[2].resolve())]
-        try:
-            import spl.core as spl_core
-
-            core_path = Path(str(spl_core.__file__)).parents[2].resolve()
-            if core_path not in [path for _, path in roots]:
-                roots.append(("framework", core_path))
-        except Exception:  # noqa: BLE001 - build/run will surface import errors.
-            pass
-        return roots
-
-    def _docker_network_args(
-        self,
-        object_record: dict[str, Any],
-        runtime_config: dict[str, Any],
-    ) -> tuple[list[str], str]:
-        mode = runtime_config.get("network", "auto")
-        has_remote_nodes = any(
-            node.get("kind") == "remote"
-            for node in object_record.get("pipeline_nodes") or []
-        )
-        if mode == "none" and has_remote_nodes:
-            raise RuntimeError(
-                "docker runtime network='none' cannot run pipelines with remote nodes"
-            )
-        if mode == "none" or (mode == "auto" and not has_remote_nodes):
-            return ["--network", "none"], self.daemon_base_url
-        if platform.system().lower() == "linux":
-            return ["--add-host", "host.docker.internal:host-gateway"], (
-                self._docker_host_daemon_url()
-            )
-        return [], self._docker_host_daemon_url()
-
-    def _docker_host_daemon_url(self) -> str:
-        parsed = urlparse(self.daemon_base_url)
-        if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
-            return self.daemon_base_url
-        host = "host.docker.internal"
-        netloc = host
-        if parsed.port is not None:
-            netloc = f"{host}:{parsed.port}"
-        return urlunparse(
-            (
-                parsed.scheme,
-                netloc,
-                parsed.path,
-                parsed.params,
-                parsed.query,
-                parsed.fragment,
-            )
-        )
-
-    def _docker_user_args(self) -> list[str]:
-        if os.name == "nt" or not hasattr(os, "getuid") or not hasattr(os, "getgid"):
-            return []
-        return ["--user", f"{os.getuid()}:{os.getgid()}"]
-
-    def _docker_container_name(self, run_id: str) -> str:
-        return f"splime-run-{validate_name(run_id)[:32]}"
-
-    def _remove_docker_container(self, name: str) -> None:
-        subprocess.run(
-            ["docker", "rm", "-f", name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-
-    def _read_docker_container_id(self, run_dir: Path) -> str | None:
-        cid_path = run_dir / "container.cid"
-        try:
-            value = cid_path.read_text(encoding="utf-8").strip()
-        except OSError:
-            return None
-        return value or None
-
-    def _rewrite_docker_artifact_paths(
-        self,
-        result_payload: dict[str, Any],
-        artifacts_dir: Path,
-    ) -> None:
-        artifacts = result_payload.get("artifacts")
-        if not isinstance(artifacts, dict):
-            return
-        result_payload["artifacts"] = {
-            name: str(artifacts_dir / name)
-            for name in artifacts
-        }
+        self.heartbeat_service.shutdown()
+        self.docker_pool.shutdown()
 
     def _read_timeout(self, input_path: Path) -> float | None:
         """Read an optional run timeout from the stored input payload."""
@@ -2682,6 +2030,12 @@ def create_app(
     docker_idle_timeout_seconds: float = 300.0,
     docker_prewarm: bool = False,
     api_token: str | None = None,
+    environment_manager: EnvironmentManagerProtocol | None = None,
+    docker_environment_manager: DockerEnvironmentManagerProtocol | None = None,
+    docker_pool: DockerPoolRunnerProtocol | None = None,
+    runtime_backends: RuntimeBackendRegistry | None = None,
+    sync_visibility: SyncVisibilityProtocol | None = None,
+    server_client_factory: ServerClientFactoryProtocol = _default_server_client_factory,
 ) -> Any:
     """Create a Quart application bound to one registry store."""
 
@@ -2698,711 +2052,50 @@ def create_app(
         docker_pool_size=docker_pool_size,
         docker_idle_timeout_seconds=docker_idle_timeout_seconds,
         docker_prewarm=docker_prewarm,
+        environment_manager=environment_manager,
+        docker_environment_manager=docker_environment_manager,
+        docker_pool=docker_pool,
+        runtime_backends=runtime_backends,
+        sync_visibility=sync_visibility,
+        server_client_factory=server_client_factory,
     )
     app.runtime = runtime
 
-    def json_response(
-        value: Any,
-        status: HTTPStatus = HTTPStatus.OK,
-    ) -> Any:
-        body = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
-        return Response(
-            body,
-            status=int(status),
-            content_type="application/json; charset=utf-8",
-        )
-
-    def route_errors(
-        handler: Callable[..., Awaitable[Any]],
-    ) -> Callable[..., Awaitable[Any]]:
-        @wraps(handler)
-        async def wrapper(*args: Any, **kwargs: Any) -> Any:
-            try:
-                return await handler(*args, **kwargs)
-            except KeyError as exc:
-                return json_response({"error": str(exc)}, HTTPStatus.NOT_FOUND)
-            except ValueError as exc:
-                return json_response({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
-            except ServerOfflineError as exc:
-                return json_response(
-                    {"error": str(exc), "offline": True},
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                )
-            except ServerClientError as exc:
-                try:
-                    status = HTTPStatus(exc.status_code)
-                except ValueError:
-                    status = HTTPStatus.BAD_GATEWAY
-                if int(status) >= 500:
-                    status = HTTPStatus.BAD_GATEWAY
-                return json_response(
-                    {
-                        "error": exc.message,
-                        "upstream_status": exc.status_code,
-                    },
-                    status,
-                )
-            except RuntimeError as exc:
-                return json_response({"error": str(exc)}, HTTPStatus.CONFLICT)
-            except Exception as exc:  # noqa: BLE001 - HTTP boundary must not crash.
-                return json_response(
-                    {"error": repr(exc)},
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-
-        return wrapper
-
-    @app.before_request
-    async def require_local_api_auth() -> Any:
-        auth_header = request.headers.get("Authorization") or ""
-        scheme, _, token = auth_header.partition(" ")
-        if (
-            scheme.casefold() == "bearer"
-            and token
-            and secrets.compare_digest(token, local_api_token)
-        ):
-            return None
-        return json_response(
-            {"error": "missing or invalid local daemon API token"},
-            HTTPStatus.UNAUTHORIZED,
-        )
-
-    async def read_json_body() -> dict[str, Any]:
-        body = await request.get_json(silent=True)
-        return body or {}
-
-    def first_query_value(*names: str) -> str | None:
-        for name in names:
-            value = request.args.get(name)
-            if value is not None:
-                return value
-        return None
-
-    def optional_int_query(name: str) -> int | None:
-        value = first_query_value(name)
-        if value is None or value == "":
-            return None
-        return int(value)
-
-    def query_bool(name: str, *, default: bool = False) -> bool:
-        value = first_query_value(name)
-        if value is None:
-            return default
-        return value.lower() in {"1", "true", "yes", "on"}
-
-    def connected_server_client() -> tuple[dict[str, Any], ServerClient]:
-        credentials = runtime._require_connected_server_credentials()
-        return credentials, ServerClient(
-            credentials["server_url"],
-            credentials["token"],
-            user_token=credentials["user_token"],
-        )
-
-    def object_function_ref(name_or_id: str) -> tuple[str, str | None]:
-        return split_object_function_ref(
-            name_or_id,
-            first_query_value("function", "entrypoint"),
-        )
-
-    def object_from_local_or_server(
-        name_or_id: str,
-        *,
-        include_yaml: bool = False,
-    ) -> dict[str, Any]:
-        version = optional_int_query("version")
-        refresh = runtime.refresh_server_object_if_available(
-            name_or_id,
-            version=version,
-        )
-        if refresh and refresh.get("current_version"):
-            return runtime.store.get_object_version(
-                refresh["current_version"]["version_id"],
-                include_yaml=include_yaml,
-            )
-        return runtime.store.get_object(
-            name_or_id,
-            version=version,
-            include_yaml=include_yaml,
-        )
+    context = RouteContext(
+        runtime=runtime,
+        response_cls=Response,
+        request=request,
+        local_api_token=local_api_token,
+    )
+    app.before_request(context.require_local_api_auth)
 
     register_diagnostics_routes(
         app,
         runtime=runtime,
-        json_response=json_response,
-        route_errors=route_errors,
+        json_response=context.json_response,
+        route_errors=context.route_errors,
     )
-
-    @app.get("/server/connection")
-    @route_errors
-    async def current_server_connection() -> Any:
-        connection = runtime.store.current_server_connection()
-        return json_response(
-            {
-                "connected": (
-                    connection is not None
-                    and connection["status"] == "connected"
-                    and bool(connection.get("remote_connection_id"))
-                ),
-                "offline": (
-                    connection is not None
-                    and connection["status"] in {"connect_failed", "heartbeat_failed"}
-                ),
-                "connection": connection,
-            }
-        )
-
-    @app.get("/server/connections")
-    @route_errors
-    async def list_server_connections() -> Any:
-        return json_response(runtime.store.list_server_connections())
-
-    @app.get("/server/machines")
-    @route_errors
-    async def list_server_machines() -> Any:
-        credentials, server = connected_server_client()
-        machines = server.list_machines()
-        current_machine_id = credentials["machine_id"]
-        for machine in machines:
-            machine["is_current"] = machine["id"] == current_machine_id
-        return json_response(
-            {
-                "current_machine_id": current_machine_id,
-                "machines": machines,
-            }
-        )
-
-    @app.get("/server/objects")
-    @route_errors
-    async def list_server_objects() -> Any:
-        _, server = connected_server_client()
-        view = (first_query_value("view") or "").lower()
-        compact = (first_query_value("compact") or "").lower() in {
-            "1",
-            "true",
-            "yes",
-        }
-        return json_response(
-            server.list_objects(
-                owner_id=first_query_value("owner", "owner_id"),
-                library=first_query_value("library"),
-                compact=view == "summary" or compact,
-            )
-        )
-
-    @app.get("/server/libraries")
-    @route_errors
-    async def list_server_libraries() -> Any:
-        _, server = connected_server_client()
-        return json_response(
-            server.list_libraries(
-                include_accessible=query_bool("include_accessible", default=True),
-            )
-        )
-
-    @app.post("/server/libraries")
-    @route_errors
-    async def create_server_library() -> Any:
-        _, server = connected_server_client()
-        return json_response(
-            server.create_library(await read_json_body()),
-            HTTPStatus.CREATED,
-        )
-
-    @app.get("/server/libraries/<library_ref>")
-    @route_errors
-    async def get_server_library(library_ref: str) -> Any:
-        _, server = connected_server_client()
-        return json_response(server.get_library(validate_name(library_ref)))
-
-    @app.put("/server/libraries/<library_ref>")
-    @route_errors
-    async def update_server_library(library_ref: str) -> Any:
-        _, server = connected_server_client()
-        return json_response(
-            server.update_library(
-                validate_name(library_ref),
-                await read_json_body(),
-            )
-        )
-
-    @app.delete("/server/libraries/<library_ref>")
-    @route_errors
-    async def delete_server_library(library_ref: str) -> Any:
-        _, server = connected_server_client()
-        return json_response(server.delete_library(validate_name(library_ref)))
-
-    @app.get("/server/libraries/<library_ref>/grants")
-    @route_errors
-    async def list_server_library_grants(library_ref: str) -> Any:
-        _, server = connected_server_client()
-        return json_response(server.list_library_grants(validate_name(library_ref)))
-
-    @app.post("/server/libraries/<library_ref>/grants")
-    @route_errors
-    async def grant_server_library(library_ref: str) -> Any:
-        _, server = connected_server_client()
-        return json_response(
-            server.grant_library(
-                validate_name(library_ref),
-                await read_json_body(),
-            ),
-            HTTPStatus.CREATED,
-        )
-
-    @app.post("/server/libraries/<library_ref>/grants/<grantee>/revoke")
-    @route_errors
-    async def revoke_server_library_grant(library_ref: str, grantee: str) -> Any:
-        _, server = connected_server_client()
-        return json_response(
-            server.revoke_library_grant(
-                validate_name(library_ref),
-                validate_name(grantee),
-            )
-        )
-
-    @app.post("/server/libraries/<library_ref>/references")
-    @route_errors
-    async def add_server_library_reference(library_ref: str) -> Any:
-        _, server = connected_server_client()
-        return json_response(
-            server.add_library_reference(
-                validate_name(library_ref),
-                await read_json_body(),
-            ),
-            HTTPStatus.CREATED,
-        )
-
-    @app.post("/server/libraries/<library_ref>/copies")
-    @route_errors
-    async def copy_server_library_object(library_ref: str) -> Any:
-        _, server = connected_server_client()
-        return json_response(
-            server.copy_object_into_library(
-                validate_name(library_ref),
-                await read_json_body(),
-            ),
-            HTTPStatus.CREATED,
-        )
-
-    @app.delete("/server/libraries/<library_ref>/entries/<name>")
-    @route_errors
-    async def remove_server_library_entry(library_ref: str, name: str) -> Any:
-        _, server = connected_server_client()
-        return json_response(
-            server.remove_library_entry(
-                validate_name(library_ref),
-                validate_name(name),
-            )
-        )
-
-    @app.post("/server/connect")
-    @route_errors
-    async def connect_server() -> Any:
-        body = await read_json_body()
-        machine_token = body.get("machine_token")
-        user_token = body.get("user_token")
-        if not machine_token or not user_token:
-            raise ValueError("machine_token and user_token are required")
-
-        server_url = body.get("server_url") or DEFAULT_SERVER_URL
-        return json_response(
-            runtime.connect_server(
-                server_url=server_url,
-                machine_token=machine_token,
-                user_token=user_token,
-                machine_id=body.get("machine_id"),
-                display_name=body.get("display_name"),
-                capabilities=body.get("capabilities") or {},
-                heartbeat_interval_seconds=body.get("heartbeat_interval_seconds"),
-            ),
-            HTTPStatus.CREATED,
-        )
-
-    @app.post("/server/disconnect")
-    @route_errors
-    async def disconnect_server() -> Any:
-        return json_response(runtime.disconnect_server())
-
-    @app.get("/envs")
-    @route_errors
-    async def list_envs() -> Any:
-        return json_response(runtime.store.list_envs())
-
-    @app.post("/envs")
-    @route_errors
-    async def register_env() -> Any:
-        body = await read_json_body()
-        return json_response(
-            runtime.store.register_env(body["name"], body["python"]),
-            HTTPStatus.CREATED,
-        )
-
-    @app.get("/objects")
-    @route_errors
-    async def list_objects() -> Any:
-        query = first_query_value("q", "query")
-        view = (first_query_value("view") or "").lower()
-        compact = (first_query_value("compact") or "").lower() in {
-            "1",
-            "true",
-            "yes",
-        }
-        if query is None:
-            records = runtime.store.list_objects()
-            if view == "summary" or compact:
-                return json_response(
-                    {
-                        name: summarize_object(record)
-                        for name, record in records.items()
-                    }
-                )
-            return json_response(records)
-
-        records = runtime.store.search_objects(query)
-        if view == "summary" or compact:
-            return json_response([summarize_object(record) for record in records])
-        return json_response(records)
-
-    @app.get("/objects/search")
-    @route_errors
-    async def search_objects() -> Any:
-        return json_response(
-            runtime.store.search_objects(first_query_value("q", "query") or "")
-        )
-
-    @app.get("/objects/<name_or_id>")
-    @route_errors
-    async def get_object(name_or_id: str) -> Any:
-        include_yaml = (first_query_value("include_yaml") or "").lower() in {
-            "1",
-            "true",
-            "yes",
-        }
-        return json_response(
-            object_from_local_or_server(
-                validate_name(name_or_id),
-                include_yaml=include_yaml,
-            )
-        )
-
-    @app.get("/objects/<name_or_id>/signature")
-    @route_errors
-    async def object_signature(name_or_id: str) -> Any:
-        object_name, function = object_function_ref(name_or_id)
-        record = object_from_local_or_server(
-            object_name,
-            include_yaml=False,
-        )
-        return json_response(build_signature(record, function=function))
-
-    @app.get("/objects/<name_or_id>/decomposition")
-    @route_errors
-    async def object_decomposition(name_or_id: str) -> Any:
-        record = object_from_local_or_server(
-            validate_name(name_or_id),
-            include_yaml=False,
-        )
-        return json_response(record["decomposition"])
-
-    @app.get("/objects/<name_or_id>/inputs")
-    @route_errors
-    async def object_inputs(name_or_id: str) -> Any:
-        object_name, function = object_function_ref(name_or_id)
-        record = object_from_local_or_server(
-            object_name,
-            include_yaml=False,
-        )
-        return json_response(build_signature(record, function=function)["inputs"])
-
-    @app.get("/objects/<name_or_id>/outputs")
-    @route_errors
-    async def object_outputs(name_or_id: str) -> Any:
-        object_name, function = object_function_ref(name_or_id)
-        record = object_from_local_or_server(
-            object_name,
-            include_yaml=False,
-        )
-        return json_response(build_signature(record, function=function)["outputs"])
-
-    @app.get("/objects/<name_or_id>/versions")
-    @route_errors
-    async def list_object_versions(name_or_id: str) -> Any:
-        refresh = runtime.refresh_server_object_if_available(validate_name(name_or_id))
-        if refresh and refresh.get("current_version"):
-            name_or_id = refresh["current_version"]["name"]
-        return json_response(
-            runtime.store.list_object_versions(validate_name(name_or_id))
-        )
-
-    @app.post("/objects")
-    @route_errors
-    async def register_object() -> Any:
-        body = await read_json_body()
-        create_library = str(
-            body.get("create_library", body.get("create"))
-        ).strip().lower() in {"1", "true", "yes", "on"}
-        record = runtime.register_object(
-            body["name"],
-            body["entrypoint"],
-            body["env"],
-            yaml_text=body.get("yaml"),
-            yaml_path=body.get("yaml_path"),
-            workdir=body.get("workdir"),
-            description=body.get("description"),
-            version_label=body.get("version_label"),
-            object_id=body.get("object_id"),
-            runtime_config=body.get("runtime_config"),
-        )
-        if not body.get("local_only", False):
-            record["sync_event"] = runtime.enqueue_object_sync(
-                record,
-                library=body.get("library") or body.get("library_slug"),
-                create_library=create_library,
-                library_display_name=(
-                    body.get("library_display_name")
-                    or body.get("library_name")
-                ),
-            )
-            try:
-                record["sync"] = runtime.sync_once()
-            except ServerClientError as exc:
-                record["sync_error"] = exc.message
-        record["environment_build"] = runtime.prepare_object_environment(record)
-        return json_response(record, HTTPStatus.CREATED)
-
-    @app.get("/environment-builds")
-    @route_errors
-    async def list_environment_builds() -> Any:
-        return json_response(runtime.store.list_environment_builds())
-
-    @app.get("/environment-builds/<spec_hash>")
-    @route_errors
-    async def get_environment_build(spec_hash: str) -> Any:
-        record = runtime.store.get_environment_build(validate_name(spec_hash))
-        if record is None:
-            return json_response(
-                {"error": f"environment build is not found: {spec_hash}"},
-                HTTPStatus.NOT_FOUND,
-            )
-        return json_response(record)
-
-    @app.post("/environment-builds/<spec_hash>/rebuild")
-    @route_errors
-    async def rebuild_environment(spec_hash: str) -> Any:
-        body = await read_json_body()
-        wait = bool(body.get("wait", False))
-        resolved_spec_hash = validate_name(spec_hash)
-        record = runtime.store.get_environment_build(resolved_spec_hash)
-        if record is None:
-            return json_response(
-                {"error": f"environment build is not found: {spec_hash}"},
-                HTTPStatus.NOT_FOUND,
-            )
-        manager = (
-            runtime.docker_environment_manager
-            if record.get("runtime_type") == "docker"
-            else runtime.environment_manager
-        )
-        return json_response(
-            manager.rebuild(resolved_spec_hash, wait=wait),
-            HTTPStatus.ACCEPTED,
-        )
-
-    @app.post("/docker-images/prune")
-    @route_errors
-    async def prune_docker_images() -> Any:
-        body = await read_json_body()
-        spec_hash = body.get("spec_hash")
-        return json_response(
-            runtime.docker_environment_manager.prune_images(
-                validate_name(spec_hash) if spec_hash else None
-            )
-        )
-
-    @app.get("/remote-signatures")
-    @route_errors
-    async def list_remote_signatures() -> Any:
-        return json_response(runtime.store.list_remote_signatures())
-
-    @app.post("/remote-signatures/resolve")
-    @route_errors
-    async def resolve_remote_signature() -> Any:
-        body = await read_json_body()
-        ref = body.get("ref") or body
-        force = bool(body.get("force", False))
-        signature = runtime.resolve_remote_signature(ref, force=force)
-        normalized = runtime._normalize_remote_ref(ref)
-        return json_response(
-            {
-                "signature": signature,
-                "cache": runtime.store.get_remote_signature(normalized),
-            }
-        )
-
-    @app.post("/remote-decompositions/resolve")
-    @route_errors
-    async def resolve_remote_decomposition() -> Any:
-        body = await read_json_body()
-        ref = body.get("ref") or body
-        return json_response(runtime.resolve_remote_decomposition(ref))
-
-    @app.post("/remote-nodes/run")
-    @route_errors
-    async def run_remote_node() -> Any:
-        body = await read_json_body()
-        return json_response(
-            runtime.run_remote_node(
-                body["node"],
-                kwargs=body.get("kwargs") or {},
-                timeout_seconds=body.get("timeout_seconds"),
-            )
-        )
-
-    @app.get("/runs")
-    @route_errors
-    async def list_runs() -> Any:
-        return json_response(runtime.store.list_runs())
-
-    @app.post("/runs")
-    @route_errors
-    async def start_run() -> Any:
-        body = await read_json_body()
-        if body.get("target_machine") or body.get("remote"):
-            return json_response(
-                runtime.start_remote_run(
-                    body["object"],
-                    target_machine=body.get("target_machine"),
-                    object_owner_id=body.get("object_owner_id"),
-                    library=body.get("library"),
-                    args=body.get("args"),
-                    kwargs=body.get("kwargs"),
-                    output=body.get("output"),
-                    timeout_seconds=body.get("timeout_seconds"),
-                    version=body.get("version"),
-                    object_version_id=body.get("version_id"),
-                    function=body.get("function"),
-                    correlation_id=body.get("correlation_id"),
-                    parent_run_id=body.get("parent_run_id"),
-                    context=body.get("context") or {},
-                    offline_policy=body.get("offline_policy"),
-                ),
-                HTTPStatus.ACCEPTED,
-            )
-        return json_response(
-            runtime.start_run(
-                body["object"],
-                args=body.get("args"),
-                kwargs=body.get("kwargs"),
-                output=body.get("output"),
-                timeout_seconds=body.get("timeout_seconds"),
-                version=body.get("version"),
-                object_version_id=body.get("version_id"),
-                function=body.get("function"),
-                source=body.get("source", "auto"),
-            ),
-            HTTPStatus.ACCEPTED,
-        )
-
-    @app.get("/remote-runs/<run_id>")
-    @route_errors
-    async def get_remote_run(run_id: str) -> Any:
-        credentials = runtime._require_connected_server_credentials()
-        return json_response(
-            ServerClient(
-                credentials["server_url"],
-                credentials["token"],
-                user_token=credentials["user_token"],
-            ).get_remote_run(validate_name(run_id))
-        )
-
-    @app.get("/remote-runs/<run_id>/artifacts")
-    @route_errors
-    async def list_remote_artifacts(run_id: str) -> Any:
-        credentials = runtime._require_connected_server_credentials()
-        artifacts = ServerClient(
-            credentials["server_url"],
-            credentials["token"],
-            user_token=credentials["user_token"],
-        ).list_artifacts(validate_name(run_id))
-        return json_response([artifact["name"] for artifact in artifacts])
-
-    @app.get("/remote-runs/<run_id>/artifacts/<artifact_name>")
-    @route_errors
-    async def get_remote_artifact(run_id: str, artifact_name: str) -> Any:
-        credentials = runtime._require_connected_server_credentials()
-        data = ServerClient(
-            credentials["server_url"],
-            credentials["token"],
-            user_token=credentials["user_token"],
-        ).artifact_bytes(validate_name(run_id), validate_name(artifact_name))
-        return Response(
-            data,
-            status=int(HTTPStatus.OK),
-            content_type="application/octet-stream",
-            headers={
-                "Content-Disposition": f'attachment; filename="{artifact_name}"'
-            },
-        )
-
-    @app.get("/runs/<run_id>")
-    @route_errors
-    async def get_run(run_id: str) -> Any:
-        return json_response(runtime.store.get_run(validate_name(run_id)))
-
-    @app.get("/runs/<run_id>/result")
-    @route_errors
-    async def get_result(run_id: str) -> Any:
-        state = runtime.store.get_run(validate_name(run_id))
-        if state.get("result") is not None:
-            return json_response(state["result"])
-
-        result_path = Path(state["result_path"])
-        if not result_path.exists():
-            return json_response(
-                {"error": "result is not available", "status": state["status"]},
-                HTTPStatus.CONFLICT,
-            )
-        return json_response(json.loads(result_path.read_text(encoding="utf-8")))
-
-    @app.get("/runs/<run_id>/artifacts")
-    @route_errors
-    async def list_artifacts(run_id: str) -> Any:
-        state = runtime.store.get_run(validate_name(run_id))
-        artifacts_dir = Path(state["artifacts_dir"])
-        if not artifacts_dir.exists():
-            return json_response([])
-        return json_response(sorted(path.name for path in artifacts_dir.iterdir()))
-
-    @app.get("/runs/<run_id>/artifacts/<artifact_name>")
-    @route_errors
-    async def get_artifact(run_id: str, artifact_name: str) -> Any:
-        state = runtime.store.get_run(validate_name(run_id))
-        artifact_path = Path(state["artifacts_dir"]) / validate_name(artifact_name)
-        if not artifact_path.exists() or not artifact_path.is_file():
-            return json_response(
-                {"error": "artifact is not found"},
-                HTTPStatus.NOT_FOUND,
-            )
-
-        return Response(
-            artifact_path.read_bytes(),
-            status=int(HTTPStatus.OK),
-            content_type="application/octet-stream",
-            headers={
-                "Content-Disposition": (
-                    f'attachment; filename="{artifact_path.name}"'
-                )
-            },
-        )
+    register_server_connection_routes(app, runtime=runtime, context=context)
+    register_library_routes(app, runtime=runtime, context=context)
+    register_object_routes(app, runtime=runtime, context=context)
+    register_env_routes(app, runtime=runtime, context=context)
+    register_remote_routes(app, runtime=runtime, context=context)
+    register_run_routes(app, runtime=runtime, context=context)
+    register_artifact_routes(app, runtime=runtime, context=context)
 
     return app
 
 
-def make_server(host: str, port: int, store: RegistryStore) -> Any:
+def make_server(
+    host: str,
+    port: int,
+    store: RegistryStore,
+    **runtime_kwargs: Any,
+) -> Any:
     """Backward-compatible factory name; returns a Quart app."""
 
     _ = (host, port)
-    return create_app(store)
+    return create_app(store, **runtime_kwargs)
 
 
 def _port_is_available(host: str, port: int) -> bool:
@@ -3465,6 +2158,12 @@ def serve(
     docker_pool_size: int = 0,
     docker_idle_timeout_seconds: float = 300.0,
     docker_prewarm: bool = False,
+    environment_manager: EnvironmentManagerProtocol | None = None,
+    docker_environment_manager: DockerEnvironmentManagerProtocol | None = None,
+    docker_pool: DockerPoolRunnerProtocol | None = None,
+    runtime_backends: RuntimeBackendRegistry | None = None,
+    sync_visibility: SyncVisibilityProtocol | None = None,
+    server_client_factory: ServerClientFactoryProtocol = _default_server_client_factory,
 ) -> None:
     """Run the local daemon until interrupted."""
 
@@ -3499,6 +2198,12 @@ def serve(
             docker_idle_timeout_seconds=docker_idle_timeout_seconds,
             docker_prewarm=docker_prewarm,
             api_token=api_token,
+            environment_manager=environment_manager,
+            docker_environment_manager=docker_environment_manager,
+            docker_pool=docker_pool,
+            runtime_backends=runtime_backends,
+            sync_visibility=sync_visibility,
+            server_client_factory=server_client_factory,
         )
         if selected_port != port:
             print(f"SPL daemon port {port} is busy; using {selected_port} instead")

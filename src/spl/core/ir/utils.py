@@ -6,12 +6,15 @@ from typing import Any
 
 import yaml
 
+from spl.core.entities.adapter import DAdapter
+from spl.core.entities.artifact import DArtifactRef
 from spl.core.entities.control import DSPLImport, DSPLSelfImport
 from spl.core.entities.distribution import DDistribution, validate_distributions
 from spl.core.entities.function import DFunction
 from spl.core.entities.local_function import DLocalAlias
 from spl.core.entities.module import DImport, DImportFrom
 from spl.core.entities.node import (
+    DFormattedOutputRef,
     DNodeInputRef,
     DNodeOutputRef,
     InputPort,
@@ -61,12 +64,15 @@ SPL_YAML_CONSTRUCTORS = {
     '!DLocalAlias': _construct_dataclass(DLocalAlias),
     '!DImport': _construct_dataclass(DImport),
     '!DImportFrom': _construct_dataclass(DImportFrom),
+    '!DFormattedOutputRef': _construct_dataclass(DFormattedOutputRef),
     '!DNodeInputRef': _construct_dataclass(DNodeInputRef),
     '!DNodeOutputRef': _construct_dataclass(DNodeOutputRef),
     '!DNodeFunction': _construct_dataclass(DNodeFunction),
     '!DNodeRemote': _construct_dataclass(DNodeRemote),
     '!DPipeline': _construct_dataclass(DPipeline),
     '!DScalar': _construct_dataclass(DScalar),
+    '!DArtifactRef': _construct_dataclass(DArtifactRef),
+    '!DAdapter': _construct_dataclass(DAdapter),
 }
 
 

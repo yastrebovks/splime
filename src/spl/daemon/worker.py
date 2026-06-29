@@ -240,7 +240,7 @@ def copy_artifact(source: Path, target: Path) -> None:
 def collect_artifacts(value: Any, artifacts_dir: Path) -> tuple[Any, dict[str, str]]:
     """Extract and copy artifacts declared by the function result.
 
-    Convention for MVP:
+    Convention for MVP::
 
         {
           "__spl_result__": {"score": 0.91},

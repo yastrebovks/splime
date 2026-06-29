@@ -199,12 +199,12 @@ def test_docker_runtime_config_is_persisted_and_command_is_constructed(
         framework_src = tmp_path / "framework-src"
         framework_src.mkdir()
         monkeypatch.setattr(
-            runtime,
-            "_docker_source_roots",
+            runtime.docker_pool,
+            "source_roots",
             lambda: [("daemon", daemon_src), ("framework", framework_src)],
         )
 
-        command = runtime._docker_worker_command(
+        command = runtime.docker_pool.worker_command(
             object_record=record,
             entrypoint=record["entrypoint"],
             run_id="abc123",
@@ -284,9 +284,9 @@ def test_docker_network_uses_bridge_host_gateway_for_remote_nodes(
     store = RegistryStore(tmp_path)
     try:
         runtime = DaemonRuntime(store, auto_build_envs=False)
-        monkeypatch.setattr("spl.daemon.server.platform.system", lambda: "Linux")
+        monkeypatch.setattr("spl.daemon.docker_pool.platform.system", lambda: "Linux")
 
-        args, daemon_url = runtime._docker_network_args(
+        args, daemon_url = runtime.docker_pool.network_args(
             {"pipeline_nodes": [{"kind": "remote"}]},
             {"mode": "docker", "network": "auto"},
         )
@@ -302,7 +302,7 @@ def test_docker_pool_exec_command_uses_runs_mount(tmp_path) -> None:
     try:
         runtime = DaemonRuntime(store, auto_build_envs=False, docker_pool_size=1)
 
-        command = runtime._docker_exec_worker_command(
+        command = runtime.docker_pool.exec_worker_command(
             object_record={"pipeline_nodes": []},
             entrypoint="artifact_func",
             run_id="abc123",
@@ -322,15 +322,15 @@ def test_docker_pool_key_includes_effective_network(tmp_path, monkeypatch) -> No
     store = RegistryStore(tmp_path)
     try:
         runtime = DaemonRuntime(store, auto_build_envs=False, docker_pool_size=1)
-        monkeypatch.setattr("spl.daemon.server.platform.system", lambda: "Linux")
+        monkeypatch.setattr("spl.daemon.docker_pool.platform.system", lambda: "Linux")
         config = {"mode": "docker", "network": "auto"}
 
-        local_key = runtime._docker_pool_key(
+        local_key = runtime.docker_pool.pool_key(
             "splime-runtime:demo",
             config,
             {"pipeline_nodes": []},
         )
-        remote_key = runtime._docker_pool_key(
+        remote_key = runtime.docker_pool.pool_key(
             "splime-runtime:demo",
             config,
             {"pipeline_nodes": [{"kind": "remote"}]},
@@ -346,17 +346,17 @@ def test_docker_pool_records_exec_lock(tmp_path, monkeypatch) -> None:
     try:
         runtime = DaemonRuntime(store, auto_build_envs=False, docker_pool_size=1)
         monkeypatch.setattr(
-            runtime,
-            "_start_docker_pool_container",
+            runtime.docker_pool,
+            "start_container",
             lambda **kwargs: {
                 "key": kwargs["key"],
                 "name": "splime-pool-test",
                 "image_tag": kwargs["image_tag"],
             },
         )
-        monkeypatch.setattr(runtime, "_docker_container_running", lambda name: True)
+        monkeypatch.setattr(runtime.docker_pool, "container_running", lambda name: True)
 
-        record = runtime._ensure_docker_pool_container(
+        record = runtime.docker_pool.ensure_container(
             object_record={"pipeline_nodes": []},
             image_tag="splime-runtime:demo",
             runtime_config={"mode": "docker", "network": "auto"},
@@ -377,8 +377,8 @@ def test_docker_pool_idle_eviction_skips_in_use_containers(tmp_path, monkeypatch
             docker_pool_size=2,
             docker_idle_timeout_seconds=1,
         )
-        monkeypatch.setattr(runtime, "_remove_docker_container", lambda name: removed.append(name))
-        runtime._docker_pool = {
+        monkeypatch.setattr(runtime.docker_pool, "remove_container", lambda name: removed.append(name))
+        runtime.docker_pool._containers = {
             "busy": {
                 "name": "splime-pool-busy",
                 "last_used": 1.0,
@@ -391,11 +391,11 @@ def test_docker_pool_idle_eviction_skips_in_use_containers(tmp_path, monkeypatch
             },
         }
 
-        runtime._evict_idle_docker_pool_locked(now=10.0)
+        runtime.docker_pool.evict_idle_locked(now=10.0)
 
         assert removed == ["splime-pool-idle"]
-        assert "busy" in runtime._docker_pool
-        assert "idle" not in runtime._docker_pool
+        assert "busy" in runtime.docker_pool._containers
+        assert "idle" not in runtime.docker_pool._containers
     finally:
         store.close()
 
@@ -405,8 +405,8 @@ def test_docker_pool_lru_eviction_skips_in_use_containers(tmp_path, monkeypatch)
     removed: list[str] = []
     try:
         runtime = DaemonRuntime(store, auto_build_envs=False, docker_pool_size=1)
-        monkeypatch.setattr(runtime, "_remove_docker_container", lambda name: removed.append(name))
-        runtime._docker_pool = {
+        monkeypatch.setattr(runtime.docker_pool, "remove_container", lambda name: removed.append(name))
+        runtime.docker_pool._containers = {
             "busy": {
                 "name": "splime-pool-busy",
                 "last_used": 1.0,
@@ -419,11 +419,11 @@ def test_docker_pool_lru_eviction_skips_in_use_containers(tmp_path, monkeypatch)
             },
         }
 
-        runtime._evict_excess_docker_pool_locked(reserve=1)
+        runtime.docker_pool.evict_excess_locked(reserve=1)
 
         assert removed == ["splime-pool-idle"]
-        assert "busy" in runtime._docker_pool
-        assert "idle" not in runtime._docker_pool
+        assert "busy" in runtime.docker_pool._containers
+        assert "idle" not in runtime.docker_pool._containers
     finally:
         store.close()
 
@@ -533,10 +533,12 @@ def test_docker_run_reports_clear_error_when_executable_is_missing(
     store = RegistryStore(tmp_path)
     try:
         runtime = DaemonRuntime(store, auto_build_envs=False)
-        monkeypatch.setattr("spl.daemon.server.shutil.which", lambda _: None)
+        monkeypatch.setattr("spl.daemon.runtime_backend.shutil.which", lambda _: None)
 
         try:
-            runtime._assert_docker_available_for_run()
+            runtime.runtime_backends.backend_for(
+                {"runtime_config": {"mode": "docker"}}
+            ).ensure_ready({})
         except RuntimeError as exc:
             assert "docker executable is not available" in str(exc)
         else:
@@ -636,7 +638,7 @@ def test_docker_runtime_reuses_warm_pool_container(tmp_path) -> None:
 
         assert [r["status"] for r in results] == ["succeeded", "succeeded"]
         # Exactly one warm container should be backing both runs.
-        assert len(runtime._docker_pool) == 1
+        assert len(runtime.docker_pool) == 1
         for run in results:
             assert run["result"]["result"] == {"answer": 7}
     finally:
@@ -680,10 +682,9 @@ def test_prepare_remote_run_artifacts_splits_inline_and_direct_uploads(
             return record
 
     store = RegistryStore(tmp_path)
-    monkeypatch.setattr(daemon_server, "ServerClient", UploadingServerClient)
     monkeypatch.setattr(daemon_server, "DEFAULT_INLINE_REMOTE_ARTIFACT_MAX_BYTES", 8)
     try:
-        runtime = DaemonRuntime(store)
+        runtime = DaemonRuntime(store, server_client_factory=UploadingServerClient)
         connection = store.save_server_connection(
             server_url="https://splime.io/api",
             token="machine-token-123456",
