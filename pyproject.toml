@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "splime"
-version = "0.1.2"
+version = "0.1.3"
 
 description = "Reuse Python functions across projects without rewriting or redeploying them."
 readme = "README.md"
@@ -110,6 +110,7 @@ ignore = []
 
 [tool.pytest.ini_options]
 addopts = "-raq --strict-markers"
+pythonpath = ["src"]
 
 python_files = ["test_*.py", "tests.py"]
 testpaths = ["tests"]

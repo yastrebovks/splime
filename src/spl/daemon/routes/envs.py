@@ -28,7 +28,7 @@ def register_env_routes(
     async def register_env() -> Any:
         body = await context.read_json_body()
         return json_response(
-            runtime.store.register_env(body["name"], body["python"]),
+            runtime.store.register_env(body["name"], body.get("python")),
             HTTPStatus.CREATED,
         )
 

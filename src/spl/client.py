@@ -18,7 +18,6 @@ dependencies imported yet.
 
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, cast, overload
@@ -463,14 +462,15 @@ class SPLClient:
     def register_env(self, name: str = "default", python: str | None = None) -> dict[str, Any]:
         """Register a Python executable as a daemon environment.
 
-        By default the currently running interpreter is registered.  This makes
-        the simplest local workflow short:
+        By default the daemon registers its own interpreter.  This keeps the
+        simplest local workflow working both when the daemon runs natively and
+        when it runs in a container:
 
             client.register_env()
             client.publish(my_function, env="default")
         """
 
-        return self._daemon.register_env(name, python or sys.executable)
+        return self._daemon.register_env(name, python)
 
     def publish(
         self,

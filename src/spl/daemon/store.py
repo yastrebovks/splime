@@ -80,7 +80,7 @@ class RegistryStore:
     def __exit__(self, *_: Any) -> None:
         self.close()
 
-    def register_env(self, name: str, python: str) -> dict[str, Any]:
+    def register_env(self, name: str, python: str | None = None) -> dict[str, Any]:
         return self.envs.register_env(name, python)
 
     def list_envs(self) -> dict[str, Any]:

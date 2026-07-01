@@ -485,13 +485,16 @@ class Client:
             f"/server/libraries/{quote(library_ref)}/entries/{quote(name)}",
         )
 
-    def register_env(self, name: str, python: str) -> dict[str, Any]:
+    def register_env(self, name: str, python: str | None = None) -> dict[str, Any]:
         """Register a Python executable as a daemon environment."""
 
+        payload = {"name": name}
+        if python is not None:
+            payload["python"] = python
         return self._json_request(
             "POST",
             "/envs",
-            {"name": name, "python": python},
+            payload,
         )
 
     def list_envs(self) -> dict[str, Any]:

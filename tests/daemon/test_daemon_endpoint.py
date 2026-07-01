@@ -5,6 +5,8 @@ import stat
 
 import pytest
 
+import spl.client as spl_client_module
+import spl.daemon.repositories.env as env_repository
 from spl.client import SPLClient
 import spl.daemon.server as daemon_server
 from spl.daemon.client import Client as CompatibilityClient
@@ -194,6 +196,110 @@ def test_clients_use_saved_daemon_endpoint(tmp_path) -> None:
 def test_base_url_and_daemon_port_are_mutually_exclusive() -> None:
     with pytest.raises(ValueError, match="either base_url or daemon_port"):
         Client("http://127.0.0.1:8765", daemon_port=8766)
+
+
+def test_spl_client_register_env_forwards_omitted_python(monkeypatch) -> None:
+    calls = []
+
+    def fake_register_env(self, name, python=None):
+        calls.append((name, python))
+        return {"name": name, "python": python}
+
+    monkeypatch.setattr(spl_client_module.Client, "register_env", fake_register_env)
+
+    result = SPLClient().register_env("default")
+
+    assert result == {"name": "default", "python": None}
+    assert calls == [("default", None)]
+
+
+def test_daemon_client_register_env_omits_python_payload_when_omitted(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    calls = []
+
+    def fake_json_request(self, method, path, payload=None):
+        calls.append((method, path, payload))
+        return {"ok": True}
+
+    monkeypatch.setattr(Client, "_json_request", fake_json_request)
+
+    client = Client()
+    assert client.register_env("default") == {"ok": True}
+    explicit_python = str(tmp_path / "client-python")
+    assert client.register_env("custom", explicit_python) == {"ok": True}
+
+    assert calls == [
+        ("POST", "/envs", {"name": "default"}),
+        ("POST", "/envs", {"name": "custom", "python": explicit_python}),
+    ]
+
+
+def test_register_env_route_defaults_to_daemon_python(tmp_path, monkeypatch) -> None:
+    daemon_python = tmp_path / "daemon-python"
+    daemon_python.touch()
+    client_python = tmp_path / "client-python"
+    client_python.touch()
+    monkeypatch.setattr(env_repository.sys, "executable", str(daemon_python))
+
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        app = create_app(store)
+        status, body = _post_json_from_app(app, "/envs", {"name": "default"})
+
+        assert status == 201
+        assert body["name"] == "default"
+        assert body["python"] == str(daemon_python.absolute())
+        assert body["python"] != str(client_python.absolute())
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_register_env_route_preserves_explicit_valid_python(tmp_path) -> None:
+    python = tmp_path / "explicit-python"
+    python.touch()
+
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        app = create_app(store)
+        status, body = _post_json_from_app(
+            app,
+            "/envs",
+            {"name": "explicit", "python": str(python)},
+        )
+
+        assert status == 201
+        assert body["name"] == "explicit"
+        assert body["python"] == str(python.absolute())
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_register_env_route_rejects_explicit_missing_python(tmp_path) -> None:
+    missing_python = tmp_path / "missing-python"
+
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        app = create_app(store)
+        status, body = _post_json_from_app(
+            app,
+            "/envs",
+            {"name": "missing", "python": str(missing_python)},
+        )
+
+        assert status == 400
+        assert body == {
+            "error": f"python executable is not found: {missing_python.absolute()}"
+        }
+    finally:
+        _shutdown_app(app)
+        store.close()
 
 
 def test_select_daemon_port_scans_when_preferred_port_is_busy() -> None:

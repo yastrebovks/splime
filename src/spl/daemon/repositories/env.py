@@ -6,6 +6,7 @@ import hashlib
 import importlib.metadata
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
@@ -30,9 +31,10 @@ from spl.daemon.storage_base import (
 class EnvRepository(RepositoryBase):
     """Persist and query env aggregate records."""
 
-    def register_env(self, name: str, python: str) -> dict[str, Any]:
+    def register_env(self, name: str, python: str | None = None) -> dict[str, Any]:
         """Register or update a named Python interpreter."""
 
+        python = python or sys.executable
         name = validate_name(name)
         python_path = Path(python).expanduser().absolute()
         if not python_path.exists():
