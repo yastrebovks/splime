@@ -696,6 +696,55 @@ class SPLClient:
             }
         raise ValueError("scope must be 'auto', 'local', 'server', or 'all'")
 
+    def forget(
+        self,
+        name: str,
+        *,
+        owner: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        """Remove one local daemon object without requiring a server connection."""
+
+        return self._daemon.forget(name, owner_id=owner, library=library)
+
+    def remove_local(
+        self,
+        name: str,
+        *,
+        owner: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        """Alias for :meth:`forget`."""
+
+        return self.forget(name, owner=owner, library=library)
+
+    def forget_version(
+        self,
+        name: str,
+        version: str | int,
+        *,
+        owner: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        """Remove one local object version without contacting the server."""
+
+        return self._daemon.forget_version(
+            name,
+            version,
+            owner_id=owner,
+            library=library,
+        )
+
+    def prune_stale_mirrors(
+        self,
+        *,
+        owner: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        """Remove locally cached server-origin mirror rows."""
+
+        return self._daemon.prune_stale_mirrors(owner_id=owner, library=library)
+
     def _has_server_connection(self) -> bool:
         if self.server_connection is not None:
             return bool(self.server_connection.get("connected"))

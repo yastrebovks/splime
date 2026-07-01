@@ -131,9 +131,13 @@ class RouteContext:
         include_yaml: bool = False,
     ) -> dict[str, Any]:
         version = self.optional_int_query("version")
+        owner_id = self.first_query_value("owner", "owner_id")
+        library = self.first_query_value("library")
         refresh = self.runtime.refresh_server_object_if_available(
             name_or_id,
             version=version,
+            owner_id=owner_id,
+            library=library,
         )
         if refresh and refresh.get("current_version"):
             return self.runtime.store.get_object_version(
@@ -144,4 +148,6 @@ class RouteContext:
             name_or_id,
             version=version,
             include_yaml=include_yaml,
+            owner_id=owner_id,
+            library=library,
         )

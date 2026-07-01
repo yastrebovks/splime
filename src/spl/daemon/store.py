@@ -15,6 +15,8 @@ from spl.daemon.repositories import (
 )
 from spl.daemon.storage_base import (
     DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    DEFAULT_OBJECT_LIBRARY,
+    DEFAULT_OBJECT_OWNER_ID,
     FUNCTION_REF_SEPARATOR,
     NAME_PATTERN,
     REDACTED_SECRET_VALUE,
@@ -330,10 +332,13 @@ class RegistryStore:
         description: str | None = None,
         version_label: str | None = None,
         object_id: str | None = None,
+        owner_id: str | None = None,
+        library: str | None = None,
         origin: str = "local",
         remote_owner_id: str | None = None,
         remote_object_id: str | None = None,
         remote_version_id: str | None = None,
+        source_object_name: str | None = None,
         remote_name: str | None = None,
         remote_signature_resolver: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -348,16 +353,60 @@ class RegistryStore:
             description=description,
             version_label=version_label,
             object_id=object_id,
+            owner_id=owner_id,
+            library=library,
             origin=origin,
             remote_owner_id=remote_owner_id,
             remote_object_id=remote_object_id,
             remote_version_id=remote_version_id,
+            source_object_name=source_object_name,
             remote_name=remote_name,
             remote_signature_resolver=remote_signature_resolver,
         )
 
     def list_objects(self) -> dict[str, Any]:
         return self.objects.list_objects()
+
+    def list_object_identities(
+        self,
+        *,
+        owner_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.objects.list_object_identities(owner_id=owner_id)
+
+    def rekey_local_placeholder_objects(self, owner_id: str) -> dict[str, Any]:
+        return self.objects.rekey_local_placeholder_objects(owner_id)
+
+    def link_object_remote_identity(
+        self,
+        *,
+        owner_id: str,
+        library: str,
+        name: str,
+        remote_owner_id: str | None = None,
+        remote_object_id: str | None = None,
+        source_object_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        return self.objects.link_object_remote_identity(
+            owner_id=owner_id,
+            library=library,
+            name=name,
+            remote_owner_id=remote_owner_id,
+            remote_object_id=remote_object_id,
+            source_object_name=source_object_name,
+        )
+
+    def enqueue_object_version_sync_once(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.objects.enqueue_object_version_sync_once(payload)
+
+    def record_object_conflict_once(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.objects.record_object_conflict_once(payload)
 
     def search_objects(self, query: str) -> list[dict[str, Any]]:
         return self.objects.search_objects(query)
@@ -371,11 +420,15 @@ class RegistryStore:
         *,
         version: int | None = None,
         include_yaml: bool = False,
+        owner_id: str | None = None,
+        library: str | None = None,
     ) -> dict[str, Any]:
         return self.objects.get_object(
             name_or_id,
             version=version,
             include_yaml=include_yaml,
+            owner_id=owner_id,
+            library=library,
         )
 
     def get_object_version(
@@ -400,8 +453,57 @@ class RegistryStore:
     ) -> list[dict[str, Any]]:
         return self.objects.list_object_versions_by_remote_object(remote_object_id)
 
-    def list_object_versions(self, name_or_id: str) -> list[dict[str, Any]]:
-        return self.objects.list_object_versions(name_or_id)
+    def list_object_versions(
+        self,
+        name_or_id: str,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.objects.list_object_versions(
+            name_or_id,
+            owner_id=owner_id,
+            library=library,
+        )
+
+    def forget_object(
+        self,
+        name_or_id: str,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        return self.objects.forget_object(
+            name_or_id,
+            owner_id=owner_id,
+            library=library,
+        )
+
+    def forget_object_version(
+        self,
+        name_or_id: str,
+        version_ref: str | int,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        return self.objects.forget_object_version(
+            name_or_id,
+            version_ref,
+            owner_id=owner_id,
+            library=library,
+        )
+
+    def prune_stale_mirrors(
+        self,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        return self.objects.prune_stale_mirrors(
+            owner_id=owner_id,
+            library=library,
+        )
 
     def create_run(
         self,

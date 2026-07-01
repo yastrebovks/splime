@@ -10,8 +10,11 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
+from spl.daemon.canonical import canonical_object_definition, canonicalize
 from spl.daemon.runtime_config import normalize_runtime_config
 from spl.daemon.storage_base import (
+    DEFAULT_OBJECT_LIBRARY,
+    DEFAULT_OBJECT_OWNER_ID,
     REDACTED_SECRET_VALUE,
     RepositoryBase,
     iso_after_now,
@@ -43,10 +46,13 @@ class ObjectRepository(RepositoryBase):
         description: str | None = None,
         version_label: str | None = None,
         object_id: str | None = None,
+        owner_id: str | None = None,
+        library: str | None = None,
         origin: str = "local",
         remote_owner_id: str | None = None,
         remote_object_id: str | None = None,
         remote_version_id: str | None = None,
+        source_object_name: str | None = None,
         remote_name: str | None = None,
         remote_signature_resolver: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -60,6 +66,13 @@ class ObjectRepository(RepositoryBase):
             remote_object_id = validate_name(remote_object_id)
         if remote_version_id is not None:
             remote_version_id = validate_name(remote_version_id)
+        if owner_id is None and origin == "server" and remote_owner_id is not None:
+            owner_id = remote_owner_id
+        owner_id = self._caller_owner_id(owner_id)
+        library = self._object_library(library)
+        source_object_name = source_object_name if source_object_name is not None else remote_name
+        if source_object_name is not None:
+            source_object_name = validate_name(str(source_object_name))
         entrypoint = validate_name(entrypoint)
         env_record = self.get_env(env)
         normalized_runtime_config = normalize_runtime_config(runtime_config)
@@ -102,6 +115,15 @@ class ObjectRepository(RepositoryBase):
         version_id = uuid4().hex
         object_description = description or ""
         yaml_sha256 = hashlib.sha256(yaml_text.encode("utf-8")).hexdigest()
+        canonical_definition = canonical_object_definition(
+            yaml_text=yaml_text,
+            entrypoint=entrypoint,
+            env=env,
+            env_python_version=self._cached_python_version(env_record["python"]),
+            metadata=metadata,
+            runtime_config=normalized_runtime_config,
+        )
+        content_hash = hashlib.sha256(canonicalize(canonical_definition)).hexdigest()
         object_kind = validate_name(str(metadata["kind"]))
 
         with self._lock, self._conn:
@@ -120,31 +142,47 @@ class ObjectRepository(RepositoryBase):
                         include_yaml=False,
                     )
 
-            if object_id is None and remote_object_id is not None:
-                object_row = self._conn.execute(
-                    """
-                    SELECT id, name, kind, created_at
-                    FROM objects
-                    WHERE remote_object_id = ?
-                    """,
-                    (remote_object_id,),
-                ).fetchone()
-            elif object_id is None:
-                object_row = self._conn.execute(
-                    "SELECT id, name, kind, created_at FROM objects WHERE name = ?",
-                    (name,),
-                ).fetchone()
+            if object_id is None:
+                object_row = None
+                if remote_object_id is not None:
+                    object_row = self._conn.execute(
+                        """
+                        SELECT id, owner_id, library, name, kind, created_at
+                        FROM objects
+                        WHERE remote_object_id = ?
+                        """,
+                        (remote_object_id,),
+                    ).fetchone()
+                if object_row is None:
+                    object_row = self._conn.execute(
+                        """
+                        SELECT id, owner_id, library, name, kind, created_at
+                        FROM objects
+                        WHERE owner_id = ? AND library = ? AND name = ?
+                        """,
+                        (owner_id, library, name),
+                    ).fetchone()
             else:
                 object_row = self._conn.execute(
-                    "SELECT id, name, kind, created_at FROM objects WHERE id = ?",
+                    """
+                    SELECT id, owner_id, library, name, kind, created_at
+                    FROM objects
+                    WHERE id = ?
+                    """,
                     (object_id,),
                 ).fetchone()
                 if object_row is None:
                     raise KeyError(f"object is not registered: {object_id}")
-                if object_row["name"] != name:
+                if (
+                    object_row["owner_id"] != owner_id
+                    or object_row["library"] != library
+                    or object_row["name"] != name
+                ):
                     raise ValueError(
                         "object_id points to object "
-                        f"{object_row['name']!r}, not {name!r}"
+                        f"{object_row['owner_id']}/{object_row['library']}/"
+                        f"{object_row['name']!r}, not "
+                        f"{owner_id}/{library}/{name!r}"
                     )
             if (
                 object_row is not None
@@ -162,20 +200,23 @@ class ObjectRepository(RepositoryBase):
                 self._conn.execute(
                     """
                     INSERT INTO objects(
-                        id, name, kind, origin, remote_owner_id, remote_object_id,
-                        remote_name, description, current_version_id,
+                        id, owner_id, library, name, kind, origin,
+                        remote_owner_id, remote_object_id, source_object_name,
+                        description, current_version_id,
                         created_at, updated_at
                     )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
                     """,
                     (
                         resolved_object_id,
+                        owner_id,
+                        library,
                         name,
                         object_kind,
                         origin,
                         remote_owner_id,
                         remote_object_id,
-                        remote_name,
+                        source_object_name,
                         object_description,
                         now,
                         now,
@@ -194,17 +235,73 @@ class ObjectRepository(RepositoryBase):
                 ).fetchone()
                 next_version = int(row["next_version"])
 
+            existing_content = self._conn.execute(
+                """
+                SELECT id
+                FROM object_versions
+                WHERE object_id = ? AND content_hash = ?
+                """,
+                (resolved_object_id, content_hash),
+            ).fetchone()
+            if existing_content is not None:
+                version_id = existing_content["id"]
+                self._conn.execute(
+                    """
+                    UPDATE object_versions
+                    SET remote_owner_id = COALESCE(?, remote_owner_id),
+                        remote_object_id = COALESCE(?, remote_object_id),
+                        remote_version_id = CASE
+                            WHEN ? IS NOT NULL THEN ?
+                            ELSE remote_version_id
+                        END
+                    WHERE id = ?
+                    """,
+                    (
+                        remote_owner_id,
+                        remote_object_id,
+                        remote_version_id,
+                        remote_version_id,
+                        version_id,
+                    ),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE objects
+                    SET description = ?,
+                        kind = COALESCE(kind, ?),
+                        current_version_id = ?,
+                        origin = ?,
+                        remote_owner_id = COALESCE(?, remote_owner_id),
+                        remote_object_id = COALESCE(?, remote_object_id),
+                        source_object_name = COALESCE(?, source_object_name),
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        object_description,
+                        object_kind,
+                        version_id,
+                        origin,
+                        remote_owner_id,
+                        remote_object_id,
+                        source_object_name,
+                        now,
+                        resolved_object_id,
+                    ),
+                )
+                return self.get_object_version(version_id, include_yaml=False)
+
             self._conn.execute(
                 """
                 INSERT INTO object_versions(
                     id, object_id, version, version_label, description,
                     entrypoint, env, env_python, kind, yaml_text, yaml_sha256,
-                    metadata_json, inputs_json, outputs_json,
+                    content_hash, metadata_json, inputs_json, outputs_json,
                     pipeline_nodes_json, distributions_json, runtime_config_json, workdir,
                     remote_owner_id, remote_object_id, remote_version_id,
                     created_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     version_id,
@@ -218,6 +315,7 @@ class ObjectRepository(RepositoryBase):
                     metadata["kind"],
                     yaml_text,
                     yaml_sha256,
+                    content_hash,
                     json_dumps(metadata),
                     json_dumps(metadata["inputs"]),
                     json_dumps(metadata["outputs"]),
@@ -246,7 +344,7 @@ class ObjectRepository(RepositoryBase):
                     origin = ?,
                     remote_owner_id = COALESCE(?, remote_owner_id),
                     remote_object_id = COALESCE(?, remote_object_id),
-                    remote_name = COALESCE(?, remote_name),
+                    source_object_name = COALESCE(?, source_object_name),
                     updated_at = ?
                 WHERE id = ?
                 """,
@@ -257,7 +355,7 @@ class ObjectRepository(RepositoryBase):
                     origin,
                     remote_owner_id,
                     remote_object_id,
-                    remote_name,
+                    source_object_name,
                     now,
                     resolved_object_id,
                 ),
@@ -277,11 +375,23 @@ class ObjectRepository(RepositoryBase):
 
         with self._lock:
             rows = self._conn.execute(self._object_select_sql()).fetchall()
+            conflicts = self._object_conflicts_by_canonical_locked()
         records = [
             self._object_row_to_record(row, include_yaml=False)
             for row in rows
         ]
-        return {record["name"]: record for record in records}
+        for record in records:
+            record["conflicts"] = conflicts.get(record["canonical_name"], [])
+        result: dict[str, Any] = {}
+        for record in records:
+            key = record["name"]
+            if key in result:
+                existing = result.pop(key)
+                result[existing["canonical_name"]] = existing
+                result[record["canonical_name"]] = record
+                continue
+            result[key] = record
+        return result
 
     def search_objects(self, query: str) -> list[dict[str, Any]]:
         """Search current objects by name, description, and indexed metadata."""
@@ -308,6 +418,302 @@ class ObjectRepository(RepositoryBase):
             if needle in haystack:
                 result.append(record)
         return result
+
+    def list_object_identities(
+        self,
+        *,
+        owner_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return object rows without joining versions."""
+
+        args: tuple[Any, ...] = ()
+        where = ""
+        if owner_id is not None:
+            where = "WHERE owner_id = ?"
+            args = (validate_name(str(owner_id)),)
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT id, owner_id, library, name, kind, origin,
+                       remote_owner_id, remote_object_id, source_object_name,
+                       current_version_id, created_at, updated_at
+                FROM objects
+                {where}
+                ORDER BY owner_id, library, name
+                """,
+                args,
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "owner_id": row["owner_id"],
+                "library": row["library"],
+                "name": row["name"],
+                "canonical_name": f"{row['owner_id']}/{row['library']}/{row['name']}",
+                "kind": row["kind"],
+                "origin": row["origin"],
+                "remote_owner_id": row["remote_owner_id"],
+                "remote_object_id": row["remote_object_id"],
+                "source_object_name": row["source_object_name"],
+                "current_version_id": row["current_version_id"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    def rekey_local_placeholder_objects(
+        self,
+        owner_id: str,
+    ) -> dict[str, Any]:
+        """Move local-placeholder objects into the connected owner's namespace."""
+
+        owner_id = validate_name(str(owner_id))
+        if owner_id == DEFAULT_OBJECT_OWNER_ID:
+            return {"owner_id": owner_id, "rekeyed": [], "merged": [], "conflicts": []}
+        report: dict[str, Any] = {
+            "owner_id": owner_id,
+            "rekeyed": [],
+            "merged": [],
+            "conflicts": [],
+        }
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                """
+                SELECT *
+                FROM objects
+                WHERE owner_id = ?
+                ORDER BY library, name, id
+                """,
+                (DEFAULT_OBJECT_OWNER_ID,),
+            ).fetchall()
+            for row in rows:
+                existing = self._conn.execute(
+                    """
+                    SELECT *
+                    FROM objects
+                    WHERE owner_id = ? AND library = ? AND name = ?
+                    """,
+                    (owner_id, row["library"], row["name"]),
+                ).fetchone()
+                if existing is not None and existing["id"] != row["id"]:
+                    if (
+                        existing["kind"] is not None
+                        and row["kind"] is not None
+                        and existing["kind"] != row["kind"]
+                    ):
+                        conflict = {
+                            "canonical_name": f"{owner_id}/{row['library']}/{row['name']}",
+                            "reason": "kind_mismatch_on_rekey",
+                            "local_object_id": row["id"],
+                            "existing_object_id": existing["id"],
+                            "local_kind": row["kind"],
+                            "existing_kind": existing["kind"],
+                        }
+                        self._enqueue_sync_event_once_locked(
+                            "object_conflict",
+                            conflict,
+                            dedupe_key=conflict["canonical_name"] + ":kind_mismatch",
+                        )
+                        report["conflicts"].append(conflict)
+                        continue
+                    merge = self._merge_object_rows_locked(row["id"], existing["id"])
+                    report["merged"].append(
+                        {
+                            "target_id": row["id"],
+                            "source_id": existing["id"],
+                            "owner_id": owner_id,
+                            "library": row["library"],
+                            "name": row["name"],
+                            **merge,
+                        }
+                    )
+                self._conn.execute(
+                    """
+                    UPDATE objects
+                    SET owner_id = ?,
+                        remote_owner_id = COALESCE(remote_owner_id, ?),
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (owner_id, owner_id, utc_now(), row["id"]),
+                )
+                report["rekeyed"].append(
+                    {
+                        "id": row["id"],
+                        "owner_id": owner_id,
+                        "library": row["library"],
+                        "name": row["name"],
+                    }
+                )
+        return report
+
+    def link_object_remote_identity(
+        self,
+        *,
+        owner_id: str,
+        library: str,
+        name: str,
+        remote_owner_id: str | None = None,
+        remote_object_id: str | None = None,
+        source_object_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        owner_id = validate_name(str(owner_id))
+        library = validate_name(str(library))
+        name = validate_name(str(name))
+        if remote_owner_id is not None:
+            remote_owner_id = validate_name(str(remote_owner_id))
+        if remote_object_id is not None:
+            remote_object_id = validate_name(str(remote_object_id))
+        if source_object_name is not None:
+            source_object_name = validate_name(str(source_object_name))
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                """
+                SELECT id
+                FROM objects
+                WHERE owner_id = ? AND library = ? AND name = ?
+                """,
+                (owner_id, library, name),
+            ).fetchone()
+            if row is None:
+                return None
+            self._conn.execute(
+                """
+                UPDATE objects
+                SET remote_owner_id = COALESCE(?, remote_owner_id),
+                    remote_object_id = COALESCE(?, remote_object_id),
+                    source_object_name = COALESCE(?, source_object_name),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (remote_owner_id, remote_object_id, source_object_name, utc_now(), row["id"]),
+            )
+        return self.get_object(name, owner_id=owner_id, library=library)
+
+    def enqueue_object_version_sync_once(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        source_version_id = str(payload.get("source_version_id") or "")
+        dedupe_key = f"object_version:{source_version_id}" if source_version_id else None
+        with self._lock, self._conn:
+            return self._enqueue_sync_event_once_locked(
+                "object_version",
+                payload,
+                dedupe_key=dedupe_key,
+            )
+
+    def record_object_conflict_once(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        canonical_name = str(payload.get("canonical_name") or "")
+        reason = str(payload.get("reason") or "conflict")
+        local_hash = str(payload.get("local_content_hash") or "")
+        remote_hash = str(payload.get("remote_content_hash") or "")
+        dedupe_key = f"{canonical_name}:{reason}:{local_hash}:{remote_hash}"
+        with self._lock, self._conn:
+            return self._enqueue_sync_event_once_locked(
+                "object_conflict",
+                payload,
+                dedupe_key=dedupe_key,
+            )
+
+    def _enqueue_sync_event_once_locked(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        dedupe_key: str | None,
+    ) -> dict[str, Any]:
+        kind = validate_name(kind)
+        if dedupe_key:
+            existing_rows = self._conn.execute(
+                """
+                SELECT *
+                FROM sync_events
+                WHERE kind = ? AND status IN ('pending', 'failed')
+                ORDER BY created_at
+                """,
+                (kind,),
+            ).fetchall()
+            for row in existing_rows:
+                existing_payload = json_loads(row["payload_json"], {})
+                if existing_payload.get("dedupe_key") == dedupe_key:
+                    return self._sync_event_row_from_row(row)
+        event_id = uuid4().hex
+        now = utc_now()
+        event_payload = dict(payload)
+        if dedupe_key:
+            event_payload["dedupe_key"] = dedupe_key
+        self._conn.execute(
+            """
+            INSERT INTO sync_events(
+                id, kind, payload_json, status, attempts, created_at, updated_at
+            )
+            VALUES(?, ?, ?, 'pending', 0, ?, ?)
+            """,
+            (event_id, kind, json_dumps(event_payload), now, now),
+        )
+        row = self._conn.execute(
+            "SELECT * FROM sync_events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+        return self._sync_event_row_from_row(row)
+
+    def _sync_event_row_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        status = row["status"]
+        attempts = int(row["attempts"] or 0)
+        will_retry = status in {"pending", "failed"}
+        return {
+            "id": row["id"],
+            "kind": row["kind"],
+            "payload": json_loads(row["payload_json"], {}),
+            "status": status,
+            "attempts": attempts,
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "sent_at": row["sent_at"],
+            "error": row["error"],
+            "retry": {
+                "will_retry": will_retry,
+                "next_attempt": attempts + 1 if will_retry else None,
+                "last_error": row["error"],
+            },
+        }
+
+    def _object_conflicts_by_canonical_locked(self) -> dict[str, list[dict[str, Any]]]:
+        rows = self._conn.execute(
+            """
+            SELECT *
+            FROM sync_events
+            WHERE kind = 'object_conflict'
+              AND status IN ('pending', 'failed')
+            ORDER BY created_at
+            """
+        ).fetchall()
+        conflicts: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            payload = json_loads(row["payload_json"], {})
+            canonical_name = payload.get("canonical_name")
+            if not canonical_name:
+                owner_id = payload.get("owner_id")
+                library = payload.get("library")
+                name = payload.get("name")
+                if owner_id and library and name:
+                    canonical_name = f"{owner_id}/{library}/{name}"
+            if not canonical_name:
+                continue
+            conflicts.setdefault(str(canonical_name), []).append(
+                {
+                    "id": row["id"],
+                    "status": row["status"],
+                    "error": row["error"],
+                    **payload,
+                }
+            )
+        return conflicts
 
     def get_object_decomposition(self, object_version_id: str) -> dict[str, Any]:
         """Return normalized Function/Node/Link rows for one object version."""
@@ -676,38 +1082,30 @@ class ObjectRepository(RepositoryBase):
         *,
         version: int | None = None,
         include_yaml: bool = False,
+        owner_id: str | None = None,
+        library: str | None = None,
     ) -> dict[str, Any]:
-        """Return one object by local name, id, or unique server display name."""
+        """Return one object by local name or id."""
 
-        if version is None:
-            with self._lock:
-                row = self._conn.execute(
-                    f"""
-                    {self._object_select_sql()}
-                    WHERE o.name = ? OR o.id = ? OR o.remote_name = ?
-                    """,
-                    (name_or_id, name_or_id, name_or_id),
-                ).fetchall()
-        else:
-            with self._lock:
-                row = self._conn.execute(
-                    f"""
-                    {self._object_select_sql(current_only=False)}
-                    WHERE (o.name = ? OR o.id = ? OR o.remote_name = ?)
-                      AND ov.version = ?
-                    """,
-                    (name_or_id, name_or_id, name_or_id, int(version)),
-                ).fetchall()
-        if not row:
+        with self._lock:
+            rows = self._resolve_object_rows_locked(
+                name_or_id,
+                version=version,
+                owner_id=owner_id,
+                library=library,
+            )
+        if not rows:
             suffix = f" version {version}" if version is not None else ""
             raise KeyError(f"object is not registered: {name_or_id}{suffix}")
-        if len(row) > 1:
-            names = ", ".join(sorted(item["object_name"] for item in row))
+        if len(rows) > 1:
+            names = ", ".join(
+                sorted(self._canonical_row_name(item) for item in rows)
+            )
             raise ValueError(
                 "object display name is ambiguous locally: "
                 f"{name_or_id}; use one of: {names}"
             )
-        [row] = row
+        [row] = rows
         return self._object_row_to_record(row, include_yaml=include_yaml)
 
     def get_object_version(
@@ -770,31 +1168,573 @@ class ObjectRepository(RepositoryBase):
             for row in rows
         ]
 
-    def list_object_versions(self, name_or_id: str) -> list[dict[str, Any]]:
+    def list_object_versions(
+        self,
+        name_or_id: str,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Return all versions of one object, newest first."""
 
         with self._lock:
-            rows = self._conn.execute(
-                f"""
-                {self._object_select_sql(current_only=False)}
-                WHERE o.name = ? OR o.id = ? OR o.remote_name = ?
-                ORDER BY ov.version DESC
-                """,
-                (name_or_id, name_or_id, name_or_id),
-            ).fetchall()
-        if not rows:
+            current_rows = self._resolve_object_rows_locked(
+                name_or_id,
+                owner_id=owner_id,
+                library=library,
+            )
+        if not current_rows:
             raise KeyError(f"object is not registered: {name_or_id}")
-        object_ids = {row["object_id"] for row in rows}
-        if len(object_ids) > 1:
-            names = ", ".join(sorted({row["object_name"] for row in rows}))
+        object_ids = {row["object_id"] for row in current_rows}
+        if len(object_ids) != 1:
+            names = ", ".join(
+                sorted({self._canonical_row_name(row) for row in current_rows})
+            )
             raise ValueError(
                 "object display name is ambiguous locally: "
                 f"{name_or_id}; use one of: {names}"
             )
+        [object_id] = object_ids
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                {self._object_select_sql(current_only=False)}
+                WHERE o.id = ?
+                ORDER BY ov.version DESC
+                """,
+                (object_id,),
+            ).fetchall()
         return [
             self._object_row_to_record(row, include_yaml=False)
             for row in rows
         ]
+
+    def forget_object(
+        self,
+        name_or_id: str,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        """Remove one local object and all dependent local rows."""
+
+        name_or_id = validate_name(str(name_or_id))
+        with self._lock, self._conn:
+            rows = self._resolve_object_identity_rows_locked(
+                name_or_id,
+                owner_id=owner_id,
+                library=library,
+            )
+            if not rows:
+                raise KeyError(f"object is not registered: {name_or_id}")
+            if len(rows) > 1:
+                names = ", ".join(
+                    sorted(self._canonical_object_identity_name(row) for row in rows)
+                )
+                raise ValueError(
+                    "object display name is ambiguous locally: "
+                    f"{name_or_id}; use one of: {names}"
+                )
+            [row] = rows
+            return self._delete_object_identity_locked(row)
+
+    def forget_object_version(
+        self,
+        name_or_id: str,
+        version_ref: str | int,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        """Remove one local object version and its dependent local rows."""
+
+        name_or_id = validate_name(str(name_or_id))
+        with self._lock, self._conn:
+            rows = self._resolve_object_identity_rows_locked(
+                name_or_id,
+                owner_id=owner_id,
+                library=library,
+            )
+            if not rows:
+                raise KeyError(f"object is not registered: {name_or_id}")
+            if len(rows) > 1:
+                names = ", ".join(
+                    sorted(self._canonical_object_identity_name(row) for row in rows)
+                )
+                raise ValueError(
+                    "object display name is ambiguous locally: "
+                    f"{name_or_id}; use one of: {names}"
+                )
+            [object_row] = rows
+            version_row = self._object_version_row_for_ref_locked(
+                object_row["id"],
+                version_ref,
+            )
+            if version_row is None:
+                raise KeyError(
+                    "object version is not found: "
+                    f"{name_or_id} version {version_ref}"
+                )
+
+            object_info = self._object_identity_info(object_row)
+            deleted = self._delete_single_object_version_locked(
+                object_row["id"],
+                version_row["id"],
+            )
+            remaining = self._conn.execute(
+                """
+                SELECT id
+                FROM object_versions
+                WHERE object_id = ?
+                ORDER BY version DESC, created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (object_row["id"],),
+            ).fetchone()
+            object_deleted = remaining is None
+            if object_deleted:
+                deleted["sync_events"] += self._delete_object_sync_events_locked(
+                    object_info,
+                    {version_row["id"]},
+                )
+                object_delete = self._conn.execute(
+                    "DELETE FROM objects WHERE id = ?",
+                    (object_row["id"],),
+                )
+                deleted["objects"] = object_delete.rowcount
+                current_version_id = None
+            else:
+                current_version_id = remaining["id"]
+                if object_row["current_version_id"] == version_row["id"]:
+                    self._conn.execute(
+                        """
+                        UPDATE objects
+                        SET current_version_id = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (current_version_id, utc_now(), object_row["id"]),
+                    )
+
+            return {
+                "forgotten": True,
+                "object_deleted": object_deleted,
+                "object": object_info,
+                "version": {
+                    "id": version_row["id"],
+                    "version": version_row["version"],
+                    "content_hash": version_row["content_hash"],
+                },
+                "current_version_id": current_version_id,
+                "deleted": deleted,
+            }
+
+    def prune_stale_mirrors(
+        self,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        """Remove locally cached server-origin mirror rows."""
+
+        clauses = ["origin = 'server'"]
+        args: list[Any] = []
+        if owner_id is not None:
+            clauses.append("owner_id = ?")
+            args.append(validate_name(str(owner_id)))
+        if library is not None:
+            clauses.append("library = ?")
+            args.append(self._object_library(library))
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                f"""
+                SELECT *
+                FROM objects
+                WHERE {' AND '.join(clauses)}
+                ORDER BY owner_id, library, name, id
+                """,
+                tuple(args),
+            ).fetchall()
+            pruned = [self._delete_object_identity_locked(row) for row in rows]
+        return {"pruned": pruned, "count": len(pruned)}
+
+    def _resolve_object_rows_locked(
+        self,
+        name_or_id: str,
+        *,
+        version: int | None = None,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> list[sqlite3.Row]:
+        id_rows = self._object_rows_for_clause_locked(
+            "o.id = ?",
+            (name_or_id,),
+            version=version,
+        )
+        if id_rows:
+            return id_rows
+
+        explicit_scope = owner_id is not None or library is not None
+        caller_owner_id = self._caller_owner_id(owner_id)
+
+        if explicit_scope:
+            if library is not None:
+                return self._object_rows_for_clause_locked(
+                    "o.owner_id = ? AND o.library = ? AND o.name = ?",
+                    (caller_owner_id, self._object_library(library), name_or_id),
+                    version=version,
+                )
+            return self._object_rows_for_clause_locked(
+                "o.owner_id = ? AND o.name = ?",
+                (caller_owner_id, name_or_id),
+                version=version,
+            )
+
+        caller_library = self._object_library(None)
+        own_library_rows = self._object_rows_for_clause_locked(
+            "o.owner_id = ? AND o.library = ? AND o.name = ?",
+            (caller_owner_id, caller_library, name_or_id),
+            version=version,
+        )
+        if own_library_rows:
+            return own_library_rows
+
+        own_rows = self._object_rows_for_clause_locked(
+            "o.owner_id = ? AND o.name = ?",
+            (caller_owner_id, name_or_id),
+            version=version,
+        )
+        if len(own_rows) == 1:
+            return own_rows
+        return []
+
+    def _resolve_object_identity_rows_locked(
+        self,
+        name_or_id: str,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> list[sqlite3.Row]:
+        id_rows = self._object_identity_rows_for_clause_locked(
+            "id = ?",
+            (name_or_id,),
+        )
+        if id_rows:
+            return id_rows
+
+        explicit_scope = owner_id is not None or library is not None
+        caller_owner_id = self._caller_owner_id(owner_id)
+
+        if explicit_scope:
+            if library is not None:
+                return self._object_identity_rows_for_clause_locked(
+                    "owner_id = ? AND library = ? AND name = ?",
+                    (caller_owner_id, self._object_library(library), name_or_id),
+                )
+            return self._object_identity_rows_for_clause_locked(
+                "owner_id = ? AND name = ?",
+                (caller_owner_id, name_or_id),
+            )
+
+        caller_library = self._object_library(None)
+        own_library_rows = self._object_identity_rows_for_clause_locked(
+            "owner_id = ? AND library = ? AND name = ?",
+            (caller_owner_id, caller_library, name_or_id),
+        )
+        if own_library_rows:
+            return own_library_rows
+
+        own_rows = self._object_identity_rows_for_clause_locked(
+            "owner_id = ? AND name = ?",
+            (caller_owner_id, name_or_id),
+        )
+        if len(own_rows) == 1:
+            return own_rows
+        return []
+
+    def _object_identity_rows_for_clause_locked(
+        self,
+        clause: str,
+        args: tuple[Any, ...],
+    ) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            f"""
+            SELECT *
+            FROM objects
+            WHERE {clause}
+            ORDER BY owner_id, library, name, id
+            """,
+            args,
+        ).fetchall()
+
+    def _object_version_row_for_ref_locked(
+        self,
+        object_id: str,
+        version_ref: str | int,
+    ) -> sqlite3.Row | None:
+        if isinstance(version_ref, int) or str(version_ref).isdigit():
+            return self._conn.execute(
+                """
+                SELECT id, version, content_hash
+                FROM object_versions
+                WHERE object_id = ? AND version = ?
+                """,
+                (object_id, int(version_ref)),
+            ).fetchone()
+        version_id = validate_name(str(version_ref))
+        return self._conn.execute(
+            """
+            SELECT id, version, content_hash
+            FROM object_versions
+            WHERE object_id = ? AND id = ?
+            """,
+            (object_id, version_id),
+        ).fetchone()
+
+    def _delete_object_identity_locked(self, row: sqlite3.Row) -> dict[str, Any]:
+        object_info = self._object_identity_info(row)
+        version_rows = self._conn.execute(
+            """
+            SELECT id, version, content_hash
+            FROM object_versions
+            WHERE object_id = ?
+            ORDER BY version, id
+            """,
+            (row["id"],),
+        ).fetchall()
+        version_ids = {version["id"] for version in version_rows}
+        deleted = self._delete_object_dependents_locked(
+            row["id"],
+            version_ids,
+        )
+        deleted["sync_events"] = self._delete_object_sync_events_locked(
+            object_info,
+            version_ids,
+        )
+        cursor = self._conn.execute("DELETE FROM objects WHERE id = ?", (row["id"],))
+        deleted["objects"] = cursor.rowcount
+        return {
+            "forgotten": True,
+            "object_deleted": True,
+            "object": object_info,
+            "versions": [
+                {
+                    "id": version["id"],
+                    "version": version["version"],
+                    "content_hash": version["content_hash"],
+                }
+                for version in version_rows
+            ],
+            "deleted": deleted,
+        }
+
+    def _delete_single_object_version_locked(
+        self,
+        object_id: str,
+        version_id: str,
+    ) -> dict[str, int]:
+        deleted = self._delete_object_dependents_locked(
+            object_id,
+            {version_id},
+            whole_object=False,
+        )
+        cursor = self._conn.execute(
+            "DELETE FROM object_versions WHERE id = ?",
+            (version_id,),
+        )
+        deleted["versions"] = cursor.rowcount
+        deleted["sync_events"] = self._delete_object_sync_events_locked(
+            None,
+            {version_id},
+        )
+        return deleted
+
+    def _delete_object_dependents_locked(
+        self,
+        object_id: str,
+        version_ids: set[str],
+        *,
+        whole_object: bool = True,
+    ) -> dict[str, int]:
+        deleted: dict[str, int] = {
+            "runs": 0,
+            "functions": 0,
+            "pipeline_nodes": 0,
+            "pipeline_links": 0,
+            "versions": 0,
+            "sync_events": 0,
+        }
+        if version_ids:
+            placeholders = ", ".join("?" for _ in version_ids)
+            version_args = tuple(sorted(version_ids))
+            run_clause = (
+                f"object_id = ? OR object_version_id IN ({placeholders})"
+                if whole_object
+                else f"object_version_id IN ({placeholders})"
+            )
+            run_args = (object_id, *version_args) if whole_object else version_args
+            run_cursor = self._conn.execute(
+                f"DELETE FROM runs WHERE {run_clause}",
+                run_args,
+            )
+            deleted["runs"] = run_cursor.rowcount
+            for table, key in (
+                ("object_functions", "functions"),
+                ("object_pipeline_nodes", "pipeline_nodes"),
+                ("object_pipeline_links", "pipeline_links"),
+            ):
+                row_clause = (
+                    f"object_id = ? OR object_version_id IN ({placeholders})"
+                    if whole_object
+                    else f"object_version_id IN ({placeholders})"
+                )
+                row_args = (
+                    (object_id, *version_args) if whole_object else version_args
+                )
+                cursor = self._conn.execute(
+                    f"""
+                    DELETE FROM {validate_name(table)}
+                    WHERE {row_clause}
+                    """,
+                    row_args,
+                )
+                deleted[key] = cursor.rowcount
+            if whole_object:
+                cursor = self._conn.execute(
+                    "DELETE FROM object_versions WHERE object_id = ?",
+                    (object_id,),
+                )
+                deleted["versions"] = cursor.rowcount
+        elif whole_object:
+            run_cursor = self._conn.execute(
+                "DELETE FROM runs WHERE object_id = ?",
+                (object_id,),
+            )
+            deleted["runs"] = run_cursor.rowcount
+            for table, key in (
+                ("object_functions", "functions"),
+                ("object_pipeline_nodes", "pipeline_nodes"),
+                ("object_pipeline_links", "pipeline_links"),
+            ):
+                cursor = self._conn.execute(
+                    f"DELETE FROM {validate_name(table)} WHERE object_id = ?",
+                    (object_id,),
+                )
+                deleted[key] = cursor.rowcount
+        return deleted
+
+    def _delete_object_sync_events_locked(
+        self,
+        object_info: dict[str, Any] | None,
+        version_ids: set[str],
+    ) -> int:
+        object_id = object_info["id"] if object_info is not None else None
+        canonical_name = (
+            object_info["canonical_name"] if object_info is not None else None
+        )
+        event_rows = self._conn.execute(
+            """
+            SELECT id, kind, payload_json
+            FROM sync_events
+            WHERE status IN ('pending', 'failed')
+            """
+        ).fetchall()
+        delete_ids: list[str] = []
+        for event in event_rows:
+            payload = json_loads(event["payload_json"], {})
+            if self._sync_event_matches_object_or_versions(
+                event["kind"],
+                payload,
+                object_id=object_id,
+                canonical_name=canonical_name,
+                version_ids=version_ids,
+            ):
+                delete_ids.append(event["id"])
+        for event_id in delete_ids:
+            self._conn.execute("DELETE FROM sync_events WHERE id = ?", (event_id,))
+        return len(delete_ids)
+
+    def _sync_event_matches_object_or_versions(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        object_id: str | None,
+        canonical_name: str | None,
+        version_ids: set[str],
+    ) -> bool:
+        if kind == "object_version":
+            return (
+                (object_id is not None and payload.get("source_object_id") == object_id)
+                or payload.get("source_version_id") in version_ids
+            )
+        if kind == "object_conflict":
+            return (
+                (object_id is not None and payload.get("local_object_id") == object_id)
+                or (
+                    canonical_name is not None
+                    and payload.get("canonical_name") == canonical_name
+                )
+            )
+        if kind == "local_run_update":
+            run_payload = payload.get("run") or {}
+            return (
+                (object_id is not None and run_payload.get("object_id") == object_id)
+                or run_payload.get("object_version_id") in version_ids
+            )
+        return False
+
+    def _object_identity_info(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "owner_id": row["owner_id"],
+            "library": row["library"],
+            "name": row["name"],
+            "canonical_name": self._canonical_object_identity_name(row),
+            "kind": row["kind"],
+            "origin": row["origin"],
+            "remote_owner_id": row["remote_owner_id"],
+            "remote_object_id": row["remote_object_id"],
+            "source_object_name": row["source_object_name"],
+        }
+
+    def _canonical_object_identity_name(self, row: sqlite3.Row) -> str:
+        return f"{row['owner_id']}/{row['library']}/{row['name']}"
+
+    def _object_rows_for_clause_locked(
+        self,
+        clause: str,
+        args: tuple[Any, ...],
+        *,
+        version: int | None,
+    ) -> list[sqlite3.Row]:
+        sql = self._object_select_sql(current_only=version is None)
+        version_filter = "" if version is None else " AND ov.version = ?"
+        version_args: tuple[Any, ...] = () if version is None else (int(version),)
+        return self._conn.execute(
+            f"""
+            {sql}
+            WHERE {clause}{version_filter}
+            """,
+            (*args, *version_args),
+        ).fetchall()
+
+    def _caller_owner_id(self, owner_id: str | None = None) -> str:
+        if owner_id is not None:
+            return validate_name(str(owner_id))
+        credentials = self.current_server_connection_credentials()
+        if (
+            credentials is not None
+            and credentials.get("remote_connection_id")
+            and credentials.get("owner_id")
+        ):
+            return validate_name(str(credentials["owner_id"]))
+        return DEFAULT_OBJECT_OWNER_ID
+
+    def _object_library(self, library: str | None = None) -> str:
+        return validate_name(str(library or DEFAULT_OBJECT_LIBRARY))
+
+    def _canonical_row_name(self, row: sqlite3.Row) -> str:
+        return f"{row['object_owner_id']}/{row['object_library']}/{row['object_name']}"
 
     def _object_select_sql(self, *, current_only: bool = True) -> str:
         join_condition = (
@@ -805,12 +1745,14 @@ class ObjectRepository(RepositoryBase):
         return f"""
             SELECT
                 o.id AS object_id,
+                o.owner_id AS object_owner_id,
+                o.library AS object_library,
                 o.name AS object_name,
                 o.kind AS object_kind,
                 o.origin AS object_origin,
                 o.remote_owner_id AS object_remote_owner_id,
                 o.remote_object_id AS object_remote_object_id,
-                o.remote_name AS object_remote_name,
+                o.source_object_name AS object_source_object_name,
                 o.description AS object_description,
                 o.current_version_id AS current_version_id,
                 o.created_at AS object_created_at,
@@ -826,6 +1768,7 @@ class ObjectRepository(RepositoryBase):
                 ov.kind AS version_kind,
                 ov.yaml_text AS yaml_text,
                 ov.yaml_sha256 AS yaml_sha256,
+                ov.content_hash AS content_hash,
                 ov.metadata_json AS metadata_json,
                 ov.inputs_json AS inputs_json,
                 ov.outputs_json AS outputs_json,
@@ -849,43 +1792,49 @@ class ObjectRepository(RepositoryBase):
     ) -> dict[str, Any]:
         metadata = json_loads(row["metadata_json"], {})
         decomposition = self.get_object_decomposition(row["version_id"])
+        source_object_name = row["object_source_object_name"]
         source_owner_id = row["object_remote_owner_id"] or row["remote_owner_id"]
         source_object_id = row["object_remote_object_id"] or row["remote_object_id"]
-        source_object_name = row["object_remote_name"]
         source_version_id = row["remote_version_id"]
         runtime_config = normalize_runtime_config(
             json_loads(row["runtime_config_json"], {"mode": "venv"})
         )
         record = {
             "id": row["object_id"],
+            "owner_id": row["object_owner_id"],
+            "library": row["object_library"],
+            "canonical_name": self._canonical_row_name(row),
             "name": row["object_name"],
             "local_registry_name": row["object_name"],
-            "display_name": row["object_remote_name"] or row["object_name"],
+            "display_name": source_object_name or row["object_name"],
             "origin": row["object_origin"],
             "object_remote_owner_id": row["object_remote_owner_id"],
             "object_remote_object_id": row["object_remote_object_id"],
-            "object_remote_name": row["object_remote_name"],
-            "remote_name": row["object_remote_name"],
+            "object_remote_name": source_object_name,
+            "object_source_object_name": source_object_name,
+            "remote_name": source_object_name,
             "source_owner_id": source_owner_id,
             "source_object_id": source_object_id,
             "source_object_name": source_object_name,
             "source_version_id": source_version_id,
-            "remote_display_name": row["object_remote_name"],
+            "remote_display_name": source_object_name,
             "remote_identity": {
                 "origin": row["object_origin"],
                 "local_registry_name": row["object_name"],
+                "owner_id": row["object_owner_id"],
+                "library": row["object_library"],
                 "source_owner_id": source_owner_id,
                 "source_object_id": source_object_id,
                 "source_object_name": source_object_name,
                 "source_version_id": source_version_id,
-                "remote_display_name": row["object_remote_name"],
-                "storage_remote_name": row["object_remote_name"],
+                "remote_display_name": source_object_name,
+                "storage_remote_name": source_object_name,
             },
             "compatibility": {
                 "remote_name": {
                     "status": "deprecated_alias",
                     "replacement": "source_object_name",
-                    "storage_field": "objects.remote_name",
+                    "storage_field": "objects.source_object_name",
                 }
             },
             "description": row["version_description"] or row["object_description"] or "",
@@ -904,6 +1853,7 @@ class ObjectRepository(RepositoryBase):
                 self._object_yaml_cache_path(row["object_name"], row["version"])
             ),
             "yaml_sha256": row["yaml_sha256"],
+            "content_hash": row["content_hash"],
             "workdir": row["workdir"],
             "runtime_config": runtime_config,
             "runtime_mode": runtime_config["mode"],

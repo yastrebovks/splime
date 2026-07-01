@@ -910,12 +910,14 @@ def test_remote_import_mirrors_server_versions_with_source_identity(
         imported = runtime.import_server_object("demo_obj")
 
         assert imported["refreshed"] is True
-        assert imported["current_version"]["name"] == "server.remote-object-1"
-        assert imported["current_version"]["version"] == 2
+        assert imported["current_version"]["name"] == "demo_obj"
+        assert imported["current_version"]["version"] == 1
         assert len(imported["versions"]) == 2
 
         current = imported["current_version"]
-        assert current["local_registry_name"] == "server.remote-object-1"
+        assert current["local_registry_name"] == "demo_obj"
+        assert current["owner_id"] == "owner-1"
+        assert current["library"] == "default"
         assert current["source_owner_id"] == "owner-1"
         assert current["source_object_id"] == "remote-object-1"
         assert current["source_object_name"] == "demo_obj"

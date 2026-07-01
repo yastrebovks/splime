@@ -105,6 +105,8 @@ from spl.daemon.server_connection import (
 )
 from spl.daemon.services.sync import SyncVisibilityService
 from spl.daemon.store import (
+    DEFAULT_OBJECT_LIBRARY,
+    DEFAULT_OBJECT_OWNER_ID,
     RegistryStore,
     split_object_function_ref,
     utc_now,
@@ -354,6 +356,10 @@ class DaemonRuntime:
         )
         if not result.get("reused") and result.get("connection") is not None:
             self.start_server_heartbeat(result["connection"], token=machine_token)
+        connection = result.get("connection") or {}
+        if connection.get("owner_id") and connection.get("remote_connection_id"):
+            credentials = self.store.get_server_connection_credentials(connection["id"])
+            result["reconcile"] = self.reconcile_connected_objects(credentials)
         return result
 
     def _matching_server_connection(
@@ -455,10 +461,23 @@ class DaemonRuntime:
         """Queue a freshly registered local object version for server sync."""
 
         version = self.store.get_object(
-            record["name"],
+            record["id"],
             version=record["version"],
             include_yaml=True,
         )
+        payload = self._object_sync_payload_for_version(version)
+        if library:
+            payload["library"] = validate_name(library)
+        if create_library:
+            payload["create_library"] = True
+        if library_display_name:
+            payload["library_display_name"] = str(library_display_name)
+        return self.store.enqueue_sync_event("object_version", payload)
+
+    def _object_sync_payload_for_version(
+        self,
+        version: dict[str, Any],
+    ) -> dict[str, Any]:
         payload = {
             "name": version["name"],
             "entrypoint": version["entrypoint"],
@@ -473,13 +492,280 @@ class DaemonRuntime:
             "source_object_id": version["id"],
             "source_version_id": version["version_id"],
         }
-        if library:
-            payload["library"] = validate_name(library)
-        if create_library:
-            payload["create_library"] = True
-        if library_display_name:
-            payload["library_display_name"] = str(library_display_name)
-        return self.store.enqueue_sync_event("object_version", payload)
+        if version.get("owner_id"):
+            payload["owner_id"] = version["owner_id"]
+        if version.get("library"):
+            payload["library"] = version["library"]
+        if version.get("content_hash"):
+            payload["content_hash"] = version["content_hash"]
+        return payload
+
+    def reconcile_connected_objects(
+        self,
+        credentials: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Link local objects to the connected owner's server namespace."""
+
+        credentials = credentials or self.store.current_server_connection_credentials()
+        if (
+            credentials is None
+            or not credentials.get("remote_connection_id")
+            or not credentials.get("owner_id")
+        ):
+            return {"skipped": True, "reason": "not_connected"}
+
+        owner_id = validate_name(str(credentials["owner_id"]))
+        report: dict[str, Any] = {
+            "owner_id": owner_id,
+            "rekey": self.store.rekey_local_placeholder_objects(owner_id),
+            "objects": [],
+            "conflicts": [],
+            "pending_sync_events": [],
+        }
+        server = self._server_client_for_credentials(credentials)
+        for identity in self.store.list_object_identities(owner_id=owner_id):
+            if str(identity["name"]).startswith("server."):
+                continue
+            object_report = self._reconcile_connected_object(
+                server,
+                identity,
+                owner_id=owner_id,
+            )
+            report["objects"].append(object_report)
+            report["conflicts"].extend(object_report.get("conflicts") or [])
+            report["pending_sync_events"].extend(
+                object_report.get("pending_sync_events") or []
+            )
+        return report
+
+    def _reconcile_connected_object(
+        self,
+        server: ServerClientProtocol,
+        identity: dict[str, Any],
+        *,
+        owner_id: str,
+    ) -> dict[str, Any]:
+        library = validate_name(str(identity.get("library") or DEFAULT_OBJECT_LIBRARY))
+        name = validate_name(str(identity["name"]))
+        canonical_name = f"{owner_id}/{library}/{name}"
+        report: dict[str, Any] = {
+            "canonical_name": canonical_name,
+            "status": "checked",
+            "conflicts": [],
+            "imported_versions": [],
+            "pending_sync_events": [],
+        }
+        try:
+            remote_current = server.get_object(
+                name,
+                include_yaml=False,
+                owner_id=owner_id,
+                library=library,
+            )
+        except ServerClientError as exc:
+            if exc.status_code == 404:
+                report["status"] = "local_only"
+                report["pending_sync_events"] = self._enqueue_local_only_object_syncs(
+                    owner_id=owner_id,
+                    library=library,
+                    name=name,
+                )
+                return report
+            raise
+
+        remote_object_id = remote_current.get("id")
+        self.store.link_object_remote_identity(
+            owner_id=owner_id,
+            library=library,
+            name=name,
+            remote_owner_id=remote_current.get("owner_id") or owner_id,
+            remote_object_id=remote_object_id,
+            source_object_name=remote_current.get("name") or name,
+        )
+        remote_versions = server.list_object_versions(
+            name,
+            include_yaml=True,
+            owner_id=owner_id,
+            library=library,
+        )
+        if not remote_versions and remote_current.get("yaml"):
+            remote_versions = [remote_current]
+        self._ensure_server_object_envs(remote_versions)
+
+        local_versions = self.store.list_object_versions(
+            name,
+            owner_id=owner_id,
+            library=library,
+        )
+        local_by_hash = {
+            item["content_hash"]: item
+            for item in local_versions
+            if item.get("content_hash")
+        }
+        local_by_version = {int(item["version"]): item for item in local_versions}
+        remote_hashes = {
+            item.get("content_hash")
+            for item in remote_versions
+            if item.get("content_hash")
+        }
+        remote_max_version = max(
+            (int(item.get("version") or 0) for item in remote_versions),
+            default=0,
+        )
+        conflict_local_version_ids: set[str] = set()
+
+        for remote_version in sorted(
+            remote_versions,
+            key=lambda item: int(item.get("version") or 0),
+        ):
+            remote_hash = remote_version.get("content_hash")
+            remote_number = int(remote_version.get("version") or 0)
+            local_at_version = local_by_version.get(remote_number)
+            if (
+                remote_hash
+                and local_at_version is not None
+                and local_at_version.get("content_hash") != remote_hash
+                and remote_hash not in local_by_hash
+            ):
+                conflict = self._record_object_reconcile_conflict(
+                    owner_id=owner_id,
+                    library=library,
+                    name=name,
+                    local_version=local_at_version,
+                    remote_version=remote_version,
+                    remote_object_id=remote_object_id,
+                )
+                report["conflicts"].append(conflict)
+                conflict_local_version_ids.add(local_at_version["version_id"])
+                continue
+            if remote_hash and remote_hash in local_by_hash:
+                self.store.link_object_remote_identity(
+                    owner_id=owner_id,
+                    library=library,
+                    name=name,
+                    remote_owner_id=remote_version.get("owner_id") or owner_id,
+                    remote_object_id=remote_version.get("id") or remote_object_id,
+                    source_object_name=remote_version.get("name") or name,
+                )
+            imported = self._import_reconcile_remote_version(
+                remote_version,
+                owner_id=owner_id,
+                library=library,
+                remote_object_id=remote_object_id,
+            )
+            report["imported_versions"].append(imported["version_id"])
+
+        for local_version in self.store.list_object_versions(
+            name,
+            owner_id=owner_id,
+            library=library,
+        ):
+            if local_version.get("remote_version_id"):
+                continue
+            if local_version.get("version_id") in conflict_local_version_ids:
+                continue
+            if local_version.get("content_hash") in remote_hashes:
+                continue
+            if int(local_version["version"]) <= remote_max_version and remote_hashes:
+                continue
+            event = self._enqueue_object_version_sync_once(local_version)
+            report["pending_sync_events"].append(event)
+        report["status"] = "linked"
+        return report
+
+    def _import_reconcile_remote_version(
+        self,
+        remote_version: dict[str, Any],
+        *,
+        owner_id: str,
+        library: str,
+        remote_object_id: str | None,
+    ) -> dict[str, Any]:
+        yaml_text = remote_version.get("yaml")
+        if not yaml_text:
+            existing = self.store.get_object_by_remote_version(
+                remote_version["version_id"],
+                include_yaml=False,
+            )
+            if existing is not None:
+                return existing
+            raise RuntimeError(
+                "server did not return YAML for object version "
+                f"{remote_version.get('version_id')}"
+            )
+        return self.register_object(
+            remote_version["name"],
+            remote_version["entrypoint"],
+            remote_version.get("env") or "default",
+            yaml_text=yaml_text,
+            owner_id=owner_id,
+            library=library,
+            description=remote_version.get("description") or "",
+            version_label=remote_version.get("version_label"),
+            origin="server",
+            remote_owner_id=remote_version.get("owner_id") or owner_id,
+            remote_object_id=remote_version.get("id") or remote_object_id,
+            remote_version_id=remote_version.get("version_id"),
+            source_object_name=remote_version["name"],
+            runtime_config=remote_version.get("runtime_config"),
+        )
+
+    def _enqueue_local_only_object_syncs(
+        self,
+        *,
+        owner_id: str,
+        library: str,
+        name: str,
+    ) -> list[dict[str, Any]]:
+        events = []
+        for version in self.store.list_object_versions(
+            name,
+            owner_id=owner_id,
+            library=library,
+        ):
+            if version.get("remote_version_id"):
+                continue
+            events.append(self._enqueue_object_version_sync_once(version))
+        return events
+
+    def _enqueue_object_version_sync_once(
+        self,
+        version: dict[str, Any],
+    ) -> dict[str, Any]:
+        full_version = self.store.get_object_version(
+            version["version_id"],
+            include_yaml=True,
+        )
+        return self.store.enqueue_object_version_sync_once(
+            self._object_sync_payload_for_version(full_version)
+        )
+
+    def _record_object_reconcile_conflict(
+        self,
+        *,
+        owner_id: str,
+        library: str,
+        name: str,
+        local_version: dict[str, Any],
+        remote_version: dict[str, Any],
+        remote_object_id: str | None,
+    ) -> dict[str, Any]:
+        payload = {
+            "canonical_name": f"{owner_id}/{library}/{name}",
+            "owner_id": owner_id,
+            "library": library,
+            "name": name,
+            "reason": "divergent_content",
+            "local_object_id": local_version["id"],
+            "local_version_id": local_version["version_id"],
+            "local_version": local_version["version"],
+            "local_content_hash": local_version.get("content_hash"),
+            "remote_object_id": remote_object_id,
+            "remote_version_id": remote_version.get("version_id"),
+            "remote_version": remote_version.get("version"),
+            "remote_content_hash": remote_version.get("content_hash"),
+        }
+        return self.store.record_object_conflict_once(payload)
 
     def build_machine_library_snapshot_manifest(self) -> tuple[str, list[dict[str, Any]]]:
         """Build a lightweight, stable manifest for the current local library."""
@@ -488,7 +774,7 @@ class DaemonRuntime:
         for record in self.store.list_objects().values():
             items.append(
                 {
-                    "library_slug": "default",
+                    "library_slug": record.get("library") or DEFAULT_OBJECT_LIBRARY,
                     "name": record["name"],
                     "display_name": record.get("display_name") or record["name"],
                     "description": record.get("description") or "",
@@ -501,6 +787,7 @@ class DaemonRuntime:
                     "kind": record.get("kind") or record.get("type") or "unknown",
                     "origin": record.get("origin") or "local",
                     "yaml_sha256": record["yaml_sha256"],
+                    "content_hash": record.get("content_hash") or record["yaml_sha256"],
                     "metadata": record.get("metadata") or {},
                     "distributions": record.get("distributions") or [],
                     "runtime_config": record.get("runtime_config") or {"mode": "venv"},
@@ -564,6 +851,8 @@ class DaemonRuntime:
     ) -> dict[str, Any]:
         """Register an object and resolve remote-node signatures if needed."""
 
+        kwargs = dict(kwargs)
+        self._adopt_server_object_identity_for_publish(name, kwargs)
         return self.store.register_object(
             name,
             entrypoint,
@@ -571,6 +860,61 @@ class DaemonRuntime:
             remote_signature_resolver=self.resolve_remote_signature,
             **kwargs,
         )
+
+    def _adopt_server_object_identity_for_publish(
+        self,
+        name: str,
+        kwargs: dict[str, Any],
+    ) -> None:
+        """Attach server identity before the first local row for a canonical key."""
+
+        if kwargs.get("object_id") is not None or kwargs.get("remote_object_id"):
+            return
+        if kwargs.get("origin", "local") != "local":
+            return
+
+        credentials = self.store.current_server_connection_credentials()
+        if (
+            credentials is None
+            or not credentials.get("remote_connection_id")
+            or not credentials.get("owner_id")
+            or credentials.get("status") != "connected"
+        ):
+            return
+
+        owner_id = validate_name(str(kwargs.get("owner_id") or credentials["owner_id"]))
+        library = validate_name(str(kwargs.get("library") or DEFAULT_OBJECT_LIBRARY))
+        object_name = validate_name(name)
+
+        try:
+            self.store.get_object(
+                object_name,
+                owner_id=owner_id,
+                library=library,
+                include_yaml=False,
+            )
+            return
+        except KeyError:
+            pass
+
+        server = self._server_client_for_credentials(credentials)
+        try:
+            remote_current = server.get_object(
+                object_name,
+                include_yaml=False,
+                owner_id=owner_id,
+                library=library,
+            )
+        except ServerClientError as exc:
+            if exc.status_code == 404:
+                return
+            raise
+
+        kwargs["owner_id"] = owner_id
+        kwargs["library"] = library
+        kwargs.setdefault("remote_owner_id", remote_current.get("owner_id") or owner_id)
+        kwargs.setdefault("remote_object_id", remote_current.get("id"))
+        kwargs.setdefault("source_object_name", remote_current.get("name") or object_name)
 
     def resolve_remote_signature(
         self,
@@ -853,6 +1197,8 @@ class DaemonRuntime:
         object_name: str,
         *,
         version: int | None = None,
+        owner_id: str | None = None,
+        library: str | None = None,
     ) -> dict[str, Any]:
         """Pull missing server object versions into the local registry.
 
@@ -872,10 +1218,17 @@ class DaemonRuntime:
 
         server = self._server_client_for_credentials(credentials)
 
+        server_scope: dict[str, Any] = {}
+        if owner_id is not None:
+            server_scope["owner_id"] = owner_id
+        if library is not None:
+            server_scope["library"] = library
+
         remote_current = server.get_object(
             object_name,
             version=version,
             include_yaml=False,
+            **server_scope,
         )
         remote_object_id = remote_current["id"]
         remote_version_id = remote_current["version_id"]
@@ -899,12 +1252,14 @@ class DaemonRuntime:
                     object_name,
                     version=version,
                     include_yaml=True,
+                    **server_scope,
                 )
             ]
         else:
             remote_versions = server.list_object_versions(
                 object_name,
                 include_yaml=True,
+                **server_scope,
             )
         if not remote_versions:
             raise KeyError(f"object is not registered on server: {object_name}")
@@ -929,17 +1284,19 @@ class DaemonRuntime:
                 )
             imported.append(
                 self.register_object(
-                    self._server_object_local_name(remote_version["id"]),
+                    remote_version["name"],
                     remote_version["entrypoint"],
                     remote_version.get("env") or "default",
                     yaml_text=yaml_text,
+                    owner_id=self._server_version_owner_id(remote_version),
+                    library=self._server_version_library(remote_version),
                     description=remote_version.get("description") or "",
                     version_label=remote_version.get("version_label"),
                     origin="server",
                     remote_owner_id=remote_version.get("owner_id"),
                     remote_object_id=remote_version.get("id"),
                     remote_version_id=remote_version.get("version_id"),
-                    remote_name=remote_version["name"],
+                    source_object_name=remote_version["name"],
                     runtime_config=remote_version.get("runtime_config"),
                 )
             )
@@ -960,10 +1317,15 @@ class DaemonRuntime:
             "refreshed": True,
         }
 
-    def _server_object_local_name(self, remote_object_id: str) -> str:
-        """Return the local registry name for a mirrored server object."""
+    def _server_version_owner_id(self, version: dict[str, Any]) -> str:
+        owner_id = version.get("owner_id") or version.get("owner")
+        return validate_name(str(owner_id or DEFAULT_OBJECT_OWNER_ID))
 
-        return f"server.{validate_name(remote_object_id)}"
+    def _server_version_library(self, version: dict[str, Any]) -> str:
+        library = version.get("library_slug") or version.get("library")
+        if isinstance(library, dict):
+            library = library.get("slug") or library.get("name")
+        return validate_name(str(library or DEFAULT_OBJECT_LIBRARY))
 
     def _ensure_server_object_envs(self, remote_versions: list[dict[str, Any]]) -> None:
         """Map server env names to local Python executables when first seen."""
@@ -984,6 +1346,8 @@ class DaemonRuntime:
         object_name: str,
         *,
         version: int | None = None,
+        owner_id: str | None = None,
+        library: str | None = None,
     ) -> dict[str, Any] | None:
         """Best-effort server refresh before a local auto-sourced run.
 
@@ -995,7 +1359,12 @@ class DaemonRuntime:
         """
 
         try:
-            return self.import_server_object(object_name, version=version)
+            return self.import_server_object(
+                object_name,
+                version=version,
+                owner_id=owner_id,
+                library=library,
+            )
         except ServerOfflineError:
             return None
         except KeyError as exc:
@@ -1167,7 +1536,7 @@ class DaemonRuntime:
         run = job["run"]
         version = job["object_version"]
         run_id = run["id"]
-        local_name = self._server_object_local_name(version["id"])
+        local_name = version["name"]
 
         try:
             self._send_server_run_update(
@@ -1181,13 +1550,15 @@ class DaemonRuntime:
                 version["entrypoint"],
                 version["env"] or "default",
                 yaml_text=version["yaml"],
+                owner_id=self._server_version_owner_id(version),
+                library=self._server_version_library(version),
                 description=version.get("description") or version["name"],
                 version_label=version.get("version_label"),
                 origin="server",
                 remote_owner_id=version.get("owner_id"),
                 remote_object_id=version.get("id"),
                 remote_version_id=version.get("version_id"),
-                remote_name=version["name"],
+                source_object_name=version["name"],
                 runtime_config=version.get("runtime_config"),
             )
             self._send_server_run_update(connection_id, run_id=run_id, status="running")

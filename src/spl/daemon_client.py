@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Literal
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 
@@ -670,17 +670,23 @@ class Client:
         *,
         version: int | None = None,
         include_yaml: bool = False,
+        owner_id: str | None = None,
+        library: str | None = None,
     ) -> dict[str, Any]:
         """Return one object by name or internal id."""
 
         path = f"/objects/{quote(name_or_id)}"
-        query = []
+        query: dict[str, str] = {}
         if version is not None:
-            query.append(f"version={version}")
+            query["version"] = str(version)
         if include_yaml:
-            query.append("include_yaml=1")
+            query["include_yaml"] = "1"
+        if owner_id is not None:
+            query["owner_id"] = owner_id
+        if library is not None:
+            query["library"] = library
         if query:
-            path = f"{path}?{'&'.join(query)}"
+            path = f"{path}?{urlencode(query)}"
         return self._json_request("GET", path)
 
     def signature(
@@ -789,10 +795,92 @@ class Client:
             path = f"{path}?version={version}"
         return self._json_request("GET", path)
 
-    def object_versions(self, name_or_id: str) -> list[dict[str, Any]]:
+    def object_versions(
+        self,
+        name_or_id: str,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Return all versions of one object."""
 
-        return self._json_request("GET", f"/objects/{quote(name_or_id)}/versions")
+        path = f"/objects/{quote(name_or_id)}/versions"
+        query: dict[str, str] = {}
+        if owner_id is not None:
+            query["owner_id"] = owner_id
+        if library is not None:
+            query["library"] = library
+        if query:
+            path = f"{path}?{urlencode(query)}"
+        return self._json_request("GET", path)
+
+    def forget(
+        self,
+        name_or_id: str,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        """Remove one local daemon object without contacting the central server."""
+
+        path = f"/objects/{quote(name_or_id)}"
+        query: dict[str, str] = {}
+        if owner_id is not None:
+            query["owner_id"] = owner_id
+        if library is not None:
+            query["library"] = library
+        if query:
+            path = f"{path}?{urlencode(query)}"
+        return self._json_request("DELETE", path)
+
+    def remove_local(
+        self,
+        name_or_id: str,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        """Alias for :meth:`forget`."""
+
+        return self.forget(name_or_id, owner_id=owner_id, library=library)
+
+    def forget_version(
+        self,
+        name_or_id: str,
+        version_ref: str | int,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        """Remove one local object version without contacting the server."""
+
+        path = f"/objects/{quote(name_or_id)}/versions/{quote(str(version_ref))}"
+        query: dict[str, str] = {}
+        if owner_id is not None:
+            query["owner_id"] = owner_id
+        if library is not None:
+            query["library"] = library
+        if query:
+            path = f"{path}?{urlencode(query)}"
+        return self._json_request("DELETE", path)
+
+    def prune_stale_mirrors(
+        self,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        """Remove locally cached server-origin mirror rows."""
+
+        path = "/objects/prune-stale-mirrors"
+        query: dict[str, str] = {}
+        if owner_id is not None:
+            query["owner_id"] = owner_id
+        if library is not None:
+            query["library"] = library
+        if query:
+            path = f"{path}?{urlencode(query)}"
+        return self._json_request("POST", path)
 
     def run(
         self,

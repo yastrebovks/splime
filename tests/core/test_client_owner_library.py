@@ -109,6 +109,22 @@ def test_daemon_client_library_management_paths() -> None:
     ]
 
 
+def test_daemon_client_local_cleanup_paths() -> None:
+    client = RecordingClient()
+
+    client.forget("demo obj", owner_id="owner 1", library="risk team")
+    client.remove_local("demo_obj")
+    client.forget_version("demo_obj", 2, library="research")
+    client.prune_stale_mirrors(owner_id="owner-1")
+
+    assert client.requests[-4:] == [
+        ("DELETE", "/objects/demo%20obj?owner_id=owner+1&library=risk+team", None),
+        ("DELETE", "/objects/demo_obj", None),
+        ("DELETE", "/objects/demo_obj/versions/2?library=research", None),
+        ("POST", "/objects/prune-stale-mirrors?owner_id=owner-1", None),
+    ]
+
+
 class FakeDaemon:
     def __init__(self) -> None:
         self.run_calls: list[dict[str, Any]] = []
@@ -121,6 +137,7 @@ class FakeDaemon:
         self.server_object_calls: list[dict[str, Any]] = []
         self.library_calls: list[tuple[Any, ...]] = []
         self.register_object_calls: list[dict[str, Any]] = []
+        self.cleanup_calls: list[tuple[Any, ...]] = []
         self.server_connected = False
 
     def run(self, object_name: str, **kwargs: Any) -> dict[str, Any]:
@@ -384,6 +401,36 @@ class FakeDaemon:
     ) -> dict[str, Any]:
         self.library_calls.append(("remove_server_library_entry", library_ref, name))
         return {"library": library_ref, "name": name, "removed": True}
+
+    def forget(
+        self,
+        name: str,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        self.cleanup_calls.append(("forget", name, owner_id, library))
+        return {"name": name, "forgotten": True}
+
+    def forget_version(
+        self,
+        name: str,
+        version: str | int,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        self.cleanup_calls.append(("forget_version", name, version, owner_id, library))
+        return {"name": name, "version": version, "forgotten": True}
+
+    def prune_stale_mirrors(
+        self,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        self.cleanup_calls.append(("prune_stale_mirrors", owner_id, library))
+        return {"count": 0, "pruned": []}
 
     def register_object(self, name: str, **kwargs: Any) -> dict[str, Any]:
         self.register_object_calls.append({"name": name, **kwargs})
@@ -693,6 +740,38 @@ def test_spl_client_library_management_requires_server_connection() -> None:
     with pytest.raises(RuntimeError, match="server-connected SPLClient"):
         client.add_reference("risk", "source")
 
+    assert fake_daemon.library_calls == []
+
+
+def test_spl_client_local_cleanup_does_not_require_server_connection() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+
+    assert client.forget("demo_obj", owner="owner-1", library="risk") == {
+        "name": "demo_obj",
+        "forgotten": True,
+    }
+    assert client.remove_local("scratch_obj") == {
+        "name": "scratch_obj",
+        "forgotten": True,
+    }
+    assert client.forget_version("demo_obj", 2, library="risk") == {
+        "name": "demo_obj",
+        "version": 2,
+        "forgotten": True,
+    }
+    assert client.prune_stale_mirrors(owner="owner-1") == {
+        "count": 0,
+        "pruned": [],
+    }
+
+    assert fake_daemon.cleanup_calls == [
+        ("forget", "demo_obj", "owner-1", "risk"),
+        ("forget", "scratch_obj", None, None),
+        ("forget_version", "demo_obj", 2, None, "risk"),
+        ("prune_stale_mirrors", "owner-1", None),
+    ]
     assert fake_daemon.library_calls == []
 
 

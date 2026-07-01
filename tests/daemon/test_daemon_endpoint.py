@@ -458,7 +458,7 @@ def test_signature_imports_server_object_by_display_name(tmp_path, monkeypatch) 
         status, body = _json_from_app(app, "/objects/demo_obj/signature")
 
         assert status == 200
-        assert body["name"] == "server.remote-object-1"
+        assert body["name"] == "demo_obj"
         assert body["display_name"] == "demo_obj"
         assert 'client.call("demo_obj"' in body["call"]["example"]
     finally:
@@ -757,6 +757,49 @@ def test_object_registration_sync_event_preserves_library_create_request(
         assert pending[0]["payload"]["library"] == "research"
         assert pending[0]["payload"]["create_library"] is True
         assert pending[0]["payload"]["library_display_name"] == "Research"
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_delete_object_route_forgets_local_object_without_server_connection(
+    tmp_path,
+) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        store.register_env("default", sys.executable)
+        first = store.register_object(
+            "demo_obj",
+            "demo_obj",
+            "default",
+            yaml_text=REMOTE_FUNCTION_YAML,
+        )
+        second = store.register_object(
+            "demo_obj",
+            "demo_obj",
+            "default",
+            yaml_text=REMOTE_FUNCTION_YAML.replace("return 1", "return 2"),
+        )
+
+        app = create_app(store, auto_build_envs=False)
+        assert store.current_server_connection() is None
+
+        status, body = _delete_json_from_app(app, "/objects/demo_obj?version=1")
+        assert status == 200
+        assert body["object_deleted"] is False
+        assert body["version"]["id"] == first["version_id"]
+        assert store.get_object("demo_obj")["version_id"] == second["version_id"]
+
+        status, body = _delete_json_from_app(app, "/objects/demo_obj")
+        assert status == 200
+        assert body["object_deleted"] is True
+        assert body["object"]["canonical_name"] == "local/default/demo_obj"
+        assert body["deleted"]["versions"] == 1
+
+        status, body = _json_from_app(app, "/objects/demo_obj")
+        assert status == 404
+        assert "object is not registered" in body["error"]
     finally:
         _shutdown_app(app)
         store.close()

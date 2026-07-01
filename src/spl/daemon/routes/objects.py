@@ -73,6 +73,16 @@ def register_object_routes(
             runtime.store.search_objects(context.first_query_value("q", "query") or "")
         )
 
+    @app.post("/objects/prune-stale-mirrors")
+    @route_errors
+    async def prune_stale_mirrors() -> Any:
+        return json_response(
+            runtime.store.prune_stale_mirrors(
+                owner_id=context.first_query_value("owner", "owner_id"),
+                library=context.first_query_value("library"),
+            )
+        )
+
     @app.get("/objects/<name_or_id>")
     @route_errors
     async def get_object(name_or_id: str) -> Any:
@@ -85,6 +95,29 @@ def register_object_routes(
             context.object_from_local_or_server(
                 validate_name(name_or_id),
                 include_yaml=include_yaml,
+            )
+        )
+
+    @app.delete("/objects/<name_or_id>")
+    @route_errors
+    async def forget_object(name_or_id: str) -> Any:
+        version = context.first_query_value("version")
+        owner_id = context.first_query_value("owner", "owner_id")
+        library = context.first_query_value("library")
+        if version is not None and version != "":
+            return json_response(
+                runtime.store.forget_object_version(
+                    validate_name(name_or_id),
+                    version,
+                    owner_id=owner_id,
+                    library=library,
+                )
+            )
+        return json_response(
+            runtime.store.forget_object(
+                validate_name(name_or_id),
+                owner_id=owner_id,
+                library=library,
             )
         )
 
@@ -130,11 +163,33 @@ def register_object_routes(
     @app.get("/objects/<name_or_id>/versions")
     @route_errors
     async def list_object_versions(name_or_id: str) -> Any:
-        refresh = runtime.refresh_server_object_if_available(validate_name(name_or_id))
+        owner_id = context.first_query_value("owner", "owner_id")
+        library = context.first_query_value("library")
+        refresh = runtime.refresh_server_object_if_available(
+            validate_name(name_or_id),
+            owner_id=owner_id,
+            library=library,
+        )
         if refresh and refresh.get("current_version"):
             name_or_id = refresh["current_version"]["name"]
         return json_response(
-            runtime.store.list_object_versions(validate_name(name_or_id))
+            runtime.store.list_object_versions(
+                validate_name(name_or_id),
+                owner_id=owner_id,
+                library=library,
+            )
+        )
+
+    @app.delete("/objects/<name_or_id>/versions/<version_ref>")
+    @route_errors
+    async def forget_object_version(name_or_id: str, version_ref: str) -> Any:
+        return json_response(
+            runtime.store.forget_object_version(
+                validate_name(name_or_id),
+                version_ref,
+                owner_id=context.first_query_value("owner", "owner_id"),
+                library=context.first_query_value("library"),
+            )
         )
 
     @app.post("/objects")
@@ -154,6 +209,8 @@ def register_object_routes(
             description=body.get("description"),
             version_label=body.get("version_label"),
             object_id=body.get("object_id"),
+            owner_id=body.get("owner_id") or body.get("object_owner_id"),
+            library=body.get("library") or body.get("library_slug"),
             runtime_config=body.get("runtime_config"),
         )
         if not body.get("local_only", False):
