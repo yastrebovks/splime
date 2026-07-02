@@ -15,7 +15,6 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
-
 NODE_WIDTH = 292
 PORT_ROW_HEIGHT = 28
 PORT_Y_OFFSET = 76

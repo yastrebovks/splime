@@ -14,7 +14,6 @@ from typing import Any, Iterator, Protocol
 
 from spl.daemon.store import RegistryStore, utc_now
 
-
 ABSENT = "absent"
 CREATING = "creating"
 READY = "ready"
@@ -211,7 +210,7 @@ class BaseEnvironmentManager(ABC):
             )
         except _ExternalBuildReady:
             return
-        except Exception as exc:  # noqa: BLE001 - build errors are persisted.
+        except Exception as exc:
             self.store.update_environment_build(
                 spec_hash,
                 status=FAILED,

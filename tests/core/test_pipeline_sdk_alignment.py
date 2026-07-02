@@ -363,6 +363,45 @@ def test_node_remote_accepts_library_owner_and_target_machine(monkeypatch) -> No
     ]
 
 
+def test_node_remote_locate_is_canonical_factory(monkeypatch) -> None:
+    calls = []
+
+    class FakeDaemonClient:
+        def resolve_remote_signature(self, ref):
+            calls.append(ref)
+            return {
+                "signature": {
+                    "inputs": [{"name": "a", "type": "int"}],
+                    "outputs": [{"name": "default", "type": "str"}],
+                }
+            }
+
+    monkeypatch.setattr(daemon_client, "Client", FakeDaemonClient)
+
+    node = NodeRemote.locate(
+        pipeline="demo_traktorist_pipeline",
+        function="happiness",
+        url="https://splime.io/api",
+        version="3",
+        target_machine="tractor-gpu",
+    )
+
+    assert node.url == "https://splime.io/api"
+    assert node.name == "demo_traktorist_pipeline::happiness"
+    assert node.version == "3"
+    assert node.target_machine == "tractor-gpu"
+    assert node.inputs == [InputPort("a", "int", None)]
+    assert node.outputs == [OutputPort("default", "str")]
+    assert calls == [
+        {
+            "url": "https://splime.io/api",
+            "name": "demo_traktorist_pipeline::happiness",
+            "version": "3",
+            "target_machine": "tractor-gpu",
+        }
+    ]
+
+
 def test_node_remote_keeps_explicit_legacy_constructor(monkeypatch) -> None:
     class FailingDaemonClient:
         def resolve_remote_signature(self, ref):

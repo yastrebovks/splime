@@ -11,9 +11,6 @@ from typing import Any
 from spl.daemon.environment_base import (
     ABSENT,
     CREATING,
-    DEFAULT_BUILD_TIMEOUT_SECONDS,
-    DEFAULT_STALE_LOCK_SECONDS,
-    FAILED,
     READY,
     BaseEnvironmentManager,
     EnvironmentBuildError,

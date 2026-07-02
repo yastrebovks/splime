@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 from typing import Protocol
 
-
 SECRET_BACKEND_ENV = "SPL_DAEMON_SECRET_BACKEND"
 KEYRING_SERVICE = "io.splime.daemon"
 FILE_BACKEND_NAME = "file"

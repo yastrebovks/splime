@@ -42,7 +42,7 @@ spl-daemon serve            # listens on http://127.0.0.1:8765 by default
 contacts a server:
 
 ```python
-from spl.client import SPLClient
+from spl import SPLClient
 
 def daily_total(date: str) -> float:
     prices = {"2026-06-08": [11.0, 6.5, 24.5]}
@@ -52,8 +52,8 @@ client = SPLClient()                       # local-first; no server contact
 client.publish(daily_total, name="daily_total")
 
 result = client.call("daily_total", kwargs={"date": "2026-06-08"})
-print(result.mode)    # "local"
-print(result.value)   # 42.0
+print(result.mode)     # "local"
+print(result.output)   # 42.0  (unwrapped value; result.value keeps the raw port dict)
 ```
 
 That is the whole loop: define a function, `publish` it as a versioned node, then `call`
@@ -85,11 +85,11 @@ Libraries group versioned objects and control who can see and run them. Creating
 curating libraries uses a server-connected client:
 
 ```python
-client.create_library("risk", display_name="Risk", visibility="private")
+client.library.create("risk", display_name="Risk", visibility="private")
 client.publish(risk_score, name="risk_score", library="risk")
 
 # Grant scoped access to a teammate
-client.grant_library("risk", "analyst1", scopes=["metadata:read", "objects:read", "execute"])
+client.library.grant("risk", "analyst1", scopes=["metadata:read", "objects:read", "execute"])
 ```
 
 A library can also reference a live object from another library (`add_reference`, follows

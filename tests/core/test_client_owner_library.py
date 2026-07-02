@@ -3,10 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+
 import spl.client as spl_client_module
 from spl.client import SPLClient
 from spl.core.entities.node_remote import NodeRemote
-from spl.daemon_client import Client
+from spl.daemon_client import Client, ClientError
+from spl.server_client import SPLServerClient
 
 
 class RecordingClient(Client):
@@ -139,6 +141,33 @@ class FakeDaemon:
         self.register_object_calls: list[dict[str, Any]] = []
         self.cleanup_calls: list[tuple[Any, ...]] = []
         self.server_connected = False
+        self.server_url = "https://splime.io/api"
+
+    def connect_server(
+        self,
+        *,
+        machine_token: str,
+        user_token: str,
+        server_url: str,
+        machine_id: str | None = None,
+        display_name: str | None = None,
+        capabilities: dict[str, Any] | None = None,
+        heartbeat_interval_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        del machine_token, user_token
+        self.server_connected = True
+        self.server_url = server_url
+        return {
+            "connected": True,
+            "connection": {
+                "status": "connected",
+                "server_url": server_url,
+                "machine_id": machine_id,
+                "display_name": display_name,
+                "capabilities": capabilities or {},
+                "heartbeat_interval_seconds": heartbeat_interval_seconds,
+            },
+        }
 
     def run(self, object_name: str, **kwargs: Any) -> dict[str, Any]:
         self.run_calls.append({"object_name": object_name, **kwargs})
@@ -304,6 +333,7 @@ class FakeDaemon:
             "connected": self.server_connected,
             "connection": {
                 "status": "connected" if self.server_connected else "offline",
+                "server_url": self.server_url,
             },
         }
 
@@ -443,6 +473,53 @@ class FakeDaemon:
         }
 
 
+class MissingServerConnectionDaemon(FakeDaemon):
+    def server_connection(self) -> dict[str, Any]:
+        return {"connected": False, "offline": False, "connection": None}
+
+    def server_machines(self) -> dict[str, Any]:
+        raise ClientError("404: active server connection is not found")
+
+    def server_objects(
+        self,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+        compact: bool = False,
+    ) -> list[dict[str, Any]]:
+        self.server_object_calls.append(
+            {
+                "owner_id": owner_id,
+                "library": library,
+                "compact": compact,
+            }
+        )
+        raise ClientError("404: active server connection is not found")
+
+    def server_libraries(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
+        self.library_calls.append(("server_libraries", include_accessible))
+        raise ClientError("404: active server connection is not found")
+
+
+class MissingServerConnectionErrorDaemon(MissingServerConnectionDaemon):
+    def server_connection(self) -> dict[str, Any]:
+        raise ClientError("404: active server connection is not found")
+
+
+class FailingServerDaemon(MissingServerConnectionDaemon):
+    def server_connection(self) -> dict[str, Any]:
+        return {"connected": True, "offline": False, "connection": {"id": "conn-1"}}
+
+    def server_libraries(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
+        self.library_calls.append(("server_libraries", include_accessible))
+        raise ClientError("503: upstream unavailable")
+
+
+class BrokenConnectionStateDaemon(MissingServerConnectionDaemon):
+    def server_connection(self) -> dict[str, Any]:
+        raise ClientError("503: connection state unavailable")
+
+
 def test_daemon_client_decomposition_uses_version_query() -> None:
     client = RecordingClient()
 
@@ -504,6 +581,31 @@ def test_spl_client_call_and_signature_accept_owner_library() -> None:
         "owner_id": "alice",
         "library": "risk",
         "function": None,
+    }
+
+
+def test_spl_client_submit_is_async_alias_for_start() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+
+    run = client.submit("fraud_score", kwargs={"customer_id": 42}, output="score")
+
+    assert run.id == "remote-run-2"
+    assert run.mode == "local"
+    assert fake_daemon.run_calls[-1] == {
+        "object_name": "fraud_score",
+        "args": None,
+        "kwargs": {"customer_id": 42},
+        "output": "score",
+        "timeout_seconds": None,
+        "target_machine": None,
+        "object_owner_id": None,
+        "library": None,
+        "offline_policy": None,
+        "function": None,
+        "source": "auto",
+        "remote": None,
     }
 
 
@@ -576,6 +678,33 @@ def test_spl_client_server_objects_returns_stable_list() -> None:
         "compact": True,
     }
     assert fake_daemon.list_object_calls == []
+
+
+def test_spl_client_object_list_aliases_route_through_objects(monkeypatch) -> None:
+    client = SPLClient(daemon_port=8765)
+    calls: list[dict[str, Any]] = []
+
+    def fake_objects(**kwargs: Any) -> dict[str, Any] | list[dict[str, Any]]:
+        calls.append(kwargs)
+        if kwargs["scope"] == "local":
+            return {"local_obj": {"name": "local_obj", "compact": kwargs["compact"]}}
+        return [{"name": "server_obj", "compact": kwargs["compact"]}]
+
+    monkeypatch.setattr(client, "objects", fake_objects)
+
+    assert client.local_objects(compact=True) == [{"name": "local_obj", "compact": True}]
+    assert client.server_objects(owner="alice", library="risk", compact=False) == [
+        {"name": "server_obj", "compact": False}
+    ]
+    assert calls == [
+        {"scope": "local", "compact": True},
+        {
+            "scope": "server",
+            "owner": "alice",
+            "library": "risk",
+            "compact": False,
+        },
+    ]
 
 
 def test_spl_client_library_management_methods_use_daemon() -> None:
@@ -729,6 +858,143 @@ def test_spl_client_library_management_methods_use_daemon() -> None:
     ]
 
 
+def test_spl_client_library_namespace_delegates_to_flat_methods() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    client._daemon = fake_daemon
+
+    library = client.library
+
+    assert library.list(include_accessible=False) == [{"slug": "risk", "accessible": False}]
+    assert library.create("risk", display_name="Risk") == {"slug": "risk", "created": True}
+    assert library.get("risk") == {"slug": "risk"}
+    assert library.update("risk", description="Updated") == {
+        "slug": "risk",
+        "description": "Updated",
+    }
+    assert library.grant("risk", "admin2", scopes=["read"]) == {
+        "library": "risk",
+        "grantee_id": "admin2",
+        "grantee_type": "user",
+        "scopes": ["read"],
+    }
+    assert library.revoke("risk", "admin2") == {
+        "library": "risk",
+        "grantee": "admin2",
+        "revoked": True,
+    }
+    assert library.add_reference(
+        "risk",
+        "source",
+        from_library="default",
+        alias="source_alias",
+    ) == {
+        "library": "risk",
+        "reference": {
+            "name": "source",
+            "from_library": "default",
+            "version": "latest",
+            "alias": "source_alias",
+        },
+    }
+    assert library.copy_object(
+        "source",
+        into_library="risk",
+        from_library="default",
+        new_name="source_copy",
+    ) == {
+        "library": "risk",
+        "copy": {
+            "name": "source",
+            "from_library": "default",
+            "version": "latest",
+            "new_name": "source_copy",
+        },
+    }
+    assert library.remove_entry("risk", "source") == {
+        "library": "risk",
+        "name": "source",
+        "removed": True,
+    }
+    assert library.delete("risk") == {"slug": "risk", "deleted": True}
+
+    assert fake_daemon.library_calls == [
+        ("server_libraries", False),
+        (
+            "create_server_library",
+            {
+                "slug": "risk",
+                "display_name": "Risk",
+                "description": "",
+                "visibility": "private",
+            },
+        ),
+        ("get_server_library", "risk"),
+        ("update_server_library", "risk", {"description": "Updated"}),
+        (
+            "grant_server_library",
+            "risk",
+            {
+                "grantee_id": "admin2",
+                "grantee_type": "user",
+                "scopes": ["read"],
+            },
+        ),
+        ("revoke_server_library_grant", "risk", "admin2"),
+        (
+            "add_server_library_reference",
+            "risk",
+            {
+                "name": "source",
+                "from_library": "default",
+                "version": "latest",
+                "alias": "source_alias",
+            },
+        ),
+        (
+            "copy_server_library_object",
+            "risk",
+            {
+                "name": "source",
+                "from_library": "default",
+                "version": "latest",
+                "new_name": "source_copy",
+            },
+        ),
+        ("remove_server_library_entry", "risk", "source"),
+        ("delete_server_library", "risk"),
+    ]
+
+
+def test_spl_client_server_property_uses_user_token_and_connection_url() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+
+    client.connect_server(
+        machine_token="machine-token",
+        user_token="user-token",
+        server_url="https://server.example/api",
+    )
+
+    server = client.server
+
+    assert isinstance(server, SPLServerClient)
+    assert server.token == "user-token"
+    assert server.base_url == "https://server.example/api"
+
+
+def test_spl_client_server_property_requires_user_token() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    client._daemon = fake_daemon
+
+    with pytest.raises(RuntimeError, match="requires a user token"):
+        _ = client.server
+
+
 def test_spl_client_library_management_requires_server_connection() -> None:
     client = SPLClient(daemon_port=8765)
     fake_daemon = FakeDaemon()
@@ -843,6 +1109,40 @@ def test_spl_client_objects_explicit_local_remains_local_when_connected() -> Non
     assert objects == {"local_obj": {"name": "local_obj", "compact": True}}
     assert fake_daemon.list_object_calls[-1] == {"compact": True}
     assert fake_daemon.server_object_calls == []
+
+
+def test_spl_client_offline_server_helpers_return_empty_states() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = MissingServerConnectionErrorDaemon()
+    client._daemon = fake_daemon
+
+    assert client.current_server_connection() == {
+        "connected": False,
+        "offline": False,
+        "connection": None,
+    }
+    assert client.machines() == {"current_machine_id": None, "machines": []}
+    assert client.libraries(include_accessible=False) == []
+    assert client.objects(scope="server", compact=True) == []
+    assert client.objects(scope="all", compact=True) == {
+        "local": {"local_obj": {"name": "local_obj", "compact": True}},
+        "server": [],
+    }
+
+    assert fake_daemon.library_calls == []
+    assert fake_daemon.server_object_calls == []
+
+
+def test_spl_client_offline_server_helpers_reraise_other_failures() -> None:
+    client = SPLClient(daemon_port=8765)
+    client._daemon = FailingServerDaemon()
+
+    with pytest.raises(ClientError, match="503: upstream unavailable"):
+        client.libraries()
+
+    client._daemon = BrokenConnectionStateDaemon()
+    with pytest.raises(ClientError, match="503: connection state unavailable"):
+        client.machines()
 
 
 def test_spl_client_run_node_uses_daemon_remote_node_bridge() -> None:

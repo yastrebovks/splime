@@ -24,7 +24,6 @@ from spl.core.entities.pipeline import DPipeline
 from spl.core.entities.scalar import DScalar
 from spl.core.ir.utils import SPLSafeLoader
 
-
 RemoteSignatureResolver = Callable[[dict[str, Any]], dict[str, Any]]
 
 

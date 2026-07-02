@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from typing import Any
 
-
 DEFAULT_RUNTIME_MODE = "venv"
 DEFAULT_DOCKER_PYTHON = "3.13"
 DEFAULT_DOCKER_DISTRO = "trixie"

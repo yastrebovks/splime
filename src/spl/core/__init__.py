@@ -2,6 +2,7 @@ import spl.core.entities.adapter
 import spl.core.entities.artifact
 import spl.core.entities.distribution
 import spl.core.entities.function
+
 # Registered before `module` so local user functions are inlined instead of
 # being captured as a bare `from local_module import ...` (see local_function).
 import spl.core.entities.local_function

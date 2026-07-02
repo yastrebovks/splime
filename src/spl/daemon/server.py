@@ -45,26 +45,20 @@ Endpoints:
 
 from __future__ import annotations
 
-import json
+import base64
 import hashlib
+import json
 import os
 import socket
 import subprocess
 import sys
 import threading
 import time
-import base64
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse, urlunparse
 from uuid import uuid4
 
-from spl.daemon_client import (
-    clear_daemon_endpoint,
-    daemon_url,
-    generate_daemon_api_token,
-    write_daemon_endpoint,
-)
 from spl.daemon.docker_environment import DockerEnvironmentManager
 from spl.daemon.docker_pool import DockerPool
 from spl.daemon.environment import EnvironmentBuildError
@@ -75,20 +69,6 @@ from spl.daemon.remote_client import (
     ServerClient,
     ServerClientError,
 )
-from spl.daemon.runtime_dependencies import (
-    DockerEnvironmentManagerProtocol,
-    DockerPoolRunnerProtocol,
-    HeartbeatsProtocol,
-    ServerClientFactoryProtocol,
-    ServerClientProtocol,
-    ServerConnectionsProtocol,
-    SyncVisibilityProtocol,
-)
-from spl.daemon.runtime_backend import (
-    RunContext,
-    RuntimeBackendRegistry,
-    RuntimeBackendServices,
-)
 from spl.daemon.routes._helpers import RouteContext
 from spl.daemon.routes.artifacts import register_artifact_routes
 from spl.daemon.routes.diagnostics import register_diagnostics_routes
@@ -98,6 +78,20 @@ from spl.daemon.routes.objects import register_object_routes
 from spl.daemon.routes.remote import register_remote_routes
 from spl.daemon.routes.runs import register_run_routes
 from spl.daemon.routes.server_connections import register_server_connection_routes
+from spl.daemon.runtime_backend import (
+    RunContext,
+    RuntimeBackendRegistry,
+    RuntimeBackendServices,
+)
+from spl.daemon.runtime_dependencies import (
+    DockerEnvironmentManagerProtocol,
+    DockerPoolRunnerProtocol,
+    HeartbeatsProtocol,
+    ServerClientFactoryProtocol,
+    ServerClientProtocol,
+    ServerConnectionsProtocol,
+    SyncVisibilityProtocol,
+)
 from spl.daemon.server_connection import (
     SERVER_OFFLINE_MESSAGE,
     ServerConnectionManager,
@@ -112,6 +106,12 @@ from spl.daemon.store import (
     utc_now,
     validate_name,
     write_json,
+)
+from spl.daemon_client import (
+    clear_daemon_endpoint,
+    daemon_url,
+    generate_daemon_api_token,
+    write_daemon_endpoint,
 )
 
 LOCAL_RUN_TEXT_ARTIFACT_MAX_BYTES = 256 * 1024
@@ -1187,8 +1187,8 @@ class DaemonRuntime:
         raise RuntimeError(
             "target machine "
             f"{target_machine!r} is {machine.get('status') or 'offline'}; "
-            "the run was not queued. Use client.queue(...) or "
-            "client.start(..., offline_policy='queue') to register the task "
+            "the run was not queued. Use "
+            "client.submit(..., offline_policy='queue') to register the task "
             "and poll it later."
         )
 
@@ -1606,7 +1606,7 @@ class DaemonRuntime:
                 payload={"local_run": final_state},
                 artifacts=artifacts,
             )
-        except Exception as exc:  # noqa: BLE001 - report job failure to server.
+        except Exception as exc:
             self._send_server_run_update(
                 connection_id,
                 run_id=run_id,
@@ -2123,7 +2123,7 @@ class DaemonRuntime:
                 stdout_text=stdout,
                 stderr_text=stderr,
             )
-        except Exception as exc:  # noqa: BLE001 - daemon must record worker errors.
+        except Exception as exc:
             self._update_local_run(
                 run_id,
                 report_local_run=report_local_run,
@@ -2170,7 +2170,7 @@ class DaemonRuntime:
     def _sync_once_safely(self, connection_id: str) -> None:
         try:
             self.sync_once(connection_id=connection_id)
-        except Exception as exc:  # noqa: BLE001 - keep pending events for heartbeat retry.
+        except Exception as exc:
             self.store.record_server_connection_error(
                 connection_id,
                 status="heartbeat_failed",

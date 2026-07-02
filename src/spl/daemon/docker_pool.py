@@ -104,7 +104,7 @@ class DockerPool:
             *self.env_args(runtime_config),
             image_tag,
             "python",
-            f"/opt/splime/src0/spl/daemon/worker.py",
+            "/opt/splime/src0/spl/daemon/worker.py",
             "--object-yaml",
             f"{container_run_dir}/object.yaml",
             "--entrypoint",
@@ -457,7 +457,7 @@ class DockerPool:
             core_path = Path(str(spl_core.__file__)).parents[2].resolve()
             if core_path not in [path for _, path in roots]:
                 roots.append(("framework", core_path))
-        except Exception:  # noqa: BLE001 - build/run will surface import errors.
+        except Exception:
             pass
         return roots
 

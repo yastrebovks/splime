@@ -1,6 +1,12 @@
 # RFC: Canonical object identity & daemon reconcile
 
-Status: draft
+Status: IMPLEMENTED (2026-07-01/02). Canonical `(owner, library, name)` schema
+with `UNIQUE(object_id, content_hash)` versions, `canonicalize()` in
+`src/spl/daemon/canonical.py`, publish/reconcile/heal migration and offline
+forget are all shipped; enforced by `tests/daemon/test_object_identity.py`
+(33 tests) plus the endpoint suite. Follow-ups that came out of review, also
+shipped: multi-library hint in the `get_object` KeyError and the
+owner/library-namespaced YAML display cache.
 Scope of change: `spl/` only (the umbrella package). `Release/spl` is a deploy mirror of a finished, tested package and MUST NOT be edited during implementation.
 
 ## 1. Summary

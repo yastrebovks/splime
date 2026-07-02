@@ -411,7 +411,7 @@ def main(argv: list[str] | None = None) -> int:
                 docker_prewarm=args.docker_prewarm,
             )
             return 0
-        except Exception as exc:  # noqa: BLE001 - CLI should show concise errors.
+        except Exception as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
 
@@ -575,7 +575,7 @@ def main(argv: list[str] | None = None) -> int:
             print_json({"path": str(path)})
         else:
             raise AssertionError(f"unhandled command: {args.command}")
-    except Exception as exc:  # noqa: BLE001 - CLI should show concise errors.
+    except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

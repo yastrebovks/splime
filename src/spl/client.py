@@ -18,33 +18,241 @@ dependencies imported yet.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field, replace
+from html import escape
 from pathlib import Path
 from typing import Any, Literal, cast, overload
 
+from spl.core.entities.node import DEFAULT_PORT
 from spl.daemon_client import (
     DEFAULT_DAEMON_HOST,
     DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
     DEFAULT_SERVER_URL,
     Client,
+    ClientError,
 )
-
+from spl.server_client import SPLServerClient
 
 OfflinePolicy = Literal["queue", "wait", "fail_fast"]
 ObjectScope = Literal["auto", "local", "server", "all"]
 RunSource = Literal["auto", "local"]
+_NO_SERVER_CONNECTION_MESSAGE = "active server connection is not found"
 
 
-@dataclass(frozen=True)
+def _preview(value: Any, *, limit: int = 80) -> str:
+    preview = repr(value)
+    if len(preview) <= limit:
+        return preview
+    return f"{preview[: limit - 3]}..."
+
+
+def _is_missing_server_connection(exc: Exception) -> bool:
+    return (
+        isinstance(exc, ClientError)
+        and _NO_SERVER_CONNECTION_MESSAGE in str(exc)
+    )
+
+
+def _warn_deprecated(old: str, new: str) -> None:
+    """Emit the standard 0.2.0 deprecation warning (see docs/migration-0.2.0.md)."""
+
+    warnings.warn(
+        f"{old} is deprecated and will be removed in splime 0.2.0; "
+        f"use {new} instead.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
+
+@dataclass(frozen=True, repr=False)
 class PublishedObject:
-    """Metadata returned after an object is stored in the daemon registry."""
+    """Receipt returned after an object is stored in the daemon registry.
+
+    The full daemon document stays available via ``.raw`` but is kept out of
+    the ``repr`` so a notebook does not print a multi-kilobyte blob.
+    """
 
     name: str
     entrypoint: str
     env: str
     yaml_path: str
     workdir: str | None = None
-    raw: dict[str, Any] = field(default_factory=dict)
+    raw: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @property
+    def version(self) -> str | None:
+        """Best-effort human version, or ``None`` if the daemon did not send one."""
+
+        current = self.raw.get("current_version")
+        if isinstance(current, dict):
+            for key in ("number", "version", "label", "name"):
+                value = current.get(key)
+                if value is not None:
+                    return str(value)
+        for key in ("version", "version_label"):
+            value = self.raw.get(key)
+            if value is not None:
+                return str(value)
+        return None
+
+    @property
+    def library(self) -> str | None:
+        """Library the object was published into, when the daemon sent one."""
+
+        value = self.raw.get("library")
+        return None if value is None else str(value)
+
+    def __repr__(self) -> str:
+        suffix = f" v{self.version}" if self.version is not None else ""
+        return f"Published {self.name}{suffix} (env={self.env})"
+
+    def _repr_html_(self) -> str:
+        rows = {
+            "name": self.name,
+            "version": self.version or "—",
+            "library": self.library or "—",
+            "env": self.env,
+            "entrypoint": self.entrypoint,
+        }
+        body = "".join(
+            "<tr>"
+            f"<th style='text-align:left'>{escape(key)}</th>"
+            f"<td><code>{escape(value)}</code></td>"
+            "</tr>"
+            for key, value in rows.items()
+        )
+        return f"<table><tbody>{body}</tbody></table>"
+
+
+_CATALOG_HEADERS = ("name", "kind", "version", "library", "inputs")
+
+
+def _catalog_rows(
+    payload: dict[str, Any] | list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Flatten a payload (records list OR name-keyed dict) to display rows."""
+
+    if isinstance(payload, dict):
+        records = [
+            {**value, "name": str(value.get("display_name") or value.get("name") or key)}
+            for key, value in payload.items()
+            if isinstance(value, dict)
+        ]
+    else:
+        records = [record for record in payload if isinstance(record, dict)]
+
+    rows: list[dict[str, str]] = []
+    for record in records:
+        library = record.get("library")
+        library_name = (
+            library.get("display_name") or library.get("slug")
+            if isinstance(library, dict)
+            else library
+        )
+        version_value = record.get("version")
+        if version_value is None:
+            current = record.get("current_version")
+            if isinstance(current, dict):
+                version_value = current.get("version") or current.get("number")
+            else:
+                version_value = current
+        rows.append(
+            {
+                "name": str(record.get("display_name") or record.get("name") or ""),
+                "kind": str(record.get("kind") or ""),
+                "version": str(version_value or ""),
+                "library": str(library_name or ""),
+                "inputs": str(len(record.get("inputs") or [])),
+            }
+        )
+    return rows
+
+
+def _rows_to_text(rows: list[dict[str, str]], title: str) -> str:
+    if not rows:
+        return f"{title}: (empty)"
+    widths = {
+        header: max(len(header), *(len(row[header]) for row in rows))
+        for header in _CATALOG_HEADERS
+    }
+    head = "  ".join(header.ljust(widths[header]) for header in _CATALOG_HEADERS)
+    body = "\n".join(
+        "  ".join(row[header].ljust(widths[header]) for header in _CATALOG_HEADERS)
+        for row in rows
+    )
+    return f"{title} ({len(rows)}):\n{head}\n{body}"
+
+
+def _rows_to_html(rows: list[dict[str, str]], title: str) -> str:
+    head = "".join(
+        f"<th style='text-align:left'>{escape(header)}</th>"
+        for header in _CATALOG_HEADERS
+    )
+    body = "".join(
+        "<tr>"
+        + "".join(f"<td>{escape(row[header])}</td>" for header in _CATALOG_HEADERS)
+        + "</tr>"
+        for row in rows
+    )
+    return (
+        f"<div><b>{escape(title)}</b> ({len(rows)})"
+        f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
+    )
+
+
+class ObjectList(list[dict[str, Any]]):
+    """Object records that print as a compact table; ``.raw`` is a plain list."""
+
+    def __repr__(self) -> str:
+        return _rows_to_text(_catalog_rows(list(self)), "objects")
+
+    def _repr_html_(self) -> str:
+        return _rows_to_html(_catalog_rows(list(self)), "objects")
+
+    @property
+    def raw(self) -> list[dict[str, Any]]:
+        return list(self)
+
+
+class ObjectTable(dict[str, Any]):
+    """Name-keyed object records with a compact table ``repr``; ``.raw`` is a plain dict."""
+
+    def __repr__(self) -> str:
+        return _rows_to_text(_catalog_rows(dict(self)), "objects")
+
+    def _repr_html_(self) -> str:
+        return _rows_to_html(_catalog_rows(dict(self)), "objects")
+
+    @property
+    def raw(self) -> dict[str, Any]:
+        return dict(self)
+
+
+class ObjectCatalog(dict[str, Any]):
+    """Local+server catalog that prints per-scope tables; ``.raw`` is a plain dict."""
+
+    def __repr__(self) -> str:
+        return "\n\n".join(
+            _rows_to_text(_catalog_rows(value), str(key)) for key, value in self.items()
+        )
+
+    def _repr_html_(self) -> str:
+        return "".join(
+            _rows_to_html(_catalog_rows(value), str(key)) for key, value in self.items()
+        )
+
+    @property
+    def raw(self) -> dict[str, Any]:
+        return dict(self)
+
+
+def _wrap_objects(
+    value: dict[str, Any] | list[dict[str, Any]],
+) -> ObjectTable | ObjectList:
+    """Wrap a payload in a view type, preserving its runtime shape."""
+
+    return ObjectTable(value) if isinstance(value, dict) else ObjectList(value)
 
 
 @dataclass(frozen=True)
@@ -69,16 +277,54 @@ class RemoteResult:
         return self.payload.get("result")
 
     @property
+    def output(self) -> Any:
+        """Return the user's unwrapped result value.
+
+        Rule: if ``payload['result']`` is a dict and contains the key
+        ``'default'`` -> return ``result['default']``; else if it has exactly
+        one key -> return that value; else return ``result`` as-is.
+        """
+
+        result = self.payload.get("result")
+        if isinstance(result, dict):
+            if DEFAULT_PORT in result:
+                return result[DEFAULT_PORT]
+            if len(result) == 1:
+                return next(iter(result.values()))
+        return result
+
+    @property
     def artifacts(self) -> dict[str, str]:
         """Return daemon-side artifact paths keyed by artifact name."""
 
-        return self.payload.get("artifacts", {})
+        artifacts = self.payload.get("artifacts")
+        if isinstance(artifacts, dict):
+            return cast("dict[str, str]", artifacts)
+        return {}
 
     @property
     def server_side(self) -> bool:
         """Return whether the result came from a central-server run."""
 
         return self.mode == "server"
+
+    def __repr__(self) -> str:
+        return f"RemoteResult(mode={self.mode!r}, output={_preview(self.output)})"
+
+    def _repr_html_(self) -> str:
+        rows = {
+            "mode": self.mode,
+            "output": _preview(self.output),
+            "artifacts": str(len(self.artifacts)),
+        }
+        body = "".join(
+            "<tr>"
+            f"<th style='text-align:left'>{escape(key)}</th>"
+            f"<td><code>{escape(value)}</code></td>"
+            "</tr>"
+            for key, value in rows.items()
+        )
+        return f"<table><tbody>{body}</tbody></table>"
 
 
 class RemoteRun:
@@ -219,6 +465,160 @@ class RemoteRun:
         )
 
 
+class _LibraryAdmin:
+    """Grouped library-management operations, reachable via ``SPLClient.library``."""
+
+    def __init__(self, client: "SPLClient") -> None:
+        self._c = client
+
+    def list(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
+        return self._c.libraries(include_accessible=include_accessible)
+
+    def create(
+        self,
+        slug: str,
+        *,
+        display_name: str | None = None,
+        description: str = "",
+        visibility: str = "private",
+        default_machine: str | None = None,
+        execution: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create a central-server library owned by the connected user."""
+
+        self._c._require_server_connection("creating a library")
+        payload: dict[str, Any] = {
+            "slug": slug,
+            "display_name": display_name or slug,
+            "description": description,
+            "visibility": visibility,
+        }
+        if default_machine is not None:
+            payload["default_machine_id"] = default_machine
+        if execution is not None:
+            payload["execution"] = execution
+        return self._c._daemon.create_server_library(payload)
+
+    def get(self, ref: str) -> dict[str, Any]:
+        """Return one central-server library by slug or id."""
+
+        self._c._require_server_connection("reading a library")
+        return self._c._daemon.get_server_library(ref)
+
+    def update(
+        self,
+        ref: str,
+        *,
+        display_name: str | None = None,
+        description: str | None = None,
+        visibility: str | None = None,
+        default_machine: str | None = None,
+        execution: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Update mutable metadata for one central-server library."""
+
+        self._c._require_server_connection("updating a library")
+        payload: dict[str, Any] = {}
+        if display_name is not None:
+            payload["display_name"] = display_name
+        if description is not None:
+            payload["description"] = description
+        if visibility is not None:
+            payload["visibility"] = visibility
+        if default_machine is not None:
+            payload["default_machine_id"] = default_machine
+        if execution is not None:
+            payload["execution"] = execution
+        return self._c._daemon.update_server_library(ref, payload)
+
+    def delete(self, ref: str) -> dict[str, Any]:
+        """Delete or archive one central-server library when supported upstream."""
+
+        self._c._require_server_connection("deleting a library")
+        return self._c._daemon.delete_server_library(ref)
+
+    def grant(
+        self,
+        ref: str,
+        grantee: str,
+        *,
+        grantee_type: str = "user",
+        scopes: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Grant a user or team access to one central-server library."""
+
+        self._c._require_server_connection("granting library access")
+        payload: dict[str, Any] = {
+            "grantee_id": grantee,
+            "grantee_type": grantee_type,
+        }
+        if scopes is not None:
+            payload["scopes"] = scopes
+        return self._c._daemon.grant_server_library(ref, payload)
+
+    def revoke(self, ref: str, grantee: str) -> dict[str, Any]:
+        """Revoke a grantee's access to one central-server library."""
+
+        self._c._require_server_connection("revoking library access")
+        return self._c._daemon.revoke_server_library_grant(ref, grantee)
+
+    def add_reference(
+        self,
+        into_library: str,
+        name: str,
+        *,
+        owner: str | None = None,
+        from_library: str = "default",
+        version: str | int | None = "latest",
+        alias: str | None = None,
+    ) -> dict[str, Any]:
+        """Add a live reference entry from another library into ``into_library``."""
+
+        self._c._require_server_connection("adding a library reference")
+        payload: dict[str, Any] = {
+            "name": name,
+            "from_library": from_library,
+        }
+        if owner is not None:
+            payload["from_owner"] = owner
+        if version is not None:
+            payload["version"] = version
+        if alias is not None:
+            payload["alias"] = alias
+        return self._c._daemon.add_server_library_reference(into_library, payload)
+
+    def copy_object(
+        self,
+        name: str,
+        *,
+        into_library: str,
+        from_owner: str | None = None,
+        from_library: str = "default",
+        version: str | int | None = "latest",
+        new_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Copy an object snapshot into a library owned by the connected user."""
+
+        self._c._require_server_connection("copying an object into a library")
+        payload: dict[str, Any] = {
+            "name": name,
+            "from_library": from_library,
+        }
+        if from_owner is not None:
+            payload["from_owner"] = from_owner
+        if version is not None:
+            payload["version"] = version
+        if new_name is not None:
+            payload["new_name"] = new_name
+        return self._c._daemon.copy_server_library_object(into_library, payload)
+
+    def remove_entry(self, library: str, name: str) -> dict[str, Any]:
+        """Remove an owned object or reference entry from a central-server library."""
+
+        self._c._require_server_connection("removing a library entry")
+        return self._c._daemon.remove_server_library_entry(library, name)
+
+
 class SPLClient:
     """High-level client used by SPL users to interact with the local daemon."""
 
@@ -246,6 +646,7 @@ class SPLClient:
             api_token=api_token,
         )
         self.server_connection: dict[str, Any] | None = None
+        self._user_token: str | None = None
         if machine_token is not None or user_token is not None:
             if not machine_token or not user_token:
                 raise ValueError("machine_token and user_token must be provided together")
@@ -281,7 +682,7 @@ class SPLClient:
         local and never contacts the central server.
         """
 
-        self.server_connection = self._daemon.connect_server(
+        connection = self._daemon.connect_server(
             machine_token=machine_token,
             user_token=user_token,
             server_url=server_url,
@@ -290,29 +691,67 @@ class SPLClient:
             capabilities=capabilities,
             heartbeat_interval_seconds=heartbeat_interval_seconds,
         )
+        self._user_token = user_token
+        self.server_connection = connection
         return self.server_connection
 
     def disconnect_server(self) -> dict[str, Any]:
         """Gracefully disconnect the local daemon from the central server."""
 
         response = self._daemon.disconnect_server()
+        self._user_token = None
         self.server_connection = None
         return response
+
+    @property
+    def server(self) -> SPLServerClient:
+        """Advanced direct central-server client for callers with a user token."""
+
+        if self._user_token is None:
+            raise RuntimeError(
+                "SPLClient.server requires a user token supplied to "
+                "SPLClient(..., user_token=...) or connect_server(...)."
+            )
+        conn = self.current_server_connection()
+        connection = conn.get("connection")
+        nested_url = (
+            connection.get("server_url")
+            if isinstance(connection, dict)
+            else None
+        )
+        server_url = conn.get("server_url") or nested_url or DEFAULT_SERVER_URL
+        return SPLServerClient(token=self._user_token, base_url=server_url)
+
+    @property
+    def library(self) -> _LibraryAdmin:
+        """Grouped library administration (create/grant/reference/copy/...)."""
+
+        return _LibraryAdmin(self)
 
     def current_server_connection(self) -> dict[str, Any]:
         """Return local daemon state for the central-server connection."""
 
-        return self._daemon.server_connection()
+        try:
+            state = self._daemon.server_connection()
+        except Exception as exc:
+            if _is_missing_server_connection(exc):
+                return {"connected": False, "offline": False, "connection": None}
+            raise
+        state.setdefault("connected", bool(state.get("server_url")))
+        return state
 
     def machines(self) -> dict[str, Any]:
-        """Return user's machines and mark the current local daemon machine."""
+        """Return the user's machines, or an empty listing when not connected."""
 
+        if not self._has_server_connection():
+            return {"current_machine_id": None, "machines": []}
         return self._daemon.server_machines()
 
     def libraries(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
-        """Return libraries visible to the connected central-server user."""
+        """Return visible libraries, or an empty list when not connected."""
 
-        self._require_server_connection("listing server libraries")
+        if not self._has_server_connection():
+            return []
         return self._daemon.server_libraries(include_accessible=include_accessible)
 
     def create_library(
@@ -325,26 +764,23 @@ class SPLClient:
         default_machine: str | None = None,
         execution: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Create a central-server library owned by the connected user."""
+        """Deprecated alias of :meth:`library.create` (see docs/migration-0.2.0.md)."""
 
-        self._require_server_connection("creating a library")
-        payload: dict[str, Any] = {
-            "slug": slug,
-            "display_name": display_name or slug,
-            "description": description,
-            "visibility": visibility,
-        }
-        if default_machine is not None:
-            payload["default_machine_id"] = default_machine
-        if execution is not None:
-            payload["execution"] = execution
-        return self._daemon.create_server_library(payload)
+        _warn_deprecated("SPLClient.create_library()", "SPLClient.library.create()")
+        return self.library.create(
+            slug,
+            display_name=display_name,
+            description=description,
+            visibility=visibility,
+            default_machine=default_machine,
+            execution=execution,
+        )
 
     def get_library(self, ref: str) -> dict[str, Any]:
-        """Return one central-server library by slug or id."""
+        """Deprecated alias of :meth:`library.get`."""
 
-        self._require_server_connection("reading a library")
-        return self._daemon.get_server_library(ref)
+        _warn_deprecated("SPLClient.get_library()", "SPLClient.library.get()")
+        return self.library.get(ref)
 
     def update_library(
         self,
@@ -356,27 +792,23 @@ class SPLClient:
         default_machine: str | None = None,
         execution: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Update mutable metadata for one central-server library."""
+        """Deprecated alias of :meth:`library.update`."""
 
-        self._require_server_connection("updating a library")
-        payload: dict[str, Any] = {}
-        if display_name is not None:
-            payload["display_name"] = display_name
-        if description is not None:
-            payload["description"] = description
-        if visibility is not None:
-            payload["visibility"] = visibility
-        if default_machine is not None:
-            payload["default_machine_id"] = default_machine
-        if execution is not None:
-            payload["execution"] = execution
-        return self._daemon.update_server_library(ref, payload)
+        _warn_deprecated("SPLClient.update_library()", "SPLClient.library.update()")
+        return self.library.update(
+            ref,
+            display_name=display_name,
+            description=description,
+            visibility=visibility,
+            default_machine=default_machine,
+            execution=execution,
+        )
 
     def delete_library(self, ref: str) -> dict[str, Any]:
-        """Delete or archive one central-server library when supported upstream."""
+        """Deprecated alias of :meth:`library.delete`."""
 
-        self._require_server_connection("deleting a library")
-        return self._daemon.delete_server_library(ref)
+        _warn_deprecated("SPLClient.delete_library()", "SPLClient.library.delete()")
+        return self.library.delete(ref)
 
     def grant_library(
         self,
@@ -386,22 +818,23 @@ class SPLClient:
         grantee_type: str = "user",
         scopes: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Grant a user or team access to one central-server library."""
+        """Deprecated alias of :meth:`library.grant`."""
 
-        self._require_server_connection("granting library access")
-        payload: dict[str, Any] = {
-            "grantee_id": grantee,
-            "grantee_type": grantee_type,
-        }
-        if scopes is not None:
-            payload["scopes"] = scopes
-        return self._daemon.grant_server_library(ref, payload)
+        _warn_deprecated("SPLClient.grant_library()", "SPLClient.library.grant()")
+        return self.library.grant(
+            ref,
+            grantee,
+            grantee_type=grantee_type,
+            scopes=scopes,
+        )
 
     def revoke_library_grant(self, ref: str, grantee: str) -> dict[str, Any]:
-        """Revoke a grantee's access to one central-server library."""
+        """Deprecated alias of :meth:`library.revoke`."""
 
-        self._require_server_connection("revoking library access")
-        return self._daemon.revoke_server_library_grant(ref, grantee)
+        _warn_deprecated(
+            "SPLClient.revoke_library_grant()", "SPLClient.library.revoke()",
+        )
+        return self.library.revoke(ref, grantee)
 
     def add_reference(
         self,
@@ -413,20 +846,19 @@ class SPLClient:
         version: str | int | None = "latest",
         alias: str | None = None,
     ) -> dict[str, Any]:
-        """Add a live reference entry from another library into ``into_library``."""
+        """Deprecated alias of :meth:`library.add_reference`."""
 
-        self._require_server_connection("adding a library reference")
-        payload: dict[str, Any] = {
-            "name": name,
-            "from_library": from_library,
-        }
-        if owner is not None:
-            payload["from_owner"] = owner
-        if version is not None:
-            payload["version"] = version
-        if alias is not None:
-            payload["alias"] = alias
-        return self._daemon.add_server_library_reference(into_library, payload)
+        _warn_deprecated(
+            "SPLClient.add_reference()", "SPLClient.library.add_reference()",
+        )
+        return self.library.add_reference(
+            into_library,
+            name,
+            owner=owner,
+            from_library=from_library,
+            version=version,
+            alias=alias,
+        )
 
     def copy_object(
         self,
@@ -438,26 +870,23 @@ class SPLClient:
         version: str | int | None = "latest",
         new_name: str | None = None,
     ) -> dict[str, Any]:
-        """Copy an object snapshot into a library owned by the connected user."""
+        """Deprecated alias of :meth:`library.copy_object`."""
 
-        self._require_server_connection("copying an object into a library")
-        payload: dict[str, Any] = {
-            "name": name,
-            "from_library": from_library,
-        }
-        if from_owner is not None:
-            payload["from_owner"] = from_owner
-        if version is not None:
-            payload["version"] = version
-        if new_name is not None:
-            payload["new_name"] = new_name
-        return self._daemon.copy_server_library_object(into_library, payload)
+        _warn_deprecated("SPLClient.copy_object()", "SPLClient.library.copy_object()")
+        return self.library.copy_object(
+            name,
+            into_library=into_library,
+            from_owner=from_owner,
+            from_library=from_library,
+            version=version,
+            new_name=new_name,
+        )
 
     def remove_entry(self, library: str, name: str) -> dict[str, Any]:
-        """Remove an owned object or reference entry from a central-server library."""
+        """Deprecated alias of :meth:`library.remove_entry`."""
 
-        self._require_server_connection("removing a library entry")
-        return self._daemon.remove_server_library_entry(library, name)
+        _warn_deprecated("SPLClient.remove_entry()", "SPLClient.library.remove_entry()")
+        return self.library.remove_entry(library, name)
 
     def register_env(self, name: str = "default", python: str | None = None) -> dict[str, Any]:
         """Register a Python executable as a daemon environment.
@@ -591,9 +1020,10 @@ class SPLClient:
         )
 
     def local_objects(self, *, compact: bool = False) -> list[dict[str, Any]]:
-        """Return local daemon objects as a stable list."""
+        """Deprecated alias of :meth:`objects` with ``scope='local'``."""
 
-        return self._object_records(self._daemon.list_objects(compact=compact))
+        _warn_deprecated("SPLClient.local_objects()", "SPLClient.objects(scope='local')")
+        return self._object_records(self.objects(scope="local", compact=compact))
 
     def server_objects(
         self,
@@ -602,12 +1032,18 @@ class SPLClient:
         library: str | None = None,
         compact: bool = False,
     ) -> list[dict[str, Any]]:
-        """Return server catalog objects as a stable list."""
+        """Deprecated alias of :meth:`objects` with ``scope='server'``."""
 
-        return self._daemon.server_objects(
-            owner_id=owner,
-            library=library,
-            compact=compact,
+        _warn_deprecated(
+            "SPLClient.server_objects()", "SPLClient.objects(scope='server')",
+        )
+        return list(
+            self.objects(
+                scope="server",
+                owner=owner,
+                library=library,
+                compact=compact,
+            )
         )
 
     @staticmethod
@@ -627,7 +1063,7 @@ class SPLClient:
         scope: Literal["local"],
         owner: None = None,
         library: None = None,
-    ) -> dict[str, Any]: ...
+    ) -> ObjectTable: ...
 
     @overload
     def objects(
@@ -637,7 +1073,7 @@ class SPLClient:
         scope: Literal["server"],
         owner: str | None = None,
         library: str | None = None,
-    ) -> list[dict[str, Any]]: ...
+    ) -> ObjectList: ...
 
     @overload
     def objects(
@@ -647,7 +1083,7 @@ class SPLClient:
         scope: Literal["all"],
         owner: str | None = None,
         library: str | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> ObjectCatalog: ...
 
     @overload
     def objects(
@@ -657,7 +1093,7 @@ class SPLClient:
         scope: Literal["auto"] = "auto",
         owner: str | None = None,
         library: str | None = None,
-    ) -> dict[str, Any] | list[dict[str, Any]]: ...
+    ) -> ObjectTable | ObjectList: ...
 
     def objects(
         self,
@@ -666,8 +1102,13 @@ class SPLClient:
         scope: ObjectScope = "auto",
         owner: str | None = None,
         library: str | None = None,
-    ) -> dict[str, Any] | list[dict[str, Any]]:
-        """Return objects from the local cache, server catalog, or both."""
+    ) -> ObjectTable | ObjectList | ObjectCatalog:
+        """Return objects from the local cache, server catalog, or both.
+
+        The returned views subclass ``dict``/``list``, so indexing, iteration,
+        and ``json.dumps`` keep working; they only add a compact ``repr`` and a
+        ``.raw`` property with the plain payload.
+        """
 
         if scope == "auto":
             scope = (
@@ -678,22 +1119,34 @@ class SPLClient:
         if scope == "local":
             if owner is not None or library is not None:
                 raise ValueError("owner/library require scope='server', scope='all', or scope='auto'")
-            return self._daemon.list_objects(compact=compact)
+            return _wrap_objects(self._daemon.list_objects(compact=compact))
         if scope == "server":
-            return self._daemon.server_objects(
-                owner_id=owner,
-                library=library,
-                compact=compact,
-            )
-        if scope == "all":
-            return {
-                "local": self._daemon.list_objects(compact=compact),
-                "server": self._daemon.server_objects(
+            if owner is None and library is None and not self._has_server_connection():
+                return ObjectList([])
+            return _wrap_objects(
+                self._daemon.server_objects(
                     owner_id=owner,
                     library=library,
                     compact=compact,
-                ),
-            }
+                )
+            )
+        if scope == "all":
+            local_objects = self._daemon.list_objects(compact=compact)
+            server_objects = (
+                []
+                if owner is None and library is None and not self._has_server_connection()
+                else self._daemon.server_objects(
+                    owner_id=owner,
+                    library=library,
+                    compact=compact,
+                )
+            )
+            return ObjectCatalog(
+                {
+                    "local": local_objects,
+                    "server": server_objects,
+                }
+            )
         raise ValueError("scope must be 'auto', 'local', 'server', or 'all'")
 
     def forget(
@@ -750,8 +1203,10 @@ class SPLClient:
             return bool(self.server_connection.get("connected"))
         try:
             state = self._daemon.server_connection()
-        except Exception:
-            return False
+        except Exception as exc:
+            if _is_missing_server_connection(exc):
+                return False
+            raise
         if bool(state.get("connected")):
             return True
         connection = state.get("connection") or state.get("remote_connection") or {}
@@ -1068,7 +1523,7 @@ class SPLClient:
 
         return self._daemon.list_runs()
 
-    def start(
+    def _start_run(
         self,
         name: str,
         *,
@@ -1083,12 +1538,7 @@ class SPLClient:
         function: str | None = None,
         source: RunSource = "auto",
     ) -> RemoteRun:
-        """Start a run and return a handle immediately.
-
-        The default path is local daemon execution.  Passing ``target_machine``,
-        ``owner``, or ``library`` intentionally selects central-server remote
-        execution through the connected daemon.
-        """
+        """Shared implementation behind ``submit``/``call`` (and legacy aliases)."""
 
         remote = target_machine is not None or owner is not None or library is not None
         state = self._daemon.run(
@@ -1107,6 +1557,48 @@ class SPLClient:
         )
         return RemoteRun(self, state, server_side=remote)
 
+    def start(self, name: str, **kwargs: Any) -> RemoteRun:
+        """Deprecated alias of :meth:`submit` (same signature and behavior)."""
+
+        _warn_deprecated("SPLClient.start()", "SPLClient.submit()")
+        return self._start_run(name, **kwargs)
+
+    def submit(
+        self,
+        name: str,
+        *,
+        args: list[Any] | None = None,
+        kwargs: dict[str, Any] | None = None,
+        output: str | None = None,
+        timeout_seconds: float | None = None,
+        target_machine: str | None = None,
+        owner: str | None = None,
+        library: str | None = None,
+        offline_policy: OfflinePolicy | None = None,
+        function: str | None = None,
+        source: RunSource = "auto",
+    ) -> RemoteRun:
+        """Canonical async entry point: start a run, return a handle immediately.
+
+        The default path is local daemon execution.  Passing ``target_machine``,
+        ``owner``, or ``library`` intentionally selects central-server remote
+        execution through the connected daemon.
+        """
+
+        return self._start_run(
+            name,
+            args=args,
+            kwargs=kwargs,
+            output=output,
+            timeout_seconds=timeout_seconds,
+            target_machine=target_machine,
+            owner=owner,
+            library=library,
+            offline_policy=offline_policy,
+            function=function,
+            source=source,
+        )
+
     def queue(
         self,
         name: str,
@@ -1121,9 +1613,12 @@ class SPLClient:
         function: str | None = None,
         source: RunSource = "auto",
     ) -> RemoteRun:
-        """Queue a server-side run and return its task handle without waiting."""
+        """Deprecated alias of :meth:`submit` with ``offline_policy='queue'``."""
 
-        return self.start(
+        _warn_deprecated(
+            "SPLClient.queue()", "SPLClient.submit(..., offline_policy='queue')",
+        )
+        return self._start_run(
             name,
             args=args,
             kwargs=kwargs,
@@ -1161,7 +1656,7 @@ class SPLClient:
         ``RemoteResult.mode`` is therefore either ``"local"`` or ``"server"``.
         """
 
-        run = self.start(
+        run = self._start_run(
             name,
             args=args,
             kwargs=kwargs,
@@ -1179,14 +1674,14 @@ class SPLClient:
             timeout_seconds=timeout_seconds,
         )
 
-    def run_node(
+    def _run_node_value(
         self,
         node: Any,
         kwargs: dict[str, Any],
         *,
         timeout_seconds: float | None = None,
     ) -> Any:
-        """Run a ``NodeRemote`` through the local daemon and central server."""
+        """Run a ``NodeRemote`` and return its value (internal; used by Deployment)."""
 
         payload = self._remote_node_payload(node)
         response = self._daemon.run_remote_node(
@@ -1196,6 +1691,25 @@ class SPLClient:
         )
         return response.get("value")
 
+    def run_node(
+        self,
+        node: Any,
+        kwargs: dict[str, Any],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Any:
+        """Deprecated: run a ``NodeRemote`` directly.
+
+        Wire the node into a pipeline instead:
+        ``Deployment(client, lift(node)...).run(...)``.
+        """
+
+        _warn_deprecated(
+            "SPLClient.run_node()",
+            "Deployment(client, pipeline).run(...) with NodeRemote.locate(...)",
+        )
+        return self._run_node_value(node, kwargs, timeout_seconds=timeout_seconds)
+
     def run_node_result(
         self,
         node: Any,
@@ -1203,8 +1717,16 @@ class SPLClient:
         kwargs: dict[str, Any] | None = None,
         timeout_seconds: float | None = None,
     ) -> RemoteResult:
-        """Run a ``NodeRemote`` and return run metadata plus the selected value."""
+        """Deprecated: run a ``NodeRemote`` and return metadata plus the value.
 
+        Wire the node into a pipeline instead:
+        ``Deployment(client, pipeline).run(...)``.
+        """
+
+        _warn_deprecated(
+            "SPLClient.run_node_result()",
+            "Deployment(client, pipeline).run(...) with NodeRemote.locate(...)",
+        )
         payload = self._remote_node_payload(node)
         response = self._daemon.run_remote_node(
             payload,

@@ -1,8 +1,8 @@
 """Compatibility imports for the framework-side local daemon HTTP client."""
 
 from spl.daemon_client import (
-    DAEMON_ENDPOINT_FILENAME,
     DAEMON_API_TOKEN_ENV,
+    DAEMON_ENDPOINT_FILENAME,
     DEFAULT_DAEMON_HOST,
     DEFAULT_DAEMON_PORT,
     DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
@@ -22,8 +22,8 @@ from spl.daemon_client import (
 )
 
 __all__ = [
-    "DAEMON_ENDPOINT_FILENAME",
     "DAEMON_API_TOKEN_ENV",
+    "DAEMON_ENDPOINT_FILENAME",
     "DEFAULT_DAEMON_HOST",
     "DEFAULT_DAEMON_PORT",
     "DEFAULT_HEARTBEAT_INTERVAL_SECONDS",

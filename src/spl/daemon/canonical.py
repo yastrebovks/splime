@@ -17,7 +17,6 @@ from spl.core.entities.node import InputPort, OutputPort
 from spl.core.entities.pipeline import DPipeline
 from spl.core.ir.utils import SPLSafeLoader
 
-
 CANONICAL_OBJECT_FORMAT_VERSION = 1
 _UNORDERED_METADATA_LIST_KEYS = {
     "aliases",

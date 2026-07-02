@@ -396,6 +396,47 @@ def test_signature_can_describe_pipeline_internal_function(tmp_path) -> None:
         store.close()
 
 
+def test_signature_prefers_local_object_over_same_name_server_mirror(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        store.register_env("default", sys.executable)
+        local = store.register_object(
+            "order_pipeline",
+            "demo_pipeline",
+            "default",
+            yaml_text=PIPELINE_WITH_INTERNAL_FUNCTION_YAML,
+        )
+        store.register_object(
+            "order_pipeline",
+            "demo_pipeline",
+            "default",
+            yaml_text=PIPELINE_WITH_INTERNAL_FUNCTION_YAML.replace(
+                "return a + b",
+                "return a - b",
+            ),
+            owner_id="owner-1",
+            library="default",
+            origin="server",
+            remote_owner_id="owner-1",
+            remote_object_id="remote-pipeline-object",
+            remote_version_id="remote-pipeline-version-1",
+            source_object_name="order_pipeline",
+        )
+
+        app = create_app(store)
+        status, body = _json_from_app(app, "/objects/order_pipeline/signature")
+
+        assert status == 200
+        assert body["id"] == local["id"]
+        assert body["origin"] == "local"
+        assert body["name"] == "order_pipeline"
+        assert body["kind"] == "pipeline"
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
 def test_signature_imports_server_object_by_display_name(tmp_path, monkeypatch) -> None:
     class ImportServerClient:
         def __init__(self, *args, **kwargs) -> None:

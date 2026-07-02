@@ -69,7 +69,7 @@ class RouteContext:
                 )
             except RuntimeError as exc:
                 return self.json_response({"error": str(exc)}, HTTPStatus.CONFLICT)
-            except Exception as exc:  # noqa: BLE001 - HTTP boundary must not crash.
+            except Exception as exc:
                 return self.json_response(
                     {"error": repr(exc)},
                     HTTPStatus.INTERNAL_SERVER_ERROR,

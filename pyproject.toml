@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "splime"
-version = "0.1.3"
+version = "0.1.4"
 
 description = "Reuse Python functions across projects without rewriting or redeploying them."
 readme = "README.md"
@@ -106,6 +106,33 @@ line-length = 120
 [tool.ruff.lint]
 select = []
 ignore = []
+
+# Scoped, justified allowances. These silence rules only where the pattern is
+# legitimate for this code (infrastructure/daemon), not project-wide.
+[tool.ruff.lint.per-file-ignores]
+# pkgutil.extend_path runs before the package re-exports its public API,
+# so the public imports intentionally sit below that call.
+"src/spl/__init__.py" = ["E402"]
+# The daemon is infrastructure: it spawns the interpreter/docker to build
+# environments and run workers (S603/S607), opens controlled URLs (S310),
+# binds its serve socket (S104), uses container-local /tmp (S108), builds SQL
+# from fixed non-user identifiers (S608), keeps sentinel/env-name constants
+# (S105), wraps transport errors without chaining (B904), does best-effort
+# cleanup in except blocks (S110/S112), and names one internal control-flow
+# signal (N818).
+"src/spl/daemon/**" = [
+    "S603", "S607", "S310", "S104", "S108", "S608",
+    "S105", "B904", "S110", "S112", "N818",
+]
+# The CLI and daemon bootstrap print to the console on purpose.
+"src/spl/daemon/cli.py" = ["T201"]
+"src/spl/daemon/server.py" = ["T201"]
+# Top-level HTTP clients use urllib against controlled endpoints and wrap
+# transport errors into their own exception types.
+"src/spl/daemon_client.py" = ["S310", "S110", "B904", "S105"]
+"src/spl/server_client.py" = ["S310", "B904"]
+# The notebook pipeline widget embeds long HTML/JS/CSS template lines.
+"src/spl/pipeline_widget.py" = ["E501"]
 
 
 [tool.pytest.ini_options]

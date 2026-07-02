@@ -10,21 +10,16 @@ derived from the database, not the other way around.
 
 from __future__ import annotations
 
-import hashlib
-import importlib.metadata
 import json
 import re
 import shutil
 import sqlite3
-import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import RLock
 from typing import Any, Callable
-from uuid import uuid4
 
 from spl.daemon.secret_store import SecretStore
-
 
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 FUNCTION_REF_SEPARATOR = "::"

@@ -10,7 +10,6 @@ from spl.core.ir.common import DBase
 from spl.core.ir.parse import _branch, ir_parse
 from spl.core.ir.unparse import ir_unparse
 
-
 _HASH_CHUNK_SIZE = 1024 * 1024
 _SHA256_HEX_DIGITS = set('0123456789abcdefABCDEF')
 

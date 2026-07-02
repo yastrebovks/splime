@@ -32,6 +32,29 @@ from spl.daemon.storage_base import (
     write_json,
 )
 
+# Public compatibility surface.  Daemon modules and tests import these helpers
+# from ``spl.daemon.store``.  Keeping every re-export in ``__all__`` marks them
+# as used, so "unused import" autofixes (ruff F401) can never strip them again.
+__all__ = [
+    "DEFAULT_HEARTBEAT_INTERVAL_SECONDS",
+    "DEFAULT_OBJECT_LIBRARY",
+    "DEFAULT_OBJECT_OWNER_ID",
+    "FUNCTION_REF_SEPARATOR",
+    "NAME_PATTERN",
+    "REDACTED_SECRET_VALUE",
+    "RegistryStore",
+    "StorageBase",
+    "iso_after_now",
+    "json_dumps",
+    "json_loads",
+    "normalize_heartbeat_interval",
+    "read_json",
+    "split_object_function_ref",
+    "utc_now",
+    "validate_name",
+    "write_json",
+]
+
 
 class RegistryStore:
     """Compatibility facade over focused daemon registry repositories."""
@@ -242,7 +265,10 @@ class RegistryStore:
         *,
         remote_connection: dict[str, Any],
     ) -> dict[str, Any]:
-        return self.server_connections.record_server_connection_heartbeat(connection_id, remote_connection=remote_connection)
+        return self.server_connections.record_server_connection_heartbeat(
+            connection_id,
+            remote_connection=remote_connection,
+        )
 
     def record_server_connection_library_snapshot(
         self,
@@ -250,7 +276,10 @@ class RegistryStore:
         *,
         snapshot_hash: str,
     ) -> dict[str, Any]:
-        return self.server_connections.record_server_connection_library_snapshot(connection_id, snapshot_hash=snapshot_hash)
+        return self.server_connections.record_server_connection_library_snapshot(
+            connection_id,
+            snapshot_hash=snapshot_hash,
+        )
 
     def record_server_connection_error(
         self,
@@ -271,7 +300,10 @@ class RegistryStore:
         *,
         remote_connection: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self.server_connections.mark_server_connection_disconnected(connection_id, remote_connection=remote_connection)
+        return self.server_connections.mark_server_connection_disconnected(
+            connection_id,
+            remote_connection=remote_connection,
+        )
 
     def enqueue_sync_event(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         return self.sync_events.enqueue_sync_event(kind, payload)

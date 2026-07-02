@@ -111,7 +111,7 @@ class HeartbeatService:
                 )
                 if status == "stale":
                     return
-            except Exception as exc:  # noqa: BLE001 - heartbeat must not kill daemon.
+            except Exception as exc:
                 self.store.record_server_connection_error(
                     connection_id,
                     status="heartbeat_failed",

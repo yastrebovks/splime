@@ -1,8 +1,8 @@
-"""Small HTTP client for the local SPL daemon.
+"""Advanced/internal HTTP client for the local SPL daemon.
 
-The client intentionally mirrors the daemon's minimal API.  It uses only the
-standard library so any local Python environment can talk to the daemon without
-installing extra web client packages.
+Most user code should go through ``SPLClient``.  This client intentionally
+mirrors the daemon's minimal API for advanced integrations and internal
+plumbing, while still using only the standard library.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from typing import Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
-
 
 DEFAULT_DAEMON_HOST = "127.0.0.1"
 DEFAULT_DAEMON_PORT = 8765
@@ -201,7 +200,7 @@ class ClientError(RuntimeError):
 
 
 class Client:
-    """Convenience wrapper around the local daemon HTTP API."""
+    """Advanced/internal wrapper around the local daemon HTTP API."""
 
     def __init__(
         self,

@@ -81,6 +81,36 @@ class NodeRemote(Node):
         object.__setattr__(self, 'library', library)
         object.__setattr__(self, 'target_machine', target_machine)
 
+    @classmethod
+    def locate(
+            cls,
+            *,
+            name: str | None = None,
+            pipeline: str | None = None,
+            function: str | None = None,
+            url: str | None = None,
+            version: str = "latest",
+            owner: str | None = None,
+            library: str | None = None,
+            target_machine: str | None = None) -> "NodeRemote":
+        """The single documented way to reference a remote object.
+
+        Pass either ``name`` (optionally with ``function``) or
+        ``pipeline`` + ``function``.  ``owner``/``library`` select another
+        user's namespace, mirroring ``SPLClient.call``.  All ``__init__``
+        forms keep working; ``locate`` is the canonical spelling.
+        """
+
+        return cls(
+            name = name,
+            pipeline = pipeline,
+            function = function,
+            url = url,
+            version = version,
+            owner = owner,
+            library = library,
+            target_machine = target_machine)
+
     def __repr__(self):
         return '<{}/{}:{}>'.format(self.url, self.name, self.version)
 

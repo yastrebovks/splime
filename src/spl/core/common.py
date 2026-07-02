@@ -9,7 +9,7 @@ from itertools import groupby
 from operator import itemgetter
 from pathlib import Path
 from types import FunctionType
-from typing import Any
+from typing import Any, overload
 
 from spl.core.entities.adapter import Adapter
 from spl.core.entities.artifact import ArtifactRef, compute_sha256
@@ -195,8 +195,18 @@ class Deployment:
     def teardown(self):
         pass
 
-    def run(self, **kwargs):
-        return Run(self._callback, self._pipeline, **kwargs)
+    @overload
+    def run(self, *, output: None = None, **kwargs: Any) -> 'Run': ...
+
+    @overload
+    def run(self, *, output: str, **kwargs: Any) -> Any: ...
+
+    def run(self, *, output: str | None = None, **kwargs: Any) -> Any:
+        run = Run(self._callback, self._pipeline, **kwargs)
+        if output is None:
+            return run
+        with run:
+            return run.value(output)
 
     def _callback(self, node, kwargs):
         final_kwargs = {port.name: v for port, v in kwargs.items()}
@@ -208,7 +218,10 @@ class Deployment:
             case NodeRemote():
                 if self._client is None:
                     raise RuntimeError('remote node execution requires a client')
-                return {output_port.name: self._client.run_node(node, final_kwargs)}
+                # The private entry point keeps this canonical pipeline path
+                # silent; the public ``run_node`` carries a DeprecationWarning.
+                run_node = getattr(self._client, '_run_node_value', None) or self._client.run_node
+                return {output_port.name: run_node(node, final_kwargs)}
 
             case _:
                 raise ValueError(node)
@@ -348,3 +361,15 @@ class Run:
         except BaseException:
             self.close()
             raise
+
+    def value(self, alias: str | None = None, port: str = DEFAULT_PORT) -> Any:
+        """Return one output value directly, without ``[node][port]`` indexing."""
+
+        return self[self._resolve_alias_node(alias)][port]
+
+    def _resolve_alias_node(self, alias: str | None) -> Node:
+        if alias is not None:
+            return self._pipeline.aliases[alias]
+        if len(self._pipeline.nodes) == 1:
+            return next(iter(self._pipeline.nodes))
+        raise ValueError("Run.value() requires alias=... for multi-node pipelines")

@@ -1,9 +1,8 @@
-"""Direct client for the central SPL daemon server.
+"""Advanced/internal direct client for the central SPL daemon server.
 
-This client is intentionally separate from ``SPLClient``.  ``SPLClient`` talks
-to the local daemon first; ``SPLServerClient`` talks to the central server
-directly with one bearer token, which is useful for external execution tokens
-and small service integrations.
+Most user code should go through ``SPLClient``.  ``SPLServerClient`` talks to
+the central server directly with one bearer token for advanced integrations,
+external execution tokens, and internal plumbing.
 """
 
 from __future__ import annotations
@@ -16,7 +15,6 @@ from typing import Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
-
 
 DEFAULT_SERVER_URL = "https://splime.io/api"
 TERMINAL_REMOTE_RUN_STATUSES = {"succeeded", "failed", "cancelled", "stale"}
@@ -162,7 +160,7 @@ class ServerRemoteRun:
 
 
 class SPLServerClient:
-    """Small stdlib HTTP client for the central SPL daemon server."""
+    """Advanced direct stdlib HTTP client for the central SPL daemon server."""
 
     def __init__(
         self,

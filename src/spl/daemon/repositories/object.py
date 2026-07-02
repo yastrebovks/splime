@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.metadata
 import sqlite3
-import subprocess
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
@@ -15,19 +13,13 @@ from spl.daemon.runtime_config import normalize_runtime_config
 from spl.daemon.storage_base import (
     DEFAULT_OBJECT_LIBRARY,
     DEFAULT_OBJECT_OWNER_ID,
-    REDACTED_SECRET_VALUE,
     RepositoryBase,
-    iso_after_now,
     json_dumps,
     json_loads,
-    normalize_heartbeat_interval,
     read_json,
-    split_object_function_ref,
     utc_now,
     validate_name,
-    write_json,
 )
-
 
 
 class ObjectRepository(RepositoryBase):
@@ -364,7 +356,12 @@ class ObjectRepository(RepositoryBase):
         # A YAML cache keeps older clients that display ``yaml_path`` useful.
         # The database remains the source of truth: workers materialize YAML from
         # SQLite into each run directory before executing.
-        yaml_cache_path = self._object_yaml_cache_path(name, next_version)
+        yaml_cache_path = self._object_yaml_cache_path(
+            object_row["owner_id"] if object_row is not None else owner_id,
+            object_row["library"] if object_row is not None else library,
+            object_row["name"] if object_row is not None else name,
+            next_version,
+        )
         yaml_cache_path.parent.mkdir(parents=True, exist_ok=True)
         yaml_cache_path.write_text(yaml_text, encoding="utf-8")
 
@@ -1094,8 +1091,26 @@ class ObjectRepository(RepositoryBase):
                 owner_id=owner_id,
                 library=library,
             )
+            same_name_libraries: list[str] = []
+            if not rows and library is None:
+                same_name_libraries = sorted(
+                    {
+                        str(item["library"])
+                        for item in self._object_identity_rows_for_clause_locked(
+                            "owner_id = ? AND name = ?",
+                            (self._caller_owner_id(owner_id), name_or_id),
+                        )
+                    }
+                )
         if not rows:
             suffix = f" version {version}" if version is not None else ""
+            if len(same_name_libraries) > 1:
+                libraries = ", ".join(same_name_libraries)
+                raise KeyError(
+                    f"object is not registered: {name_or_id}{suffix} "
+                    f"(you have {name_or_id!r} in several libraries: {libraries}; "
+                    "pass library=... to choose one)"
+                )
             raise KeyError(f"object is not registered: {name_or_id}{suffix}")
         if len(rows) > 1:
             names = ", ".join(
@@ -1850,7 +1865,12 @@ class ObjectRepository(RepositoryBase):
             "kind": row["kind"],
             "type": row["kind"],
             "yaml_path": str(
-                self._object_yaml_cache_path(row["object_name"], row["version"])
+                self._object_yaml_cache_path(
+                    row["object_owner_id"],
+                    row["object_library"],
+                    row["object_name"],
+                    row["version"],
+                )
             ),
             "yaml_sha256": row["yaml_sha256"],
             "content_hash": row["content_hash"],
@@ -1884,8 +1904,29 @@ class ObjectRepository(RepositoryBase):
             record["yaml"] = row["yaml_text"]
         return record
 
-    def _object_yaml_cache_path(self, name: str, version: int) -> Path:
-        return self.objects_dir / validate_name(name) / "versions" / f"{version}.yaml"
+    def _object_yaml_cache_path(
+        self,
+        owner_id: str,
+        library: str,
+        name: str,
+        version: int,
+    ) -> Path:
+        """Return the display-cache YAML path for one object version.
+
+        The path is namespaced by ``owner/library`` so two same-named objects
+        from different owners or libraries can never overwrite each other's
+        cache file.  The database stays the source of truth; this file only
+        keeps ``yaml_path`` displays useful.
+        """
+
+        return (
+            self.objects_dir
+            / validate_name(owner_id)
+            / validate_name(library)
+            / validate_name(name)
+            / "versions"
+            / f"{version}.yaml"
+        )
 
     def _backfill_object_kinds_locked(self) -> None:
         self._conn.execute(

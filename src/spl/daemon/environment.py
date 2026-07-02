@@ -17,13 +17,20 @@ from typing import Any
 from spl.daemon.environment_base import (
     ABSENT,
     CREATING,
-    DEFAULT_BUILD_TIMEOUT_SECONDS,
-    DEFAULT_STALE_LOCK_SECONDS,
-    FAILED,
     READY,
     BaseEnvironmentManager,
-    EnvironmentBuildError,
     _ExternalBuildReady,
+)
+
+# Compatibility re-exports: ``spl.daemon.server`` and older callers import
+# these names from ``spl.daemon.environment``.  The redundant ``X as X`` alias
+# marks each one as an explicit re-export, so "unused import" autofixes
+# (ruff F401) can never strip them again.
+from spl.daemon.environment_base import (
+    DEFAULT_BUILD_TIMEOUT_SECONDS as DEFAULT_BUILD_TIMEOUT_SECONDS,
+    DEFAULT_STALE_LOCK_SECONDS as DEFAULT_STALE_LOCK_SECONDS,
+    FAILED as FAILED,
+    EnvironmentBuildError as EnvironmentBuildError,
 )
 from spl.daemon.store import utc_now
 

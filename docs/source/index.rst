@@ -6,6 +6,12 @@ reused across projects and executed locally or remotely.
 
 .. toctree::
    :maxdepth: 2
+   :caption: Guides
+
+   cookbook
+
+.. toctree::
+   :maxdepth: 2
    :caption: API Reference
 
    api/modules

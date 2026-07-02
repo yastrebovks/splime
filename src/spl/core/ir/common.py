@@ -30,5 +30,5 @@ def mk_dispatcher() -> Dispatcher:
                 return f(x, *args, **kwargs)
         raise ValueError(x)
 
-    setattr(dispatch, 'register', register)
+    dispatch.register = register
     return cast(Dispatcher, dispatch)

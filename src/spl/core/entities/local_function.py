@@ -58,7 +58,6 @@ from spl.core.ir.common import DBase
 from spl.core.ir.parse import _attach, _branch, ir_parse
 from spl.core.ir.unparse import ir_unparse
 
-
 # --------------------------------------------------------------------------- #
 # DLocalAlias: rebind an aliased local import after the target is inlined.
 #
@@ -215,7 +214,7 @@ def is_inlinable_local_function(x: Any) -> bool:
         if not _module_is_local(module_name):
             return False
         return _function_def(x) is not None
-    except Exception:  # noqa: BLE001 - a predicate must not abort dispatch.
+    except Exception:
         return False
 
 

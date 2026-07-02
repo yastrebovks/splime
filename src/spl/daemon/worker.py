@@ -86,7 +86,6 @@ from urllib.request import Request, urlopen
 
 from spl.daemon.store import validate_name
 
-
 ARTIFACTS_KEY = "__spl_artifacts__"
 RESULT_KEY = "__spl_result__"
 
@@ -394,7 +393,7 @@ def _install_node_remote_hydration(remote_ports: dict[str, dict[str, Any]]) -> N
     from spl.core.entities.node_remote import NodeRemote
 
     if getattr(NodeRemote, "__spl_daemon_hydrated__", False):
-        setattr(NodeRemote, "__spl_daemon_remote_ports__", remote_ports)
+        NodeRemote.__spl_daemon_remote_ports__ = remote_ports
         return
 
     original_init = NodeRemote.__init__
@@ -434,8 +433,8 @@ def _install_node_remote_hydration(remote_ports: dict[str, dict[str, Any]]) -> N
                 if remote.get(attr) is not None:
                     object.__setattr__(self, attr, remote[attr])
 
-    setattr(NodeRemote, "__spl_daemon_hydrated__", True)
-    setattr(NodeRemote, "__spl_daemon_remote_ports__", remote_ports)
+    NodeRemote.__spl_daemon_hydrated__ = True
+    NodeRemote.__spl_daemon_remote_ports__ = remote_ports
     NodeRemote.__init__ = hydrated_init
 
 
