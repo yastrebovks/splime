@@ -697,9 +697,33 @@ class Client:
         library: str | None = None,
         function: str | None = None,
     ) -> dict[str, Any]:
-        """Return a compact call/read signature for one object."""
+        """Return a compact call/read signature for one object.
 
-        if owner_id is not None or library is not None:
+        Scoped lookups (``owner_id``/``library``) resolve against the LOCAL
+        registry first — the caller's own objects in any library work fully
+        offline. Only when the local registry has no match does the daemon ask
+        the central server (cross-owner objects that are not cached yet).
+        """
+
+        path = f"/objects/{quote(name_or_id)}/signature"
+        query = []
+        if version is not None:
+            query.append(f"version={version}")
+        if function is not None:
+            query.append(f"function={quote(function)}")
+        if owner_id is not None:
+            query.append(f"owner_id={quote(owner_id)}")
+        if library is not None:
+            query.append(f"library={quote(library)}")
+        if query:
+            path = f"{path}?{'&'.join(query)}"
+        try:
+            return self._json_request("GET", path)
+        except ClientError as local_error:
+            if owner_id is None and library is None:
+                raise
+            if not str(local_error).startswith("404:"):
+                raise
             ref: dict[str, Any] = {"object_name": name_or_id}
             if owner_id is not None:
                 ref["owner_id"] = owner_id
@@ -709,17 +733,14 @@ class Client:
                 ref["version"] = version
             if function is not None:
                 ref["function"] = function
-            return self.resolve_remote_signature(ref)["signature"]
-
-        path = f"/objects/{quote(name_or_id)}/signature"
-        query = []
-        if version is not None:
-            query.append(f"version={version}")
-        if function is not None:
-            query.append(f"function={quote(function)}")
-        if query:
-            path = f"{path}?{'&'.join(query)}"
-        return self._json_request("GET", path)
+            try:
+                return self.resolve_remote_signature(ref)["signature"]
+            except ClientError as remote_error:
+                # Offline: the local "is not registered" message is the
+                # useful one; "no server connection" would only mislead.
+                if "server connection" in str(remote_error):
+                    raise local_error from None
+                raise
 
     def inputs(
         self,

@@ -67,7 +67,9 @@ def test_publish_receipt_call_output_describe(client: SPLClient) -> None:
         result = client.call(SMOKE_OBJECT, kwargs={"date": "2026-06-08"})
         assert result.mode == "local"
         assert result.output == 42.0
-        assert result.value["default"] == 42.0  # raw port dict stays available
+        # Functions return a plain value; the port dict appears for pipelines
+        # (where .output unwraps it and .value keeps it raw).
+        assert result.value == 42.0
 
         assert SMOKE_OBJECT in client.describe(SMOKE_OBJECT)
     finally:

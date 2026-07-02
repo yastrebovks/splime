@@ -53,7 +53,8 @@ client.publish(daily_total, name="daily_total")
 
 result = client.call("daily_total", kwargs={"date": "2026-06-08"})
 print(result.mode)     # "local"
-print(result.output)   # 42.0  (unwrapped value; result.value keeps the raw port dict)
+print(result.output)   # 42.0  (.output always yields the plain value;
+                       #  for pipelines .value keeps the raw port dict)
 ```
 
 That is the whole loop: define a function, `publish` it as a versioned node, then `call`
