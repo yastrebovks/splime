@@ -125,7 +125,7 @@ pytest
 
 ## Project status
 
-Alpha (`0.1.0`). The API may change between releases. Feedback and issues are welcome at
+Alpha. The API may change between releases. Feedback and issues are welcome at
 the [issue tracker](https://github.com/yastrebovks/splime/issues).
 
 ## Links
