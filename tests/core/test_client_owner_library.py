@@ -4,8 +4,10 @@ from typing import Any
 
 import pytest
 
-import spl.client as spl_client_module
-from spl.client import SPLClient
+# The implementation module is patched directly: monkeypatching the
+# ``spl.client`` shim would not affect lookups inside ``spl._client``.
+import spl._client as spl_client_module
+from spl._client import SPLClient
 from spl.core.entities.node_remote import NodeRemote
 from spl.daemon_client import Client, ClientError
 from spl.server_client import SPLServerClient
@@ -179,12 +181,17 @@ class FakeDaemon:
         *,
         poll_interval: float,
         timeout_seconds: float | None,
+        on_state: Any | None = None,
     ) -> dict[str, Any]:
-        return {
+        state = {
             "id": run_id,
             "status": "succeeded",
             "result": {"result": {"score": 0.91}, "artifacts": {}},
         }
+        if on_state is not None:
+            # Mirror the real client: the callback sees the terminal state.
+            on_state(state)
+        return state
 
     def get_remote_run(self, run_id: str) -> dict[str, Any]:
         return {
@@ -199,8 +206,13 @@ class FakeDaemon:
         *,
         poll_interval: float,
         timeout_seconds: float | None,
+        on_state: Any | None = None,
     ) -> dict[str, Any]:
-        return {"id": run_id, "status": "succeeded"}
+        state = {"id": run_id, "status": "succeeded"}
+        if on_state is not None:
+            # Mirror the real client: the callback sees the terminal state.
+            on_state(state)
+        return state
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         return {"id": run_id, "status": "succeeded"}
@@ -645,24 +657,17 @@ def test_spl_client_objects_auto_uses_local_when_disconnected() -> None:
     assert fake_daemon.server_object_calls == []
 
 
-def test_spl_client_local_objects_returns_stable_list() -> None:
+# ``local_objects()``/``server_objects()`` were removed in 0.2.0 (WP-07b);
+# the removal itself is pinned in ``test_deprecations.py``.  The canonical
+# ``objects(scope=...)`` behavior stays covered here.
+
+
+def test_spl_client_objects_server_scope_returns_stable_list() -> None:
     client = SPLClient(daemon_port=8765)
     fake_daemon = FakeDaemon()
     client._daemon = fake_daemon
 
-    objects = client.local_objects(compact=True)
-
-    assert objects == [{"name": "local_obj", "compact": True}]
-    assert fake_daemon.list_object_calls[-1] == {"compact": True}
-    assert fake_daemon.server_object_calls == []
-
-
-def test_spl_client_server_objects_returns_stable_list() -> None:
-    client = SPLClient(daemon_port=8765)
-    fake_daemon = FakeDaemon()
-    client._daemon = fake_daemon
-
-    objects = client.server_objects(owner="alice", library="risk", compact=True)
+    objects = client.objects(scope="server", owner="alice", library="risk", compact=True)
 
     assert objects == [
         {
@@ -680,33 +685,6 @@ def test_spl_client_server_objects_returns_stable_list() -> None:
     assert fake_daemon.list_object_calls == []
 
 
-def test_spl_client_object_list_aliases_route_through_objects(monkeypatch) -> None:
-    client = SPLClient(daemon_port=8765)
-    calls: list[dict[str, Any]] = []
-
-    def fake_objects(**kwargs: Any) -> dict[str, Any] | list[dict[str, Any]]:
-        calls.append(kwargs)
-        if kwargs["scope"] == "local":
-            return {"local_obj": {"name": "local_obj", "compact": kwargs["compact"]}}
-        return [{"name": "server_obj", "compact": kwargs["compact"]}]
-
-    monkeypatch.setattr(client, "objects", fake_objects)
-
-    assert client.local_objects(compact=True) == [{"name": "local_obj", "compact": True}]
-    assert client.server_objects(owner="alice", library="risk", compact=False) == [
-        {"name": "server_obj", "compact": False}
-    ]
-    assert calls == [
-        {"scope": "local", "compact": True},
-        {
-            "scope": "server",
-            "owner": "alice",
-            "library": "risk",
-            "compact": False,
-        },
-    ]
-
-
 def test_spl_client_library_management_methods_use_daemon() -> None:
     client = SPLClient(daemon_port=8765)
     fake_daemon = FakeDaemon()
@@ -716,7 +694,7 @@ def test_spl_client_library_management_methods_use_daemon() -> None:
     assert client.libraries(include_accessible=False) == [
         {"slug": "risk", "accessible": False}
     ]
-    assert client.create_library(
+    assert client.library.create(
         "risk",
         display_name="Risk",
         description="Models",
@@ -724,8 +702,8 @@ def test_spl_client_library_management_methods_use_daemon() -> None:
         default_machine="gpu-a",
         execution={"mode": "manual"},
     ) == {"slug": "risk", "created": True}
-    assert client.get_library("risk") == {"slug": "risk"}
-    assert client.update_library(
+    assert client.library.get("risk") == {"slug": "risk"}
+    assert client.library.update(
         "risk",
         display_name="Risk Team",
         description="Updated",
@@ -740,7 +718,7 @@ def test_spl_client_library_management_methods_use_daemon() -> None:
         "default_machine_id": "gpu-b",
         "execution": {"mode": "auto"},
     }
-    assert client.grant_library(
+    assert client.library.grant(
         "risk",
         "admin2",
         scopes=["metadata:read"],
@@ -750,12 +728,12 @@ def test_spl_client_library_management_methods_use_daemon() -> None:
         "grantee_type": "user",
         "scopes": ["metadata:read"],
     }
-    assert client.revoke_library_grant("risk", "admin2") == {
+    assert client.library.revoke("risk", "admin2") == {
         "library": "risk",
         "grantee": "admin2",
         "revoked": True,
     }
-    assert client.add_reference(
+    assert client.library.add_reference(
         "risk",
         "source",
         owner="alice",
@@ -772,7 +750,7 @@ def test_spl_client_library_management_methods_use_daemon() -> None:
             "alias": "alice_source",
         },
     }
-    assert client.copy_object(
+    assert client.library.copy_object(
         "source",
         into_library="risk",
         from_owner="alice",
@@ -789,12 +767,12 @@ def test_spl_client_library_management_methods_use_daemon() -> None:
             "new_name": "source_copy",
         },
     }
-    assert client.remove_entry("risk", "source") == {
+    assert client.library.remove_entry("risk", "source") == {
         "library": "risk",
         "name": "source",
         "removed": True,
     }
-    assert client.delete_library("risk") == {"slug": "risk", "deleted": True}
+    assert client.library.delete("risk") == {"slug": "risk", "deleted": True}
 
     assert fake_daemon.library_calls == [
         ("server_libraries", False),
@@ -1001,10 +979,10 @@ def test_spl_client_library_management_requires_server_connection() -> None:
     client._daemon = fake_daemon
 
     with pytest.raises(RuntimeError, match="server-connected SPLClient"):
-        client.create_library("risk")
+        client.library.create("risk")
 
     with pytest.raises(RuntimeError, match="server-connected SPLClient"):
-        client.add_reference("risk", "source")
+        client.library.add_reference("risk", "source")
 
     assert fake_daemon.library_calls == []
 
@@ -1145,7 +1123,12 @@ def test_spl_client_offline_server_helpers_reraise_other_failures() -> None:
         client.machines()
 
 
-def test_spl_client_run_node_uses_daemon_remote_node_bridge() -> None:
+# ``run_node()``/``run_node_result()`` were removed in 0.2.0 (WP-07b); the
+# removal is pinned in ``test_deprecations.py``.  The remote-node bridge that
+# ``Deployment`` uses internally keeps its payload contract covered here.
+
+
+def test_spl_client_remote_node_bridge_payload() -> None:
     client = SPLClient(daemon_port=8765)
     fake_daemon = FakeDaemon()
     client._daemon = fake_daemon
@@ -1157,7 +1140,7 @@ def test_spl_client_run_node_uses_daemon_remote_node_bridge() -> None:
         outputs=[],
     )
 
-    value = client.run_node(node, {"a": 301}, timeout_seconds=12.5)
+    value = client._run_node_value(node, {"a": 301}, timeout_seconds=12.5)
 
     assert value == "Happy"
     assert fake_daemon.remote_node_calls == [
@@ -1172,69 +1155,6 @@ def test_spl_client_run_node_uses_daemon_remote_node_bridge() -> None:
             "timeout_seconds": 12.5,
         }
     ]
-
-
-def test_spl_client_run_node_result_returns_remote_result() -> None:
-    client = SPLClient(daemon_port=8765)
-    fake_daemon = FakeDaemon()
-    client._daemon = fake_daemon
-
-    node = NodeRemote(
-        name="demo_traktorist_pipeline::happiness",
-        version="latest",
-        inputs=[],
-        outputs=[],
-    )
-
-    result = client.run_node_result(
-        node,
-        kwargs={"a": 301},
-        timeout_seconds=12.5,
-    )
-
-    assert result.value == "Happy"
-    assert result.mode == "server"
-    assert result.server_side is True
-    assert result.run == {"id": "remote-run-1", "status": "succeeded"}
-    assert result.artifacts == {"plot": "server-path"}
-    assert fake_daemon.remote_node_calls[-1] == {
-        "node": {
-            "uuid": str(node.uuid),
-            "url": "",
-            "name": "demo_traktorist_pipeline::happiness",
-            "version": "latest",
-        },
-        "kwargs": {"a": 301},
-        "timeout_seconds": 12.5,
-    }
-
-
-def test_spl_client_run_node_result_handles_legacy_daemon_response() -> None:
-    client = SPLClient(daemon_port=8765)
-    fake_daemon = FakeDaemon()
-    client._daemon = fake_daemon
-
-    def legacy_run_remote_node(
-        node: dict[str, Any],
-        *,
-        kwargs: dict[str, Any],
-        timeout_seconds: float | None = None,
-    ) -> dict[str, Any]:
-        return {"value": "Happy"}
-
-    fake_daemon.run_remote_node = legacy_run_remote_node
-    node = NodeRemote(
-        name="demo_traktorist_pipeline::happiness",
-        version="latest",
-        inputs=[],
-        outputs=[],
-    )
-
-    result = client.run_node_result(node)
-
-    assert result.value == "Happy"
-    assert result.run == {"id": None, "status": "succeeded"}
-    assert result.artifacts == {}
 
 
 def test_spl_client_decomposition_accepts_node_remote() -> None:

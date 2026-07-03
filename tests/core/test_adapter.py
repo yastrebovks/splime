@@ -12,7 +12,7 @@ from typing import Any, cast
 import pytest
 import yaml
 
-from spl.core.common import Deployment, lift
+from spl import Deployment, lift
 from spl.core.entities.adapter import Adapter, DAdapter, make_key
 from spl.core.entities.distribution import DDistribution
 from spl.core.entities.node import DFormattedOutputRef, FormattedOutputRef

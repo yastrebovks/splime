@@ -10,8 +10,8 @@ from __future__ import annotations
 import inspect
 
 import spl
-import spl.client
-import spl.core.common
+import spl._client
+import spl.core._common
 import spl.core.entities.node
 
 EXPECTED_ALL = {
@@ -38,9 +38,9 @@ def test_public_all_matches_snapshot() -> None:
 
 
 def test_facade_symbols_are_canonical() -> None:
-    assert spl.lift is spl.core.common.lift
-    assert spl.Deployment is spl.core.common.Deployment
-    assert spl.SPLClient is spl.client.SPLClient
+    assert spl.lift is spl.core._common.lift
+    assert spl.Deployment is spl.core._common.Deployment
+    assert spl.SPLClient is spl._client.SPLClient
     assert spl.DEFAULT_PORT == spl.core.entities.node.DEFAULT_PORT == "default"
 
 

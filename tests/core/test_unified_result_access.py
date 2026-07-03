@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
 
-from spl.client import RemoteResult, SPLClient
-from spl.core.common import Deployment, lift
+from spl import Deployment, RemoteResult, SPLClient, lift
 from spl.core.entities.function import METADATA_DUNDER_NAME, DFunction
 from spl.core.entities.node import DEFAULT_PORT, InputPort, OutputPort
 
@@ -60,8 +59,13 @@ class _CallDaemon:
         *,
         poll_interval: float,
         timeout_seconds: float | None,
+        on_state: Any | None = None,
     ) -> dict[str, Any]:
-        return {"id": run_id, "status": "succeeded"}
+        state = {"id": run_id, "status": "succeeded"}
+        if on_state is not None:
+            # Mirror the real client: the callback sees the terminal state.
+            on_state(state)
+        return state
 
     def result(self, run_id: str) -> dict[str, Any]:
         return {"result": self._result, "artifacts": {}}

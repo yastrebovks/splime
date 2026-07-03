@@ -908,7 +908,9 @@ def test_connect_reconcile_links_existing_server_object_without_fork(tmp_path) -
             owner_id=None,
             library=None,
         ):
-            assert include_yaml is True
+            # Stage 1.4: reconcile lists version metadata WITHOUT bodies;
+            # YAML is fetched lazily per missing version.
+            assert include_yaml is False
             return [
                 {
                     "id": "remote-object-1",

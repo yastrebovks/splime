@@ -2,9 +2,9 @@ from __future__ import annotations
 
 __path__ = __import__("pkgutil").extend_path(__path__, __name__)
 
-from spl.client import PublishedObject, RemoteResult, RemoteRun, SPLClient
+from spl._client import PublishedObject, RemoteResult, RemoteRun, SPLClient
 from spl.core import spl_export_to_dir, spl_export_to_file, spl_import_from_file
-from spl.core.common import Deployment, lift
+from spl.core._common import Deployment, lift
 from spl.core.entities.distribution import DDistribution
 from spl.core.entities.node import DEFAULT_PORT, InputPort, OutputPort
 from spl.core.entities.node_remote import NodeRemote

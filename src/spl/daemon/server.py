@@ -486,6 +486,7 @@ class DaemonRuntime:
             "description": version.get("description") or "",
             "version_label": version.get("version_label"),
             "yaml": version["yaml"],
+            "content_hash": version.get("content_hash") or version["yaml_sha256"],
             "metadata": version.get("metadata") or {},
             "distributions": version.get("distributions") or [],
             "runtime_config": version.get("runtime_config") or {"mode": "venv"},
@@ -582,13 +583,16 @@ class DaemonRuntime:
             remote_object_id=remote_object_id,
             source_object_name=remote_current.get("name") or name,
         )
+        # One metadata-only request: version numbers + content_hash suffice for
+        # linking and conflict detection; YAML bodies are fetched lazily and
+        # only for versions that actually need importing.
         remote_versions = server.list_object_versions(
             name,
-            include_yaml=True,
+            include_yaml=False,
             owner_id=owner_id,
             library=library,
         )
-        if not remote_versions and remote_current.get("yaml"):
+        if not remote_versions:
             remote_versions = [remote_current]
         self._ensure_server_object_envs(remote_versions)
 
@@ -620,6 +624,19 @@ class DaemonRuntime:
         ):
             remote_hash = remote_version.get("content_hash")
             remote_number = int(remote_version.get("version") or 0)
+            remote_version_id = remote_version.get("version_id")
+            if remote_version_id:
+                already_imported = self.store.get_object_by_remote_version(
+                    remote_version_id,
+                    include_yaml=False,
+                )
+                if already_imported is not None:
+                    # Steady state: the version is linked locally already —
+                    # no conflict is possible and no YAML round-trip happens.
+                    report["imported_versions"].append(
+                        already_imported["version_id"]
+                    )
+                    continue
             local_at_version = local_by_version.get(remote_number)
             if (
                 remote_hash
@@ -652,6 +669,7 @@ class DaemonRuntime:
                 owner_id=owner_id,
                 library=library,
                 remote_object_id=remote_object_id,
+                server=server,
             )
             report["imported_versions"].append(imported["version_id"])
 
@@ -680,6 +698,7 @@ class DaemonRuntime:
         owner_id: str,
         library: str,
         remote_object_id: str | None,
+        server: ServerClientProtocol | None = None,
     ) -> dict[str, Any]:
         yaml_text = remote_version.get("yaml")
         if not yaml_text:
@@ -689,6 +708,23 @@ class DaemonRuntime:
             )
             if existing is not None:
                 return existing
+            if server is not None:
+                # Lazy body fetch: only versions that are genuinely new to
+                # this daemon cost a YAML round-trip.
+                remote_number = remote_version.get("version")
+                fetched = server.get_object(
+                    remote_version["name"],
+                    version=(
+                        int(remote_number) if remote_number is not None else None
+                    ),
+                    include_yaml=True,
+                    owner_id=owner_id,
+                    library=library,
+                )
+                if fetched:
+                    remote_version = {**remote_version, **fetched}
+                    yaml_text = remote_version.get("yaml")
+        if not yaml_text:
             raise RuntimeError(
                 "server did not return YAML for object version "
                 f"{remote_version.get('version_id')}"
@@ -1084,7 +1120,9 @@ class DaemonRuntime:
         if version is None:
             return None
         version_text = str(version)
-        if version_text in {"", "latest", "current", "TODO"}:
+        # 0.2.0 dropped the legacy 'TODO' placeholder from this alias set
+        # (docs/migration-0.2.0.md); only real aliases stay recognized.
+        if version_text in {"", "latest", "current"}:
             return None
         try:
             return int(version_text)

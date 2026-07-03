@@ -5,9 +5,9 @@ import stat
 
 import pytest
 
-import spl.client as spl_client_module
+import spl._client as spl_client_module
 import spl.daemon.repositories.env as env_repository
-from spl.client import SPLClient
+from spl import SPLClient
 import spl.daemon.server as daemon_server
 from spl.daemon.client import Client as CompatibilityClient
 from spl.daemon_client import (

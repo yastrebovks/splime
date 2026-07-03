@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from spl.client import ObjectCatalog, ObjectList, ObjectTable, PublishedObject
+from spl._client import ObjectCatalog, ObjectList, ObjectTable, PublishedObject
 
 _BIG_RAW = {
     "name": "daily_total",

@@ -13,11 +13,12 @@ Subpackages
 Submodules
 ----------
 
-spl.core.common module
-----------------------
+spl.core.\_common module
+------------------------
 
-.. automodule:: spl.core.common
+.. automodule:: spl.core._common
    :members:
+   :private-members:
    :show-inheritance:
    :undoc-members:
 
@@ -26,5 +27,6 @@ Module contents
 
 .. automodule:: spl.core
    :members:
+   :private-members:
    :show-inheritance:
    :undoc-members:

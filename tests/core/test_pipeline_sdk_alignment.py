@@ -6,8 +6,7 @@ import pytest
 import yaml
 
 import spl.daemon_client as daemon_client
-from spl.client import SPLClient
-from spl.core.common import Deployment, lift
+from spl import Deployment, SPLClient, lift
 from spl.core.entities.function import DFunction, METADATA_DUNDER_NAME
 from spl.core.entities.node import (
     DNodeInputRef,
@@ -307,10 +306,11 @@ def test_node_remote_accepts_pipeline_function_alias(monkeypatch) -> None:
 
     monkeypatch.setattr(daemon_client, "Client", FakeDaemonClient)
 
-    node = NodeRemote(
-        pipeline="demo_traktorist_pipeline",
-        function="happiness",
-    )
+    with pytest.warns(DeprecationWarning, match=r"NodeRemote\.locate"):
+        node = NodeRemote(
+            pipeline="demo_traktorist_pipeline",
+            function="happiness",
+        )
 
     assert node.url == ""
     assert node.name == "demo_traktorist_pipeline::happiness"

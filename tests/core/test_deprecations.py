@@ -1,18 +1,43 @@
-"""Deprecation contract for the 0.2.0 cleanup (WP-07a).
+"""Deprecation and removal contract for the 0.2.0 cleanup (WP-07b).
 
-Every legacy path keeps working in 0.1.x but emits ``DeprecationWarning``;
-every canonical path stays silent. See ``docs/migration-0.2.0.md``.
+Three layers are pinned here:
+
+* aliases that warned through 0.1.4/0.1.5 are **gone** in 0.2.0;
+* the canonical replacements stay silent;
+* the new 0.2.0 deprecations (deep-import shims, convenience ``NodeRemote``
+  constructor forms) warn while keeping the old behavior.
+
+See ``docs/migration-0.2.0.md``.
 """
 
 from __future__ import annotations
 
+import importlib
 import warnings
 from typing import Any
 
 import pytest
 
 from spl import DEFAULT_PORT, Deployment, InputPort, NodeRemote, OutputPort, lift
-from spl.client import SPLClient
+from spl._client import SPLClient
+
+REMOVED_CLIENT_ALIASES = (
+    "create_library",
+    "get_library",
+    "update_library",
+    "delete_library",
+    "grant_library",
+    "revoke_library_grant",
+    "add_reference",
+    "copy_object",
+    "remove_entry",
+    "local_objects",
+    "server_objects",
+    "start",
+    "queue",
+    "run_node",
+    "run_node_result",
+)
 
 
 class _FakeDaemon:
@@ -65,75 +90,155 @@ def _offline_node() -> NodeRemote:
     )
 
 
-def test_flat_library_methods_warn_and_delegate() -> None:
-    client, fake = _client()
+class TestRemovedAliases:
+    def test_legacy_client_aliases_are_gone(self) -> None:
+        client, _ = _client()
+        for alias in REMOVED_CLIENT_ALIASES:
+            assert not hasattr(client, alias), (
+                f"SPLClient.{alias} was removed in 0.2.0 and must not come back"
+            )
 
-    with pytest.warns(DeprecationWarning, match=r"library\.create"):
-        created = client.create_library("risk", display_name="Risk")
-    assert created["slug"] == "risk"
-    assert fake.library_payloads[-1]["display_name"] == "Risk"
+    def test_canonical_library_namespace_is_silent(self) -> None:
+        client, _ = _client()
 
-    with pytest.warns(DeprecationWarning, match=r"library\.grant"):
-        granted = client.grant_library("risk", "analyst1", scopes=["execute"])
-    assert granted == {
-        "ref": "risk",
-        "grantee_id": "analyst1",
-        "grantee_type": "user",
-        "scopes": ["execute"],
-    }
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            created = client.library.create("risk")
+            granted = client.library.grant("risk", "analyst1", scopes=["execute"])
 
+        assert created["slug"] == "risk"
+        assert granted["grantee_id"] == "analyst1"
 
-def test_canonical_library_namespace_is_silent() -> None:
-    client, _ = _client()
+    def test_canonical_objects_and_submit_are_silent(self) -> None:
+        client, _ = _client()
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", DeprecationWarning)
-        created = client.library.create("risk")
-        granted = client.library.grant("risk", "analyst1", scopes=["execute"])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            client.objects(scope="local")
+            client.objects(scope="server")
+            client.objects(scope="all")
+            run = client.submit("obj")
 
-    assert created["slug"] == "risk"
-    assert granted["grantee_id"] == "analyst1"
+        assert run.id == "run-1"
 
+    def test_deployment_remote_path_is_silent(self) -> None:
+        client, _ = _client()
+        node = _offline_node()
+        pipeline = lift(node).bind(amount=2).alias("out").render("deprecation_probe")
 
-def test_object_list_aliases_warn_objects_is_silent() -> None:
-    client, _ = _client()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            value = Deployment(client, pipeline).run(output="out")
 
-    with pytest.warns(DeprecationWarning, match=r"objects\(scope='local'\)"):
-        assert client.local_objects() == [{"name": "obj", "compact": False}]
-    with pytest.warns(DeprecationWarning, match=r"objects\(scope='server'\)"):
-        client.server_objects()
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", DeprecationWarning)
-        client.objects(scope="local")
-        client.objects(scope="server")
-        client.objects(scope="all")
+        assert value == {"kwargs": {"amount": 2}}
 
 
-def test_execution_aliases_warn_submit_is_silent() -> None:
-    client, _ = _client()
+class TestDeepImportShims:
+    def test_spl_client_shim_warns_and_matches_canonical(self) -> None:
+        import spl
+        import spl.client as legacy_client
 
-    with pytest.warns(DeprecationWarning, match=r"submit"):
-        client.start("obj")
-    with pytest.warns(DeprecationWarning, match=r"offline_policy"):
-        client.queue("obj", target_machine="m1")
+        with pytest.warns(DeprecationWarning, match=r"importing from spl\.client"):
+            importlib.reload(legacy_client)
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", DeprecationWarning)
-        run = client.submit("obj")
-    assert run.id == "run-1"
+        assert legacy_client.SPLClient is spl.SPLClient
+        assert legacy_client.RemoteResult is spl.RemoteResult
+        # Attribute fallback keeps even private helpers reachable.
+        assert legacy_client._progress_callback is not None
+
+    def test_spl_core_common_shim_warns_and_matches_canonical(self) -> None:
+        import spl
+        import spl.core.common as legacy_common
+
+        with pytest.warns(DeprecationWarning, match=r"importing from spl\.core\.common"):
+            importlib.reload(legacy_common)
+
+        assert legacy_common.Deployment is spl.Deployment
+        assert legacy_common.lift is spl.lift
+        assert legacy_common.Run is not None
 
 
-def test_run_node_warns_deployment_path_is_silent() -> None:
-    client, _ = _client()
-    node = _offline_node()
+class TestNodeRemoteConstructorForms:
+    def test_pipeline_keyword_warns(self) -> None:
+        with pytest.warns(DeprecationWarning, match=r"NodeRemote\.locate"):
+            node = NodeRemote(
+                pipeline="demo_pipeline",
+                function="happiness",
+                inputs=[],
+                outputs=[],
+            )
+        assert node.name == "demo_pipeline::happiness"
 
-    with pytest.warns(DeprecationWarning, match=r"Deployment"):
-        direct = client.run_node(node, {"amount": 1})
-    assert direct == {"kwargs": {"amount": 1}}
+    def test_function_keyword_warns(self) -> None:
+        with pytest.warns(DeprecationWarning, match=r"NodeRemote\.locate"):
+            node = NodeRemote(
+                name="demo_pipeline",
+                function="happiness",
+                inputs=[],
+                outputs=[],
+            )
+        assert node.name == "demo_pipeline::happiness"
 
-    pipeline = lift(node).bind(amount=2).alias("out").render("deprecation_probe")
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", DeprecationWarning)
-        value = Deployment(client, pipeline).run(output="out")
-    assert value == {"kwargs": {"amount": 2}}
+    def test_name_in_url_slot_warns(self) -> None:
+        with pytest.warns(DeprecationWarning, match=r"NodeRemote\.locate"):
+            node = NodeRemote("demo_obj", inputs=[], outputs=[])
+        assert node.name == "demo_obj"
+        assert node.url == ""
+
+    def test_plain_serialization_constructor_is_silent(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            node = NodeRemote(
+                url="http://fake",
+                name="demo_obj",
+                version="latest",
+                inputs=[],
+                outputs=[],
+            )
+        assert node.name == "demo_obj"
+
+    def test_locate_is_silent_for_all_forms(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import spl.daemon_client as daemon_client
+
+        class FakeDaemonClient:
+            def resolve_remote_signature(self, ref: dict[str, Any]) -> dict[str, Any]:
+                return {
+                    "signature": {
+                        "inputs": [{"name": "a", "type": "int"}],
+                        "outputs": [{"name": "default", "type": "str"}],
+                    }
+                }
+
+        monkeypatch.setattr(daemon_client, "Client", FakeDaemonClient)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            by_name = NodeRemote.locate(
+                name="demo_obj",
+                url="http://fake",
+            )
+            by_pipeline = NodeRemote.locate(
+                pipeline="demo_pipeline",
+                function="happiness",
+                url="http://fake",
+            )
+            by_function = NodeRemote.locate(
+                name="demo_pipeline",
+                function="happiness",
+                url="http://fake",
+            )
+
+        assert by_name.name == "demo_obj"
+        assert by_pipeline.name == "demo_pipeline::happiness"
+        assert by_function.name == "demo_pipeline::happiness"
+
+    def test_locate_requires_a_reference(self) -> None:
+        with pytest.raises(TypeError, match="requires name or pipeline"):
+            NodeRemote.locate(url="http://fake")
+
+    def test_locate_rejects_name_with_pipeline(self) -> None:
+        with pytest.raises(TypeError, match="not both"):
+            NodeRemote.locate(name="a", pipeline="b")

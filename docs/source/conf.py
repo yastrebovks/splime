@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.abspath('../../src'))
 project = 'splime'
 copyright = '2026, Yastrebov Kirill'
 author = 'Yastrebov Kirill'
-release = '0.1.5'
+release = '0.2.0'
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -36,5 +36,21 @@ language = 'en'
 html_theme = 'sphinx_rtd_theme'
 html_static_path = ['_static']
 apidoc_modules = [
-    {'path': '../../src/spl', 'destination': 'api'},
+    {
+        'path': '../../src/spl',
+        'destination': 'api',
+        # 0.2.0: the implementation lives in private modules (spl._client,
+        # spl.core._common); spl.client / spl.core.common are deprecated
+        # warning shims scheduled for removal in 0.3.0.  Document the real
+        # modules and skip the shims so builds stay warning-free.
+        'include_private': True,
+        'exclude_patterns': [
+            # Literal paths are resolved relative to this conf.py directory;
+            # the fnmatch variants are a safety net for absolute-path matching.
+            '../../src/spl/client.py',
+            '../../src/spl/core/common.py',
+            '**/spl/client.py',
+            '**/spl/core/common.py',
+        ],
+    },
 ]

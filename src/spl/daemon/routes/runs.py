@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from spl.daemon.routes._helpers import RouteContext
+from spl.daemon.run_progress import environment_progress
 from spl.daemon.store import validate_name
 
 
@@ -78,7 +79,11 @@ def register_run_routes(
     @app.get("/runs/<run_id>")
     @route_errors
     async def get_run(run_id: str) -> Any:
-        return json_response(runtime.store.get_run(validate_name(run_id)))
+        state = runtime.store.get_run(validate_name(run_id))
+        progress = environment_progress(runtime.store, state)
+        if progress is not None:
+            state = {**state, "environment": progress}
+        return json_response(state)
 
     @app.get("/runs/<run_id>/result")
     @route_errors

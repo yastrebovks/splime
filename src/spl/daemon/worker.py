@@ -302,7 +302,7 @@ def run_pipeline(
     * multi-node pipelines should define aliases for daemon use.
     """
 
-    from spl.core.common import Deployment
+    from spl.core._common import Deployment
 
     client = RemoteNodeClient(daemon_url, timeout_seconds=timeout_seconds)
     try:

@@ -10,9 +10,11 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import sys
 import time
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TextIO
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -197,6 +199,139 @@ def resolve_base_url(
 
 class ClientError(RuntimeError):
     """Raised when the daemon returns an error response."""
+
+
+RunStateCallback = Callable[[dict[str, Any]], None]
+
+_ENVIRONMENT_BUILD_PHASE = "environment_build"
+_SLOW_WAIT_STATUSES = frozenset({"queued", "starting", "preparing_environment"})
+
+
+def _format_duration(seconds: float) -> str:
+    """Format elapsed seconds as a short human-readable duration."""
+
+    total = int(max(seconds, 0))
+    if total < 60:
+        return f"{total}s"
+    minutes, remainder = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m {remainder:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+class RunProgressPrinter:
+    """Print progress lines for run phases that can stay silent for minutes.
+
+    The printer is a ``RunStateCallback`` for the ``wait_run`` and
+    ``wait_remote_run`` polling loops.  It stays quiet for fast runs and only
+    speaks up in two situations:
+
+    * the daemon reports an environment build in progress for the run
+      (``state["environment"]["status"] == "creating"``) — the first run of an
+      object builds a fresh venv or image, which can take minutes;
+    * the run stays in one waiting status (``queued``, ``starting``,
+      ``preparing_environment``) longer than ``interval_seconds``.
+
+    Repeated messages are throttled to one line per ``interval_seconds``, and
+    the printer never raises: progress output must not abort a wait loop.
+    """
+
+    _LOG_TAIL_LIMIT = 120
+
+    def __init__(
+        self,
+        *,
+        stream: TextIO | None = None,
+        interval_seconds: float = 5.0,
+        clock: Callable[[], float] = time.monotonic,
+        label: str = "[spl]",
+    ):
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be positive")
+        self._stream = stream
+        self._interval = float(interval_seconds)
+        self._clock = clock
+        self._label = label
+        self._phase: str | None = None
+        self._phase_started_at = 0.0
+        self._last_printed_at: float | None = None
+        self._announced_build = False
+
+    def __call__(self, state: Mapping[str, Any]) -> None:
+        try:
+            self._observe(state)
+        except Exception:  # noqa: BLE001 - progress output must never raise.
+            return
+
+    def _observe(self, state: Mapping[str, Any]) -> None:
+        status = str(state.get("status") or "")
+        environment = state.get("environment")
+        if not isinstance(environment, Mapping):
+            environment = {}
+        now = self._clock()
+
+        phase = self._phase_for(status, environment)
+        if phase != self._phase:
+            self._announce_build_finished(status)
+            self._phase = phase
+            self._phase_started_at = now
+            self._last_printed_at = None
+        if phase is None:
+            return
+
+        building = phase == _ENVIRONMENT_BUILD_PHASE
+        if not building and now - self._phase_started_at < self._interval:
+            return
+        if (
+            self._last_printed_at is not None
+            and now - self._last_printed_at < self._interval
+        ):
+            return
+
+        self._last_printed_at = now
+        if building:
+            self._announced_build = True
+            self._print(self._build_message(environment, now))
+        else:
+            self._print(self._waiting_message(status, now))
+
+    def _phase_for(self, status: str, environment: Mapping[str, Any]) -> str | None:
+        if environment.get("status") == "creating":
+            return _ENVIRONMENT_BUILD_PHASE
+        if status in _SLOW_WAIT_STATUSES:
+            return f"waiting:{status}"
+        return None
+
+    def _build_message(self, environment: Mapping[str, Any], now: float) -> str:
+        elapsed = environment.get("elapsed_seconds")
+        if not isinstance(elapsed, int | float):
+            elapsed = now - self._phase_started_at
+        runtime_type = str(environment.get("runtime_type") or "venv")
+        message = (
+            f"{self._label} building the {runtime_type} environment "
+            f"({_format_duration(elapsed)}; a first run can take minutes)"
+        )
+        log_tail = environment.get("log_tail")
+        if isinstance(log_tail, str) and log_tail.strip():
+            message += f": {log_tail.strip()[: self._LOG_TAIL_LIMIT]}"
+        return message
+
+    def _waiting_message(self, status: str, now: float) -> str:
+        elapsed = _format_duration(now - self._phase_started_at)
+        phase_name = status.replace("_", " ")
+        return f"{self._label} run is still {phase_name} after {elapsed}"
+
+    def _announce_build_finished(self, status: str) -> None:
+        if not self._announced_build:
+            return
+        self._announced_build = False
+        if status == "running":
+            self._print(f"{self._label} environment is ready; running")
+
+    def _print(self, message: str) -> None:
+        stream = self._stream if self._stream is not None else sys.stderr
+        print(message, file=stream, flush=True)
 
 
 class Client:
@@ -985,12 +1120,19 @@ class Client:
         *,
         poll_interval: float = 0.5,
         timeout_seconds: float | None = None,
+        on_state: RunStateCallback | None = None,
     ) -> dict[str, Any]:
-        """Poll a server-side remote run until it reaches a terminal state."""
+        """Poll a server-side remote run until it reaches a terminal state.
+
+        ``on_state`` is invoked with every polled state, including the final
+        one; exceptions raised by the callback abort the wait.
+        """
 
         started = time.monotonic()
         while True:
             state = self.get_remote_run(run_id)
+            if on_state is not None:
+                on_state(state)
             if state["status"] in {"succeeded", "failed", "cancelled", "stale"}:
                 return state
             if timeout_seconds is not None and time.monotonic() - started > timeout_seconds:
@@ -1015,12 +1157,19 @@ class Client:
         *,
         poll_interval: float = 0.25,
         timeout_seconds: float | None = None,
+        on_state: RunStateCallback | None = None,
     ) -> dict[str, Any]:
-        """Poll a run until it reaches a terminal state."""
+        """Poll a run until it reaches a terminal state.
+
+        ``on_state`` is invoked with every polled state, including the final
+        one; exceptions raised by the callback abort the wait.
+        """
 
         started = time.monotonic()
         while True:
             state = self.get_run(run_id)
+            if on_state is not None:
+                on_state(state)
             if state["status"] in {"succeeded", "failed"}:
                 return state
             if timeout_seconds is not None and time.monotonic() - started > timeout_seconds:

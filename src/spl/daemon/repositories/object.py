@@ -262,7 +262,10 @@ class ObjectRepository(RepositoryBase):
                     SET description = ?,
                         kind = COALESCE(kind, ?),
                         current_version_id = ?,
-                        origin = ?,
+                        -- Local authorship is sticky: republishing your own
+                        -- object never silently demotes it to a mirror, while
+                        -- a mirror the caller republishes becomes local.
+                        origin = CASE WHEN origin = 'local' THEN origin ELSE ? END,
                         remote_owner_id = COALESCE(?, remote_owner_id),
                         remote_object_id = COALESCE(?, remote_object_id),
                         source_object_name = COALESCE(?, source_object_name),
@@ -333,7 +336,8 @@ class ObjectRepository(RepositoryBase):
                 SET description = ?,
                     kind = COALESCE(kind, ?),
                     current_version_id = ?,
-                    origin = ?,
+                    -- Local authorship is sticky (see the dedup path above).
+                    origin = CASE WHEN origin = 'local' THEN origin ELSE ? END,
                     remote_owner_id = COALESCE(?, remote_owner_id),
                     remote_object_id = COALESCE(?, remote_object_id),
                     source_object_name = COALESCE(?, source_object_name),

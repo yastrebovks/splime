@@ -6,6 +6,7 @@ from uuid import UUID
 
 import yaml
 
+from spl._deprecate import warn_deprecated
 from spl.core.entities.node import InputPort, Node, OutputPort
 from spl.core.ir.common import DBase
 from spl.core.ir.parse import _branch, ir_parse
@@ -40,14 +41,23 @@ class NodeRemote(Node):
         if pipeline is not None:
             if name is not None:
                 raise TypeError('pass either name or pipeline/function, not both')
+            warn_deprecated(
+                'NodeRemote(pipeline=..., function=...)',
+                'NodeRemote.locate(pipeline=..., function=...)')
             name = _remote_name(pipeline, function)
         elif function is not None:
             if name is None:
                 raise TypeError('function requires name or pipeline')
+            warn_deprecated(
+                'NodeRemote(name=..., function=...)',
+                'NodeRemote.locate(name=..., function=...)')
             name = _remote_name(name, function)
         if name is None:
             if url is None:
                 raise TypeError('NodeRemote requires object name')
+            warn_deprecated(
+                'NodeRemote(<object name> passed as the positional url)',
+                'NodeRemote.locate(name=...)')
             name = url
             url = None
         url = '' if url is None else str(url)
@@ -97,15 +107,29 @@ class NodeRemote(Node):
 
         Pass either ``name`` (optionally with ``function``) or
         ``pipeline`` + ``function``.  ``owner``/``library`` select another
-        user's namespace, mirroring ``SPLClient.call``.  All ``__init__``
-        forms keep working; ``locate`` is the canonical spelling.
+        user's namespace, mirroring ``SPLClient.call``.  Since 0.2.0 the
+        convenience ``__init__`` forms (``pipeline=``/``function=`` keywords,
+        object name in the positional ``url`` slot) emit
+        ``DeprecationWarning``; ``locate`` is the canonical spelling and the
+        plain serialization constructor stays silent.
         """
 
+        if pipeline is not None:
+            if name is not None:
+                raise TypeError('pass either name or pipeline/function, not both')
+            resolved_name = _remote_name(pipeline, function)
+        elif function is not None:
+            if name is None:
+                raise TypeError('function requires name or pipeline')
+            resolved_name = _remote_name(name, function)
+        elif name is not None:
+            resolved_name = str(name)
+        else:
+            raise TypeError('NodeRemote.locate() requires name or pipeline')
+
         return cls(
-            name = name,
-            pipeline = pipeline,
-            function = function,
             url = url,
+            name = resolved_name,
             version = version,
             owner = owner,
             library = library,

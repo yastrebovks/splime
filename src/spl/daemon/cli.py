@@ -17,7 +17,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from spl.daemon_client import DEFAULT_DAEMON_PORT, DEFAULT_SERVER_URL, DEFAULT_URL, Client
+from spl.daemon_client import (
+    DEFAULT_DAEMON_PORT,
+    DEFAULT_SERVER_URL,
+    DEFAULT_URL,
+    Client,
+    RunProgressPrinter,
+)
 
 
 def print_json(value: Any) -> None:
@@ -155,6 +161,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("health", help="show daemon health details")
+
+    doctor = subparsers.add_parser(
+        "doctor",
+        help="diagnose the local splime setup (interpreter, home, daemon, server)",
+    )
+    doctor.add_argument(
+        "--home",
+        type=Path,
+        default=None,
+        help="daemon home directory to inspect; defaults to SPL_DAEMON_HOME",
+    )
+    doctor.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        help="print machine-readable check results",
+    )
 
     server_connect = subparsers.add_parser(
         "server-connect",
@@ -368,6 +391,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="wait for completion and print the final result when available",
     )
+    run.add_argument(
+        "--no-progress",
+        dest="progress",
+        action="store_false",
+        default=True,
+        help="with --wait, do not print slow-phase progress lines to stderr",
+    )
 
     run_status = subparsers.add_parser("run-status", help="show one run state")
     run_status.add_argument("run_id")
@@ -420,6 +450,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "health":
             print_json(client.health())
+        elif args.command == "doctor":
+            from spl.daemon.doctor import run_doctor
+
+            report = run_doctor(client, home=args.home)
+            if args.as_json:
+                print_json(report.to_payload())
+            else:
+                print(report.render())
+            return report.exit_code
         elif args.command == "server-connect":
             capabilities = parse_json_arg(args.capabilities, dict)
             print_json(
@@ -539,10 +578,12 @@ def main(argv: list[str] | None = None) -> int:
                 print_json(state)
                 return 0
 
+            on_state = RunProgressPrinter() if args.progress else None
             if args.target_machine is not None:
                 final_state = client.wait_remote_run(
                     state["id"],
                     timeout_seconds=args.timeout,
+                    on_state=on_state,
                 )
                 print_json(
                     {
@@ -552,7 +593,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 0
 
-            final_state = client.wait_run(state["id"])
+            final_state = client.wait_run(state["id"], on_state=on_state)
             if final_state["status"] == "succeeded":
                 print_json(
                     {
