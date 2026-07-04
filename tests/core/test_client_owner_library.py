@@ -90,7 +90,8 @@ def test_daemon_client_library_management_paths() -> None:
     client.create_server_library({"slug": "risk"})
     client.get_server_library("risk")
     client.update_server_library("risk", {"description": "Updated"})
-    client.delete_server_library("risk")
+    with pytest.raises(NotImplementedError, match="not supported"):
+        client.delete_server_library("risk")
     client.server_library_grants("risk")
     client.grant_server_library("risk", {"grantee_id": "admin2"})
     client.revoke_server_library_grant("risk", "admin2")
@@ -98,12 +99,11 @@ def test_daemon_client_library_management_paths() -> None:
     client.copy_server_library_object("risk", {"name": "source"})
     client.remove_server_library_entry("risk", "source")
 
-    assert client.requests[-11:] == [
+    assert client.requests[-10:] == [
         ("GET", "/server/libraries?include_accessible=0", None),
         ("POST", "/server/libraries", {"slug": "risk"}),
         ("GET", "/server/libraries/risk", None),
         ("PUT", "/server/libraries/risk", {"description": "Updated"}),
-        ("DELETE", "/server/libraries/risk", None),
         ("GET", "/server/libraries/risk/grants", None),
         ("POST", "/server/libraries/risk/grants", {"grantee_id": "admin2"}),
         ("POST", "/server/libraries/risk/grants/admin2/revoke", None),
@@ -772,7 +772,8 @@ def test_spl_client_library_management_methods_use_daemon() -> None:
         "name": "source",
         "removed": True,
     }
-    assert client.library.delete("risk") == {"slug": "risk", "deleted": True}
+    with pytest.raises(NotImplementedError, match="not supported"):
+        client.library.delete("risk")
 
     assert fake_daemon.library_calls == [
         ("server_libraries", False),
@@ -832,7 +833,6 @@ def test_spl_client_library_management_methods_use_daemon() -> None:
             },
         ),
         ("remove_server_library_entry", "risk", "source"),
-        ("delete_server_library", "risk"),
     ]
 
 
@@ -895,7 +895,8 @@ def test_spl_client_library_namespace_delegates_to_flat_methods() -> None:
         "name": "source",
         "removed": True,
     }
-    assert library.delete("risk") == {"slug": "risk", "deleted": True}
+    with pytest.raises(NotImplementedError, match="not supported"):
+        library.delete("risk")
 
     assert fake_daemon.library_calls == [
         ("server_libraries", False),
@@ -941,7 +942,6 @@ def test_spl_client_library_namespace_delegates_to_flat_methods() -> None:
             },
         ),
         ("remove_server_library_entry", "risk", "source"),
-        ("delete_server_library", "risk"),
     ]
 
 

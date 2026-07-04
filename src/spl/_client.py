@@ -40,6 +40,11 @@ ObjectScope = Literal["auto", "local", "server", "all"]
 RunSource = Literal["auto", "local"]
 ProgressOption = bool | RunStateCallback
 _NO_SERVER_CONNECTION_MESSAGE = "active server connection is not found"
+_LIBRARY_DELETE_UNSUPPORTED_MESSAGE = (
+    "Deleting central-server libraries is not supported by the SPL server API. "
+    "Use the Console archive action to hide a library, or remove individual "
+    "entries with client.library.remove_entry()."
+)
 
 
 def _preview(value: Any, *, limit: int = 80) -> str:
@@ -552,10 +557,10 @@ class _LibraryAdmin:
         return self._c._daemon.update_server_library(ref, payload)
 
     def delete(self, ref: str) -> dict[str, Any]:
-        """Delete or archive one central-server library when supported upstream."""
+        """Raise a clear error because server-side library delete is unsupported."""
 
         self._c._require_server_connection("deleting a library")
-        return self._c._daemon.delete_server_library(ref)
+        raise NotImplementedError(_LIBRARY_DELETE_UNSUPPORTED_MESSAGE)
 
     def grant(
         self,

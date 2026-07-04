@@ -15,6 +15,11 @@ from spl._http import urlopen_verified, verified_https_context
 
 DEFAULT_SERVER_URL = "https://splime.io/api"
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60.0
+LIBRARY_DELETE_UNSUPPORTED_MESSAGE = (
+    "Deleting central-server libraries is not supported by the SPL server API. "
+    "Use the Console archive action to hide a library, or remove individual "
+    "entries with client.library.remove_entry()."
+)
 
 
 class ServerClientError(RuntimeError):
@@ -40,12 +45,22 @@ class ServerClient:
         self.machine_token = machine_token
         self.user_token = user_token
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, *, auth: str = "machine") -> dict[str, str]:
+        token = self.machine_token
+        if auth == "user":
+            if not self.user_token:
+                raise ServerClientError(
+                    401,
+                    "central SPL daemon server user token is required for this operation",
+                )
+            token = self.user_token
+        elif auth != "machine":
+            raise ValueError("auth must be 'machine' or 'user'")
         headers = {
             "Accept": "application/json",
-            "Authorization": f"Bearer {self.machine_token}",
+            "Authorization": f"Bearer {token}",
         }
-        if self.user_token:
+        if auth == "machine" and self.user_token:
             headers["X-SPL-User-Token"] = self.user_token
         return headers
 
@@ -54,9 +69,11 @@ class ServerClient:
         method: str,
         path: str,
         payload: dict[str, Any] | None = None,
+        *,
+        auth: str = "machine",
     ) -> Any:
         body = None
-        headers = self._headers()
+        headers = self._headers(auth=auth)
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json; charset=utf-8"
@@ -229,34 +246,53 @@ class ServerClient:
 
     def list_libraries(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
         query = {"include_accessible": "1" if include_accessible else "0"}
-        return self._json_request("GET", f"/libraries?{urlencode(query)}")
+        return self._json_request(
+            "GET",
+            f"/libraries?{urlencode(query)}",
+            auth="user" if self.user_token else "machine",
+        )
 
     def create_library(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._json_request("POST", "/libraries", payload)
+        return self._json_request("POST", "/libraries", payload, auth="user")
 
     def get_library(self, library_ref: str) -> dict[str, Any]:
-        return self._json_request("GET", f"/libraries/{quote(library_ref)}")
+        return self._json_request(
+            "GET",
+            f"/libraries/{quote(library_ref)}",
+            auth="user" if self.user_token else "machine",
+        )
 
     def update_library(self, library_ref: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._json_request("PUT", f"/libraries/{quote(library_ref)}", payload)
+        return self._json_request(
+            "PUT",
+            f"/libraries/{quote(library_ref)}",
+            payload,
+            auth="user",
+        )
 
     def delete_library(self, library_ref: str) -> dict[str, Any]:
-        return self._json_request("DELETE", f"/libraries/{quote(library_ref)}")
+        raise NotImplementedError(LIBRARY_DELETE_UNSUPPORTED_MESSAGE)
 
     def list_library_grants(self, library_ref: str) -> list[dict[str, Any]]:
-        return self._json_request("GET", f"/libraries/{quote(library_ref)}/grants")
+        return self._json_request(
+            "GET",
+            f"/libraries/{quote(library_ref)}/grants",
+            auth="user",
+        )
 
     def grant_library(self, library_ref: str, payload: dict[str, Any]) -> dict[str, Any]:
         return self._json_request(
             "POST",
             f"/libraries/{quote(library_ref)}/grants",
             payload,
+            auth="user",
         )
 
     def revoke_library_grant(self, library_ref: str, grantee: str) -> dict[str, Any]:
         return self._json_request(
             "POST",
             f"/libraries/{quote(library_ref)}/grants/{quote(grantee)}/revoke",
+            auth="user",
         )
 
     def add_library_reference(
@@ -268,6 +304,7 @@ class ServerClient:
             "POST",
             f"/libraries/{quote(library_ref)}/references",
             payload,
+            auth="user",
         )
 
     def copy_object_into_library(
@@ -279,12 +316,14 @@ class ServerClient:
             "POST",
             f"/libraries/{quote(library_ref)}/copies",
             payload,
+            auth="user",
         )
 
     def remove_library_entry(self, library_ref: str, name: str) -> dict[str, Any]:
         return self._json_request(
             "DELETE",
             f"/libraries/{quote(library_ref)}/entries/{quote(name)}",
+            auth="user",
         )
 
     def list_objects(

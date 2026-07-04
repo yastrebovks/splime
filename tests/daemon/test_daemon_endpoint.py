@@ -591,10 +591,6 @@ def test_server_libraries_are_managed_through_daemon_proxy(
             self.calls.append(("update_library", library_ref, payload))
             return {"slug": library_ref, **payload}
 
-        def delete_library(self, library_ref):
-            self.calls.append(("delete_library", library_ref))
-            return {"slug": library_ref, "deleted": True}
-
         def list_library_grants(self, library_ref):
             self.calls.append(("list_library_grants", library_ref))
             return [{"library": library_ref, "grantee_id": "admin2"}]
@@ -701,8 +697,8 @@ def test_server_libraries_are_managed_through_daemon_proxy(
         assert body == {"library": "risk", "name": "source", "removed": True}
 
         status, body = _delete_json_from_app(app, "/server/libraries/risk")
-        assert status == 200
-        assert body == {"slug": "risk", "deleted": True}
+        assert status == 501
+        assert "not supported" in body["error"]
 
         assert LibraryServerClient.calls == [
             ("list_libraries", False),
@@ -715,7 +711,6 @@ def test_server_libraries_are_managed_through_daemon_proxy(
             ("add_library_reference", "risk", reference_payload),
             ("copy_object_into_library", "risk", copy_payload),
             ("remove_library_entry", "risk", "source"),
-            ("delete_library", "risk"),
         ]
     finally:
         _shutdown_app(app)

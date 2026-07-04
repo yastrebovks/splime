@@ -26,6 +26,11 @@ DEFAULT_SERVER_URL = "https://splime.io/api"
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60.0
 DAEMON_ENDPOINT_FILENAME = "daemon-endpoint.json"
 DAEMON_API_TOKEN_ENV = "SPL_DAEMON_API_TOKEN"
+LIBRARY_DELETE_UNSUPPORTED_MESSAGE = (
+    "Deleting central-server libraries is not supported by the SPL server API. "
+    "Use the Console archive action to hide a library, or remove individual "
+    "entries with client.library.remove_entry()."
+)
 
 OfflinePolicy = Literal["queue", "wait", "fail_fast"]
 RunSource = Literal["auto", "local"]
@@ -544,9 +549,9 @@ class Client:
         )
 
     def delete_server_library(self, library_ref: str) -> dict[str, Any]:
-        """Delete or archive one central-server library when supported upstream."""
+        """Raise a clear error because server-side library delete is unsupported."""
 
-        return self._json_request("DELETE", f"/server/libraries/{quote(library_ref)}")
+        raise NotImplementedError(LIBRARY_DELETE_UNSUPPORTED_MESSAGE)
 
     def server_library_grants(self, library_ref: str) -> list[dict[str, Any]]:
         """Return grants for one central-server library."""

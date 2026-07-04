@@ -5,6 +5,7 @@ from __future__ import annotations
 from http import HTTPStatus
 from typing import Any
 
+from spl.daemon_client import LIBRARY_DELETE_UNSUPPORTED_MESSAGE
 from spl.daemon.routes._helpers import RouteContext
 from spl.daemon.store import validate_name
 
@@ -61,8 +62,11 @@ def register_library_routes(
     @app.delete("/server/libraries/<library_ref>")
     @route_errors
     async def delete_server_library(library_ref: str) -> Any:
-        _, server = context.connected_server_client()
-        return json_response(server.delete_library(validate_name(library_ref)))
+        validate_name(library_ref)
+        return json_response(
+            {"error": LIBRARY_DELETE_UNSUPPORTED_MESSAGE},
+            HTTPStatus.NOT_IMPLEMENTED,
+        )
 
     @app.get("/server/libraries/<library_ref>/grants")
     @route_errors

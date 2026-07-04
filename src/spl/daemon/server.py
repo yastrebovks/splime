@@ -26,7 +26,7 @@ Endpoints:
     POST /server/libraries
     GET  /server/libraries/<ref>
     PUT  /server/libraries/<ref>
-    DELETE /server/libraries/<ref>
+    DELETE /server/libraries/<ref>  (501 until upstream archive/delete exists)
     GET  /server/libraries/<ref>/grants
     POST /server/libraries/<ref>/grants
     POST /server/libraries/<ref>/grants/<grantee>/revoke

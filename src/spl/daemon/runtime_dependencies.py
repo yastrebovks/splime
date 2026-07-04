@@ -228,7 +228,7 @@ class ServerClientProtocol(Protocol):
         ...
 
     def delete_library(self, library_ref: str) -> dict[str, Any]:
-        """Delete a server library."""
+        """Delete a server library when upstream support is added."""
         ...
 
     def list_library_grants(self, library_ref: str) -> list[dict[str, Any]]:
