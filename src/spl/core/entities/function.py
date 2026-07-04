@@ -3,6 +3,7 @@ import builtins
 import dis
 import inspect
 import sys
+import textwrap
 import typing
 from dataclasses import dataclass
 from itertools import chain
@@ -134,7 +135,9 @@ def serialize_function_output(func: FunctionType, tree: ast.FunctionDef):
 
 def serialize_function(func: FunctionType, tree: ast.FunctionDef | None = None):
     if tree is None:
-        [tree] = ast.parse(inspect.getsource(func)).body
+        # dedent: getsource keeps the original indentation, so a function
+        # defined inside an ``if``/``with``/function body would not parse.
+        [tree] = ast.parse(textwrap.dedent(inspect.getsource(func))).body
 
     args = tree.args
 
@@ -163,7 +166,7 @@ def _ir_parse__function(
         # We imported this function using SPL, using it's metadata.
         return _attach(chain([DSPLImport(*getattr(x, LOCATION_DUNDER_NAME))]))
 
-    [tree] = ast.parse(inspect.getsource(x)).body
+    [tree] = ast.parse(textwrap.dedent(inspect.getsource(x))).body
     return _branch(
         x,
         lambda: serialize_function(x, tree),
