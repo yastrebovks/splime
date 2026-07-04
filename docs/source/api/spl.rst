@@ -31,6 +31,15 @@ spl.\_deprecate module
    :show-inheritance:
    :undoc-members:
 
+spl.\_http module
+-----------------
+
+.. automodule:: spl._http
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.daemon\_client module
 -------------------------
 

@@ -129,8 +129,20 @@ class ObjectRepository(RepositoryBase):
                     (remote_version_id,),
                 ).fetchone()
                 if existing_remote is not None:
+                    version_id = existing_remote["id"]
+                    env_python = str(Path(env_record["python"]).expanduser().absolute())
+                    if origin == "server" and Path(env_python).exists():
+                        self._conn.execute(
+                            """
+                            UPDATE object_versions
+                            SET env = ?,
+                                env_python = ?
+                            WHERE id = ?
+                            """,
+                            (env, env_python, version_id),
+                        )
                     return self.get_object_version(
-                        existing_remote["id"],
+                        version_id,
                         include_yaml=False,
                     )
 

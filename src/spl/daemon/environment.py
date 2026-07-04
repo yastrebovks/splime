@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -41,7 +42,7 @@ class EnvironmentManager(BaseEnvironmentManager):
     def build_spec(self, object_record: dict[str, Any]) -> dict[str, Any]:
         """Build a deterministic venv specification from an object version."""
 
-        base_python = str(Path(object_record["env_python"]).expanduser().absolute())
+        base_python = self._base_python_for_object(object_record)
         distributions = self._normalize_distributions(object_record["distributions"])
         runtime_packages = self._runtime_packages(distributions)
         python_version = self._python_version(base_python)
@@ -73,6 +74,39 @@ class EnvironmentManager(BaseEnvironmentManager):
             "lock_path": env_dir / "build.lock",
             "force_rebuild": False,
         }
+
+    def _base_python_for_object(self, object_record: dict[str, Any]) -> str:
+        stored_python = Path(str(object_record["env_python"])).expanduser().absolute()
+        if stored_python.exists():
+            return str(stored_python)
+
+        env_name = object_record.get("env")
+        if env_name:
+            try:
+                current_env = self.store.get_env(str(env_name))
+            except KeyError:
+                current_env = None
+            if current_env is not None:
+                env_python = Path(str(current_env.get("python"))).expanduser().absolute()
+                if env_python.exists():
+                    return str(env_python)
+
+        if object_record.get("origin") == "server":
+            try:
+                default_env = self.store.get_env("default")
+            except KeyError:
+                default_env = None
+            if default_env is not None:
+                default_python = Path(
+                    str(default_env.get("python"))
+                ).expanduser().absolute()
+                if default_python.exists():
+                    return str(default_python)
+            executable = Path(sys.executable).expanduser().absolute()
+            if executable.exists():
+                return str(executable)
+
+        return str(stored_python)
 
     def _build_environment(self, spec: dict[str, Any]) -> None:
         env_dir = Path(spec["venv_path"]).parent

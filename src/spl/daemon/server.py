@@ -1268,6 +1268,7 @@ class DaemonRuntime:
             include_yaml=False,
             **server_scope,
         )
+        self._ensure_server_object_envs([remote_current])
         remote_object_id = remote_current["id"]
         remote_version_id = remote_current["version_id"]
         existing_current = self.store.get_object_by_remote_version(
@@ -1375,6 +1376,8 @@ class DaemonRuntime:
     def _register_auto_server_env(self, name: str) -> dict[str, Any]:
         try:
             base_python = self.store.get_env("default")["python"]
+            if not Path(str(base_python)).expanduser().exists():
+                raise KeyError("default environment python is missing")
         except KeyError:
             base_python = sys.executable
         return self.store.register_env(name, base_python)
@@ -1420,10 +1423,11 @@ class DaemonRuntime:
 
     def _has_local_env(self, name: str) -> bool:
         try:
-            self.store.get_env(name)
+            env = self.store.get_env(name)
         except KeyError:
             return False
-        return True
+        python = env.get("python")
+        return bool(python) and Path(str(python)).expanduser().exists()
 
     def sync_once(
         self,
@@ -1583,6 +1587,7 @@ class DaemonRuntime:
                 status="fetching_object",
                 message="registering object bundle in local daemon",
             )
+            self._ensure_server_object_envs([version])
             object_record = self.register_object(
                 local_name,
                 version["entrypoint"],

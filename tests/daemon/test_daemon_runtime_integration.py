@@ -45,6 +45,20 @@ REMOTE_FUNCTION_YAML = """\
 """
 
 
+class _NoopHeartbeats:
+    def restore_server_heartbeat(self) -> None:
+        pass
+
+    def start_server_heartbeat(self, connection, *, token: str) -> None:
+        pass
+
+    def stop_server_heartbeat(self, connection_id: str) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        pass
+
+
 PIPELINE_WITH_INTERNAL_FUNCTION_YAML = """\
 - !DPipeline
   name: demo_pipeline
@@ -933,7 +947,7 @@ def test_remote_node_can_target_pipeline_internal_function(
 ) -> None:
     store = RegistryStore(tmp_path)
     try:
-        runtime = DaemonRuntime(store)
+        runtime = DaemonRuntime(store, heartbeat_service=_NoopHeartbeats())
         calls: dict[str, Any] = {}
 
         def resolve_remote_signature(ref: dict[str, Any]) -> dict[str, Any]:
@@ -1043,12 +1057,257 @@ def test_remote_import_auto_registers_missing_server_env(
             },
             heartbeat_interval_seconds=60,
         )
-        runtime = DaemonRuntime(store)
+        runtime = DaemonRuntime(store, heartbeat_service=_NoopHeartbeats())
 
         imported = runtime.import_server_object("demo_obj")
 
         assert imported["refreshed"] is True
         assert imported["current_version"]["env"] == "spl_core"
         assert store.get_env("spl_core")["python"] == default_env["python"]
+    finally:
+        store.close()
+
+
+def test_remote_import_repairs_stale_server_env_python(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class ImportServerClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def get_object(self, name_or_id, *, version=None, include_yaml=False):
+            assert name_or_id == "demo_obj"
+            assert include_yaml is False
+            return {
+                "id": "remote-object-1",
+                "owner_id": "owner-1",
+                "name": "demo_obj",
+                "version": 1,
+                "version_id": "remote-version-1",
+                "entrypoint": "demo_obj",
+                "env": "spl_core",
+            }
+
+        def list_object_versions(self, name_or_id, *, include_yaml=False):
+            assert name_or_id == "demo_obj"
+            assert include_yaml is True
+            return [
+                {
+                    "id": "remote-object-1",
+                    "owner_id": "owner-1",
+                    "name": "demo_obj",
+                    "version": 1,
+                    "version_id": "remote-version-1",
+                    "entrypoint": "demo_obj",
+                    "env": "spl_core",
+                    "description": "first",
+                    "version_label": "v1",
+                    "yaml": REMOTE_FUNCTION_YAML,
+                },
+            ]
+
+    store = RegistryStore(tmp_path)
+    monkeypatch.setattr(daemon_server, "ServerClient", ImportServerClient)
+    try:
+        default_env = store.register_env("default", sys.executable)
+        store.register_env("spl_core", sys.executable)
+        stale_python = str(tmp_path / "missing-python")
+        with store._lock, store._conn:  # noqa: SLF001 - regression seeds stale local state.
+            store._conn.execute(
+                "UPDATE envs SET python = ? WHERE name = ?",
+                (stale_python, "spl_core"),
+            )
+        store.save_server_connection(
+            server_url="https://splime.io/api",
+            token="machine-token-123456",
+            user_token="user-token-123456",
+            connection={
+                "id": "remote-connection-1",
+                "owner_id": "owner-1",
+                "subject_type": "machine",
+                "subject_id": "machine-1",
+                "machine_id": "machine-1",
+                "display_name": "lab-machine",
+                "status": "connected",
+                "capabilities": {},
+            },
+            heartbeat_interval_seconds=60,
+        )
+        runtime = DaemonRuntime(store, heartbeat_service=_NoopHeartbeats())
+
+        imported = runtime.import_server_object("demo_obj")
+
+        assert store.get_env("spl_core")["python"] == default_env["python"]
+        assert imported["current_version"]["env_python"] == default_env["python"]
+    finally:
+        store.close()
+
+
+def test_remote_import_repairs_stale_env_for_existing_mirror(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class ImportServerClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def get_object(self, name_or_id, *, version=None, include_yaml=False):
+            assert name_or_id == "demo_obj"
+            assert include_yaml is False
+            return {
+                "id": "remote-object-1",
+                "owner_id": "owner-1",
+                "name": "demo_obj",
+                "version": 1,
+                "version_id": "remote-version-1",
+                "entrypoint": "demo_obj",
+                "env": "spl_core",
+            }
+
+    store = RegistryStore(tmp_path)
+    monkeypatch.setattr(daemon_server, "ServerClient", ImportServerClient)
+    try:
+        default_env = store.register_env("default", sys.executable)
+        store.register_env("spl_core", sys.executable)
+        store.register_object(
+            "demo_obj",
+            "demo_obj",
+            "spl_core",
+            yaml_text=REMOTE_FUNCTION_YAML,
+            owner_id="owner-1",
+            library="default",
+            origin="server",
+            remote_owner_id="owner-1",
+            remote_object_id="remote-object-1",
+            remote_version_id="remote-version-1",
+            source_object_name="demo_obj",
+        )
+        stale_python = str(tmp_path / "missing-python")
+        with store._lock, store._conn:  # noqa: SLF001 - regression seeds stale local state.
+            store._conn.execute(
+                "UPDATE envs SET python = ? WHERE name = ?",
+                (stale_python, "spl_core"),
+            )
+        store.save_server_connection(
+            server_url="https://splime.io/api",
+            token="machine-token-123456",
+            user_token="user-token-123456",
+            connection={
+                "id": "remote-connection-1",
+                "owner_id": "owner-1",
+                "subject_type": "machine",
+                "subject_id": "machine-1",
+                "machine_id": "machine-1",
+                "display_name": "lab-machine",
+                "status": "connected",
+                "capabilities": {},
+            },
+            heartbeat_interval_seconds=60,
+        )
+        runtime = DaemonRuntime(store, heartbeat_service=_NoopHeartbeats())
+
+        imported = runtime.import_server_object("demo_obj")
+
+        assert imported["refreshed"] is False
+        assert store.get_env("spl_core")["python"] == default_env["python"]
+    finally:
+        store.close()
+
+
+def test_venv_build_spec_uses_current_env_when_stored_python_is_missing(
+    tmp_path,
+) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        env = store.register_env("spl_core", sys.executable)
+        runtime = DaemonRuntime(store, auto_build_envs=False)
+        record = {
+            "env": "spl_core",
+            "env_python": str(tmp_path / "missing-python"),
+            "distributions": [],
+        }
+
+        spec = runtime.environment_manager.build_spec(record)
+
+        assert spec["base_python"] == env["python"]
+    finally:
+        store.close()
+
+
+def test_server_mirror_reregister_repairs_existing_version_env_python(
+    tmp_path,
+) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        default_env = store.register_env("default", sys.executable)
+        store.register_env("default1", sys.executable)
+        runtime = DaemonRuntime(
+            store,
+            auto_build_envs=False,
+            heartbeat_service=_NoopHeartbeats(),
+        )
+        first = runtime.register_object(
+            "demo_obj",
+            "demo_obj",
+            "default1",
+            yaml_text=REMOTE_FUNCTION_YAML,
+            owner_id="owner-1",
+            library="default",
+            origin="server",
+            remote_owner_id="owner-1",
+            remote_object_id="remote-object-1",
+            remote_version_id="remote-version-1",
+            source_object_name="demo_obj",
+        )
+        stale_python = str(tmp_path / "missing-python")
+        with store._lock, store._conn:  # noqa: SLF001 - regression seeds stale local state.
+            store._conn.execute(
+                "UPDATE envs SET python = ? WHERE name = ?",
+                (stale_python, "default1"),
+            )
+            store._conn.execute(
+                "UPDATE object_versions SET env_python = ? WHERE id = ?",
+                (stale_python, first["version_id"]),
+            )
+        runtime._ensure_server_object_envs([{"env": "default1"}])
+
+        repaired = runtime.register_object(
+            "demo_obj",
+            "demo_obj",
+            "default1",
+            yaml_text=REMOTE_FUNCTION_YAML,
+            owner_id="owner-1",
+            library="default",
+            origin="server",
+            remote_owner_id="owner-1",
+            remote_object_id="remote-object-1",
+            remote_version_id="remote-version-1",
+            source_object_name="demo_obj",
+        )
+
+        assert repaired["version_id"] == first["version_id"]
+        assert repaired["env_python"] == default_env["python"]
+    finally:
+        store.close()
+
+
+def test_venv_build_spec_uses_default_env_for_stale_server_mirror(
+    tmp_path,
+) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        default_env = store.register_env("default", sys.executable)
+        runtime = DaemonRuntime(store, auto_build_envs=False)
+        record = {
+            "origin": "server",
+            "env": "spl_core",
+            "env_python": str(tmp_path / "missing-python"),
+            "distributions": [],
+        }
+
+        spec = runtime.environment_manager.build_spec(record)
+
+        assert spec["base_python"] == default_env["python"]
     finally:
         store.close()

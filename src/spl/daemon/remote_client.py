@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from spl._http import urlopen_verified, verified_https_context
 
 DEFAULT_SERVER_URL = "https://splime.io/api"
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60.0
@@ -66,7 +68,7 @@ class ServerClient:
             method=method,
         )
         try:
-            with urlopen(request) as response:  # noqa: S310 - configured server URL.
+            with urlopen_verified(request) as response:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")
@@ -95,7 +97,7 @@ class ServerClient:
     def _bytes_request(self, path: str) -> bytes:
         request = Request(f"{self.base_url}{path}", headers=self._headers())
         try:
-            with urlopen(request) as response:  # noqa: S310 - configured server URL.
+            with urlopen_verified(request) as response:
                 return response.read()
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")
@@ -128,15 +130,18 @@ class ServerClient:
         url = urlparse(self.base_url)
         if url.scheme not in {"http", "https"}:
             raise ServerClientError(400, f"unsupported server URL scheme: {url.scheme}")
-        connection_class = (
-            http.client.HTTPSConnection
-            if url.scheme == "https"
-            else http.client.HTTPConnection
-        )
         host = url.hostname
         if not host:
             raise ServerClientError(400, f"invalid server URL: {self.base_url}")
-        connection = connection_class(host, url.port, timeout=300)
+        if url.scheme == "https":
+            connection = http.client.HTTPSConnection(
+                host,
+                url.port,
+                timeout=300,
+                context=verified_https_context(),
+            )
+        else:
+            connection = http.client.HTTPConnection(host, url.port, timeout=300)
         request_path = f"{url.path.rstrip('/')}{path}"
         request_headers = {
             **self._headers(),

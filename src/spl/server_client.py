@@ -14,7 +14,9 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from spl._http import urlopen_verified
 
 DEFAULT_SERVER_URL = "https://splime.io/api"
 TERMINAL_REMOTE_RUN_STATUSES = {"succeeded", "failed", "cancelled", "stale"}
@@ -208,7 +210,7 @@ class SPLServerClient:
             method=method,
         )
         try:
-            with urlopen(request) as response:  # noqa: S310 - configured server URL.
+            with urlopen_verified(request) as response:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")
@@ -232,7 +234,7 @@ class SPLServerClient:
     def _bytes_request(self, path: str) -> bytes:
         request = Request(f"{self.base_url}{path}", headers=self._headers())
         try:
-            with urlopen(request) as response:  # noqa: S310 - configured server URL.
+            with urlopen_verified(request) as response:
                 return response.read()
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")
