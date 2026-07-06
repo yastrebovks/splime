@@ -76,6 +76,7 @@ _prefer_runtime_env_over_pythonpath_site_packages()
 import argparse
 import importlib.metadata
 import json
+import re
 import shutil
 from collections.abc import Mapping, Sequence
 from importlib.metadata import PackageNotFoundError
@@ -87,7 +88,10 @@ from urllib.request import Request, urlopen
 from spl.daemon.store import validate_name
 
 ARTIFACTS_KEY = "__spl_artifacts__"
+ARTIFACT_REF_KEY = "__spl_artifact_ref__"
 RESULT_KEY = "__spl_result__"
+_JSON_SCALAR_TYPES = (str, int, float, bool)
+_ARTIFACT_NAME_TOKEN_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 def read_json(path: Path) -> Any:
@@ -282,6 +286,159 @@ def collect_artifacts(value: Any, artifacts_dir: Path) -> tuple[Any, dict[str, s
     return result, copied
 
 
+def _type_name(value: Any) -> str:
+    typ = type(value)
+    if typ.__module__ == "builtins":
+        return typ.__qualname__
+    return f"{typ.__module__}.{typ.__qualname__}"
+
+
+def _result_path(parts: Sequence[str]) -> str:
+    return ".".join(parts)
+
+
+def _artifact_name_token(value: str) -> str:
+    token = _ARTIFACT_NAME_TOKEN_PATTERN.sub("_", str(value)).strip("._-")
+    return token or "value"
+
+
+def _with_numeric_suffix(name: str, index: int) -> str:
+    stem, separator, suffix = name.rpartition(".")
+    if stem and separator and suffix:
+        return f"{stem}-{index}.{suffix}"
+    return f"{name}-{index}"
+
+
+class PipelineResultNormalizer:
+    """Convert final pipeline values into the daemon's JSON/artifact protocol."""
+
+    def __init__(self, pipeline: Any, artifacts_dir: Path):
+        self.pipeline = pipeline
+        self.artifacts_dir = artifacts_dir
+        self.artifacts: dict[str, str] = {}
+        self._used_artifact_names: set[str] = set()
+
+    def normalize(self, value: Any, path: tuple[str, ...] = ("result",)) -> Any:
+        if value is None or isinstance(value, _JSON_SCALAR_TYPES):
+            return value
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, Mapping):
+            if ARTIFACTS_KEY in value:
+                result = self._result_from_explicit_artifact_mapping(value)
+                self._copy_declared_artifacts(value[ARTIFACTS_KEY])
+                return self.normalize(result, path)
+            return {
+                str(key): self.normalize(item, (*path, str(key)))
+                for key, item in value.items()
+            }
+        if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+            return [
+                self.normalize(item, (*path, str(index)))
+                for index, item in enumerate(value)
+            ]
+        if isinstance(value, set):
+            return [
+                self.normalize(item, (*path, str(index)))
+                for index, item in enumerate(sorted(value, key=repr))
+            ]
+        return self._materialize_adapter_artifact(value, path)
+
+    @staticmethod
+    def _result_from_explicit_artifact_mapping(value: Mapping[Any, Any]) -> Any:
+        if RESULT_KEY in value:
+            return value[RESULT_KEY]
+        return {
+            key: item
+            for key, item in value.items()
+            if key not in {ARTIFACTS_KEY, RESULT_KEY}
+        }
+
+    def _copy_declared_artifacts(self, artifact_spec: Any) -> None:
+        if isinstance(artifact_spec, Mapping):
+            items = artifact_spec.items()
+        elif isinstance(artifact_spec, Sequence) and not isinstance(
+            artifact_spec,
+            str | bytes | bytearray,
+        ):
+            items = ((Path(str(path)).name, path) for path in artifact_spec)
+        else:
+            raise TypeError("__spl_artifacts__ must be a mapping or a list of paths")
+
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        for name, source in items:
+            artifact_name = self._reserve_artifact_name(safe_artifact_name(str(name)))
+            source_path = Path(str(source)).expanduser().absolute()
+            target_path = self.artifacts_dir / artifact_name
+            if source_path.resolve() != target_path.resolve():
+                copy_artifact(source_path, target_path)
+            self.artifacts[artifact_name] = str(target_path)
+
+    def _materialize_adapter_artifact(
+        self,
+        value: Any,
+        path: tuple[str, ...],
+    ) -> dict[str, Any]:
+        adapter = self._resolve_adapter(value, path)
+        artifact_name = self._artifact_name(path, adapter.format)
+        artifact_path = self.artifacts_dir / artifact_name
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            adapter.save(str(artifact_path), value)
+        except BaseException:
+            artifact_path.unlink(missing_ok=True)
+            raise
+
+        from spl.core.entities.artifact import compute_sha256
+
+        size = artifact_path.stat().st_size
+        sha256 = compute_sha256(artifact_path)
+        self.artifacts[artifact_name] = str(artifact_path)
+        return {
+            ARTIFACT_REF_KEY: True,
+            "name": artifact_name,
+            "key": adapter.key,
+            "format": adapter.format,
+            "size": size,
+            "sha256": sha256,
+        }
+
+    def _resolve_adapter(self, value: Any, path: tuple[str, ...]) -> Any:
+        try:
+            adapter = self.pipeline.resolve_adapter(py_type=type(value))
+        except ValueError as exc:
+            raise TypeError(
+                f"{_result_path(path)} {_type_name(value)} is not JSON serializable; "
+                f"add_adapter({_type_name(value)}, ...) or remove ambiguous adapters"
+            ) from exc
+        if adapter is None:
+            raise TypeError(
+                f"{_result_path(path)} {_type_name(value)} is not JSON serializable; "
+                f"add_adapter({_type_name(value)}, ...)"
+            )
+        return adapter
+
+    def _artifact_name(self, path: tuple[str, ...], format_name: str) -> str:
+        parts = [_artifact_name_token(part) for part in path[1:]]
+        if len(parts) > 1 and parts[-1] == "default":
+            parts = parts[:-1]
+        if not parts:
+            parts = ["result"]
+        base_name = ".".join(parts)
+        format_token = _artifact_name_token(format_name)
+        return self._reserve_artifact_name(f"{base_name}.{format_token}")
+
+    def _reserve_artifact_name(self, name: str) -> str:
+        candidate = safe_artifact_name(name)
+        index = 2
+        while candidate in self._used_artifact_names:
+            candidate = safe_artifact_name(_with_numeric_suffix(name, index))
+            index += 1
+        self._used_artifact_names.add(candidate)
+        return candidate
+
+
 def run_pipeline(
     pipeline: Any,
     kwargs: dict[str, Any],
@@ -289,7 +446,8 @@ def run_pipeline(
     *,
     daemon_url: str,
     timeout_seconds: float | None,
-) -> Any:
+    artifacts_dir: Path,
+) -> tuple[Any, dict[str, str]]:
     """Run a ``spl.core`` pipeline without changing the existing core files.
 
     The current core exposes ``Deployment`` and ``Run`` but does not provide a
@@ -311,20 +469,25 @@ def run_pipeline(
         # Older framework builds did not require a client for local-only
         # pipelines.  Keep the worker tolerant while NodeRemote is still moving.
         deployment = Deployment(pipeline)
-    run = deployment.run(**kwargs)
+    normalizer = PipelineResultNormalizer(pipeline, artifacts_dir)
+    with deployment.run(**kwargs) as run:
+        if output is not None:
+            result = run[pipeline.get_node_by_alias(output)]
+            return normalizer.normalize(result, ("result", output)), normalizer.artifacts
 
-    if output is not None:
-        return run[pipeline.get_node_by_alias(output)]
+        if pipeline.aliases:
+            result = {
+                alias: run[node]
+                for alias, node in sorted(
+                    pipeline.aliases.items(),
+                    key=lambda item: item[0],
+                )
+            }
+            return normalizer.normalize(result), normalizer.artifacts
 
-    if pipeline.aliases:
-        return {
-            alias: run[node]
-            for alias, node in sorted(pipeline.aliases.items(), key=lambda item: item[0])
-        }
-
-    if len(pipeline.nodes) == 1:
-        [node] = list(pipeline.nodes)
-        return run[node]
+        if len(pipeline.nodes) == 1:
+            [node] = list(pipeline.nodes)
+            return normalizer.normalize(run[node]), normalizer.artifacts
 
     raise ValueError(
         "pipeline has multiple nodes and no aliases; pass output or register aliases"
@@ -468,19 +631,20 @@ def execute(
     from spl.core.entities.pipeline import Pipeline
 
     if isinstance(target, Pipeline):
-        raw_result = run_pipeline(
+        result_without_artifacts, artifacts = run_pipeline(
             target,
             kwargs,
             output,
             daemon_url=daemon_url,
             timeout_seconds=payload.get("timeout_seconds"),
+            artifacts_dir=artifacts_dir,
         )
     elif callable(target):
         raw_result = target(*args, **kwargs)
+        result_without_artifacts, artifacts = collect_artifacts(raw_result, artifacts_dir)
     else:
         raise TypeError(f"entrypoint is not callable or Pipeline: {entrypoint}")
 
-    result_without_artifacts, artifacts = collect_artifacts(raw_result, artifacts_dir)
     result_payload = {
         "result": to_jsonable(result_without_artifacts),
         "artifacts": artifacts,

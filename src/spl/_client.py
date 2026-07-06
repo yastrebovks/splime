@@ -23,6 +23,21 @@ from html import escape
 from pathlib import Path
 from typing import Any, Literal, cast, overload
 
+from spl._views import (
+    ConnectionStatusView,
+    DecompositionView,
+    EnvTableView,
+    EnvironmentBuildListView,
+    HealthView,
+    InputListView,
+    LibraryListView,
+    MachineListView,
+    OutputListView,
+    RunListView,
+    RunRecordView,
+    SignatureView,
+    wrap_action,
+)
 from spl.core.entities.node import DEFAULT_PORT
 from spl.daemon_client import (
     DEFAULT_DAEMON_HOST,
@@ -353,7 +368,7 @@ class RemoteRun:
         server_side: bool = False,
     ):
         self._client = client
-        self.state = state
+        self.state = RunRecordView(state)
         self.server_side = server_side
 
     @property
@@ -378,9 +393,9 @@ class RemoteRun:
         """Refresh and return the run state from the daemon."""
 
         if self.server_side:
-            self.state = self._client._daemon.get_remote_run(self.id)
+            self.state = RunRecordView(self._client._daemon.get_remote_run(self.id))
         else:
-            self.state = self._client._daemon.get_run(self.id)
+            self.state = RunRecordView(self._client._daemon.get_run(self.id))
         return self.state
 
     def wait(
@@ -400,18 +415,22 @@ class RemoteRun:
 
         on_state = _progress_callback(progress)
         if self.server_side:
-            self.state = self._client._daemon.wait_remote_run(
-                self.id,
-                poll_interval=poll_interval,
-                timeout_seconds=timeout_seconds,
-                on_state=on_state,
+            self.state = RunRecordView(
+                self._client._daemon.wait_remote_run(
+                    self.id,
+                    poll_interval=poll_interval,
+                    timeout_seconds=timeout_seconds,
+                    on_state=on_state,
+                )
             )
         else:
-            self.state = self._client._daemon.wait_run(
-                self.id,
-                poll_interval=poll_interval,
-                timeout_seconds=timeout_seconds,
-                on_state=on_state,
+            self.state = RunRecordView(
+                self._client._daemon.wait_run(
+                    self.id,
+                    poll_interval=poll_interval,
+                    timeout_seconds=timeout_seconds,
+                    on_state=on_state,
+                )
             )
         return self.state
 
@@ -522,13 +541,16 @@ class _LibraryAdmin:
             payload["default_machine_id"] = default_machine
         if execution is not None:
             payload["execution"] = execution
-        return self._c._daemon.create_server_library(payload)
+        return wrap_action(
+            self._c._daemon.create_server_library(payload),
+            "library created",
+        )
 
     def get(self, ref: str) -> dict[str, Any]:
         """Return one central-server library by slug or id."""
 
         self._c._require_server_connection("reading a library")
-        return self._c._daemon.get_server_library(ref)
+        return wrap_action(self._c._daemon.get_server_library(ref), "library")
 
     def update(
         self,
@@ -554,7 +576,10 @@ class _LibraryAdmin:
             payload["default_machine_id"] = default_machine
         if execution is not None:
             payload["execution"] = execution
-        return self._c._daemon.update_server_library(ref, payload)
+        return wrap_action(
+            self._c._daemon.update_server_library(ref, payload),
+            "library updated",
+        )
 
     def delete(self, ref: str) -> dict[str, Any]:
         """Raise a clear error because server-side library delete is unsupported."""
@@ -579,13 +604,19 @@ class _LibraryAdmin:
         }
         if scopes is not None:
             payload["scopes"] = scopes
-        return self._c._daemon.grant_server_library(ref, payload)
+        return wrap_action(
+            self._c._daemon.grant_server_library(ref, payload),
+            "library grant",
+        )
 
     def revoke(self, ref: str, grantee: str) -> dict[str, Any]:
         """Revoke a grantee's access to one central-server library."""
 
         self._c._require_server_connection("revoking library access")
-        return self._c._daemon.revoke_server_library_grant(ref, grantee)
+        return wrap_action(
+            self._c._daemon.revoke_server_library_grant(ref, grantee),
+            "library grant revoked",
+        )
 
     def add_reference(
         self,
@@ -610,7 +641,10 @@ class _LibraryAdmin:
             payload["version"] = version
         if alias is not None:
             payload["alias"] = alias
-        return self._c._daemon.add_server_library_reference(into_library, payload)
+        return wrap_action(
+            self._c._daemon.add_server_library_reference(into_library, payload),
+            "library reference",
+        )
 
     def copy_object(
         self,
@@ -635,13 +669,19 @@ class _LibraryAdmin:
             payload["version"] = version
         if new_name is not None:
             payload["new_name"] = new_name
-        return self._c._daemon.copy_server_library_object(into_library, payload)
+        return wrap_action(
+            self._c._daemon.copy_server_library_object(into_library, payload),
+            "library copy",
+        )
 
     def remove_entry(self, library: str, name: str) -> dict[str, Any]:
         """Remove an owned object or reference entry from a central-server library."""
 
         self._c._require_server_connection("removing a library entry")
-        return self._c._daemon.remove_server_library_entry(library, name)
+        return wrap_action(
+            self._c._daemon.remove_server_library_entry(library, name),
+            "library entry removed",
+        )
 
 
 class SPLClient:
@@ -688,7 +728,7 @@ class SPLClient:
     def health(self) -> dict[str, Any]:
         """Check that the local daemon is reachable."""
 
-        return self._daemon.health()
+        return HealthView(self._daemon.health())
 
     def connect_server(
         self,
@@ -718,7 +758,7 @@ class SPLClient:
         )
         self._user_token = user_token
         self.server_connection = connection
-        return self.server_connection
+        return ConnectionStatusView(self.server_connection)
 
     def disconnect_server(self) -> dict[str, Any]:
         """Gracefully disconnect the local daemon from the central server."""
@@ -760,24 +800,28 @@ class SPLClient:
             state = self._daemon.server_connection()
         except Exception as exc:
             if _is_missing_server_connection(exc):
-                return {"connected": False, "offline": False, "connection": None}
+                return ConnectionStatusView(
+                    {"connected": False, "offline": False, "connection": None}
+                )
             raise
         state.setdefault("connected", bool(state.get("server_url")))
-        return state
+        return ConnectionStatusView(state)
 
     def machines(self) -> dict[str, Any]:
         """Return the user's machines, or an empty listing when not connected."""
 
         if not self._has_server_connection():
-            return {"current_machine_id": None, "machines": []}
-        return self._daemon.server_machines()
+            return MachineListView({"current_machine_id": None, "machines": []})
+        return MachineListView(self._daemon.server_machines())
 
     def libraries(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
         """Return visible libraries, or an empty list when not connected."""
 
         if not self._has_server_connection():
-            return []
-        return self._daemon.server_libraries(include_accessible=include_accessible)
+            return LibraryListView([])
+        return LibraryListView(
+            self._daemon.server_libraries(include_accessible=include_accessible)
+        )
 
     # The flat library aliases (create_library, get_library, update_library,
     # delete_library, grant_library, revoke_library_grant, add_reference,
@@ -795,7 +839,7 @@ class SPLClient:
             client.publish(my_function, env="default")
         """
 
-        return self._daemon.register_env(name, python)
+        return wrap_action(self._daemon.register_env(name, python), "env registered")
 
     def publish(
         self,
@@ -1021,7 +1065,10 @@ class SPLClient:
     ) -> dict[str, Any]:
         """Remove one local daemon object without requiring a server connection."""
 
-        return self._daemon.forget(name, owner_id=owner, library=library)
+        return wrap_action(
+            self._daemon.forget(name, owner_id=owner, library=library),
+            "object forgotten",
+        )
 
     def remove_local(
         self,
@@ -1044,11 +1091,14 @@ class SPLClient:
     ) -> dict[str, Any]:
         """Remove one local object version without contacting the server."""
 
-        return self._daemon.forget_version(
-            name,
-            version,
-            owner_id=owner,
-            library=library,
+        return wrap_action(
+            self._daemon.forget_version(
+                name,
+                version,
+                owner_id=owner,
+                library=library,
+            ),
+            "object version forgotten",
         )
 
     def prune_stale_mirrors(
@@ -1059,7 +1109,10 @@ class SPLClient:
     ) -> dict[str, Any]:
         """Remove locally cached server-origin mirror rows."""
 
-        return self._daemon.prune_stale_mirrors(owner_id=owner, library=library)
+        return wrap_action(
+            self._daemon.prune_stale_mirrors(owner_id=owner, library=library),
+            "stale mirrors pruned",
+        )
 
     def _has_server_connection(self) -> bool:
         if self.server_connection is not None:
@@ -1104,12 +1157,14 @@ class SPLClient:
     ) -> dict[str, Any]:
         """Return a concise call/read signature for one daemon object."""
 
-        return self._daemon.signature(
-            name,
-            version=version,
-            owner_id=owner,
-            library=library,
-            function=function,
+        return SignatureView(
+            self._daemon.signature(
+                name,
+                version=version,
+                owner_id=owner,
+                library=library,
+                function=function,
+            )
         )
 
     def inputs(
@@ -1123,12 +1178,14 @@ class SPLClient:
     ) -> list[dict[str, Any]]:
         """Return the inputs that can be passed through ``kwargs``."""
 
-        return self._daemon.inputs(
-            name,
-            version=version,
-            owner_id=owner,
-            library=library,
-            function=function,
+        return InputListView(
+            self._daemon.inputs(
+                name,
+                version=version,
+                owner_id=owner,
+                library=library,
+                function=function,
+            )
         )
 
     def outputs(
@@ -1142,12 +1199,14 @@ class SPLClient:
     ) -> list[dict[str, Any]]:
         """Return output selectors and how to read ``result.value``."""
 
-        return self._daemon.outputs(
-            name,
-            version=version,
-            owner_id=owner,
-            library=library,
-            function=function,
+        return OutputListView(
+            self._daemon.outputs(
+                name,
+                version=version,
+                owner_id=owner,
+                library=library,
+                function=function,
+            )
         )
 
     def decomposition(
@@ -1161,17 +1220,20 @@ class SPLClient:
         """Return normalized function/node/link metadata for one object."""
 
         if self._is_node_remote(name):
-            return self._remote_decomposition_response(name, version=version)["decomposition"]
+            return DecompositionView(
+                self._remote_decomposition_response(name, version=version)["decomposition"]
+            )
         if owner is not None or library is not None:
-            return self._remote_decomposition_response(
+            response = self._remote_decomposition_response(
                 {
                     "name": str(name),
                     "version": version,
                     "owner_id": owner,
                     "library": library,
                 }
-            )["decomposition"]
-        return self._daemon.decomposition(str(name), version=version)
+            )
+            return DecompositionView(response["decomposition"])
+        return DecompositionView(self._daemon.decomposition(str(name), version=version))
 
     def pipeline_widget(
         self,
@@ -1364,12 +1426,12 @@ class SPLClient:
     def envs(self) -> dict[str, Any]:
         """Return registered daemon environments."""
 
-        return self._daemon.list_envs()
+        return EnvTableView(self._daemon.list_envs())
 
     def environment_builds(self) -> list[dict[str, Any]]:
         """Return cached daemon venv builds."""
 
-        return self._daemon.list_environment_builds()
+        return EnvironmentBuildListView(self._daemon.list_environment_builds())
 
     def rebuild_environment(
         self,
@@ -1379,12 +1441,15 @@ class SPLClient:
     ) -> dict[str, Any]:
         """Force a cached daemon venv build to be recreated."""
 
-        return self._daemon.rebuild_environment_build(spec_hash, wait=wait)
+        return wrap_action(
+            self._daemon.rebuild_environment_build(spec_hash, wait=wait),
+            "environment build",
+        )
 
     def runs(self) -> list[dict[str, Any]]:
         """Return known daemon runs, newest first."""
 
-        return self._daemon.list_runs()
+        return RunListView(self._daemon.list_runs())
 
     def _start_run(
         self,

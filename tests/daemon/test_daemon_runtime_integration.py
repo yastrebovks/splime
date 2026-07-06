@@ -12,8 +12,11 @@ from typing import Any
 import pytest
 
 import spl.daemon.server as daemon_server
+from spl import lift
+from spl.core.ir.utils import spl_export_to_file
 from spl.daemon.server import DaemonRuntime
 from spl.daemon.store import RegistryStore, utc_now
+from spl.daemon.worker import ARTIFACT_REF_KEY, run_pipeline
 
 
 ARTIFACT_FUNCTION_YAML = """\
@@ -43,6 +46,32 @@ REMOTE_FUNCTION_YAML = """\
   body: |-
     return 1
 """
+
+
+def _worker_final_png() -> bytes:
+    return b"\x89PNG\r\n\x1a\nsplime-final-output"
+
+
+def _worker_save_bytes(path: str, obj: bytes) -> None:
+    with open(path, "wb") as f:
+        f.write(obj)
+
+
+def _worker_load_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _worker_explicit_artifact_payload() -> dict[str, Any]:
+    Path("nested.txt").write_text("nested daemon artifact", encoding="utf-8")
+    return {
+        "__spl_result__": {"ok": True},
+        "__spl_artifacts__": {"nested.txt": "nested.txt"},
+    }
+
+
+def _worker_final_unadapted_bytes() -> bytes:
+    return b"missing adapter"
 
 
 class _NoopHeartbeats:
@@ -126,6 +155,99 @@ def _wait_for_run(
             return state
         time.sleep(0.1)
     raise TimeoutError(f"run did not finish: {run_id}")
+
+
+def _final_png_pipeline():
+    return (
+        lift(_worker_final_png)
+        .alias("thumbnail")
+        .render("thumbnail_pipeline")
+        .add_adapter(bytes, "png", save=_worker_save_bytes, load=_worker_load_bytes)
+    )
+
+
+def test_pipeline_final_adapter_output_is_daemon_artifact(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        store.register_env("default", sys.executable)
+        runtime = DaemonRuntime(store)
+        pipeline = _final_png_pipeline()
+        yaml_path = tmp_path / "thumbnail_pipeline.yaml"
+        spl_export_to_file(yaml_path, [pipeline])
+        record = runtime.register_object(
+            "thumbnail_pipeline",
+            "thumbnail_pipeline",
+            "default",
+            yaml_text=yaml_path.read_text(encoding="utf-8"),
+        )
+        build = _mark_object_environment_ready(runtime, record)
+
+        started = runtime.start_run(
+            "thumbnail_pipeline",
+            output="thumbnail",
+            source="local",
+            report_local_run=False,
+            timeout_seconds=30,
+        )
+        final = _wait_for_run(store, started["id"])
+
+        assert final["status"] == "succeeded"
+        assert final["env_build_hash"] == build["spec_hash"]
+        artifact_path = Path(final["artifacts_dir"]) / "thumbnail.png"
+        assert artifact_path.read_bytes() == _worker_final_png()
+        assert final["result"]["artifacts"] == {"thumbnail.png": str(artifact_path)}
+        assert final["result"]["result"] == {
+            "default": {
+                ARTIFACT_REF_KEY: True,
+                "format": "png",
+                "key": "builtins.bytes@png",
+                "name": "thumbnail.png",
+                "sha256": hashlib.sha256(_worker_final_png()).hexdigest(),
+                "size": len(_worker_final_png()),
+            }
+        }
+    finally:
+        store.close()
+
+
+def test_pipeline_output_normalizer_extracts_nested_explicit_artifacts(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    pipeline = lift(_worker_explicit_artifact_payload).alias("payload").render("payload_pipeline")
+
+    result, artifacts = run_pipeline(
+        pipeline,
+        {},
+        "payload",
+        daemon_url="http://127.0.0.1:8765",
+        timeout_seconds=None,
+        artifacts_dir=tmp_path / "artifacts",
+    )
+
+    assert result == {"default": {"ok": True}}
+    assert artifacts == {"nested.txt": str(tmp_path / "artifacts" / "nested.txt")}
+    assert (tmp_path / "artifacts" / "nested.txt").read_text(encoding="utf-8") == "nested daemon artifact"
+
+
+def test_pipeline_output_normalizer_reports_missing_adapter_path(tmp_path) -> None:
+    pipeline = lift(_worker_final_unadapted_bytes).alias("thumbnail").render("thumbnail_pipeline")
+
+    with pytest.raises(TypeError) as exc_info:
+        run_pipeline(
+            pipeline,
+            {},
+            "thumbnail",
+            daemon_url="http://127.0.0.1:8765",
+            timeout_seconds=None,
+            artifacts_dir=tmp_path / "artifacts",
+        )
+
+    assert str(exc_info.value) == (
+        "result.thumbnail.default bytes is not JSON serializable; "
+        "add_adapter(bytes, ...)"
+    )
 
 
 def test_publish_run_environment_and_artifact_flow(tmp_path) -> None:

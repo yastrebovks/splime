@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.abspath('../../src'))
 project = 'splime'
 copyright = '2026, Yastrebov Kirill'
 author = 'Yastrebov Kirill'
-release = '0.2.4'
+release = '0.2.5'
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration

@@ -25,7 +25,7 @@ MIN_SCALE = 0.52
 MAX_SCALE = 1.8
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class PipelineGraphWidget:
     """Rich notebook display object for one pipeline graph."""
 
@@ -34,6 +34,21 @@ class PipelineGraphWidget:
     height: int = 560
     theme: str = "dark"
     dom_id: str = field(default_factory=lambda: f"spl-pipeline-{uuid4().hex}")
+
+    def __repr__(self) -> str:
+        """Return a compact text fallback instead of dumping graph JSON."""
+
+        model = create_pipeline_graph_model(self.decomposition, self.object_info)
+        stats = model["stats"]
+        return (
+            "PipelineGraphWidget("
+            f"title={model['title']!r}, "
+            f"nodes={len(model['nodes'])}, "
+            f"links={len(model['links'])}, "
+            f"ports={stats['portCount']}, "
+            f"height={self.height}, "
+            f"theme={self.theme!r})"
+        )
 
     def _repr_html_(self) -> str:
         """Return the HTML representation used by Jupyter rich display."""

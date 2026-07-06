@@ -17,6 +17,22 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request
 
 from spl._http import urlopen_verified
+from spl._views import (
+    ArtifactListView,
+    DecompositionView,
+    EventListView,
+    InputListView,
+    ObjectListView,
+    ObjectRecordView,
+    OutputListView,
+    RunListView,
+    RunRecordView,
+    SignatureView,
+    VersionListView,
+    details_to_html,
+    details_to_text,
+    preview,
+)
 
 DEFAULT_SERVER_URL = "https://splime.io/api"
 TERMINAL_REMOTE_RUN_STATUSES = {"succeeded", "failed", "cancelled", "stale"}
@@ -38,7 +54,15 @@ class ServerClientError(RuntimeError):
         super().__init__(f"{status_code}: {message}")
 
 
-@dataclass(frozen=True)
+def _view_dict(payload: Any, view_type: type[dict[str, Any]]) -> Any:
+    return view_type(payload) if isinstance(payload, dict) else payload
+
+
+def _view_list(payload: Any, view_type: type[list[Any]]) -> Any:
+    return view_type(payload) if isinstance(payload, list) else payload
+
+
+@dataclass(frozen=True, repr=False)
 class ServerCallResult:
     """Completed server run plus optional downloaded artifacts."""
 
@@ -60,7 +84,29 @@ class ServerCallResult:
 
     @property
     def artifacts(self) -> list[dict[str, Any]]:
-        return list(self.detail.get("artifacts") or [])
+        return ArtifactListView(list(self.detail.get("artifacts") or []))
+
+    def __repr__(self) -> str:
+        return details_to_text(
+            "ServerCallResult",
+            [
+                ("status", self.run.get("status")),
+                ("output", preview(self.value)),
+                ("artifacts", len(self.artifacts)),
+                ("downloaded", len(self.downloaded_artifacts)),
+            ],
+        )
+
+    def _repr_html_(self) -> str:
+        return details_to_html(
+            "ServerCallResult",
+            [
+                ("status", self.run.get("status")),
+                ("output", preview(self.value)),
+                ("artifacts", len(self.artifacts)),
+                ("downloaded", len(self.downloaded_artifacts)),
+            ],
+        )
 
 
 class ServerRemoteRun:
@@ -68,7 +114,11 @@ class ServerRemoteRun:
 
     def __init__(self, client: "SPLServerClient", state: dict[str, Any]):
         self._client = client
-        self.state = state
+        self.state = (
+            state
+            if isinstance(state, RunRecordView)
+            else RunRecordView(state if isinstance(state, dict) else {})
+        )
 
     @property
     def id(self) -> str:
@@ -83,7 +133,7 @@ class ServerRemoteRun:
         return "server"
 
     def refresh(self) -> dict[str, Any]:
-        self.state = self._client.get_run(self.id)
+        self.state = _view_dict(self._client.get_run(self.id), RunRecordView)
         return self.state
 
     def wait(
@@ -102,10 +152,10 @@ class ServerRemoteRun:
             time.sleep(max(0.0, poll_interval))
 
     def detail(self) -> dict[str, Any]:
-        return self._client.get_run_detail(self.id)
+        return _view_dict(self._client.get_run_detail(self.id), RunRecordView)
 
     def events(self) -> list[dict[str, Any]]:
-        return self._client.list_events(self.id)
+        return _view_list(self._client.list_events(self.id), EventListView)
 
     def artifact_names(self) -> list[str]:
         return [item["name"] for item in self._client.list_artifacts(self.id)]
@@ -125,7 +175,7 @@ class ServerRemoteRun:
         }
 
     def cancel(self) -> dict[str, Any]:
-        self.state = self._client.cancel_run(self.id)
+        self.state = _view_dict(self._client.cancel_run(self.id), RunRecordView)
         return self.state
 
     def retry(self) -> "ServerRemoteRun":
@@ -269,7 +319,10 @@ class SPLServerClient:
             query["library"] = library
         if compact:
             query["view"] = "summary"
-        return self._json_request("GET", self._with_query(path, query))
+        return _view_list(
+            self._json_request("GET", self._with_query(path, query)),
+            ObjectListView,
+        )
 
     def get_object(
         self,
@@ -288,7 +341,10 @@ class SPLServerClient:
         if library and owner is None:
             query["library"] = library
         path = self._object_path(name_or_id, owner=owner, library=library)
-        return self._json_request("GET", self._with_query(path, query))
+        return _view_dict(
+            self._json_request("GET", self._with_query(path, query)),
+            ObjectRecordView,
+        )
 
     def signature(
         self,
@@ -299,13 +355,16 @@ class SPLServerClient:
         version: int | None = None,
         function: str | None = None,
     ) -> dict[str, Any]:
-        return self._object_view(
-            name_or_id,
-            "signature",
-            owner=owner,
-            library=library,
-            version=version,
-            function=function,
+        return _view_dict(
+            self._object_view(
+                name_or_id,
+                "signature",
+                owner=owner,
+                library=library,
+                version=version,
+                function=function,
+            ),
+            SignatureView,
         )
 
     def inputs(
@@ -317,13 +376,16 @@ class SPLServerClient:
         version: int | None = None,
         function: str | None = None,
     ) -> list[dict[str, Any]]:
-        return self._object_view(
-            name_or_id,
-            "inputs",
-            owner=owner,
-            library=library,
-            version=version,
-            function=function,
+        return _view_list(
+            self._object_view(
+                name_or_id,
+                "inputs",
+                owner=owner,
+                library=library,
+                version=version,
+                function=function,
+            ),
+            InputListView,
         )
 
     def outputs(
@@ -335,13 +397,16 @@ class SPLServerClient:
         version: int | None = None,
         function: str | None = None,
     ) -> list[dict[str, Any]]:
-        return self._object_view(
-            name_or_id,
-            "outputs",
-            owner=owner,
-            library=library,
-            version=version,
-            function=function,
+        return _view_list(
+            self._object_view(
+                name_or_id,
+                "outputs",
+                owner=owner,
+                library=library,
+                version=version,
+                function=function,
+            ),
+            OutputListView,
         )
 
     def decomposition(
@@ -352,12 +417,15 @@ class SPLServerClient:
         library: str | None = None,
         version: int | None = None,
     ) -> dict[str, Any]:
-        return self._object_view(
-            name_or_id,
-            "decomposition",
-            owner=owner,
-            library=library,
-            version=version,
+        return _view_dict(
+            self._object_view(
+                name_or_id,
+                "decomposition",
+                owner=owner,
+                library=library,
+                version=version,
+            ),
+            DecompositionView,
         )
 
     def versions(
@@ -374,7 +442,10 @@ class SPLServerClient:
         if library and owner is None:
             query["library"] = library
         path = f"{self._object_path(name_or_id, owner=owner, library=library)}/versions"
-        return self._json_request("GET", self._with_query(path, query))
+        return _view_list(
+            self._json_request("GET", self._with_query(path, query)),
+            VersionListView,
+        )
 
     def start(
         self,
@@ -430,7 +501,10 @@ class SPLServerClient:
             payload["context"] = context
         if offline_policy is not None:
             payload["offline_policy"] = offline_policy
-        return ServerRemoteRun(self, self._json_request("POST", "/remote-runs", payload))
+        return ServerRemoteRun(
+            self,
+            _view_dict(self._json_request("POST", "/remote-runs", payload), RunRecordView),
+        )
 
     def call(
         self,
@@ -483,22 +557,37 @@ class SPLServerClient:
 
     def runs(self, *, scope: RemoteRunScope | None = None) -> list[dict[str, Any]]:
         query = {"scope": scope} if scope else {}
-        return self._json_request("GET", self._with_query("/remote-runs", query))
+        return _view_list(
+            self._json_request("GET", self._with_query("/remote-runs", query)),
+            RunListView,
+        )
 
     def list_runs(self, *, scope: RemoteRunScope | None = None) -> list[dict[str, Any]]:
         return self.runs(scope=scope)
 
     def get_run(self, run_id: str) -> dict[str, Any]:
-        return self._json_request("GET", f"/remote-runs/{_url_part(run_id)}")
+        return _view_dict(
+            self._json_request("GET", f"/remote-runs/{_url_part(run_id)}"),
+            RunRecordView,
+        )
 
     def get_run_detail(self, run_id: str) -> dict[str, Any]:
-        return self._json_request("GET", f"/remote-runs/{_url_part(run_id)}/detail")
+        return _view_dict(
+            self._json_request("GET", f"/remote-runs/{_url_part(run_id)}/detail"),
+            RunRecordView,
+        )
 
     def list_events(self, run_id: str) -> list[dict[str, Any]]:
-        return self._json_request("GET", f"/remote-runs/{_url_part(run_id)}/events")
+        return _view_list(
+            self._json_request("GET", f"/remote-runs/{_url_part(run_id)}/events"),
+            EventListView,
+        )
 
     def list_artifacts(self, run_id: str) -> list[dict[str, Any]]:
-        return self._json_request("GET", f"/remote-runs/{_url_part(run_id)}/artifacts")
+        return _view_list(
+            self._json_request("GET", f"/remote-runs/{_url_part(run_id)}/artifacts"),
+            ArtifactListView,
+        )
 
     def artifact_bytes(self, run_id: str, name: str) -> bytes:
         return self._bytes_request(
@@ -514,10 +603,16 @@ class SPLServerClient:
         return target_path
 
     def cancel_run(self, run_id: str) -> dict[str, Any]:
-        return self._json_request("POST", f"/remote-runs/{_url_part(run_id)}/cancel")
+        return _view_dict(
+            self._json_request("POST", f"/remote-runs/{_url_part(run_id)}/cancel"),
+            RunRecordView,
+        )
 
     def retry_run(self, run_id: str) -> ServerRemoteRun:
-        state = self._json_request("POST", f"/remote-runs/{_url_part(run_id)}/retry")
+        state = _view_dict(
+            self._json_request("POST", f"/remote-runs/{_url_part(run_id)}/retry"),
+            RunRecordView,
+        )
         return ServerRemoteRun(self, state)
 
     def _object_view(
