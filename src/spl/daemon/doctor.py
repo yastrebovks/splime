@@ -22,6 +22,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from spl.core.entities.pipeline import Pipeline
+from spl.core.ir.utils import spl_import_from_file
+from spl.core.adapter_compat import find_pipeline_adapter_compatibility_issues, probe_pipeline_adapters
 from spl.daemon.interpreter_visibility import python_minor_mismatch
 from spl.daemon_client import default_daemon_home
 
@@ -104,6 +107,8 @@ def run_doctor(
     client: DaemonHealthClient,
     *,
     home: str | Path | None = None,
+    pipeline: Pipeline | None = None,
+    probe_pipeline: bool = False,
 ) -> DoctorReport:
     """Run all diagnostic checks and return the collected report."""
 
@@ -120,8 +125,24 @@ def run_doctor(
     checks.append(check_server_connection(health))
     checks.append(check_environment_builds(health))
     checks.append(check_interpreter_substitutions(health))
+    if pipeline is not None:
+        checks.append(check_pipeline_adapter_tags(pipeline))
+        if probe_pipeline:
+            checks.append(check_pipeline_adapter_probe(pipeline))
     checks.append(check_docker())
     return DoctorReport(checks=checks)
+
+
+def load_pipeline_from_yaml_file(path: str | Path) -> Pipeline:
+    """Load exactly one runtime ``Pipeline`` from a local SPL YAML file."""
+
+    source = Path(path).expanduser().absolute()
+    namespace: dict[str, Any] = {}
+    spl_import_from_file(source, namespace)
+    pipelines = [value for value in namespace.values() if isinstance(value, Pipeline)]
+    if len(pipelines) != 1:
+        raise ValueError("doctor --pipeline expects exactly one Pipeline in {}".format(source))
+    return pipelines[0]
 
 
 def check_python() -> CheckResult:
@@ -369,6 +390,52 @@ def check_interpreter_substitutions(health: dict[str, Any] | None) -> CheckResul
             + (f": {examples}" if examples else "")
         ),
         hint="register a matching local env or republish after validating behavior on this Python version",
+    )
+
+
+def check_pipeline_adapter_tags(pipeline: Pipeline) -> CheckResult:
+    """Statically compare save artifact tags with load accepted tags."""
+
+    issues = find_pipeline_adapter_compatibility_issues(pipeline)
+    if not issues:
+        return CheckResult(
+            name="adapter tags",
+            status=OK,
+            detail="pipeline adapter tags are statically compatible",
+        )
+    first = issues[0]
+    return CheckResult(
+        name="adapter tags",
+        status=WARN,
+        detail=first.detail + ("; {} total mismatches".format(len(issues)) if len(issues) > 1 else ""),
+        hint=first.hint,
+    )
+
+
+def check_pipeline_adapter_probe(pipeline: Pipeline) -> CheckResult:
+    """Run local save/load probes for pipeline adapters that declare examples."""
+
+    report = probe_pipeline_adapters(pipeline)
+    if report.failures:
+        first = report.failures[0]
+        return CheckResult(
+            name="adapter probe",
+            status=WARN,
+            detail="{} of {} adapter probe(s) failed; first failure: {}: {}".format(
+                len(report.failures), report.probed, first.adapter, first.reason
+            ),
+            hint="fix the adapter example/save/load round-trip before relying on resume repair",
+        )
+    if report.probed == 0:
+        return CheckResult(
+            name="adapter probe",
+            status=SKIP,
+            detail="no adapter examples declared for this pipeline",
+        )
+    return CheckResult(
+        name="adapter probe",
+        status=OK,
+        detail="{} adapter example probe(s) passed".format(report.probed),
     )
 
 

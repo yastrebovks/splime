@@ -1,0 +1,13 @@
+# SPL YAML compatibility corpus fixture.
+# Source format: splime 0.3.0 baseline, compatible with 0.2.x/0.3.x readers.
+# Generated on: 2026-07-08.
+# Generated with: ir_parse/get_top_level_deps and yaml.dump_all.
+# Static by design: do not regenerate inside tests.
+- !DFunction
+  name: compat_constant
+  inputs: []
+  outputs:
+  - name: default
+    type: int
+  body: |-
+    return 41

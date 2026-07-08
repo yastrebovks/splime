@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
+from spl.core.manifest import KeepPolicy
 from spl.daemon.repositories import (
     EnvRepository,
     LibraryRepository,
@@ -550,6 +551,10 @@ class RegistryStore:
         version: int | None = None,
         object_version_id: str | None = None,
         function: str | None = None,
+        runtimes: dict[str, str] | None = None,
+        keep: KeepPolicy = "on_failure",
+        parent_run_id: str | None = None,
+        resume: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return self.runs.create_run(
             object_name,
@@ -560,6 +565,10 @@ class RegistryStore:
             version=version,
             object_version_id=object_version_id,
             function=function,
+            runtimes=runtimes,
+            keep=keep,
+            parent_run_id=parent_run_id,
+            resume=resume,
         )
 
     def update_run(self, run_id: str, **changes: Any) -> dict[str, Any]:
@@ -570,3 +579,27 @@ class RegistryStore:
 
     def list_runs(self) -> list[dict[str, Any]]:
         return self.runs.list_runs()
+
+    def show_run(self, run_id: str, *, include_inline_values: bool = False) -> dict[str, Any]:
+        return self.runs.show_run(run_id, include_inline_values=include_inline_values)
+
+    def run_tag_stats(self) -> dict[str, Any]:
+        return self.runs.tag_stats()
+
+    def delete_run(self, run_id: str, *, dry_run: bool = False) -> dict[str, Any]:
+        return self.runs.delete_run(run_id, dry_run=dry_run)
+
+    def prune_runs(
+        self,
+        *,
+        run_id: str | None = None,
+        statuses: list[str] | tuple[str, ...] | set[str] | None = None,
+        older_than_seconds: float | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        return self.runs.prune_runs(
+            run_id=run_id,
+            statuses=statuses,
+            older_than_seconds=older_than_seconds,
+            dry_run=dry_run,
+        )

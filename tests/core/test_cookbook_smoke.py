@@ -10,11 +10,16 @@ from __future__ import annotations
 
 import json
 from contextlib import suppress
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
-# DX invariant: the whole cookbook works with imports from ``spl`` only.
-from spl import SPLClient
+# DX invariant: the introductory cookbook path works with imports from ``spl`` only;
+# adapter recipes may use the stable advanced adapter modules.
+from spl import Deployment, SPLClient, lift
+from spl.core.adapter_compat import find_pipeline_adapter_compatibility_issues
+from spl.core.entities.adapter import Adapter, make_key
 
 pytestmark = pytest.mark.smoke
 
@@ -24,6 +29,44 @@ SMOKE_OBJECT = "cookbook_smoke_daily_total"
 def cookbook_smoke_daily_total(date: str) -> float:
     prices = {"2026-06-08": [11.0, 6.5, 24.5]}
     return sum(prices.get(date, []))
+
+
+class CookbookDictCsvEdgeAdapter(Adapter):
+    @property
+    def accepted_tags(self) -> frozenset[str]:
+        """Return the tag accepted by the consumer load half in the recipe."""
+
+        return frozenset({"json"})
+
+
+def cookbook_extract_csv() -> str:
+    return "name,score\nAda,7\nGrace,9\n"
+
+
+def cookbook_save_csv_rows(path: str, value: str) -> None:
+    Path(path).write_text(value, encoding="utf-8")
+
+
+def cookbook_load_csv_rows(path: str) -> str:
+    return Path(path).read_text(encoding="utf-8")
+
+
+def cookbook_save_json_rows(path: str, value: dict) -> None:
+    Path(path).write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+
+
+def cookbook_load_json_rows(path: str) -> dict:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def cookbook_max_score(value: dict) -> int:
+    return max(int(row["score"]) for row in value["rows"])
+
+
+def cookbook_csv_to_json_rows(value: str) -> dict:
+    header, *lines = value.strip().splitlines()
+    columns = header.split(",")
+    return {"rows": [dict(zip(columns, line.split(","))) for line in lines]}
 
 
 @pytest.fixture(scope="module")
@@ -91,3 +134,45 @@ def test_catalog_prints_compactly(client: SPLClient) -> None:
     # never a raw transport dump.
     assert len(text) < 200 * (len(table) + 3), "objects() repr must stay tabular"
     assert "yaml" not in text, "objects() repr must not leak object bodies"
+
+
+def test_converter_node_recipe_warns_then_runs() -> None:
+    """Cookbook converter-node recipe: mismatch warning, converter, green run."""
+
+    extract = lift(cookbook_extract_csv).alias("extract")
+    broken = (
+        lift(cookbook_max_score)
+        .bind(value=extract.as_format("csv-lines"))
+        .alias("score")
+        .render("broken_scores")
+        .add_adapter(str, "csv-lines", save=cookbook_save_csv_rows, load=cookbook_load_csv_rows)
+    )
+    load_half = CookbookDictCsvEdgeAdapter(
+        key=make_key(dict, "csv-lines"),
+        save=cookbook_save_json_rows,
+        load=cookbook_load_json_rows,
+        py_type=dict,
+        format="csv-lines",
+    )
+    broken = replace(broken, adapters={**broken.adapters, load_half.key: load_half})
+
+    issues = find_pipeline_adapter_compatibility_issues(broken)
+
+    assert len(issues) == 1
+    assert issues[0].edge == "extract.default -> score.value"
+    assert issues[0].save_tag == "csv-lines"
+    assert issues[0].accepted_tags == ("json",)
+    assert "Converter Nodes For Adapter Tags" in issues[0].warning_message
+
+    extract = lift(cookbook_extract_csv).alias("extract")
+    convert = lift(cookbook_csv_to_json_rows).bind(value=extract.as_format("csv-lines")).alias("convert")
+    fixed = (
+        lift(cookbook_max_score)
+        .bind(value=convert.as_format("json"))
+        .alias("score")
+        .render("fixed_scores")
+        .add_adapter(str, "csv-lines", save=cookbook_save_csv_rows, load=cookbook_load_csv_rows)
+    )
+
+    assert find_pipeline_adapter_compatibility_issues(fixed) == ()
+    assert Deployment(fixed).run(output="score", keep=False) == 9

@@ -2,6 +2,7 @@ import ast
 import gc
 import hashlib
 import importlib
+import json
 import re
 import sys
 import textwrap
@@ -13,10 +14,20 @@ import pytest
 import yaml
 
 from spl import Deployment, lift
-from spl.core.entities.adapter import Adapter, DAdapter, make_key
+from spl.core._common import Run, decode
+from spl.core.entities.adapter import (
+    BUILTIN_JSON_ADAPTER,
+    Adapter,
+    DAdapter,
+    DLoadAdapter,
+    DSaveAdapter,
+    adapter_identity,
+    make_key,
+)
+from spl.core.entities.artifact import ArtifactRef
 from spl.core.entities.distribution import DDistribution
-from spl.core.entities.node import DFormattedOutputRef, FormattedOutputRef
-from spl.core.entities.pipeline import DPipeline, Pipeline
+from spl.core.entities.node import DEFAULT_PORT, DFormattedOutputRef, FormattedOutputRef
+from spl.core.entities.pipeline import AdapterResolutionSource, DPipeline, Pipeline
 from spl.core.ir.parse import get_top_level_deps
 from spl.core.ir.unparse import ir_unparse
 from spl.core.ir.utils import SPLSafeLoader, spl_export_to_file, spl_import_from_file
@@ -32,9 +43,22 @@ def _adapter_load(path: str) -> str:
         return f.read()
 
 
+def _adapter_load_should_not_run(path: str) -> str:
+    raise AssertionError("load must not run before tag compatibility is checked")
+
+
 def _adapter_save_upper(path: str, obj: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write(obj.upper())
+
+
+@dataclass(frozen=True)
+class _TagOnlyLoadAdapter:
+    key: str
+    load: Any
+    accepted_tags: frozenset[str]
+    legacy_key_guard: bool = False
+    distributions: tuple[DDistribution, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -61,9 +85,23 @@ def _runtime_load_box(path: str) -> RuntimeBox:
         return RuntimeBox(f.read().decode("utf-8"), decoded=True)
 
 
+def _runtime_example_box() -> RuntimeBox:
+    return RuntimeBox("hello-runtime")
+
+
+def _runtime_load_box_broken(path: str) -> RuntimeBox:
+    del path
+    raise ValueError("broken runtime box load")
+
+
 def _runtime_save_box_alt(path: str, obj: RuntimeBox) -> None:
     with open(path, "wb") as f:
         f.write(obj.value.upper().encode("utf-8"))
+
+
+def _unused_run_callback(**kwargs: Any) -> dict[str, Any]:
+    del kwargs
+    return {}
 
 
 def _runtime_box_pipeline() -> Pipeline:
@@ -73,12 +111,25 @@ def _runtime_box_pipeline() -> Pipeline:
     return cast(Pipeline, pipeline.add_adapter(RuntimeBox, "bytes", save=_runtime_save_box, load=_runtime_load_box))
 
 
+def _runtime_box_override_pipeline() -> Pipeline:
+    lift_any = cast(Any, lift)
+    producer = lift_any(_runtime_make_box).alias("producer")
+    pipeline = lift_any(_runtime_consume_box).bind(box=producer).alias("consumer").render("runtime_override_pipeline")
+    return cast(
+        Pipeline, pipeline.add_adapter(RuntimeBox, "bytes", save=_runtime_save_box, load=_runtime_load_box_broken)
+    )
+
+
 def _format_make_value() -> str:
     return "hello-format"
 
 
 def _format_consume_value(value: str) -> str:
     return value
+
+
+def _json_scalar_add(left: int, right: int) -> int:
+    return left + right
 
 
 def _format_save_csv(path: str, obj: str) -> None:
@@ -238,6 +289,23 @@ def test_adapter_yaml_ir_round_trip_reconstructs_save_load(tmp_path: Path) -> No
     assert reconstructed.load(str(path)) == "hello adapter"
 
 
+def test_adapter_exposes_legacy_save_and_load_halves() -> None:
+    adapter = Adapter(key=make_key(str, "txt"), save=_adapter_save, load=_adapter_load, py_type=str, format="txt")
+
+    assert adapter.tag == "txt"
+    assert adapter.accepted_tags == frozenset({"txt"})
+    assert adapter.legacy_key_guard is True
+
+
+def test_adapter_half_yaml_tags_are_additive() -> None:
+    save = DSaveAdapter(key=make_key(str, "json"), tag="json", save="_adapter_save")
+    load = DLoadAdapter(key=make_key(str, "json"), accepted_tags=("json", "ndjson"), load="_adapter_load")
+    dumped = yaml.dump([save, load], sort_keys=False)
+    loaded = yaml.load(dumped, Loader=SPLSafeLoader)
+
+    assert loaded == [save, load]
+
+
 def test_make_key_is_stable() -> None:
     assert make_key(str, "txt") == "builtins.str@txt"
     assert make_key(str, "txt") == make_key(str, "txt")
@@ -254,6 +322,62 @@ def test_pipeline_add_adapter_returns_new_pipeline() -> None:
     assert adapter is updated.adapters[key]
     assert updated.resolve_adapter(key=key) is adapter
     assert updated.resolve_adapter(py_type=bytes, format="txt") is None
+    assert Pipeline().resolve_adapter(py_type=dict) is None
+
+
+def test_adapter_resolution_uses_port_default_json_for_json_native_values() -> None:
+    resolution = Pipeline().resolve_adapter_binding(py_type=dict)
+
+    assert resolution is not None
+    assert resolution.adapter is BUILTIN_JSON_ADAPTER
+    assert resolution.adapter.tag == "json"
+    assert resolution.source == AdapterResolutionSource.PORT_DEFAULT
+
+
+def test_builtin_json_adapter_can_round_trip_file(tmp_path: Path) -> None:
+    path = tmp_path / "value.json"
+
+    BUILTIN_JSON_ADAPTER.save(str(path), {"items": [1, 2], "ok": True})
+
+    assert BUILTIN_JSON_ADAPTER.load(str(path)) == {"items": [1, 2], "ok": True}
+    assert BUILTIN_JSON_ADAPTER.accepted_tags == frozenset({"json"})
+    assert BUILTIN_JSON_ADAPTER.legacy_key_guard is False
+
+
+def test_adapter_resolution_reports_pipeline_source_for_registered_adapter() -> None:
+    pipeline = _runtime_box_pipeline()
+    registered = pipeline.resolve_adapter(py_type=RuntimeBox)
+    resolution = pipeline.resolve_adapter_binding(py_type=RuntimeBox)
+
+    assert registered is not None
+    assert resolution is not None
+    assert resolution.adapter is registered
+    assert resolution.source == AdapterResolutionSource.PIPELINE
+
+
+def test_adapter_resolution_reports_edge_source_for_format_override() -> None:
+    pipeline = _format_pipeline()
+    resolution = pipeline.resolve_adapter_binding(py_type=str, format="csv")
+
+    assert resolution is not None
+    assert resolution.adapter is pipeline.resolve_adapter(py_type=str, format="csv")
+    assert resolution.source == AdapterResolutionSource.EDGE
+
+
+def test_adapter_resolution_run_override_extension_point_wins_last() -> None:
+    pipeline = _runtime_box_pipeline()
+    override = Adapter(
+        key=make_key(RuntimeBox, "override"),
+        save=_runtime_save_box_alt,
+        load=_runtime_load_box,
+        py_type=RuntimeBox,
+        format="override",
+    )
+    resolution = pipeline.resolve_adapter_binding(py_type=RuntimeBox, run_override=override)
+
+    assert resolution is not None
+    assert resolution.adapter is override
+    assert resolution.source == AdapterResolutionSource.RUN_OVERRIDE
 
 
 def test_pipeline_or_merges_adapters_and_rejects_conflicts() -> None:
@@ -330,9 +454,97 @@ def test_run_encodes_and_decodes_adapter_edges(tmp_path: Path) -> None:
     assert result == {"default": ("hello-runtime", True)}
     assert len(refs) == 1
     assert refs[0].key == make_key(RuntimeBox, "bytes")
+    assert refs[0].tag == "bytes"
     assert refs[0].sha256 == expected_sha256
     assert refs[0].size == len(b"hello-runtime")
     assert not artifacts_dir.exists()
+
+
+def test_run_adapter_override_replaces_edge_adapter_and_records_source() -> None:
+    deployment = cast(Any, Deployment)
+    pipeline = _runtime_box_override_pipeline()
+    consumer = cast(Any, pipeline).get_node_by_alias("consumer")
+    producer = cast(Any, pipeline).get_node_by_alias("producer")
+    override = Adapter(
+        key=make_key(RuntimeBox, "bytes"),
+        save=_runtime_save_box,
+        load=_runtime_load_box,
+        py_type=RuntimeBox,
+        format="bytes",
+    )
+    identity = adapter_identity(override)
+
+    with pytest.raises(ValueError, match="broken runtime box load"):
+        deployment(pipeline).run(output="consumer")
+
+    run = deployment(pipeline).run(adapters={("producer", DEFAULT_PORT): override})
+    with run:
+        assert run[consumer] == {"default": ("hello-runtime", True)}
+        assert run._adapter_resolutions[(producer, DEFAULT_PORT)].source == AdapterResolutionSource.RUN_OVERRIDE
+
+    assert identity["key"] == make_key(RuntimeBox, "bytes")
+    assert identity["tag"] == "bytes"
+    assert identity["accepted_tags"] == ["bytes"]
+    json.dumps(identity, sort_keys=True)
+
+
+def test_adapter_example_does_not_change_hash_or_identity() -> None:
+    without_example = Adapter(
+        key=make_key(RuntimeBox, "bytes"),
+        save=_runtime_save_box,
+        load=_runtime_load_box,
+        py_type=RuntimeBox,
+        format="bytes",
+    )
+    with_example = Adapter(
+        key=make_key(RuntimeBox, "bytes"),
+        save=_runtime_save_box,
+        load=_runtime_load_box,
+        py_type=RuntimeBox,
+        format="bytes",
+        example=_runtime_example_box,
+    )
+
+    assert with_example == without_example
+    assert hash(with_example) == hash(without_example)
+    assert adapter_identity(with_example) == adapter_identity(without_example)
+
+
+def test_run_adapter_override_validates_alias_and_port_before_execution() -> None:
+    deployment = cast(Any, Deployment)
+    pipeline = _runtime_box_override_pipeline()
+    override = Adapter(
+        key=make_key(RuntimeBox, "bytes"),
+        save=_runtime_save_box,
+        load=_runtime_load_box,
+        py_type=RuntimeBox,
+        format="bytes",
+    )
+
+    with pytest.raises(ValueError, match="unknown alias `missing`"):
+        deployment(pipeline).run(adapters={("missing", DEFAULT_PORT): override})
+
+    with pytest.raises(ValueError, match="unknown output port `missing` for alias `producer`"):
+        deployment(pipeline).run(adapters={("producer", "missing"): override})
+
+
+def test_run_adapter_override_does_not_leak_between_runs() -> None:
+    deployment = cast(Any, Deployment)
+    pipeline = _runtime_box_override_pipeline()
+    override = Adapter(
+        key=make_key(RuntimeBox, "bytes"),
+        save=_runtime_save_box,
+        load=_runtime_load_box,
+        py_type=RuntimeBox,
+        format="bytes",
+    )
+
+    assert deployment(pipeline).run(output="consumer", adapters={("producer", DEFAULT_PORT): override}) == (
+        "hello-runtime",
+        True,
+    )
+    with pytest.raises(ValueError, match="broken runtime box load"):
+        deployment(pipeline).run(output="consumer")
 
 
 def test_run_without_context_cleans_artifacts_with_finalizer() -> None:
@@ -351,6 +563,51 @@ def test_run_without_adapters_does_not_create_artifacts_dir() -> None:
     run = deployment(pipeline).run()
 
     assert run._artifacts_dir is None
+    assert run[consumer] == {"default": "hello-format"}
+    assert run._artifact_refs == {}
+    assert run._artifacts_dir is None
+
+
+def test_run_with_json_native_scalars_does_not_create_artifacts_dir() -> None:
+    lift_any = cast(Any, lift)
+    deployment = cast(Any, Deployment)
+    pipeline = lift_any(_json_scalar_add).bind(left=2, right=5).alias("sum").render("json_scalar_pipeline")
+    node = cast(Any, pipeline).get_node_by_alias("sum")
+    run = deployment(pipeline).run()
+
+    assert run[node] == {"default": 7}
+    assert run._artifact_refs == {}
+    assert run._artifacts_dir is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        7,
+        {"left": 1, "right": [True, "ok"]},
+        list(range(256)),
+    ],
+)
+def test_json_native_shortcut_matches_folded_builtin_json_adapter_path(value: Any) -> None:
+    pipeline = Pipeline()
+    shortcut_run = Run(_unused_run_callback, pipeline, keep=False)
+    folded_run = Run(_unused_run_callback, pipeline, keep=False)
+
+    assert shortcut_run._round_trip_artifact(value) == value
+    assert folded_run._round_trip_resolved(value, None, None, None) == value
+    assert shortcut_run._artifact_refs == folded_run._artifact_refs == {}
+    assert shortcut_run._adapter_resolutions == folded_run._adapter_resolutions == {}
+    assert shortcut_run._artifacts_dir is folded_run._artifacts_dir is None
+
+
+def test_explicit_json_edge_uses_builtin_adapter_without_artifact_files() -> None:
+    lift_any = cast(Any, lift)
+    deployment = cast(Any, Deployment)
+    producer = lift_any(_format_make_value)
+    pipeline = lift_any(_format_consume_value).bind(value=producer.as_format("json")).alias("consumer").render()
+    consumer = cast(Any, pipeline).get_node_by_alias("consumer")
+    run = deployment(pipeline).run()
+
     assert run[consumer] == {"default": "hello-format"}
     assert run._artifact_refs == {}
     assert run._artifacts_dir is None
@@ -421,6 +678,43 @@ def test_pipeline_builder_format_override_selects_edge_adapter() -> None:
     assert csv_result == {"default": "csv:hello-format"}
     assert bytes_result == {"default": "bytes:hello-format"}
     assert sorted([ref.key for ref in refs]) == [make_key(str, "bytes"), make_key(str, "csv")]
+    assert sorted([ref.tag for ref in refs]) == ["bytes", "csv"]
+
+
+def test_decode_rejects_unaccepted_artifact_tag_before_loading(tmp_path: Path) -> None:
+    path = tmp_path / "value.csv"
+    path.write_text("a,b\n", encoding="utf-8")
+    ref = ArtifactRef(
+        key=make_key(str, "csv"),
+        uri=str(path),
+        sha256=hashlib.sha256(b"a,b\n").hexdigest(),
+        size=path.stat().st_size,
+        tag="csv",
+    )
+    adapter = _TagOnlyLoadAdapter(
+        key=make_key(str, "tsv"),
+        load=_adapter_load_should_not_run,
+        accepted_tags=frozenset({"tsv"}),
+    )
+
+    with pytest.raises(ValueError, match=r"artifact tag `csv`.*_adapter_load_should_not_run.*accepted tags: tsv"):
+        decode(ref, adapter)
+
+
+def test_legacy_decode_still_requires_adapter_key_match(tmp_path: Path) -> None:
+    path = tmp_path / "value.txt"
+    path.write_text("hello", encoding="utf-8")
+    adapter = Adapter(key=make_key(str, "txt"), save=_adapter_save, load=_adapter_load, py_type=str, format="txt")
+    ref = ArtifactRef(
+        key=make_key(bytes, "txt"),
+        uri=str(path),
+        sha256=hashlib.sha256(b"hello").hexdigest(),
+        size=path.stat().st_size,
+        tag="txt",
+    )
+
+    with pytest.raises(ValueError, match="artifact ref key does not match adapter"):
+        decode(ref, adapter)
 
 
 def test_pipeline_builder_format_override_requires_matching_adapter() -> None:

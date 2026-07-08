@@ -11,6 +11,7 @@ derived from the database, not the other way around.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -18,6 +19,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import RLock
 from typing import Any, Callable
+from uuid import uuid4
 
 from spl.daemon.secret_store import SecretStore
 
@@ -105,13 +107,15 @@ def read_json(path: Path, default: Any) -> Any:
 def write_json(path: Path, value: Any) -> None:
     """Write JSON atomically enough for local daemon files."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f"{path.name}.tmp")
-    tmp_path.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    tmp_path.replace(path)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _chmod_owner_dir(path.parent)
+    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        _write_text_owner_only(tmp_path, json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+        tmp_path.replace(path)
+        _chmod_owner_file(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def json_dumps(value: Any) -> str:
@@ -126,6 +130,26 @@ def json_loads(value: str | None, default: Any) -> Any:
     if value is None:
         return default
     return json.loads(value)
+
+
+def _write_text_owner_only(path: Path, text: str) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def _chmod_owner_dir(path: Path) -> None:
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
+def _chmod_owner_file(path: Path) -> None:
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
 
 
 class StorageBase:
@@ -144,9 +168,11 @@ class StorageBase:
         # SQLite cannot create the database file when the parent directory is
         # absent.  Create the daemon home before opening the connection so a new
         # --home path works on the first run.
-        self.home.mkdir(parents=True, exist_ok=True)
+        self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _chmod_owner_dir(self.home)
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        _chmod_owner_file(self.db_path)
 
     def register_repositories(self, *repositories: object) -> None:
         """Register aggregate repositories for private cross-aggregate helpers."""
@@ -170,10 +196,12 @@ class StorageBase:
     ) -> None:
         """Create the database schema and local run directories."""
 
-        self.home.mkdir(parents=True, exist_ok=True)
-        self.objects_dir.mkdir(parents=True, exist_ok=True)
-        self.runs_dir.mkdir(parents=True, exist_ok=True)
-        self.environment_builds_dir.mkdir(parents=True, exist_ok=True)
+        self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.objects_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.runs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.environment_builds_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for path in (self.home, self.objects_dir, self.runs_dir, self.environment_builds_dir):
+            _chmod_owner_dir(path)
         with self._lock:
             self._conn.execute("PRAGMA foreign_keys = ON")
             self._conn.execute("PRAGMA busy_timeout = 5000")
@@ -345,6 +373,8 @@ class StorageBase:
                     stderr_path TEXT,
                     stdout_text TEXT,
                     stderr_text TEXT,
+                    keep TEXT NOT NULL DEFAULT 'on_failure',
+                    manifest_json TEXT,
                     FOREIGN KEY(object_id) REFERENCES objects(id),
                     FOREIGN KEY(object_version_id) REFERENCES object_versions(id)
                 );
@@ -440,6 +470,8 @@ class StorageBase:
             self._ensure_column("runs", "container_id", "TEXT")
             self._ensure_column("runs", "resolved_python", "TEXT")
             self._ensure_column("runs", "interpreter_substitution_json", "TEXT")
+            self._ensure_column("runs", "keep", "TEXT NOT NULL DEFAULT 'on_failure'")
+            self._ensure_column("runs", "manifest_json", "TEXT")
             self._ensure_column("server_connections", "user_token_hint", "TEXT")
             self._ensure_column("server_connections", "token_secret_ref", "TEXT")
             self._ensure_column("server_connections", "user_token_secret_ref", "TEXT")

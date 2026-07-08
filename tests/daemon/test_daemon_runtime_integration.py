@@ -72,6 +72,15 @@ def _worker_explicit_artifact_payload() -> dict[str, Any]:
     }
 
 
+def _worker_slow_marker(marker_path: str) -> str:
+    import time
+    from pathlib import Path
+
+    time.sleep(1.2)
+    Path(marker_path).write_text("finished", encoding="utf-8")
+    return "finished"
+
+
 def _worker_final_unadapted_bytes() -> bytes:
     return b"missing adapter"
 
@@ -247,6 +256,30 @@ def test_pipeline_output_normalizer_reports_missing_adapter_path(tmp_path) -> No
         )
 
     assert str(exc_info.value) == ("result.thumbnail.default bytes is not JSON serializable; add_adapter(bytes, ...)")
+
+
+def test_pipeline_node_timeout_runtime_config_reaches_daemon_worker(tmp_path) -> None:
+    marker_path = tmp_path / "marker.txt"
+    pipeline = (
+        lift(_worker_slow_marker)
+        .alias("slow")
+        .render("slow_worker_pipeline")
+        .with_node_runtime("slow", "venv-subprocess")
+    )
+
+    with pytest.raises(RuntimeError, match=r"node runtime `venv-subprocess` timed out after 0.8s"):
+        run_pipeline(
+            pipeline,
+            {"marker_path": str(marker_path)},
+            "slow",
+            daemon_url="http://127.0.0.1:8765",
+            timeout_seconds=None,
+            artifacts_dir=tmp_path / "artifacts",
+            runtime_config={"node_timeout_seconds": 0.8},
+        )
+
+    time.sleep(0.7)
+    assert not marker_path.exists()
 
 
 def test_publish_run_environment_and_artifact_flow(tmp_path) -> None:

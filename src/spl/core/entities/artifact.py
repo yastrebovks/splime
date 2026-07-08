@@ -6,6 +6,7 @@ from typing import Any, Generator
 
 import yaml
 
+from spl.core.entities.adapter import _format_from_key
 from spl.core.ir.common import DBase
 from spl.core.ir.parse import _branch, ir_parse
 from spl.core.ir.unparse import ir_unparse
@@ -34,11 +35,25 @@ def _validate_size(value: int) -> None:
         raise ValueError("artifact ref size must be non-negative")
 
 
-def _validate_artifact_ref(key: str, uri: str, sha256: str, size: int) -> None:
+def _default_tag_from_key(key: str) -> str:
+    try:
+        return _format_from_key(key)
+    except ValueError:
+        return key
+
+
+def _normalize_tag(key: str, tag: str | None) -> str:
+    normalized_tag = _default_tag_from_key(key) if tag is None else tag
+    _validate_non_empty_string("tag", normalized_tag)
+    return normalized_tag
+
+
+def _validate_artifact_ref(key: str, uri: str, sha256: str, size: int, tag: str | None) -> str:
     _validate_non_empty_string("key", key)
     _validate_non_empty_string("uri", uri)
     _validate_sha256(sha256)
     _validate_size(size)
+    return _normalize_tag(key, tag)
 
 
 @dataclass(frozen=True)
@@ -49,9 +64,11 @@ class ArtifactRef:
     uri: str
     sha256: str
     size: int
+    tag: str | None = None
 
     def __post_init__(self) -> None:
-        _validate_artifact_ref(key=self.key, uri=self.uri, sha256=self.sha256, size=self.size)
+        tag = _validate_artifact_ref(key=self.key, uri=self.uri, sha256=self.sha256, size=self.size, tag=self.tag)
+        object.__setattr__(self, "tag", tag)
 
 
 @dataclass(frozen=True)
@@ -62,9 +79,11 @@ class DArtifactRef(DBase):
     uri: str
     sha256: str
     size: int
+    tag: str | None = None
 
     def __post_init__(self) -> None:
-        _validate_artifact_ref(key=self.key, uri=self.uri, sha256=self.sha256, size=self.size)
+        tag = _validate_artifact_ref(key=self.key, uri=self.uri, sha256=self.sha256, size=self.size, tag=self.tag)
+        object.__setattr__(self, "tag", tag)
 
 
 yaml.add_representer(DArtifactRef, lambda dumper, data: dumper.represent_mapping("!DArtifactRef", data.__dict__))
@@ -93,7 +112,11 @@ def _mk_empty_dependencies(frame_offset: int) -> Generator[DBase]:
 
 @ir_parse.register(lambda x: isinstance(x, ArtifactRef))
 def _ir_parse__artifact_ref(x: ArtifactRef, name: str | None = None) -> _branch:
-    return _branch(x, lambda: DArtifactRef(key=x.key, uri=x.uri, sha256=x.sha256, size=x.size), _mk_empty_dependencies)
+    return _branch(
+        x,
+        lambda: DArtifactRef(key=x.key, uri=x.uri, sha256=x.sha256, size=x.size, tag=x.tag),
+        _mk_empty_dependencies,
+    )
 
 
 @ir_unparse.register(lambda x: isinstance(x, DArtifactRef))
@@ -107,6 +130,7 @@ def _ir_unparse__artifact_ref(x: DArtifactRef, source: Path) -> Generator[ast.st
                 ast.keyword(arg="uri", value=ast.Constant(value=x.uri)),
                 ast.keyword(arg="sha256", value=ast.Constant(value=x.sha256)),
                 ast.keyword(arg="size", value=ast.Constant(value=x.size)),
+                ast.keyword(arg="tag", value=ast.Constant(value=x.tag)),
             ],
         ),
     )

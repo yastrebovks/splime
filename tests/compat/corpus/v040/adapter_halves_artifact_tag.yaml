@@ -1,0 +1,23 @@
+# SPL YAML compatibility corpus fixture.
+# Source format: splime 0.4.0 additive adapter-halves format.
+# Generated on: 2026-07-08.
+# Generated with: DSaveAdapter/DLoadAdapter/DArtifactRef and yaml.dump_all.
+# Static by design: do not regenerate inside tests.
+- !DSaveAdapter
+  key: builtins.str@json
+  tag: json
+  save: save_json
+  distributions: []
+- !DLoadAdapter
+  key: builtins.str@json
+  accepted_tags:
+  - json
+  - ndjson
+  load: load_json
+  distributions: []
+- !DArtifactRef
+  key: builtins.str@json
+  uri: compat-value.json
+  sha256: "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+  size: 2
+  tag: json

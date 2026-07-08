@@ -1,9 +1,12 @@
 import asyncio
+import json
+import logging
 import socket
 import sys
 import stat
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -65,6 +68,192 @@ PIPELINE_WITH_INTERNAL_FUNCTION_YAML = """\
 """
 
 
+SECRET_PIPELINE_YAML = """\
+- !DPipeline
+  name: secret_pipeline
+  nodes:
+  - !DNodeFunction
+    uuid: 33333333-3333-4333-8333-333333333333
+    func: accept_secret
+  links: []
+  aliases:
+  - - login
+    - 33333333-3333-4333-8333-333333333333
+---
+- !DFunction
+  name: accept_secret
+  inputs:
+  - name: password
+    type: str
+    default: null
+  outputs:
+  - name: default
+    type: str
+  body: |-
+    return "ok"
+"""
+
+
+VENV_SUBPROCESS_PIPELINE_YAML = """\
+- !DPipeline
+  name: daemon_venv_pipeline
+  nodes:
+  - !DNodeFunction
+    uuid: 44444444-4444-4444-8444-444444444444
+    func: daemon_seed
+  - !DNodeFunction
+    uuid: 55555555-5555-4555-8555-555555555555
+    func: daemon_consumer
+  links:
+  - - !DNodeInputRef
+      uuid: 55555555-5555-4555-8555-555555555555
+      port: value
+    - !DNodeOutputRef
+      uuid: 44444444-4444-4444-8444-444444444444
+      port: default
+  aliases:
+  - - seed
+    - 44444444-4444-4444-8444-444444444444
+  - - consumer
+    - 55555555-5555-4555-8555-555555555555
+  adapters: []
+  tags:
+    55555555-5555-4555-8555-555555555555:
+      runtime: venv-subprocess
+---
+- !DFunction
+  name: daemon_seed
+  inputs: []
+  outputs:
+  - name: default
+    type: str
+  body: |-
+    return "seed"
+---
+- !DFunction
+  name: daemon_consumer
+  inputs:
+  - name: value
+    type: str
+    default: null
+  outputs:
+  - name: default
+    type: str
+  body: |-
+    return value.upper()
+"""
+
+
+RESUMABLE_PIPELINE_YAML = """\
+- !DPipeline
+  name: resumable_pipeline
+  nodes:
+  - !DNodeFunction
+    uuid: 11111111-1111-4111-8111-111111111111
+    func: produce_text
+  - !DNodeFunction
+    uuid: 22222222-2222-4222-8222-222222222222
+    func: consume_text
+  links:
+  - - !DNodeInputRef
+      uuid: 22222222-2222-4222-8222-222222222222
+      port: value
+    - !DFormattedOutputRef
+      uuid: 11111111-1111-4111-8111-111111111111
+      port: default
+      format: txt
+  aliases:
+  - - producer
+    - 11111111-1111-4111-8111-111111111111
+  - - consumer
+    - 22222222-2222-4222-8222-222222222222
+  adapters:
+  - !DAdapter
+    key: builtins.str@txt
+    save: save_text
+    load: bad_load_text
+    distributions: []
+- !DSPLSelfImport
+  name: produce_text
+- !DSPLSelfImport
+  name: consume_text
+- !DSPLSelfImport
+  name: save_text
+- !DSPLSelfImport
+  name: bad_load_text
+- !DSPLSelfImport
+  name: good_load_text
+---
+- !DFunction
+  name: produce_text
+  inputs:
+  - name: counter_path
+    type: str
+    default: null
+  outputs:
+  - name: default
+    type: str
+  body: |-
+    from pathlib import Path
+    path = Path(counter_path)
+    count = int(path.read_text()) if path.exists() else 0
+    path.write_text(str(count + 1))
+    return "seed"
+---
+- !DFunction
+  name: consume_text
+  inputs:
+  - name: value
+    type: str
+    default: null
+  outputs:
+  - name: default
+    type: str
+  body: |-
+    return "consumed:" + value
+---
+- !DFunction
+  name: save_text
+  inputs:
+  - name: path
+    type: null
+    default: null
+  - name: value
+    type: null
+    default: null
+  outputs:
+  - name: default
+    type: null
+  body: |-
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(value)
+---
+- !DFunction
+  name: bad_load_text
+  inputs:
+  - name: path
+    type: null
+    default: null
+  outputs:
+  - name: default
+    type: null
+  body: |-
+    raise RuntimeError("bad load for " + open(path, encoding="utf-8").read())
+---
+- !DFunction
+  name: good_load_text
+  inputs:
+  - name: path
+    type: null
+    default: null
+  outputs:
+  - name: default
+    type: null
+  body: |-
+    return open(path, encoding="utf-8").read()
+"""
+
+
 def _json_from_app(app, path: str):
     async def _request():
         client = app.test_client()
@@ -113,6 +302,26 @@ def _delete_json_from_app(app, path: str):
         return response.status_code, await response.get_json()
 
     return asyncio.run(_request())
+
+
+def _wait_store_run(store: RegistryStore, run_id: str, *, timeout: float = 10.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = store.get_run(run_id)
+        if state["status"] in {"succeeded", "failed", "cancelled", "stale"}:
+            return state
+        time.sleep(0.05)
+    raise TimeoutError(f"run did not finish: {run_id}")
+
+
+def _manifest_node_by_alias(manifest: dict, alias: str) -> dict:
+    return next(node for node in manifest["nodes"].values() if node["alias"] == alias)
+
+
+def _worker_manifest_dir(run_dir: str) -> Path:
+    manifests = sorted((Path(run_dir) / "pipeline-state").glob("*/manifest.json"))
+    assert manifests
+    return manifests[0].parent
 
 
 def _json_from_app_without_auth(app, path: str):
@@ -281,6 +490,96 @@ def test_daemon_client_register_env_omits_python_payload_when_omitted(
         ("POST", "/envs", {"name": "default"}),
         ("POST", "/envs", {"name": "custom", "python": explicit_python}),
     ]
+
+
+def test_run_management_cli_commands(monkeypatch, capsys) -> None:
+    import spl.daemon.cli as cli_module
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, url=None) -> None:
+            calls.append(("init", url))
+
+        def list_runs(self):
+            calls.append(("list_runs",))
+            return [{"id": "run-1", "has_manifest": True}]
+
+        def run_tag_stats(self):
+            calls.append(("run_tag_stats",))
+            return {"runs_scanned": 0, "edges_scanned": 0, "tags": [], "pairs": []}
+
+        def show_run(self, run_id, *, full_inline=False):
+            calls.append(("show_run", run_id, full_inline))
+            return {"id": run_id, "full_inline": full_inline}
+
+        def prune_runs(self, *, run_id=None, statuses=None, older_than_seconds=None, dry_run=False):
+            calls.append(("prune_runs", run_id, statuses, older_than_seconds, dry_run))
+            return {"count": 1, "dry_run": dry_run}
+
+    monkeypatch.setattr(cli_module, "Client", FakeClient)
+
+    assert cli_module.main(["run-list"]) == 0
+    assert cli_module.main(["run-list", "--tag-stats"]) == 0
+    assert cli_module.main(["run-show", "run-1", "--full-inline"]) == 0
+    assert cli_module.main(["run-prune", "run-1", "--status", "failed", "--dry-run"]) == 0
+
+    captured = capsys.readouterr()
+    assert '"has_manifest": true' in captured.out
+    assert '"tags": []' in captured.out
+    assert calls == [
+        ("init", None),
+        ("list_runs",),
+        ("init", None),
+        ("run_tag_stats",),
+        ("init", None),
+        ("show_run", "run-1", True),
+        ("init", None),
+        ("prune_runs", "run-1", ["failed"], None, True),
+    ]
+
+
+def test_run_show_cli_hides_sensitive_inline_values_without_flag(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    import spl.daemon.cli as cli_module
+    from spl.core import manifest as m_manifest
+
+    monkeypatch.setenv("SPL_RUNS_HOME", str(tmp_path / "runs"))
+    run_id = "sensitive-run"
+    run_dir = m_manifest.create_run_dir(run_id)
+    payload = m_manifest.build_initial_manifest(run_id=run_id, keep=True, pipeline_name="sensitive_pipeline")
+    payload["nodes"] = {
+        "node-1": {
+            "id": "node-1",
+            "alias": "login",
+            "status": "succeeded",
+            "inputs": {
+                "password": {
+                    "kind": "json",
+                    "tag": "json",
+                    "value": "hunter2",
+                    "sha256": "0" * 64,
+                }
+            },
+            "outputs": {},
+        }
+    }
+    m_manifest.atomic_write_json(run_dir / m_manifest.RUN_MANIFEST_FILENAME, payload)
+
+    assert cli_module.main(["run-show", run_id, "--local"]) == 0
+    output = capsys.readouterr().out
+
+    assert "hunter2" not in output
+    assert '"value_preview": "<omitted>"' in output
+    assert '"value_size_bytes"' in output
+    assert '"sha256": "' in output
+
+    assert cli_module.main(["run-show", run_id, "--local", "--full-inline"]) == 0
+    full_output = capsys.readouterr().out
+    assert "hunter2" in full_output
 
 
 def test_register_env_route_defaults_to_daemon_python(tmp_path, monkeypatch) -> None:
@@ -695,6 +994,68 @@ def test_server_objects_are_listed_through_daemon_proxy(tmp_path, monkeypatch) -
         store.close()
 
 
+def test_server_machines_use_machine_token_aliases(tmp_path, monkeypatch) -> None:
+    class MachineServerClient:
+        def __init__(self, base_url, machine_token, *, user_token=None) -> None:
+            assert base_url == "https://splime.io/api"
+            assert machine_token == "machine-token-123456"
+            assert user_token == "user-token-123456"
+
+        def list_machines(self):
+            return [
+                {
+                    "id": "machine-86c8b6063d0bef7b",
+                    "display_name": "machine-86c8b6063d0bef7b",
+                    "status": "offline",
+                },
+                {
+                    "id": "machine-f82b6486f6595e39",
+                    "display_name": "machine-f82b6486f6595e39",
+                    "status": "online",
+                },
+                {
+                    "id": "machine-custom",
+                    "display_name": "Already Custom",
+                    "status": "online",
+                },
+            ]
+
+        def list_tokens(self):
+            return [
+                {
+                    "subject_type": "machine",
+                    "subject_id": "machine-86c8b6063d0bef7b",
+                    "name": "Machine credential for Pair3",
+                    "status": "active",
+                },
+                {
+                    "subject_type": "machine",
+                    "subject_id": "machine-f82b6486f6595e39",
+                    "name": "Machine credential for MBP16_N+1",
+                    "status": "active",
+                },
+            ]
+
+    store = RegistryStore(tmp_path)
+    monkeypatch.setattr(daemon_server, "ServerClient", MachineServerClient)
+    app = None
+    try:
+        _save_connected_server_connection(store)
+        app = create_app(store)
+
+        status, body = _json_from_app(app, "/server/machines")
+
+        machines = {machine["id"]: machine for machine in body["machines"]}
+        assert status == 200
+        assert machines["machine-86c8b6063d0bef7b"]["display_name"] == "Pair3"
+        assert machines["machine-86c8b6063d0bef7b"]["stored_display_name"] == "machine-86c8b6063d0bef7b"
+        assert machines["machine-f82b6486f6595e39"]["display_name"] == "MBP16_N+1"
+        assert machines["machine-custom"]["display_name"] == "Already Custom"
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
 def test_server_libraries_are_managed_through_daemon_proxy(
     tmp_path,
     monkeypatch,
@@ -925,6 +1286,339 @@ def test_object_registration_sync_event_preserves_library_create_request(
         assert pending[0]["payload"]["library"] == "research"
         assert pending[0]["payload"]["create_library"] is True
         assert pending[0]["payload"]["library_display_name"] == "Research"
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_run_management_routes_list_show_prune_and_delete(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        store.register_env("default", sys.executable)
+        store.register_object("demo_obj", "demo_obj", "default", yaml_text=REMOTE_FUNCTION_YAML)
+        run = store.create_run("demo_obj", keep=True)
+        manifest = dict(run["manifest"])
+        manifest["nodes"] = {
+            "node-1": {
+                "id": "node-1",
+                "alias": "producer",
+                "status": "succeeded",
+                "runtime": {
+                    "name": "venv-subprocess",
+                    "source": "node-tag",
+                    "config_hash": "abc123",
+                },
+                "outputs": {
+                    "default": {
+                        "kind": "json",
+                        "tag": "json",
+                        "value": {"secret": "route-default-preview"},
+                        "sha256": "0" * 64,
+                    }
+                },
+            }
+        }
+        adapter = {
+            "identity": {
+                "key": "builtins.dict@json",
+                "tag": "json",
+                "accepted_tags": ["json"],
+                "save": "spl.core.entities.adapter._json_save",
+                "load": "spl.core.entities.adapter._json_load",
+                "distributions": [],
+            },
+            "tag": "json",
+            "accepted_tags": ["json"],
+            "source": "port-default",
+        }
+        manifest["nodes"]["node-2"] = {
+            "id": "node-2",
+            "alias": "consumer",
+            "status": "succeeded",
+            "runtime": {
+                "name": "native",
+                "source": "default",
+                "config_hash": None,
+            },
+            "inputs": {},
+            "outputs": {},
+        }
+        manifest["edges"] = [
+            {
+                "source": {"node_id": "node-1", "port": "default"},
+                "target": {"node_id": "node-2", "port": "value"},
+                "artifact": {"kind": "json", "tag": "json", "sha256": "0" * 64},
+                "adapter": {"save": adapter, "load": adapter},
+            }
+        ]
+        store.update_run(run["id"], status="failed", manifest=manifest)
+        app = create_app(store)
+
+        status, listed = _json_from_app(app, "/runs")
+        assert status == 200
+        assert listed[0]["has_manifest"] is True
+        assert listed[0]["disk_size_bytes"] > 0
+        assert listed[0]["node_runtimes"] == [
+            {
+                "node_id": "node-2",
+                "alias": "consumer",
+                "name": "native",
+                "source": "default",
+                "config_hash": None,
+            },
+            {
+                "node_id": "node-1",
+                "alias": "producer",
+                "name": "venv-subprocess",
+                "source": "node-tag",
+                "config_hash": "abc123",
+            },
+        ]
+        assert listed[0]["edge_adapters"] == [
+            {
+                "source": "producer.default",
+                "target": "consumer.value",
+                "source_node_id": "node-1",
+                "source_port": "default",
+                "target_node_id": "node-2",
+                "target_port": "value",
+                "tag": "json",
+                "save": "spl.core.entities.adapter._json_save / spl.core.entities.adapter._json_load",
+                "load": "spl.core.entities.adapter._json_save / spl.core.entities.adapter._json_load",
+                "source_level": "port-default",
+            }
+        ]
+
+        status, observed = _json_from_app(app, f"/runs/{run['id']}")
+        assert status == 200
+        assert "route-default-preview" not in json.dumps(observed, sort_keys=True)
+        assert observed["run_progress"]["node_runtimes"] == listed[0]["node_runtimes"]
+        assert observed["run_progress"]["edge_adapters"] == listed[0]["edge_adapters"]
+
+        status, shown = _json_from_app(app, f"/runs/{run['id']}?view=show")
+        assert status == 200
+        assert shown["edge_adapters"] == listed[0]["edge_adapters"]
+        output = shown["manifest"]["nodes"]["node-1"]["outputs"]["default"]
+        assert output["value_omitted"] is True
+        assert "value" not in output
+        assert output["value_preview"] == "<omitted>"
+        assert "route-default-preview" not in json.dumps(shown, sort_keys=True)
+
+        status, shown_full = _json_from_app(app, f"/runs/{run['id']}?view=show&full_inline=1")
+        assert status == 200
+        assert shown_full["manifest"]["nodes"]["node-1"]["outputs"]["default"]["value"] == {
+            "secret": "route-default-preview"
+        }
+
+        status, tag_stats = _json_from_app(app, "/runs/tag-stats")
+        assert status == 200
+        assert tag_stats == {
+            "runs_scanned": 1,
+            "edges_scanned": 1,
+            "tags": [{"tag": "json", "edge_count": 1, "run_count": 1}],
+            "pairs": [{"save_tag": "json", "load_tags": ["json"], "edge_count": 1, "run_count": 1}],
+        }
+
+        status, preview = _post_json_from_app(app, "/runs/prune", {"statuses": ["failed"], "dry_run": True})
+        assert status == 200
+        assert preview["candidates"][0]["id"] == run["id"]
+        assert store.get_run(run["id"])["status"] == "failed"
+
+        status, deleted = _delete_json_from_app(app, f"/runs/{run['id']}")
+        assert status == 200
+        assert deleted["pruned"][0]["id"] == run["id"]
+        assert not Path(run["run_dir"]).exists()
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_daemon_kept_state_does_not_log_sensitive_inline_values(
+    tmp_path,
+    caplog,
+) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        caplog.set_level(logging.INFO, logger="spl.daemon.server")
+        store.register_env("default", sys.executable)
+        store.register_object("secret_pipeline", "secret_pipeline", "default", yaml_text=SECRET_PIPELINE_YAML)
+        app = create_app(store, auto_build_envs=False)
+
+        run = app.runtime.start_run(
+            "secret_pipeline",
+            kwargs={"password": "hunter2"},
+            output="login",
+            keep=True,
+            source="local",
+        )
+        state = _wait_store_run(store, run["id"])
+
+        assert state["status"] == "succeeded"
+        assert "hunter2" not in caplog.text
+        assert "hunter2" not in str(state.get("stdout") or "")
+        assert "hunter2" not in str(state.get("stderr") or "")
+
+        status, observed = _json_from_app(app, f"/runs/{run['id']}")
+        assert status == 200
+        rendered = json.dumps(observed, sort_keys=True)
+        assert "hunter2" not in rendered
+        assert '"value_preview": "<omitted>"' in rendered
+
+        status, shown = _json_from_app(app, f"/runs/{run['id']}?view=show")
+        assert status == 200
+        assert "hunter2" not in json.dumps(shown, sort_keys=True)
+
+        status, shown_full = _json_from_app(app, f"/runs/{run['id']}?view=show&full_inline=1")
+        assert status == 200
+        assert "hunter2" in json.dumps(shown_full, sort_keys=True)
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_daemon_pipeline_venv_subprocess_uses_ir_source_for_yaml_functions(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        store.register_env("default", sys.executable)
+        store.register_object(
+            "daemon_venv_pipeline",
+            "daemon_venv_pipeline",
+            "default",
+            yaml_text=VENV_SUBPROCESS_PIPELINE_YAML,
+        )
+        app = create_app(store, auto_build_envs=False)
+
+        status, started = _post_json_from_app(
+            app,
+            "/runs",
+            {
+                "object": "daemon_venv_pipeline",
+                "output": "consumer",
+                "source": "local",
+                "keep": True,
+            },
+        )
+        assert status == 202
+        final = _wait_store_run(store, started["id"])
+
+        assert final["status"] == "succeeded"
+        assert final["result"]["result"] == {"default": "SEED"}
+        consumer = _manifest_node_by_alias(final["manifest"], "consumer")
+        assert consumer["runtime"]["name"] == "venv-subprocess"
+        assert consumer["runtime"]["source"] == "node-tag"
+
+        status, observed = _json_from_app(app, f"/runs/{started['id']}")
+        assert status == 200
+        assert {
+            "alias": "consumer",
+            "node_id": "55555555-5555-4555-8555-555555555555",
+            "name": "venv-subprocess",
+            "source": "node-tag",
+            "config_hash": consumer["runtime"]["config_hash"],
+        } in observed["run_progress"]["node_runtimes"]
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_daemon_pipeline_resume_via_http_reuses_core_semantics(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        store.register_env("default", sys.executable)
+        store.register_object("resumable_pipeline", "resumable_pipeline", "default", yaml_text=RESUMABLE_PIPELINE_YAML)
+        app = create_app(store, auto_build_envs=False)
+        counter_path = tmp_path / "producer-count.txt"
+
+        initial = app.runtime.start_run(
+            "resumable_pipeline",
+            kwargs={"counter_path": str(counter_path)},
+            output="consumer",
+            keep=True,
+            source="local",
+        )
+        failed = _wait_store_run(store, initial["id"])
+
+        assert failed["status"] == "failed"
+        assert counter_path.read_text(encoding="utf-8") == "1"
+        assert _manifest_node_by_alias(failed["manifest"], "producer")["status"] == "succeeded"
+        assert _manifest_node_by_alias(failed["manifest"], "consumer")["status"] == "failed"
+
+        override = {
+            "producer.default": {
+                "key": "builtins.str@txt",
+                "save": "save_text",
+                "load": "good_load_text",
+                "distributions": [],
+            }
+        }
+        status, resumed = _post_json_from_app(
+            app,
+            f"/runs/{initial['id']}/resume",
+            {"from": "consumer", "adapters": override},
+        )
+        assert status == 202
+        assert resumed["parent_run_id"] == initial["id"]
+        child = _wait_store_run(store, resumed["id"])
+
+        assert child["status"] == "succeeded"
+        assert child["result"]["result"] == {"default": "consumed:seed"}
+        assert counter_path.read_text(encoding="utf-8") == "1"
+        assert child["manifest"]["parent_run_id"] == initial["id"]
+        assert _manifest_node_by_alias(child["manifest"], "producer")["status"] == "frozen"
+        assert _manifest_node_by_alias(child["manifest"], "consumer")["status"] == "succeeded"
+
+        status, observed = _json_from_app(app, f"/runs/{child['id']}")
+        assert status == 200
+        assert {"alias": "producer", "node_id": "11111111-1111-4111-8111-111111111111", "status": "frozen"} in observed[
+            "run_progress"
+        ]["nodes"]
+        assert {
+            "alias": "consumer",
+            "node_id": "22222222-2222-4222-8222-222222222222",
+            "status": "succeeded",
+        } in observed["run_progress"]["nodes"]
+
+        status, _ = _post_json_from_app(app, "/runs/missing-run/resume", {"from": "consumer"})
+        assert status == 404
+
+        corrupt_parent = app.runtime.start_run(
+            "resumable_pipeline",
+            kwargs={"counter_path": str(tmp_path / "corrupt-count.txt")},
+            output="consumer",
+            keep=True,
+            source="local",
+        )
+        corrupt_failed = _wait_store_run(store, corrupt_parent["id"])
+        manifest_dir = _worker_manifest_dir(corrupt_failed["run_dir"])
+        producer = _manifest_node_by_alias(corrupt_failed["manifest"], "producer")
+        artifact_path = manifest_dir / producer["outputs"]["default"]["ref"]["uri"]
+        artifact_path.write_text("broken", encoding="utf-8")
+
+        status, body = _post_json_from_app(
+            app,
+            f"/runs/{corrupt_parent['id']}/resume",
+            {"from": "consumer", "adapters": override},
+        )
+        assert status == 409
+        assert "sha256 mismatch" in body["error"]
+
+        status, first = _post_json_from_app(
+            app, f"/runs/{initial['id']}/resume", {"from": "consumer", "adapters": override}
+        )
+        assert status == 202
+        status, second = _post_json_from_app(
+            app,
+            f"/runs/{initial['id']}/resume",
+            {"from": "consumer", "adapters": override},
+        )
+        assert status == 202
+        assert first["id"] != second["id"]
+        _wait_store_run(store, first["id"])
+        _wait_store_run(store, second["id"])
     finally:
         _shutdown_app(app)
         store.close()

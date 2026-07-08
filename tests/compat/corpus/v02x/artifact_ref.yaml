@@ -1,0 +1,10 @@
+# SPL YAML compatibility corpus fixture.
+# Source format: splime 0.3.0 baseline, compatible with 0.2.x/0.3.x readers.
+# Generated on: 2026-07-08.
+# Generated with: ir_parse/get_top_level_deps and yaml.dump_all.
+# Static by design: do not regenerate inside tests.
+- !DArtifactRef
+  key: builtins.bytes@bin
+  uri: compat-artifact.bin
+  sha256: d515e7de03bddd01aa8fc23800035c28de9f60c78d3ad598138b6373f9e1bc85
+  size: 16

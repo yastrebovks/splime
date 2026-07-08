@@ -6,6 +6,7 @@ import argparse
 import importlib.metadata
 import importlib.util
 import json
+import os
 import re
 import shutil
 import sys
@@ -39,11 +40,26 @@ def read_json(path: Path) -> Any:
 def write_json(path: Path, value: Any) -> None:
     """Write a UTF-8 JSON file with stable formatting."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    _ensure_private_dir(path.parent)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+    _chmod_owner_file(path)
+
+
+def _ensure_private_dir(path: Path) -> None:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
+def _chmod_owner_file(path: Path) -> None:
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
 
 
 def validate_environment(distributions: list[dict[str, str]]) -> None:
@@ -88,9 +104,11 @@ def copy_artifact(source: Path, target: Path) -> None:
         raise ValueError(f"artifact source is not found: {source}")
     if source.is_dir():
         shutil.copytree(source, target, dirs_exist_ok=True)
+        _chmod_artifact_tree(target)
     else:
-        target.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_private_dir(target.parent)
         shutil.copy2(source, target)
+        _chmod_owner_file(target)
 
 
 def collect_artifacts(value: Any, artifacts_dir: Path) -> tuple[Any, dict[str, str]]:
@@ -114,7 +132,7 @@ def collect_artifacts(value: Any, artifacts_dir: Path) -> tuple[Any, dict[str, s
         raise TypeError("__spl_artifacts__ must be a mapping or a list of paths")
 
     copied: dict[str, str] = {}
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(artifacts_dir)
     for name, source in items:
         artifact_name = validate_name(str(name))
         source_path = Path(str(source)).expanduser().absolute()
@@ -123,6 +141,24 @@ def collect_artifacts(value: Any, artifacts_dir: Path) -> tuple[Any, dict[str, s
         copied[artifact_name] = str(target_path)
 
     return result, copied
+
+
+def _chmod_artifact_tree(path: Path) -> None:
+    if path.is_dir():
+        try:
+            path.chmod(0o700)
+        except OSError:
+            pass
+        for item in path.rglob("*"):
+            if item.is_dir():
+                try:
+                    item.chmod(0o700)
+                except OSError:
+                    pass
+            elif item.is_file():
+                _chmod_owner_file(item)
+    elif path.is_file():
+        _chmod_owner_file(path)
 
 
 def load_module(module_path: Path, module_name: str) -> ModuleType:

@@ -286,6 +286,36 @@ def test_service_views_preserve_container_semantics_and_hide_raw_blobs() -> None
         assert hasattr(view, "_repr_html_")
 
 
+def test_run_record_view_shows_observability_tables() -> None:
+    payload = {
+        **_RUN_PAYLOAD,
+        "node_runtimes": [
+            {"alias": "producer", "name": "native", "source": "default"},
+            {"alias": "consumer", "name": "venv-subprocess", "source": "node-tag"},
+        ],
+        "edge_adapters": [
+            {
+                "source": "producer.default",
+                "target": "consumer.value",
+                "tag": "txt",
+                "save": "save_text",
+                "load": "load_text",
+                "source_level": "pipeline",
+            }
+        ],
+    }
+
+    rendered = repr(RunRecordView(payload))
+    listed = repr(RunListView([payload]))
+
+    assert "node runtimes" in rendered
+    assert "producer.default -> consumer.value" in rendered
+    assert "save_text -> load_text" in rendered
+    assert "venv-subprocess" in rendered
+    assert "edge adapters" not in listed
+    assert "producer.default" not in listed
+
+
 class _PresentationDaemon:
     def health(self) -> dict[str, object]:
         return {"ok": True, "counts": {"objects": 1}, "db": {"exists": True}}
@@ -384,6 +414,27 @@ def test_spl_client_methods_return_compact_views() -> None:
         assert json.dumps(result)
         assert len(repr(result)) < 1_500
         assert hasattr(result, "_repr_html_")
+
+
+def test_spl_client_machines_does_not_hide_daemon_machine_payload() -> None:
+    class MachinesDaemon(_PresentationDaemon):
+        def server_connection(self) -> dict[str, object]:
+            return {"connected": False, "connection": {"status": "heartbeat_failed"}}
+
+        def server_machines(self) -> dict[str, object]:
+            return {
+                "current_machine_id": "machine-1",
+                "machines": [{"id": "machine-1", "display_name": "Pair3", "status": "online"}],
+            }
+
+    client = SPLClient.__new__(SPLClient)
+    client._daemon = MachinesDaemon()
+    client.server_connection = None
+
+    machines = client.machines()
+
+    assert machines["machines"][0]["display_name"] == "Pair3"
+    assert "Pair3" in repr(machines)
 
 
 class _FakeServerClient(SPLServerClient):

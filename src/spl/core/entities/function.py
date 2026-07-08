@@ -167,6 +167,12 @@ def get_function_metadata(func: FunctionType) -> DFunction:
     return serialize_function(func)
 
 
+@ir_parse.register(lambda x: isinstance(x, FunctionType) and hasattr(x, METADATA_DUNDER_NAME))
+def _ir_parse__function_metadata(x: FunctionType, name: str | None = None) -> _branch:
+    del name
+    return _branch(x, lambda: get_function_metadata(x), lambda frame_offset: ())
+
+
 @ir_unparse.register(lambda x: isinstance(x, DFunction))
 def _ir_unparse__function(x: DFunction, source: Path) -> Generator[ast.stmt]:
     outputs = cast(list[OutputPort], x.outputs)

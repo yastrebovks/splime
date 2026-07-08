@@ -55,6 +55,32 @@ def test_daemon_client_run_sends_owner_library_and_remote_flag() -> None:
     }
 
 
+def test_daemon_client_run_sends_keep_when_requested() -> None:
+    client = RecordingClient()
+
+    client.run("fraud_score", keep=True)
+
+    method, path, payload = client.requests[-1]
+    assert method == "POST"
+    assert path == "/runs"
+    assert payload == {"object": "fraud_score", "source": "auto", "keep": True}
+
+
+def test_daemon_client_run_sends_runtime_overrides_when_requested() -> None:
+    client = RecordingClient()
+
+    client.run("fraud_score", runtimes={"heavy": "venv-subprocess"})
+
+    method, path, payload = client.requests[-1]
+    assert method == "POST"
+    assert path == "/runs"
+    assert payload == {
+        "object": "fraud_score",
+        "source": "auto",
+        "runtimes": {"heavy": "venv-subprocess"},
+    }
+
+
 def test_daemon_client_register_object_sends_target_library() -> None:
     client = RecordingClient()
 
@@ -120,12 +146,20 @@ def test_daemon_client_local_cleanup_paths() -> None:
     client.remove_local("demo_obj")
     client.forget_version("demo_obj", 2, library="research")
     client.prune_stale_mirrors(owner_id="owner-1")
+    client.show_run("run 1")
+    client.show_run("run 1", full_inline=True)
+    client.prune_runs(statuses=["failed"], older_than_seconds=10, dry_run=True)
+    client.delete_run("run 1")
 
-    assert client.requests[-4:] == [
+    assert client.requests[-8:] == [
         ("DELETE", "/objects/demo%20obj?owner_id=owner+1&library=risk+team", None),
         ("DELETE", "/objects/demo_obj", None),
         ("DELETE", "/objects/demo_obj/versions/2?library=research", None),
         ("POST", "/objects/prune-stale-mirrors?owner_id=owner-1", None),
+        ("GET", "/runs/run%201?view=show&full_inline=0", None),
+        ("GET", "/runs/run%201?view=show&full_inline=1", None),
+        ("POST", "/runs/prune", {"dry_run": True, "statuses": ["failed"], "older_than_seconds": 10}),
+        ("DELETE", "/runs/run%201", None),
     ]
 
 
@@ -175,6 +209,10 @@ class FakeDaemon:
         self.run_calls.append({"object_name": object_name, **kwargs})
         return {"id": "remote-run-2", "status": "queued"}
 
+    def resume_run(self, run_id: str, **kwargs: Any) -> dict[str, Any]:
+        self.run_calls.append({"resume_run_id": run_id, **kwargs})
+        return {"id": "resume-run-1", "status": "queued"}
+
     def wait_remote_run(
         self,
         run_id: str,
@@ -216,6 +254,24 @@ class FakeDaemon:
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         return {"id": run_id, "status": "succeeded"}
+
+    def show_run(self, run_id: str, *, full_inline: bool = False) -> dict[str, Any]:
+        self.cleanup_calls.append(("show_run", run_id, full_inline))
+        return {"id": run_id, "status": "succeeded", "manifest": {"full_inline": full_inline}}
+
+    def list_runs(self) -> list[dict[str, Any]]:
+        return [{"id": "run-1", "status": "failed", "keep": "on_failure", "has_manifest": True}]
+
+    def prune_runs(
+        self,
+        *,
+        run_id: str | None = None,
+        statuses: list[str] | None = None,
+        older_than_seconds: float | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        self.cleanup_calls.append(("prune_runs", run_id, statuses, older_than_seconds, dry_run))
+        return {"count": 1, "pruned": [{"id": run_id or "run-1"}], "dry_run": dry_run}
 
     def result(self, run_id: str) -> dict[str, Any]:
         return {"result": {"local": True}, "artifacts": {}}
@@ -621,6 +677,77 @@ def test_spl_client_submit_is_async_alias_for_start() -> None:
     }
 
 
+def test_spl_client_rejects_run_adapter_overrides_before_daemon_call() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+
+    with pytest.raises(NotImplementedError, match="local Deployment.run"):
+        client.submit("fraud_score", adapters={("producer", "default"): object()})
+
+    with pytest.raises(NotImplementedError, match="local Deployment.run"):
+        client.call("fraud_score", adapters={("producer", "default"): object()})
+
+    assert fake_daemon.run_calls == []
+
+
+def test_spl_client_passes_runtime_overrides_to_daemon() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+
+    client.submit("fraud_score", runtimes={"heavy": "venv-subprocess"})
+
+    assert fake_daemon.run_calls[-1]["runtimes"] == {"heavy": "venv-subprocess"}
+
+
+def test_spl_client_resume_passes_daemon_resume_options() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+    adapters = {
+        "producer.default": {
+            "key": "builtins.str@txt",
+            "save": "save_text",
+            "load": "good_load_text",
+            "distributions": [],
+        }
+    }
+
+    run = client.resume(
+        "parent-run",
+        from_="consumer",
+        kwargs={"seed": 2},
+        output="consumer",
+        adapters=adapters,
+        runtimes={"consumer": "native"},
+        keep=True,
+    )
+
+    assert run.id == "resume-run-1"
+    assert fake_daemon.run_calls[-1] == {
+        "resume_run_id": "parent-run",
+        "from_": "consumer",
+        "kwargs": {"seed": 2},
+        "output": "consumer",
+        "timeout_seconds": None,
+        "adapters": adapters,
+        "runtimes": {"consumer": "native"},
+        "keep": True,
+    }
+
+
+def test_spl_client_resume_wait_collects_result() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+
+    result = client.resume("parent-run", from_="consumer", wait=True, progress=False)
+
+    assert result.output is True
+    assert fake_daemon.run_calls[-1]["resume_run_id"] == "parent-run"
+
+
 def test_spl_client_objects_auto_prefers_server_when_connected() -> None:
     client = SPLClient(daemon_port=8765)
     fake_daemon = FakeDaemon()
@@ -1007,12 +1134,21 @@ def test_spl_client_local_cleanup_does_not_require_server_connection() -> None:
         "count": 0,
         "pruned": [],
     }
+    assert client.run_show("run-1", full_inline=True)["manifest"] == {"full_inline": True}
+    assert client.prune_runs(run_id="run-1", status="failed", older_than_seconds=10, dry_run=True) == {
+        "count": 1,
+        "pruned": [{"id": "run-1"}],
+        "dry_run": True,
+    }
+    assert client.runs()[0]["id"] == "run-1"
 
     assert fake_daemon.cleanup_calls == [
         ("forget", "demo_obj", "owner-1", "risk"),
         ("forget", "scratch_obj", None, None),
         ("forget_version", "demo_obj", 2, None, "risk"),
         ("prune_stale_mirrors", "owner-1", None),
+        ("show_run", "run-1", True),
+        ("prune_runs", "run-1", ["failed"], 10, True),
     ]
     assert fake_daemon.library_calls == []
 

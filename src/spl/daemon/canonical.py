@@ -10,7 +10,8 @@ from typing import Any
 
 import yaml
 
-from spl.core.entities.adapter import DAdapter
+from spl.core.entities.adapter import DAdapter, DLoadAdapter, DSaveAdapter
+from spl.core.entities.artifact import DArtifactRef, _default_tag_from_key
 from spl.core.entities.distribution import DDistribution
 from spl.core.entities.function import DFunction
 from spl.core.entities.node import InputPort, OutputPort
@@ -96,7 +97,7 @@ def _canonical_ir(value: Any) -> Any:
             "outputs": None if value.outputs is None else [_canonical_ir(item) for item in value.outputs],
         }
     if isinstance(value, DPipeline):
-        return {
+        pipeline_document: dict[str, Any] = {
             "tag": "DPipeline",
             "name": value.name,
             "nodes": _sorted_canonical(_canonical_ir(item) for item in value.nodes),
@@ -104,6 +105,9 @@ def _canonical_ir(value: Any) -> Any:
             "aliases": _sorted_canonical(_canonical_ir(item) for item in value.aliases),
             "adapters": _sorted_canonical(_canonical_ir(item) for item in value.adapters),
         }
+        if value.tags:
+            pipeline_document["tags"] = _canonical_ir(value.tags)
+        return pipeline_document
     if isinstance(value, DAdapter):
         return {
             "tag": "DAdapter",
@@ -113,6 +117,33 @@ def _canonical_ir(value: Any) -> Any:
             "load": value.load,
             "distributions": _sorted_canonical(_canonical_ir(item) for item in value.distributions),
         }
+    if isinstance(value, DSaveAdapter):
+        return {
+            "tag": "DSaveAdapter",
+            "key": value.key,
+            "artifact_tag": value.tag,
+            "save": value.save,
+            "distributions": _sorted_canonical(_canonical_ir(item) for item in value.distributions),
+        }
+    if isinstance(value, DLoadAdapter):
+        return {
+            "tag": "DLoadAdapter",
+            "key": value.key,
+            "accepted_tags": list(value.accepted_tags),
+            "load": value.load,
+            "distributions": _sorted_canonical(_canonical_ir(item) for item in value.distributions),
+        }
+    if isinstance(value, DArtifactRef):
+        document: dict[str, Any] = {
+            "tag": "DArtifactRef",
+            "key": value.key,
+            "uri": value.uri,
+            "sha256": value.sha256,
+            "size": value.size,
+        }
+        if _default_tag_from_key(value.key) != value.tag:
+            document["artifact_tag"] = value.tag
+        return document
     if isinstance(value, DDistribution):
         return {
             "tag": "DDistribution",

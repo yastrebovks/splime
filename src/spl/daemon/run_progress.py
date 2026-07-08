@@ -79,6 +79,42 @@ def environment_progress(
     return progress
 
 
+def run_observability_progress(run_state: dict[str, Any]) -> dict[str, Any] | None:
+    """Return compact edge/runtime observability for a polled run state."""
+
+    edge_adapters = run_state.get("edge_adapters")
+    node_runtimes = run_state.get("node_runtimes")
+    payload: dict[str, Any] = {}
+    node_statuses = _node_status_progress(run_state.get("manifest"))
+    if node_statuses:
+        payload["nodes"] = node_statuses
+    if isinstance(edge_adapters, list) and edge_adapters:
+        payload["edge_adapters"] = edge_adapters
+    if isinstance(node_runtimes, list) and node_runtimes:
+        payload["node_runtimes"] = node_runtimes
+    return payload or None
+
+
+def _node_status_progress(manifest: Any) -> list[dict[str, Any]]:
+    if not isinstance(manifest, dict):
+        return []
+    nodes = manifest.get("nodes")
+    if not isinstance(nodes, dict):
+        return []
+    rows = []
+    for node_id, record in nodes.items():
+        if not isinstance(record, dict):
+            continue
+        rows.append(
+            {
+                "node_id": str(node_id),
+                "alias": record.get("alias"),
+                "status": record.get("status"),
+            }
+        )
+    return sorted(rows, key=lambda item: (str(item.get("alias") or ""), item["node_id"]))
+
+
 def _elapsed_seconds(started_at: Any) -> float | None:
     """Return non-negative seconds since ``started_at``, or ``None``."""
 

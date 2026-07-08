@@ -76,6 +76,37 @@ class ServerConnectionManager:
         )
         if existing is not None and existing.get("remote_connection_id"):
             local_connection = self.store.get_server_connection(existing["id"])
+            if (
+                display_name
+                and display_name != local_connection.get("display_name")
+                and self._is_technical_machine_label(
+                    local_connection.get("display_name"),
+                    local_connection["machine_id"],
+                )
+            ):
+                server = self.server_client(
+                    server_url,
+                    machine_token,
+                    user_token=user_token,
+                )
+                remote_connection = server.connect_machine(
+                    machine_id=machine_id or local_connection["machine_id"],
+                    display_name=display_name,
+                    capabilities=capabilities,
+                    heartbeat_interval_seconds=heartbeat_interval_seconds,
+                )
+                local_connection = self.store.complete_server_connection(
+                    existing["id"],
+                    remote_connection=remote_connection,
+                    heartbeat_interval_seconds=heartbeat_interval_seconds,
+                )
+                return {
+                    "connected": True,
+                    "reused": True,
+                    "refreshed": True,
+                    "connection": local_connection,
+                    "remote_connection": remote_connection,
+                }
             return {
                 "connected": local_connection["status"] == "connected",
                 "offline": local_connection["status"] == "heartbeat_failed",
@@ -213,6 +244,25 @@ class ServerConnectionManager:
             return validate_name(machine_id)
         digest = hashlib.sha256(machine_token.encode("utf-8")).hexdigest()[:12]
         return f"machine-{digest}"
+
+    @staticmethod
+    def _is_technical_machine_label(value: Any, machine_id: str) -> bool:
+        label = str(value or "").strip()
+        if not label:
+            return True
+        folded = label.casefold()
+        if folded == str(machine_id).casefold():
+            return True
+        if folded == f"mach_{machine_id}".casefold():
+            return True
+        if folded.startswith(("mach_", "mach-")):
+            return True
+        if not folded.startswith("machine"):
+            return False
+        suffix = folded.removeprefix("machine")
+        if suffix.startswith(("_", "-")):
+            suffix = suffix[1:]
+        return len(suffix) >= 8 and all(char in "0123456789abcdef" for char in suffix)
 
     def restore_pending_server_connection(
         self,

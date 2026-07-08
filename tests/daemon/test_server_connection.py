@@ -27,11 +27,16 @@ class ConnectedClient:
     def __init__(self):
         self.connect_calls = 0
         self.disconnect_calls = 0
+        self.connect_kwargs: list[dict[str, Any]] = []
 
     def connect_machine(self, **kwargs: Any) -> dict[str, Any]:
         self.connect_calls += 1
+        self.connect_kwargs.append(kwargs)
         machine_id = kwargs.get("machine_id") or "machine-1"
-        return _remote_connection(machine_id=machine_id)
+        connection = _remote_connection(machine_id=machine_id)
+        if kwargs.get("display_name"):
+            connection["display_name"] = kwargs["display_name"]
+        return connection
 
     def disconnect_machine(self) -> dict[str, Any]:
         self.disconnect_calls += 1
@@ -229,6 +234,51 @@ def test_server_connection_manager_reuses_matching_connection(
     assert second["remote_connection"]["id"] == "remote-connection-1"
     assert second["remote_connection"]["machine_id"] == "machine-1"
     assert client.connect_calls == 1
+
+
+def test_server_connection_manager_refreshes_reused_technical_display_name(
+    store: RegistryStore,
+) -> None:
+    client = ConnectedClient()
+    manager = ServerConnectionManager(store, ClientFactory(client))
+
+    first = manager.connect_server(
+        server_url="https://splime.io/api/",
+        machine_token="machine-token-secret",
+        user_token="user-token-secret",
+        machine_id="machine-86c8b6063d0bef7b",
+        display_name=None,
+        capabilities={},
+        heartbeat_interval_seconds=60,
+    )
+    second = manager.connect_server(
+        server_url="https://splime.io/api",
+        machine_token="machine-token-secret",
+        user_token="user-token-secret",
+        machine_id="machine-86c8b6063d0bef7b",
+        display_name="Pair3",
+        capabilities={},
+        heartbeat_interval_seconds=60,
+    )
+    third = manager.connect_server(
+        server_url="https://splime.io/api",
+        machine_token="machine-token-secret",
+        user_token="user-token-secret",
+        machine_id="machine-86c8b6063d0bef7b",
+        display_name="Pair3",
+        capabilities={},
+        heartbeat_interval_seconds=60,
+    )
+
+    assert first["connection"]["display_name"] == "machine-86c8b6063d0bef7b"
+    assert second["reused"] is True
+    assert second["refreshed"] is True
+    assert second["connection"]["display_name"] == "Pair3"
+    assert second["remote_connection"]["display_name"] == "Pair3"
+    assert third["reused"] is True
+    assert "refreshed" not in third
+    assert client.connect_calls == 2
+    assert client.connect_kwargs[1]["display_name"] == "Pair3"
 
 
 def test_server_connection_manager_disconnects_pending_connection(

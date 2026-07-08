@@ -7,7 +7,7 @@ from typing import Any, TypeVar, cast
 
 import yaml
 
-from spl.core.entities.adapter import DAdapter
+from spl.core.entities.adapter import DAdapter, DLoadAdapter, DSaveAdapter
 from spl.core.entities.artifact import DArtifactRef
 from spl.core.entities.control import DSPLImport, DSPLSelfImport
 from spl.core.entities.distribution import DDistribution, validate_distributions
@@ -72,6 +72,8 @@ SPL_YAML_CONSTRUCTORS = {
     "!DScalar": _construct_dataclass(DScalar),
     "!DArtifactRef": _construct_dataclass(DArtifactRef),
     "!DAdapter": _construct_dataclass(DAdapter),
+    "!DSaveAdapter": _construct_dataclass(DSaveAdapter),
+    "!DLoadAdapter": _construct_dataclass(DLoadAdapter),
 }
 
 

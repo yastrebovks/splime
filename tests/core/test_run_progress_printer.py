@@ -109,6 +109,40 @@ class TestRunProgressPrinter:
 
         assert stream.getvalue() == ""
 
+    def test_announces_observability_once(self) -> None:
+        clock = FakeClock()
+        printer, stream = make_printer(clock)
+        state = {
+            "status": "running",
+            "run_progress": {
+                "node_runtimes": [
+                    {"alias": "producer", "name": "native", "source": "default"},
+                    {"alias": "consumer", "name": "venv-subprocess", "source": "node-tag"},
+                ],
+                "edge_adapters": [
+                    {
+                        "source": "producer.default",
+                        "target": "consumer.value",
+                        "tag": "txt",
+                        "save": "save_text",
+                        "load": "load_text",
+                        "source_level": "pipeline",
+                    }
+                ],
+            },
+        }
+
+        printer(state)
+        printer(state)
+
+        lines = stream.getvalue().splitlines()
+        assert len(lines) == 1
+        assert "producer=native/default" in lines[0]
+        assert "consumer=venv-subprocess/node-tag" in lines[0]
+        assert "producer.default -> consumer.value" in lines[0]
+        assert "tag=txt" in lines[0]
+        assert "source=pipeline" in lines[0]
+
     def test_slow_waiting_phase_reports_after_interval(self) -> None:
         clock = FakeClock()
         printer, stream = make_printer(clock)

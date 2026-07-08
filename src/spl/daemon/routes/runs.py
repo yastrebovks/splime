@@ -7,8 +7,9 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
+from spl.core import manifest as m_manifest
 from spl.daemon.routes._helpers import RouteContext, RouteRegistrar
-from spl.daemon.run_progress import environment_progress
+from spl.daemon.run_progress import environment_progress, run_observability_progress
 from spl.daemon.store import validate_name
 
 
@@ -26,10 +27,34 @@ def register_run_routes(
     async def list_runs() -> Any:
         return json_response(runtime.store.list_runs())
 
+    @app.get("/runs/tag-stats")
+    @route_errors
+    async def tag_stats() -> Any:
+        return json_response(runtime.store.run_tag_stats())
+
+    @app.post("/runs/prune")
+    @route_errors
+    async def prune_runs() -> Any:
+        body = await context.read_json_body()
+        statuses = body.get("statuses")
+        if statuses is not None and not isinstance(statuses, list):
+            raise ValueError("statuses must be a list")
+        return json_response(
+            runtime.store.prune_runs(
+                run_id=body.get("run_id"),
+                statuses=statuses,
+                older_than_seconds=body.get("older_than_seconds"),
+                dry_run=bool(body.get("dry_run", False)),
+            )
+        )
+
     @app.post("/runs")
     @route_errors
     async def start_run() -> Any:
         body = await context.read_json_body()
+        runtimes = body.get("runtimes")
+        if runtimes is not None and not isinstance(runtimes, dict):
+            raise ValueError("runtimes must be a mapping")
         if body.get("target_machine") or body.get("remote"):
             return json_response(
                 runtime.start_remote_run(
@@ -62,6 +87,8 @@ def register_run_routes(
                 object_version_id=body.get("version_id"),
                 function=body.get("function"),
                 source=body.get("source", "auto"),
+                runtimes=runtimes,
+                keep=body.get("keep", "on_failure"),
             ),
             HTTPStatus.ACCEPTED,
         )
@@ -75,11 +102,61 @@ def register_run_routes(
     @app.get("/runs/<run_id>")
     @route_errors
     async def get_run(run_id: str) -> Any:
+        if context.first_query_value("view") == "show":
+            return json_response(
+                runtime.store.show_run(
+                    validate_name(run_id),
+                    include_inline_values=context.query_bool("full_inline", default=False),
+                )
+            )
         state = runtime.store.get_run(validate_name(run_id))
         progress = environment_progress(runtime.store, state)
         if progress is not None:
             state = {**state, "environment": progress}
-        return json_response(state)
+        observability = run_observability_progress(state)
+        if observability is not None:
+            state = {**state, "run_progress": observability}
+        return json_response(m_manifest.sanitize_run_state(state))
+
+    @app.post("/runs/<run_id>/resume")
+    @route_errors
+    async def resume_run(run_id: str) -> Any:
+        body = await context.read_json_body()
+        from_selection = body.get("from", body.get("from_"))
+        if from_selection is None:
+            raise ValueError("resume requires `from`")
+        kwargs = body.get("kwargs")
+        if kwargs is not None and not isinstance(kwargs, dict):
+            raise ValueError("kwargs must be a mapping")
+        adapters = body.get("adapters")
+        if adapters is not None and not isinstance(adapters, dict):
+            raise ValueError("adapters must be a mapping")
+        runtimes = body.get("runtimes")
+        if runtimes is not None and not isinstance(runtimes, dict):
+            raise ValueError("runtimes must be a mapping")
+        return json_response(
+            runtime.resume_run(
+                validate_name(run_id),
+                from_=from_selection,
+                kwargs=kwargs,
+                output=body.get("output"),
+                timeout_seconds=body.get("timeout_seconds"),
+                adapters=adapters,
+                runtimes=runtimes,
+                keep=body.get("keep", "on_failure"),
+            ),
+            HTTPStatus.ACCEPTED,
+        )
+
+    @app.delete("/runs/<run_id>")
+    @route_errors
+    async def delete_run(run_id: str) -> Any:
+        return json_response(
+            runtime.store.delete_run(
+                validate_name(run_id),
+                dry_run=context.query_bool("dry_run", default=False),
+            )
+        )
 
     @app.get("/runs/<run_id>/result")
     @route_errors

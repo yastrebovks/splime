@@ -224,6 +224,10 @@ class ServerClientProtocol(Protocol):
         """Return machines visible to the connected identity."""
         ...
 
+    def list_tokens(self) -> list[dict[str, Any]]:
+        """Return tokens visible to the connected user identity."""
+        ...
+
     def list_libraries(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
         """Return visible server libraries."""
         ...

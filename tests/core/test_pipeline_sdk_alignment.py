@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from uuid import uuid4
 
 import pytest
@@ -39,6 +40,18 @@ def _attach_metadata(
         ),
     )
     return func
+
+
+def _reserved_keep_value(keep):
+    return keep
+
+
+def _regular_input_value(value):
+    return value
+
+
+def _resume_from_value(from_):
+    return from_
 
 
 def test_pipeline_rejects_duplicate_link_targets() -> None:
@@ -100,6 +113,52 @@ def test_deployment_accepts_pipeline_without_client_for_compatibility() -> None:
     run = Deployment(Pipeline(nodes={node})).run()
 
     assert run[node] == {"score": 7}
+
+
+def test_deployment_warns_for_free_input_named_like_run_parameter() -> None:
+    pipeline = lift(_reserved_keep_value).alias("echo").render("reserved_keep")
+
+    with pytest.warns(UserWarning, match=r"`keep`") as captured:
+        Deployment(pipeline).run(keep=False)
+    assert len(captured) == 1
+    assert "bind these inputs via `lift(...).bind(<name>=...)` before `render()`" in str(captured[0].message)
+
+
+def test_deployment_bound_reserved_input_name_does_not_warn_and_value_arrives() -> None:
+    pipeline = lift(_reserved_keep_value).bind(keep="bound").alias("echo").render("reserved_keep_bound")
+
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        result = Deployment(pipeline).run(output="echo", keep=False)
+
+    assert result == "bound"
+    assert not [warning for warning in captured if issubclass(warning.category, UserWarning)]
+
+
+def test_deployment_regular_free_input_name_does_not_warn() -> None:
+    pipeline = lift(_regular_input_value).alias("echo").render("regular_input")
+
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        result = Deployment(pipeline).run(output="echo", keep=False, value="ok")
+
+    assert result == "ok"
+    assert not [warning for warning in captured if issubclass(warning.category, UserWarning)]
+
+
+def test_resume_warns_for_resume_only_reserved_free_input_name(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SPL_RUNS_HOME", str(tmp_path / "runs"))
+    pipeline = lift(_resume_from_value).alias("echo").render("reserved_resume_from")
+
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        parent = Deployment(pipeline).run(keep=True, from_="parent")
+    assert not [warning for warning in captured if issubclass(warning.category, UserWarning)]
+    with parent:
+        assert parent.value("echo") == "parent"
+
+    with pytest.warns(UserWarning, match=r"`from_`"):
+        parent.resume(from_="echo", keep=False)
 
 
 def test_deployment_rejects_multi_output_nodes() -> None:

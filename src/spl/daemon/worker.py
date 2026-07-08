@@ -67,10 +67,12 @@ import shutil
 from collections.abc import Iterable, Mapping, Sequence
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast, overload
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from spl.core.entities.adapter import Adapter
+from spl.core.entities.distribution import DDistribution
 from spl.daemon.store import validate_name
 
 ARTIFACTS_KEY = "__spl_artifacts__"
@@ -90,11 +92,26 @@ def read_json(path: Path) -> Any:
 def write_json(path: Path, value: Any) -> None:
     """Write a UTF-8 JSON file with stable formatting."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    _ensure_private_dir(path.parent)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+    _chmod_owner_file(path)
+
+
+def _ensure_private_dir(path: Path) -> None:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
+def _chmod_owner_file(path: Path) -> None:
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
 
 
 class RemoteNodeClient:
@@ -221,9 +238,11 @@ def copy_artifact(source: Path, target: Path) -> None:
         raise ValueError(f"artifact source is not found: {source}")
     if source.is_dir():
         shutil.copytree(source, target, dirs_exist_ok=True)
+        _chmod_artifact_tree(target)
     else:
-        target.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_private_dir(target.parent)
         shutil.copy2(source, target)
+        _chmod_owner_file(target)
 
 
 def collect_artifacts(value: Any, artifacts_dir: Path) -> tuple[Any, dict[str, str]]:
@@ -258,7 +277,7 @@ def collect_artifacts(value: Any, artifacts_dir: Path) -> tuple[Any, dict[str, s
         raise TypeError("__spl_artifacts__ must be a mapping or a list of paths")
 
     copied: dict[str, str] = {}
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(artifacts_dir)
     for name, source in items:
         artifact_name = safe_artifact_name(str(name))
         source_path = Path(str(source)).expanduser().absolute()
@@ -290,6 +309,24 @@ def _with_numeric_suffix(name: str, index: int) -> str:
     if stem and separator and suffix:
         return f"{stem}-{index}.{suffix}"
     return f"{name}-{index}"
+
+
+def _chmod_artifact_tree(path: Path) -> None:
+    if path.is_dir():
+        try:
+            path.chmod(0o700)
+        except OSError:
+            pass
+        for item in path.rglob("*"):
+            if item.is_dir():
+                try:
+                    item.chmod(0o700)
+                except OSError:
+                    pass
+            elif item.is_file():
+                _chmod_owner_file(item)
+    elif path.is_file():
+        _chmod_owner_file(path)
 
 
 class PipelineResultNormalizer:
@@ -336,7 +373,7 @@ class PipelineResultNormalizer:
         else:
             raise TypeError("__spl_artifacts__ must be a mapping or a list of paths")
 
-        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_private_dir(self.artifacts_dir)
         for name, source in items:
             artifact_name = self._reserve_artifact_name(safe_artifact_name(str(name)))
             source_path = Path(str(source)).expanduser().absolute()
@@ -353,7 +390,7 @@ class PipelineResultNormalizer:
         adapter = self._resolve_adapter(value, path)
         artifact_name = self._artifact_name(path, adapter.format)
         artifact_path = self.artifacts_dir / artifact_name
-        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_private_dir(self.artifacts_dir)
 
         try:
             adapter.save(str(artifact_path), value)
@@ -366,6 +403,7 @@ class PipelineResultNormalizer:
         size = artifact_path.stat().st_size
         sha256 = compute_sha256(artifact_path)
         self.artifacts[artifact_name] = str(artifact_path)
+        _chmod_owner_file(artifact_path)
         return {
             ARTIFACT_REF_KEY: True,
             "name": artifact_name,
@@ -410,6 +448,7 @@ class PipelineResultNormalizer:
         return candidate
 
 
+@overload
 def run_pipeline(
     pipeline: Any,
     kwargs: dict[str, Any],
@@ -418,7 +457,48 @@ def run_pipeline(
     daemon_url: str,
     timeout_seconds: float | None,
     artifacts_dir: Path,
-) -> tuple[Any, dict[str, str]]:
+    namespace: Mapping[str, Any] | None = None,
+    runtime_config: dict[str, Any] | None = None,
+    runtime_env_spec: list[dict[str, Any]] | None = None,
+    runtimes: dict[str, str] | None = None,
+    resume: Mapping[str, Any] | None = None,
+    include_manifest: Literal[False] = False,
+) -> tuple[Any, dict[str, str]]: ...
+
+
+@overload
+def run_pipeline(
+    pipeline: Any,
+    kwargs: dict[str, Any],
+    output: str | None,
+    *,
+    daemon_url: str,
+    timeout_seconds: float | None,
+    artifacts_dir: Path,
+    namespace: Mapping[str, Any] | None = None,
+    runtime_config: dict[str, Any] | None = None,
+    runtime_env_spec: list[dict[str, Any]] | None = None,
+    runtimes: dict[str, str] | None = None,
+    resume: Mapping[str, Any] | None = None,
+    include_manifest: Literal[True],
+) -> tuple[Any, dict[str, str], dict[str, Any] | None]: ...
+
+
+def run_pipeline(
+    pipeline: Any,
+    kwargs: dict[str, Any],
+    output: str | None,
+    *,
+    daemon_url: str,
+    timeout_seconds: float | None,
+    artifacts_dir: Path,
+    namespace: Mapping[str, Any] | None = None,
+    runtime_config: dict[str, Any] | None = None,
+    runtime_env_spec: list[dict[str, Any]] | None = None,
+    runtimes: dict[str, str] | None = None,
+    resume: Mapping[str, Any] | None = None,
+    include_manifest: bool = False,
+) -> tuple[Any, dict[str, str]] | tuple[Any, dict[str, str], dict[str, Any] | None]:
     """Run a ``spl.core`` pipeline without changing the existing core files.
 
     The current core exposes ``Deployment`` and ``Run`` but does not provide a
@@ -435,32 +515,168 @@ def run_pipeline(
 
     client = RemoteNodeClient(daemon_url, timeout_seconds=timeout_seconds)
     try:
-        deployment = Deployment(client, pipeline)
+        deployment = Deployment(
+            client,
+            pipeline,
+            runtime_config=runtime_config,
+            runtime_env_spec=runtime_env_spec,
+        )
     except TypeError:
         # Older framework builds did not require a client for local-only
         # pipelines.  Keep the worker tolerant while NodeRemote is still moving.
-        deployment = Deployment(pipeline)
+        deployment = Deployment(
+            pipeline,
+            runtime_config=runtime_config,
+            runtime_env_spec=runtime_env_spec,
+        )
     normalizer = PipelineResultNormalizer(pipeline, artifacts_dir)
-    with deployment.run(**kwargs) as run:
-        if output is not None:
-            result = run[pipeline.get_node_by_alias(output)]
-            return normalizer.normalize(result, ("result", output)), normalizer.artifacts
+    previous_runs_home = os.environ.get("SPL_RUNS_HOME")
+    os.environ["SPL_RUNS_HOME"] = str(artifacts_dir.parent / "pipeline-state")
+    try:
+        if resume is None:
+            run = deployment.run(runtimes=runtimes, keep=True, **kwargs)
+        else:
+            run = deployment.resume(
+                _resume_parent_run_dir(resume),
+                from_=_resume_from_selection(resume),
+                adapters=_adapter_overrides_from_payload(pipeline, namespace or {}, resume.get("adapters")),
+                runtimes=runtimes,
+                kwargs=_resume_kwargs(resume),
+                keep=True,
+            )
+        with run:
+            if output is not None:
+                result = run[pipeline.get_node_by_alias(output)]
+            elif pipeline.aliases:
+                result = {
+                    alias: run[node]
+                    for alias, node in sorted(
+                        pipeline.aliases.items(),
+                        key=lambda item: item[0],
+                    )
+                }
+            elif len(pipeline.nodes) == 1:
+                [node] = list(pipeline.nodes)
+                result = run[node]
+            else:
+                raise ValueError("pipeline has multiple nodes and no aliases; pass output or register aliases")
+    finally:
+        if previous_runs_home is None:
+            os.environ.pop("SPL_RUNS_HOME", None)
+        else:
+            os.environ["SPL_RUNS_HOME"] = previous_runs_home
 
-        if pipeline.aliases:
-            result = {
-                alias: run[node]
-                for alias, node in sorted(
-                    pipeline.aliases.items(),
-                    key=lambda item: item[0],
-                )
-            }
-            return normalizer.normalize(result), normalizer.artifacts
+    run_manifest = read_json(run.manifest_path) if run.manifest_path is not None else None
+    if output is not None:
+        normalized = normalizer.normalize(result, ("result", output))
+        if include_manifest:
+            return normalized, normalizer.artifacts, run_manifest
+        return normalized, normalizer.artifacts
 
-        if len(pipeline.nodes) == 1:
-            [node] = list(pipeline.nodes)
-            return normalizer.normalize(run[node]), normalizer.artifacts
+    normalized = normalizer.normalize(result)
+    if include_manifest:
+        return normalized, normalizer.artifacts, run_manifest
+    return normalized, normalizer.artifacts
 
-    raise ValueError("pipeline has multiple nodes and no aliases; pass output or register aliases")
+
+def _resume_parent_run_dir(resume: Mapping[str, Any]) -> str:
+    value = resume.get("parent_run_dir")
+    if not isinstance(value, str) or not value:
+        raise ValueError("resume parent_run_dir must be a non-empty string")
+    return value
+
+
+def _resume_from_selection(resume: Mapping[str, Any]) -> Any:
+    if "from" in resume:
+        return resume["from"]
+    if "from_" in resume:
+        return resume["from_"]
+    raise ValueError("resume requires `from`")
+
+
+def _resume_kwargs(resume: Mapping[str, Any]) -> dict[str, Any] | None:
+    value = resume.get("kwargs")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise TypeError("resume kwargs must be a mapping")
+    return value
+
+
+def _adapter_overrides_from_payload(
+    pipeline: Any, namespace: Mapping[str, Any], payload: Any
+) -> dict[tuple[str, str], Adapter] | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, Mapping):
+        raise TypeError("resume adapter overrides must be a mapping")
+    overrides: dict[tuple[str, str], Adapter] = {}
+    for raw_key, raw_spec in payload.items():
+        alias, port = _adapter_override_target(raw_key, raw_spec)
+        overrides[(alias, port)] = _adapter_from_payload(pipeline, namespace, raw_spec)
+    return overrides
+
+
+def _adapter_override_target(raw_key: Any, raw_spec: Any) -> tuple[str, str]:
+    if (
+        isinstance(raw_spec, Mapping)
+        and isinstance(raw_spec.get("alias"), str)
+        and isinstance(raw_spec.get("port"), str)
+    ):
+        return validate_name(raw_spec["alias"]), validate_name(raw_spec["port"])
+    if not isinstance(raw_key, str) or "." not in raw_key:
+        raise ValueError("resume adapter override key must be `alias.port`")
+    alias, port = raw_key.rsplit(".", 1)
+    return validate_name(alias), validate_name(port)
+
+
+def _adapter_from_payload(pipeline: Any, namespace: Mapping[str, Any], raw_spec: Any) -> Adapter:
+    if isinstance(raw_spec, str):
+        adapter = pipeline.resolve_adapter(key=raw_spec)
+        if adapter is None:
+            raise ValueError("resume adapter override references unknown adapter key `{}`".format(raw_spec))
+        return cast(Adapter, adapter)
+    if not isinstance(raw_spec, Mapping):
+        raise TypeError("resume adapter override spec must be a mapping or adapter key")
+    key = _required_string(raw_spec, "key")
+    save = namespace[_required_string(raw_spec, "save")]
+    load = namespace[_required_string(raw_spec, "load")]
+    _, separator, format_name = key.rpartition("@")
+    if not separator or not format_name:
+        raise ValueError("resume adapter override key must be `<python_type>@<format>`")
+    return Adapter(
+        key=key,
+        save=save,
+        load=load,
+        py_type=None,
+        format=str(raw_spec.get("format") or format_name),
+        distributions=_adapter_distributions(raw_spec.get("distributions")),
+    )
+
+
+def _required_string(spec: Mapping[str, Any], key: str) -> str:
+    value = spec.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError("resume adapter override `{}` must be a non-empty string".format(key))
+    return value
+
+
+def _adapter_distributions(value: Any) -> tuple[DDistribution, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise TypeError("resume adapter override distributions must be a list")
+    distributions: list[DDistribution] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise TypeError("resume adapter override distribution entries must be mappings")
+        distributions.append(
+            DDistribution(
+                package=_required_string(item, "package"),
+                version=_required_string(item, "version"),
+            )
+        )
+    return tuple(distributions)
 
 
 def load_entrypoint(
@@ -471,6 +687,22 @@ def load_entrypoint(
 ) -> Any:
     """Import a serialized SPL file and return the requested object."""
 
+    target, _ = load_entrypoint_with_namespace(
+        object_yaml,
+        entrypoint,
+        remote_signatures_path=remote_signatures_path,
+    )
+    return target
+
+
+def load_entrypoint_with_namespace(
+    object_yaml: Path,
+    entrypoint: str,
+    *,
+    remote_signatures_path: Path | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Import a serialized SPL file and return the entrypoint plus namespace."""
+
     from spl.core.ir.utils import spl_import_from_file
 
     remote_ports = _read_remote_ports(remote_signatures_path)
@@ -480,7 +712,7 @@ def load_entrypoint(
     _seed_node_remote_namespace(namespace)
     spl_import_from_file(object_yaml, globals=namespace)
     try:
-        return namespace[entrypoint]
+        return namespace[entrypoint], namespace
     except KeyError as exc:
         raise KeyError(f"entrypoint is not found in SPL file: {entrypoint}") from exc
 
@@ -588,11 +820,15 @@ def execute(
     args = payload.get("args", [])
     kwargs = payload.get("kwargs", {})
     output = payload.get("output")
+    runtime_config = payload.get("runtime_config")
+    runtimes = payload.get("runtimes")
 
+    runtime_env_spec: list[dict[str, Any]] = []
     if env_spec_path is not None:
-        validate_environment(read_json(env_spec_path))
+        runtime_env_spec = read_json(env_spec_path)
+        validate_environment(runtime_env_spec)
 
-    target = load_entrypoint(
+    target, namespace = load_entrypoint_with_namespace(
         object_yaml,
         entrypoint,
         remote_signatures_path=remote_signatures_path,
@@ -601,17 +837,24 @@ def execute(
     from spl.core.entities.pipeline import Pipeline
 
     if isinstance(target, Pipeline):
-        result_without_artifacts, artifacts = run_pipeline(
+        result_without_artifacts, artifacts, manifest = run_pipeline(
             target,
             kwargs,
             output,
             daemon_url=daemon_url,
             timeout_seconds=payload.get("timeout_seconds"),
             artifacts_dir=artifacts_dir,
+            namespace=namespace,
+            runtime_config=runtime_config if isinstance(runtime_config, dict) else None,
+            runtime_env_spec=runtime_env_spec,
+            runtimes=runtimes if isinstance(runtimes, dict) else None,
+            resume=payload.get("resume") if isinstance(payload.get("resume"), Mapping) else None,
+            include_manifest=True,
         )
     elif callable(target):
         raw_result = target(*args, **kwargs)
         result_without_artifacts, artifacts = collect_artifacts(raw_result, artifacts_dir)
+        manifest = None
     else:
         raise TypeError(f"entrypoint is not callable or Pipeline: {entrypoint}")
 
@@ -619,6 +862,8 @@ def execute(
         "result": to_jsonable(result_without_artifacts),
         "artifacts": artifacts,
     }
+    if manifest is not None:
+        result_payload["manifest"] = manifest
     write_json(result_path, result_payload)
     return result_payload
 

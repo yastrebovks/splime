@@ -1,0 +1,84 @@
+# SPL YAML compatibility corpus fixture.
+# Source format: splime 0.3.0 baseline, compatible with 0.2.x/0.3.x readers.
+# Generated on: 2026-07-08.
+# Generated with: ir_parse/get_top_level_deps and yaml.dump_all.
+# Static by design: do not regenerate inside tests.
+- !DPipeline
+  name: multinode_dag
+  nodes:
+  - !DNodeFunction
+    uuid: 42244175-309d-4ecc-8531-aeb2b6116bb4
+    func: dag_double
+  - !DNodeFunction
+    uuid: 6702f265-d858-4b71-9e31-fa6f28c3a7bc
+    func: dag_source
+  - !DNodeFunction
+    uuid: 3697afd6-8d2c-4da9-aa32-cfc5d09f7854
+    func: dag_total
+  links:
+  - - !DNodeInputRef
+      uuid: 3697afd6-8d2c-4da9-aa32-cfc5d09f7854
+      port: right
+    - !DNodeOutputRef
+      uuid: 42244175-309d-4ecc-8531-aeb2b6116bb4
+      port: default
+  - - !DNodeInputRef
+      uuid: 42244175-309d-4ecc-8531-aeb2b6116bb4
+      port: value
+    - !DNodeOutputRef
+      uuid: 6702f265-d858-4b71-9e31-fa6f28c3a7bc
+      port: default
+  - - !DNodeInputRef
+      uuid: 3697afd6-8d2c-4da9-aa32-cfc5d09f7854
+      port: left
+    - !DNodeOutputRef
+      uuid: 6702f265-d858-4b71-9e31-fa6f28c3a7bc
+      port: default
+  aliases:
+  - - doubled
+    - 42244175-309d-4ecc-8531-aeb2b6116bb4
+  - - total
+    - 3697afd6-8d2c-4da9-aa32-cfc5d09f7854
+  adapters: []
+- !DSPLSelfImport
+  name: dag_total
+- !DSPLSelfImport
+  name: dag_source
+- !DSPLSelfImport
+  name: dag_double
+---
+- !DFunction
+  name: dag_total
+  inputs:
+  - name: left
+    type: int
+    default: null
+  - name: right
+    type: int
+    default: null
+  outputs:
+  - name: default
+    type: int
+  body: |-
+    return left + right
+---
+- !DFunction
+  name: dag_source
+  inputs: []
+  outputs:
+  - name: default
+    type: int
+  body: |-
+    return 4
+---
+- !DFunction
+  name: dag_double
+  inputs:
+  - name: value
+    type: int
+    default: null
+  outputs:
+  - name: default
+    type: int
+  body: |-
+    return value * 2

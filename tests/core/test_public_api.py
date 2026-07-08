@@ -294,7 +294,7 @@ def test_facade_symbols_are_canonical() -> None:
 
 def test_call_signature_keeps_expected_parameters() -> None:
     params = inspect.signature(spl.SPLClient.call).parameters
-    for name in ("name", "kwargs", "output", "function", "target_machine"):
+    for name in ("name", "kwargs", "output", "function", "target_machine", "adapters"):
         assert name in params
 
 

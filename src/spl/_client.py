@@ -39,6 +39,7 @@ from spl._views import (
     SignatureView,
     wrap_action,
 )
+from spl.core import manifest as m_manifest
 from spl.core.entities.node import DEFAULT_PORT
 from spl.daemon_client import (
     DEFAULT_DAEMON_HOST,
@@ -71,7 +72,8 @@ def _preview(value: Any, *, limit: int = 80) -> str:
 
 
 def _is_missing_server_connection(exc: Exception) -> bool:
-    return isinstance(exc, ClientError) and _NO_SERVER_CONNECTION_MESSAGE in str(exc)
+    message = str(exc)
+    return isinstance(exc, ClientError) and _NO_SERVER_CONNECTION_MESSAGE in message
 
 
 def _progress_callback(progress: ProgressOption) -> RunStateCallback | None:
@@ -767,11 +769,29 @@ class SPLClient:
         return ConnectionStatusView(state)
 
     def machines(self) -> dict[str, Any]:
-        """Return the user's machines, or an empty listing when not connected."""
+        """Return the user's machines, or an empty listing when not connected.
 
-        if not self._has_server_connection():
+        The connection-state endpoint is probed for health only: a missing
+        connection maps to an empty listing and any other state failure
+        re-raises (0.3.0 contract). A degraded-but-present state (for
+        example ``heartbeat_failed``) must not hide the daemon's machine
+        payload, so the state content itself does not gate the listing.
+        """
+
+        if self.server_connection is None:
+            try:
+                self._daemon.server_connection()
+            except Exception as exc:
+                if not _is_missing_server_connection(exc):
+                    raise
+                return MachineListView({"current_machine_id": None, "machines": []})
+        try:
+            machines = self._daemon.server_machines()
+        except Exception as exc:
+            if not _is_missing_server_connection(exc):
+                raise
             return MachineListView({"current_machine_id": None, "machines": []})
-        return MachineListView(self._daemon.server_machines())
+        return MachineListView(machines)
 
     def libraries(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
         """Return visible libraries, or an empty list when not connected."""
@@ -1368,10 +1388,89 @@ class SPLClient:
             "environment build",
         )
 
-    def runs(self) -> list[dict[str, Any]]:
+    def runs(self, *, local: bool = False) -> list[dict[str, Any]]:
         """Return known daemon runs, newest first."""
 
-        return RunListView(self._daemon.list_runs())
+        return RunListView(m_manifest.list_local_runs() if local else self._daemon.list_runs())
+
+    def run_show(self, run_id: str, *, full_inline: bool = False, local: bool = False) -> dict[str, Any]:
+        """Return one retained run manifest.
+
+        Inline JSON values are summarized by default; pass ``full_inline=True``
+        to include the full manifest values.
+        """
+
+        payload = (
+            m_manifest.show_local_run(run_id, include_inline_values=full_inline)
+            if local
+            else self._daemon.show_run(run_id, full_inline=full_inline)
+        )
+        return RunRecordView(payload)
+
+    def resume(
+        self,
+        run_id: str,
+        *,
+        from_: Any,
+        kwargs: dict[str, Any] | None = None,
+        output: str | None = None,
+        timeout_seconds: float | None = None,
+        adapters: dict[str, Any] | None = None,
+        runtimes: dict[str, str] | None = None,
+        keep: bool | str | None = None,
+        wait: bool = False,
+        artifacts_dir: str | Path | None = None,
+        progress: ProgressOption = True,
+    ) -> RemoteRun | RemoteResult:
+        """Resume a retained daemon pipeline run from selected recalculation nodes."""
+
+        state = self._daemon.resume_run(
+            run_id,
+            from_=from_,
+            kwargs=kwargs,
+            output=output,
+            timeout_seconds=timeout_seconds,
+            adapters=adapters,
+            runtimes=runtimes,
+            keep=keep,
+        )
+        run = RemoteRun(self, state)
+        if not wait:
+            return run
+        return run.collect(
+            artifacts_dir=artifacts_dir,
+            timeout_seconds=timeout_seconds,
+            progress=progress,
+        )
+
+    def prune_runs(
+        self,
+        *,
+        run_id: str | None = None,
+        status: str | list[str] | None = None,
+        older_than_seconds: float | None = None,
+        dry_run: bool = False,
+        local: bool = False,
+    ) -> dict[str, Any]:
+        """Prune inactive retained runs by id, status, age, or retention TTL."""
+
+        statuses = [status] if isinstance(status, str) else status
+        result = (
+            m_manifest.prune_local_runs(
+                run_id=run_id,
+                statuses=statuses,
+                older_than_seconds=older_than_seconds,
+                dry_run=dry_run,
+            )
+            if local
+            else self._daemon.prune_runs(
+                run_id=run_id,
+                statuses=statuses,
+                older_than_seconds=older_than_seconds,
+                dry_run=dry_run,
+            )
+        )
+        return wrap_action(result, "runs pruned")
 
     def _start_run(
         self,
@@ -1387,24 +1486,37 @@ class SPLClient:
         offline_policy: OfflinePolicy | None = None,
         function: str | None = None,
         source: RunSource = "auto",
+        adapters: Any | None = None,
+        runtimes: dict[str, str] | None = None,
+        keep: bool | str | None = None,
     ) -> RemoteRun:
         """Shared implementation behind ``submit``/``call`` (and legacy aliases)."""
 
+        if adapters is not None:
+            raise NotImplementedError(
+                "run-level adapter overrides are supported only by local Deployment.run in 0.4.0; "
+                "SPLClient daemon runs cannot serialize Python adapter callables yet"
+            )
+
         remote = target_machine is not None or owner is not None or library is not None
-        state = self._daemon.run(
-            name,
-            args=args,
-            kwargs=kwargs,
-            output=output,
-            timeout_seconds=timeout_seconds,
-            target_machine=target_machine,
-            object_owner_id=owner,
-            library=library,
-            offline_policy=offline_policy,
-            function=function,
-            source=source,
-            remote=remote or None,
-        )
+        run_kwargs: dict[str, Any] = {
+            "args": args,
+            "kwargs": kwargs,
+            "output": output,
+            "timeout_seconds": timeout_seconds,
+            "target_machine": target_machine,
+            "object_owner_id": owner,
+            "library": library,
+            "offline_policy": offline_policy,
+            "function": function,
+            "source": source,
+            "remote": remote or None,
+        }
+        if runtimes is not None:
+            run_kwargs["runtimes"] = runtimes
+        if keep is not None:
+            run_kwargs["keep"] = keep
+        state = self._daemon.run(name, **run_kwargs)
         return RemoteRun(self, state, server_side=remote)
 
     # ``start()`` warned through 0.1.4/0.1.5 and was removed in 0.2.0 — use
@@ -1424,12 +1536,17 @@ class SPLClient:
         offline_policy: OfflinePolicy | None = None,
         function: str | None = None,
         source: RunSource = "auto",
+        adapters: Any | None = None,
+        runtimes: dict[str, str] | None = None,
+        keep: bool | str | None = None,
     ) -> RemoteRun:
         """Canonical async entry point: start a run, return a handle immediately.
 
         The default path is local daemon execution.  Passing ``target_machine``,
         ``owner``, or ``library`` intentionally selects central-server remote
-        execution through the connected daemon.
+        execution through the connected daemon.  ``adapters`` is reserved for
+        run-level adapter overrides and currently raises because daemon runs do
+        not serialize Python adapter callables.
         """
 
         return self._start_run(
@@ -1444,6 +1561,9 @@ class SPLClient:
             offline_policy=offline_policy,
             function=function,
             source=source,
+            adapters=adapters,
+            runtimes=runtimes,
+            keep=keep,
         )
 
     # ``queue()`` warned through 0.1.4/0.1.5 and was removed in 0.2.0 — use
@@ -1464,6 +1584,9 @@ class SPLClient:
         offline_policy: OfflinePolicy | None = None,
         function: str | None = None,
         source: RunSource = "auto",
+        adapters: Any | None = None,
+        runtimes: dict[str, str] | None = None,
+        keep: bool | str | None = None,
         progress: ProgressOption = True,
     ) -> RemoteResult:
         """Run an object, wait for completion, and return result/artifacts.
@@ -1476,7 +1599,9 @@ class SPLClient:
         While waiting, slow phases (a first-run environment build, a queued
         server-side run) print short progress lines to stderr.  Pass
         ``progress=False`` to wait silently, or a callable to receive every
-        polled run state instead.
+        polled run state instead.  ``adapters`` is reserved for run-level
+        adapter overrides and currently raises because daemon runs do not
+        serialize Python adapter callables.
         """
 
         run = self._start_run(
@@ -1491,6 +1616,9 @@ class SPLClient:
             offline_policy=offline_policy,
             function=function,
             source=source,
+            adapters=adapters,
+            runtimes=runtimes,
+            keep=keep,
         )
         return run.collect(
             artifacts_dir=artifacts_dir,

@@ -8,11 +8,18 @@ and the ``--json`` renderings.
 from __future__ import annotations
 
 import json
+import sys
+import warnings
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from spl import lift
+from spl.core.adapter_compat import AdapterCompatibilityWarning
+from spl.core.entities.adapter import Adapter, make_key
+from spl.core.ir.utils import spl_export_to_file
 from spl.daemon import doctor as doctor_module
 from spl.daemon.doctor import (
     FAIL,
@@ -26,12 +33,151 @@ from spl.daemon.doctor import (
     check_disk_space,
     check_environment_builds,
     check_interpreter_substitutions,
+    check_pipeline_adapter_probe,
+    check_pipeline_adapter_tags,
     check_python,
     check_server_connection,
     check_uv_builder,
     check_venv_tooling,
     run_doctor,
 )
+from spl.daemon.store import RegistryStore
+
+
+def _doctor_make_text() -> str:
+    return "hello"
+
+
+def _doctor_consume_text(value: str) -> str:
+    return value
+
+
+def _doctor_make_number() -> int:
+    return 7
+
+
+def _doctor_consume_number(value: int) -> int:
+    return value
+
+
+def _doctor_save_text(path: str, obj: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(obj)
+
+
+def _doctor_load_text(path: str) -> str:
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def _doctor_save_should_not_run(path: str, obj: str) -> None:
+    del path, obj
+    raise AssertionError("static adapter tag checks must not call save")
+
+
+def _doctor_load_should_not_run(path: str) -> str:
+    del path
+    raise AssertionError("static adapter tag checks must not call load")
+
+
+class MismatchedRuntimeAdapter(Adapter):
+    @property
+    def accepted_tags(self) -> frozenset[str]:
+        """Return a deliberately incompatible accepted tag set."""
+
+        return frozenset({"tsv"})
+
+
+def _mismatched_pipeline() -> Any:
+    producer = lift(_doctor_make_text).alias("producer")
+    pipeline = lift(_doctor_consume_text).bind(value=producer.as_format("csv")).alias("consumer").render()
+    adapter = MismatchedRuntimeAdapter(
+        key=make_key(str, "csv"),
+        save=_doctor_save_should_not_run,
+        load=_doctor_load_should_not_run,
+        py_type=str,
+        format="csv",
+    )
+    return replace(pipeline, adapters={adapter.key: adapter})
+
+
+def _matching_pipeline() -> Any:
+    producer = lift(_doctor_make_text).alias("producer")
+    pipeline = lift(_doctor_consume_text).bind(value=producer.as_format("csv")).alias("consumer").render()
+    return pipeline.add_adapter(str, "csv", save=_doctor_save_text, load=_doctor_load_text)
+
+
+def _json_probe_pipeline() -> Any:
+    producer = lift(_doctor_make_number).alias("producer")
+    return lift(_doctor_consume_number).bind(value=producer).alias("consumer").render("json_probe_pipeline")
+
+
+MISMATCH_PIPELINE_YAML = """
+- !DPipeline
+  name: mismatch_pipeline
+  nodes:
+  - !DNodeFunction
+    uuid: 00000000-0000-0000-0000-000000000001
+    func: make_text
+  - !DNodeFunction
+    uuid: 00000000-0000-0000-0000-000000000002
+    func: consume_text
+  links:
+  - - !DNodeInputRef
+      uuid: 00000000-0000-0000-0000-000000000002
+      port: value
+    - !DFormattedOutputRef
+      uuid: 00000000-0000-0000-0000-000000000001
+      port: default
+      format: csv
+  aliases:
+  - [producer, 00000000-0000-0000-0000-000000000001]
+  - [consumer, 00000000-0000-0000-0000-000000000002]
+  adapters:
+  - !DSaveAdapter
+    key: builtins.str@csv
+    tag: csv
+    save: save_csv
+    distributions: []
+  - !DLoadAdapter
+    key: builtins.str@csv
+    accepted_tags: [tsv]
+    load: load_tsv
+    distributions: []
+- !DFunction
+  name: make_text
+  inputs: []
+  outputs:
+  - name: default
+    type: str
+  body: |-
+    return "hello"
+- !DFunction
+  name: consume_text
+  inputs:
+  - name: value
+    type: str
+    default: null
+  outputs:
+  - name: default
+    type: str
+  body: |-
+    return value
+- !DFunction
+  name: save_csv
+  inputs: []
+  outputs: []
+  body: |-
+    pass
+- !DFunction
+  name: load_tsv
+  inputs: []
+  outputs:
+  - name: default
+    type: str
+  body: |-
+    return ""
+"""
 
 
 class FakeClient:
@@ -262,6 +408,52 @@ class TestIndividualChecks:
         assert "demo_obj" in mismatch.detail
         assert "matching local env" in (mismatch.hint or "")
 
+    def test_pipeline_build_warns_once_for_adapter_tag_mismatch(self) -> None:
+        pipeline = _mismatched_pipeline()
+
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always", AdapterCompatibilityWarning)
+            pipeline._validate_consistency()
+            pipeline._validate_consistency()
+
+        adapter_warnings = [item for item in captured if issubclass(item.category, AdapterCompatibilityWarning)]
+        assert len(adapter_warnings) == 1
+        assert "producer.default -> consumer.value" in str(adapter_warnings[0].message)
+        assert "save tag `csv`" in str(adapter_warnings[0].message)
+        assert "accepted tags: tsv" in str(adapter_warnings[0].message)
+        assert ".as_format()" in str(adapter_warnings[0].message)
+
+    def test_pipeline_build_does_not_warn_for_matching_adapter_tags(self) -> None:
+        pipeline = _matching_pipeline()
+
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always", AdapterCompatibilityWarning)
+            pipeline._validate_consistency()
+
+        assert [item for item in captured if issubclass(item.category, AdapterCompatibilityWarning)] == []
+
+    def test_pipeline_adapter_tag_check_reports_warning_and_ok(self) -> None:
+        mismatch = check_pipeline_adapter_tags(_mismatched_pipeline())
+        compatible = check_pipeline_adapter_tags(_matching_pipeline())
+
+        assert mismatch.status == WARN
+        assert "producer.default -> consumer.value" in mismatch.detail
+        assert ".as_format()" in (mismatch.hint or "")
+        assert compatible.status == OK
+
+    def test_pipeline_adapter_probe_runs_builtin_json_example(self) -> None:
+        result = check_pipeline_adapter_probe(_json_probe_pipeline())
+
+        assert result.status == OK
+        assert "1 adapter example probe" in result.detail
+
+    def test_object_registration_warns_for_serialized_adapter_tag_mismatch(self, tmp_path: Path) -> None:
+        store = RegistryStore(tmp_path)
+        store.register_env("default", sys.executable)
+
+        with pytest.warns(AdapterCompatibilityWarning, match="producer.default -> consumer.value"):
+            store.register_object("mismatch_pipeline", "mismatch_pipeline", "default", yaml_text=MISMATCH_PIPELINE_YAML)
+
 
 class TestDockerCheck:
     def test_not_installed_is_ok(self) -> None:
@@ -410,6 +602,30 @@ class TestCli:
         payload = json.loads(capsys.readouterr().out)
         assert exit_code == 0
         assert payload["ok"] is True
+
+    def test_doctor_pipeline_flag_runs_adapter_probe(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        import spl.daemon.cli as cli_module
+
+        yaml_path = tmp_path / "json-probe.yaml"
+        spl_export_to_file(yaml_path, [_json_probe_pipeline()])
+        monkeypatch.setattr(
+            cli_module,
+            "Client",
+            lambda url=None: FakeClient(_healthy_payload()),
+        )
+
+        exit_code = cli_module.main(["doctor", "--home", str(tmp_path), "--pipeline", str(yaml_path), "--json"])
+        payload = json.loads(capsys.readouterr().out)
+        checks = {check["name"]: check for check in payload["checks"]}
+
+        assert exit_code == 0
+        assert checks["adapter tags"]["status"] == OK
+        assert checks["adapter probe"]["status"] == OK
 
     def test_doctor_human_output_reports_failure_exit_code(
         self,

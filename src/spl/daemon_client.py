@@ -227,6 +227,7 @@ RunStateCallback = Callable[[dict[str, Any]], None]
 
 _ENVIRONMENT_BUILD_PHASE = "environment_build"
 _SLOW_WAIT_STATUSES = frozenset({"queued", "starting", "preparing_environment"})
+_OBSERVABILITY_PREVIEW_LIMIT = 3
 
 
 def _format_duration(seconds: float) -> str:
@@ -242,6 +243,24 @@ def _format_duration(seconds: float) -> str:
     return f"{hours}h {minutes:02d}m"
 
 
+def _progress_rows(value: Any) -> list[Mapping[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, Mapping)]
+
+
+def _short(value: Any, *, width: int = 12) -> str:
+    text = "" if value is None else str(value)
+    return text[:width] if len(text) > width else text
+
+
+def _append_remaining(items: list[str], total: int) -> list[str]:
+    remaining = total - len(items)
+    if remaining > 0:
+        return [*items, f"+{remaining} more"]
+    return items
+
+
 class RunProgressPrinter:
     """Print progress lines for run phases that can stay silent for minutes.
 
@@ -254,6 +273,8 @@ class RunProgressPrinter:
       object builds a fresh venv or image, which can take minutes;
     * the run stays in one waiting status (``queued``, ``starting``,
       ``preparing_environment``) longer than ``interval_seconds``.
+    * the daemon reports resolved edge adapters or node runtimes through
+      ``state["run_progress"]``.
 
     Repeated messages are throttled to one line per ``interval_seconds``, and
     the printer never raises: progress output must not abort a wait loop.
@@ -279,6 +300,7 @@ class RunProgressPrinter:
         self._phase_started_at = 0.0
         self._last_printed_at: float | None = None
         self._announced_build = False
+        self._announced_observability = False
 
     def __call__(self, state: Mapping[str, Any]) -> None:
         try:
@@ -299,6 +321,7 @@ class RunProgressPrinter:
             self._phase = phase
             self._phase_started_at = now
             self._last_printed_at = None
+        self._announce_observability(state)
         if phase is None:
             return
 
@@ -347,6 +370,51 @@ class RunProgressPrinter:
         self._announced_build = False
         if status == "running":
             self._print(f"{self._label} environment is ready; running")
+
+    def _announce_observability(self, state: Mapping[str, Any]) -> None:
+        if self._announced_observability:
+            return
+        progress = state.get("run_progress")
+        if not isinstance(progress, Mapping):
+            return
+        message = self._observability_message(progress)
+        if message is None:
+            return
+        self._announced_observability = True
+        self._print(message)
+
+    def _observability_message(self, progress: Mapping[str, Any]) -> str | None:
+        sections = []
+        runtimes = self._runtime_resolution_summary(progress.get("node_runtimes"))
+        edges = self._edge_resolution_summary(progress.get("edge_adapters"))
+        if runtimes:
+            sections.append("runtimes: {}".format(", ".join(runtimes)))
+        if edges:
+            sections.append("edges: {}".format(", ".join(edges)))
+        if not sections:
+            return None
+        return "{} resolved {}".format(self._label, "; ".join(sections))
+
+    def _runtime_resolution_summary(self, value: Any) -> list[str]:
+        rows = _progress_rows(value)
+        items = []
+        for item in rows[:_OBSERVABILITY_PREVIEW_LIMIT]:
+            node = item.get("alias") or _short(item.get("node_id"))
+            runtime = item.get("name")
+            source = item.get("source")
+            items.append("{}={}/{}".format(node or "node", runtime or "runtime", source or "unknown"))
+        return _append_remaining(items, len(rows))
+
+    def _edge_resolution_summary(self, value: Any) -> list[str]:
+        rows = _progress_rows(value)
+        items = []
+        for item in rows[:_OBSERVABILITY_PREVIEW_LIMIT]:
+            edge = "{} -> {}".format(item.get("source") or "source", item.get("target") or "target")
+            tag = item.get("tag") or "unknown"
+            adapter = item.get("save") or item.get("load") or "adapter"
+            source = item.get("source_level") or "unknown"
+            items.append("{} tag={} adapter={} source={}".format(edge, tag, adapter, source))
+        return _append_remaining(items, len(rows))
 
     def _print(self, message: str) -> None:
         stream = self._stream if self._stream is not None else sys.stderr
@@ -1124,6 +1192,8 @@ class Client:
         offline_policy: OfflinePolicy | None = None,
         source: RunSource = "auto",
         remote: bool | None = None,
+        keep: bool | str | None = None,
+        runtimes: dict[str, str] | None = None,
         wait: bool = False,
     ) -> dict[str, Any]:
         """Start a daemon run and return its initial state."""
@@ -1155,6 +1225,10 @@ class Client:
             payload["remote"] = remote
         elif object_owner_id is not None or library is not None:
             payload["remote"] = True
+        if keep is not None:
+            payload["keep"] = keep
+        if runtimes is not None:
+            payload["runtimes"] = runtimes
         if wait:
             payload["wait"] = True
         # Some compatibility daemon routes may honor wait=True by holding the
@@ -1221,10 +1295,87 @@ class Client:
 
         return _as_json_dict(self._json_request("GET", f"/runs/{quote(run_id)}"))
 
+    def resume_run(
+        self,
+        run_id: str,
+        *,
+        from_: Any,
+        kwargs: dict[str, Any] | None = None,
+        output: str | None = None,
+        timeout_seconds: float | None = None,
+        adapters: dict[str, Any] | None = None,
+        runtimes: dict[str, str] | None = None,
+        keep: bool | str | None = None,
+        wait: bool = False,
+    ) -> dict[str, Any]:
+        """Start a daemon resume run and return its state."""
+
+        payload: dict[str, Any] = {"from": from_}
+        if kwargs is not None:
+            payload["kwargs"] = kwargs
+        if output is not None:
+            payload["output"] = output
+        if timeout_seconds is not None:
+            payload["timeout_seconds"] = timeout_seconds
+        if adapters is not None:
+            payload["adapters"] = adapters
+        if runtimes is not None:
+            payload["runtimes"] = runtimes
+        if keep is not None:
+            payload["keep"] = keep
+        state = _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/runs/{quote(run_id)}/resume",
+                payload,
+                timeout=timeout_seconds if wait else DEFAULT_HTTP_TIMEOUT_SECONDS,
+            )
+        )
+        if wait:
+            return self.wait_run(state["id"], timeout_seconds=timeout_seconds)
+        return state
+
+    def show_run(self, run_id: str, *, full_inline: bool = False) -> dict[str, Any]:
+        """Read one run with a show-safe manifest."""
+
+        query = urlencode({"view": "show", "full_inline": "1" if full_inline else "0"})
+        return _as_json_dict(self._json_request("GET", f"/runs/{quote(run_id)}?{query}"))
+
     def list_runs(self) -> list[dict[str, Any]]:
         """List known runs."""
 
         return _as_json_dict_list(self._json_request("GET", "/runs"))
+
+    def run_tag_stats(self) -> dict[str, Any]:
+        """Aggregate edge tag counts from local daemon run manifests."""
+
+        return _as_json_dict(self._json_request("GET", "/runs/tag-stats"))
+
+    def prune_runs(
+        self,
+        *,
+        run_id: str | None = None,
+        statuses: list[str] | None = None,
+        older_than_seconds: float | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Prune inactive daemon runs by id, status, age, or retention TTL."""
+
+        payload: dict[str, Any] = {"dry_run": dry_run}
+        if run_id is not None:
+            payload["run_id"] = run_id
+        if statuses is not None:
+            payload["statuses"] = statuses
+        if older_than_seconds is not None:
+            payload["older_than_seconds"] = older_than_seconds
+        return _as_json_dict(self._json_request("POST", "/runs/prune", payload))
+
+    def delete_run(self, run_id: str, *, dry_run: bool = False) -> dict[str, Any]:
+        """Delete one inactive daemon run."""
+
+        query = urlencode({"dry_run": "1"}) if dry_run else ""
+        suffix = f"?{query}" if query else ""
+        return _as_json_dict(self._json_request("DELETE", f"/runs/{quote(run_id)}{suffix}"))
 
     def wait_run(
         self,

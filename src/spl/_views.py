@@ -136,6 +136,20 @@ def _status(value: Any) -> str:
     return _EMPTY if value is None else str(value)
 
 
+def _mapping_rows(value: Any) -> list[Mapping[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, Mapping)]
+
+
+def _adapter_label(row: Mapping[str, Any]) -> str:
+    save = row.get("save")
+    load = row.get("load")
+    if save and load and save != load:
+        return "{} -> {}".format(save, load)
+    return _EMPTY if save is None and load is None else str(save or load)
+
+
 class CompactDict(dict[str, Any]):
     """A dict with compact ``repr`` and plain ``.raw`` access."""
 
@@ -516,6 +530,8 @@ class DecompositionView(CompactDict):
 
 class RunRecordView(CompactDict):
     title = "run"
+    runtime_headers = ("node", "runtime", "source")
+    edge_headers = ("edge", "tag", "adapter", "source")
 
     def _summary_rows(self) -> list[tuple[str, Any]]:
         result = self.get("result")
@@ -526,9 +542,13 @@ class RunRecordView(CompactDict):
         return [
             ("id", self.get("id")),
             ("status", self.get("status")),
+            ("keep", self.get("keep")),
             ("mode", self.get("mode") or self.get("source")),
             ("object", self.get("object") or self.get("object_name")),
             ("output", self.get("output")),
+            ("parent", self.get("parent_run_id")),
+            ("manifest", self.get("has_manifest")),
+            ("disk bytes", self.get("disk_size_bytes")),
             ("created", self.get("created_at")),
             ("started", self.get("started_at")),
             ("finished", self.get("finished_at")),
@@ -536,10 +556,51 @@ class RunRecordView(CompactDict):
             ("error", self.get("error")),
         ]
 
+    def _runtime_rows(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "node": item.get("alias") or short_id(item.get("node_id")),
+                "runtime": item.get("name"),
+                "source": item.get("source"),
+            }
+            for item in _mapping_rows(self.get("node_runtimes"))
+        ]
+
+    def _edge_rows(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "edge": "{} -> {}".format(item.get("source") or _EMPTY, item.get("target") or _EMPTY),
+                "tag": item.get("tag"),
+                "adapter": _adapter_label(item),
+                "source": item.get("source_level"),
+            }
+            for item in _mapping_rows(self.get("edge_adapters"))
+        ]
+
+    def __repr__(self) -> str:
+        lines = [details_to_text(self._title, self._summary_rows())]
+        runtime_rows = self._runtime_rows()
+        edge_rows = self._edge_rows()
+        if runtime_rows:
+            lines.append(table_to_text("node runtimes", self.runtime_headers, runtime_rows))
+        if edge_rows:
+            lines.append(table_to_text("edge adapters", self.edge_headers, edge_rows))
+        return "\n\n".join(lines)
+
+    def _repr_html_(self) -> str:
+        parts = [details_to_html(self._title, self._summary_rows())]
+        runtime_rows = self._runtime_rows()
+        edge_rows = self._edge_rows()
+        if runtime_rows:
+            parts.append(table_to_html("node runtimes", self.runtime_headers, runtime_rows))
+        if edge_rows:
+            parts.append(table_to_html("edge adapters", self.edge_headers, edge_rows))
+        return "".join(parts)
+
 
 class RunListView(CompactList):
     title = "runs"
-    headers = ("id", "status", "mode", "object", "output", "created", "error")
+    headers = ("id", "status", "keep", "manifest", "parent", "size", "object", "created")
 
     def __init__(self, payload: list[Any] | None = None, *, title: str | None = None):
         super().__init__(
@@ -556,11 +617,12 @@ class RunListView(CompactList):
             {
                 "id": short_id(item.get("id")),
                 "status": _status(item.get("status")),
-                "mode": item.get("mode") or item.get("source"),
+                "keep": item.get("keep"),
+                "manifest": "yes" if item.get("has_manifest") else "no",
+                "parent": short_id(item.get("parent_run_id")),
+                "size": item.get("disk_size_bytes"),
                 "object": item.get("object") or item.get("object_name"),
-                "output": item.get("output"),
                 "created": item.get("created_at"),
-                "error": item.get("error"),
             }
             for item in self
             if isinstance(item, Mapping)

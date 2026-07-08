@@ -235,6 +235,9 @@ class ServerClient:
     def list_machines(self) -> list[dict[str, Any]]:
         return _as_json_list(self._json_request("GET", "/machines"))
 
+    def list_tokens(self) -> list[dict[str, Any]]:
+        return _as_json_list(self._json_request("GET", "/tokens", auth="user"))
+
     def list_libraries(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
         query = {"include_accessible": "1" if include_accessible else "0"}
         return _as_json_list(

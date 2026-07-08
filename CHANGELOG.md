@@ -5,6 +5,68 @@ All notable changes to the `splime` package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-09
+
+Preparation release for multilingual pipelines, implemented on Python only:
+adapters split into save/load halves with artifact tags, runs become persistent
+data with manifests and resume, and runtime becomes a per-node property. The
+public API and 0.2.x/0.3.x YAML stay compatible; the only intended default
+change is `keep="on_failure"` for local runs.
+
+### Added
+
+- Save/load adapter halves behind the unchanged public `Adapter` facade;
+  artifact refs carry an additive `tag`; mismatched halves fail loudly on the
+  tag comparison before any bytes are read; additive `!DSaveAdapter` and
+  `!DLoadAdapter` YAML forms.
+- Built-in `json` default edge adapter with a four-level resolution hierarchy
+  (port default -> pipeline -> edge -> run override) that records the winning
+  source level per edge; the JSON-native inline short-circuit stays byte-
+  identical (ADR-002).
+- Run-level adapter overrides keyed by `(alias, port)` on `run()` and
+  `resume()` — no node republish needed.
+- Static save/load tag compatibility warnings at pipeline build and daemon
+  registration, plus an optional `example` probe via
+  `spl-daemon doctor --pipeline`.
+- Versioned run manifests with deterministic node fingerprints (single core
+  fingerprint module); retained state lives under `SPL_RUNS_HOME` /
+  `<daemon_home>/runs` with owner-only permissions.
+- Resume from a recalculation set `S`: selected nodes plus descendants
+  recompute, everything else is frozen and digest-validated; every resume
+  creates a new run with `parent_run_id` lineage.
+- Run management: `spl-daemon run-list/run-show/run-prune`, daemon
+  `POST /runs/<id>/resume`, `DELETE /runs/<id>`, `/runs/prune`,
+  `/runs/tag-stats`; client `runs()/run_show()/resume()/prune_runs()` with
+  local variants; 7-day retention TTL for kept failures.
+- Per-node runtime tags (`native`, `venv-subprocess`, reserved `docker`) with
+  adapter-style resolution recorded in manifests and run progress;
+  `venv-subprocess` executes function nodes through the SPL-free runner and
+  honors `runtime_config["node_timeout_seconds"]`.
+- Local edge-tag statistics aggregated from retained manifests.
+- Converter-node recipe in the cookbook and a bilingual
+  fail -> change -> continue demo notebook.
+- Server-connection quality: technical machine display names are reconciled
+  with server-side token names, and the daemon client exposes `list_tokens()`.
+
+### Changed
+
+- `keep="on_failure"` is the new default for local runs; successful default
+  runs still clean up (manifest materialization is deferred for successful
+  runs per ADR-003), failed runs retain state with a TTL.
+- Retained state is redacted by default: `run-show` summarizes inline values
+  unless full output is explicitly requested.
+- Reserved `run()`/`resume()` parameter names emit a warning when they collide
+  with free pipeline input ports.
+
+### Fixed
+
+- Daemon-side `venv-subprocess` nodes: functions restored from `object.yaml`
+  no longer break module generation (YAML `inspect.getsource` results fall
+  back to the IR function body).
+- Non-JSON inputs into `venv-subprocess` fail fast with a clear error naming
+  the node and port instead of a raw serialization traceback.
+- Adapter compatibility warnings deduplicate by content, not object identity.
+
 ## [0.3.0] - 2026-07-08
 
 Portability and correctness release for environment resolution, worker

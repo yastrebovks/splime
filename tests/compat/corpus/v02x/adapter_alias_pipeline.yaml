@@ -1,0 +1,92 @@
+# SPL YAML compatibility corpus fixture.
+# Source format: splime 0.3.0 baseline, compatible with 0.2.x/0.3.x readers.
+# Generated on: 2026-07-08.
+# Generated with: ir_parse/get_top_level_deps and yaml.dump_all.
+# Static by design: do not regenerate inside tests.
+- !DPipeline
+  name: adapter_pipeline
+  nodes:
+  - !DNodeFunction
+    uuid: 1bbccde7-8414-419b-b21a-b174cfa6e68c
+    func: consume_text
+  - !DNodeFunction
+    uuid: 83dc51f2-888e-4805-9130-ea4efa1b22b6
+    func: produce_text
+  links:
+  - - !DNodeInputRef
+      uuid: 1bbccde7-8414-419b-b21a-b174cfa6e68c
+      port: value
+    - !DFormattedOutputRef
+      uuid: 83dc51f2-888e-4805-9130-ea4efa1b22b6
+      port: default
+      format: txt
+  aliases:
+  - - result
+    - 1bbccde7-8414-419b-b21a-b174cfa6e68c
+  adapters:
+  - !DAdapter
+    key: builtins.str@txt
+    save: save_text
+    load: load_text
+    distributions:
+    - !DDistribution
+      package: PyYAML
+      version: 6.0.3
+- !DSPLSelfImport
+  name: load_text
+- !DSPLSelfImport
+  name: save_text
+- !DSPLSelfImport
+  name: produce_text
+- !DSPLSelfImport
+  name: consume_text
+---
+- !DFunction
+  name: load_text
+  inputs:
+  - name: path
+    type: null
+    default: null
+  outputs:
+  - name: default
+    type: null
+  body: |-
+    with open(path, encoding='utf-8') as f:
+        return 'loaded:' + f.read()
+---
+- !DFunction
+  name: save_text
+  inputs:
+  - name: path
+    type: null
+    default: null
+  - name: value
+    type: null
+    default: null
+  outputs:
+  - name: default
+    type: null
+  body: |-
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(value)
+---
+- !DFunction
+  name: produce_text
+  inputs: []
+  outputs:
+  - name: default
+    type: str
+  body: |-
+    return 'hello'
+---
+- !DFunction
+  name: consume_text
+  inputs:
+  - name: value
+    type: str
+    default: null
+  outputs:
+  - name: default
+    type: str
+  body: |-
+    return value + '|consumed'

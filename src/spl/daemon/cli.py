@@ -174,6 +174,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print machine-readable check results",
     )
+    doctor.add_argument(
+        "--pipeline",
+        type=Path,
+        default=None,
+        help="SPL YAML file to check with adapter tag compatibility and explicit local probes",
+    )
 
     server_connect = subparsers.add_parser(
         "server-connect",
@@ -398,7 +404,51 @@ def build_parser() -> argparse.ArgumentParser:
     run_status = subparsers.add_parser("run-status", help="show one run state")
     run_status.add_argument("run_id")
 
-    subparsers.add_parser("run-list", help="list known runs")
+    run_list = subparsers.add_parser("run-list", help="list known runs with keep, manifest, lineage, and disk size")
+    run_list.add_argument(
+        "--local",
+        action="store_true",
+        help="list retained local Deployment runs from SPL_RUNS_HOME instead of the daemon",
+    )
+    run_list.add_argument(
+        "--tag-stats",
+        action="store_true",
+        help="aggregate edge tag counts from retained local manifests; no data is uploaded",
+    )
+
+    run_show = subparsers.add_parser("run-show", help="show one retained run manifest")
+    run_show.add_argument("run_id")
+    run_show.add_argument(
+        "--full-inline",
+        action="store_true",
+        help="print full inline JSON values, including pipeline data; by default run-show prints safe summaries",
+    )
+    run_show.add_argument(
+        "--local",
+        action="store_true",
+        help="read a retained local Deployment run from SPL_RUNS_HOME instead of the daemon",
+    )
+
+    run_prune = subparsers.add_parser("run-prune", help="prune inactive retained runs by TTL, status, age, or id")
+    run_prune.add_argument("run_id", nargs="?", default=None, help="optional explicit run id to prune")
+    run_prune.add_argument(
+        "--status",
+        action="append",
+        default=None,
+        help="status to prune; repeat for multiple statuses (active runs are never removed)",
+    )
+    run_prune.add_argument(
+        "--older-than-seconds",
+        type=float,
+        default=None,
+        help="prune inactive runs older than this many seconds",
+    )
+    run_prune.add_argument("--dry-run", action="store_true", help="print prune candidates without deleting them")
+    run_prune.add_argument(
+        "--local",
+        action="store_true",
+        help="prune retained local Deployment runs from SPL_RUNS_HOME instead of the daemon",
+    )
 
     run_result = subparsers.add_parser("run-result", help="show one run result")
     run_result.add_argument("run_id")
@@ -447,9 +497,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "health":
             print_json(client.health())
         elif args.command == "doctor":
-            from spl.daemon.doctor import run_doctor
+            from spl.daemon.doctor import load_pipeline_from_yaml_file, run_doctor
 
-            report = run_doctor(client, home=args.home)
+            pipeline = load_pipeline_from_yaml_file(args.pipeline) if args.pipeline is not None else None
+            report = run_doctor(client, home=args.home, pipeline=pipeline, probe_pipeline=args.pipeline is not None)
             if args.as_json:
                 print_json(report.to_payload())
             else:
@@ -596,7 +647,40 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "run-status":
             print_json(client.get_run(args.run_id))
         elif args.command == "run-list":
-            print_json(client.list_runs())
+            if args.local:
+                from spl.core import manifest as m_manifest
+
+                print_json(m_manifest.local_tag_stats() if args.tag_stats else m_manifest.list_local_runs())
+            else:
+                print_json(client.run_tag_stats() if args.tag_stats else client.list_runs())
+        elif args.command == "run-show":
+            if args.local:
+                from spl.core import manifest as m_manifest
+
+                print_json(m_manifest.show_local_run(args.run_id, include_inline_values=args.full_inline))
+            else:
+                print_json(client.show_run(args.run_id, full_inline=args.full_inline))
+        elif args.command == "run-prune":
+            if args.local:
+                from spl.core import manifest as m_manifest
+
+                print_json(
+                    m_manifest.prune_local_runs(
+                        run_id=args.run_id,
+                        statuses=args.status,
+                        older_than_seconds=args.older_than_seconds,
+                        dry_run=args.dry_run,
+                    )
+                )
+            else:
+                print_json(
+                    client.prune_runs(
+                        run_id=args.run_id,
+                        statuses=args.status,
+                        older_than_seconds=args.older_than_seconds,
+                        dry_run=args.dry_run,
+                    )
+                )
         elif args.command == "run-result":
             print_json(client.result(args.run_id))
         elif args.command == "artifact-list":

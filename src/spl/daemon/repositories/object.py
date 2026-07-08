@@ -98,6 +98,10 @@ class ObjectRepository(RepositoryBase):
             normalized_runtime_config,
             metadata,
         )
+        if metadata["kind"] == "pipeline":
+            from spl.core.adapter_compat import warn_yaml_adapter_compatibility
+
+            warn_yaml_adapter_compatibility(yaml_text, entrypoint)
 
         resolved_workdir = None
         if workdir is not None:

@@ -60,6 +60,9 @@ from typing import Any, Callable, cast
 from urllib.parse import urlparse, urlunparse
 from uuid import uuid4
 
+from spl.core import resume as m_resume
+from spl.core.entities.pipeline import Pipeline
+from spl.core.ir.utils import spl_import_from_file
 from spl.daemon.docker_environment import DockerEnvironmentManager
 from spl.daemon.docker_pool import DockerPool
 from spl.daemon.environment import EnvironmentBuildError
@@ -1901,6 +1904,8 @@ class DaemonRuntime:
         function: str | None = None,
         source: str = "auto",
         report_local_run: bool = True,
+        runtimes: dict[str, str] | None = None,
+        keep: Any = "on_failure",
     ) -> dict[str, Any]:
         """Create a run and execute it in a background worker thread."""
 
@@ -1927,6 +1932,8 @@ class DaemonRuntime:
                 version=version,
                 object_version_id=resolved_version_id,
                 function=function,
+                runtimes=runtimes,
+                keep=keep,
             )
         except KeyError as exc:
             can_import = source == "auto" and resolved_version_id is None and "object is not registered" in str(exc)
@@ -1946,7 +1953,99 @@ class DaemonRuntime:
                 version=version,
                 object_version_id=resolved_version_id,
                 function=function,
+                runtimes=runtimes,
+                keep=keep,
             )
+        thread = threading.Thread(
+            target=self._execute_run,
+            args=(state["id"], report_local_run),
+            name=f"spl-run-{state['id']}",
+            daemon=True,
+        )
+        thread.start()
+        return self._update_local_run(
+            state["id"],
+            report_local_run=report_local_run,
+            status="starting",
+        )
+
+    def resume_run(
+        self,
+        run_id: str,
+        *,
+        from_: Any,
+        kwargs: dict[str, Any] | None = None,
+        output: str | None = None,
+        timeout_seconds: float | None = None,
+        adapters: dict[str, Any] | None = None,
+        runtimes: dict[str, str] | None = None,
+        keep: Any = "on_failure",
+        report_local_run: bool = True,
+    ) -> dict[str, Any]:
+        """Create a child run that resumes one retained daemon pipeline run."""
+
+        parent = self.store.get_run(validate_name(run_id))
+        if str(parent.get("status")) not in {"failed", "succeeded"}:
+            raise RuntimeError(
+                "resume requires a terminal retained run; current status is `{}`".format(parent.get("status"))
+            )
+        parent_run_dir = Path(str(parent["run_dir"]))
+        parent_manifest_path = self._worker_manifest_path(parent_run_dir)
+        if parent_manifest_path is not None:
+            parent_manifest_dir = parent_manifest_path.parent
+            try:
+                parent_manifest = cast(
+                    dict[str, Any],
+                    json.loads(parent_manifest_path.read_text(encoding="utf-8")),
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError("resume requires a readable retained worker manifest") from exc
+        else:
+            manifest = parent.get("manifest")
+            if not isinstance(manifest, dict):
+                raise RuntimeError("resume requires a retained pipeline manifest")
+            parent_manifest = manifest
+            parent_manifest_dir = parent_run_dir
+
+        object_record = self.store.get_object_version(parent["object_version_id"])
+        pipeline = self._load_pipeline_entrypoint(
+            parent_run_dir / "object.yaml",
+            str(parent["entrypoint"]),
+        )
+        m_resume.plan_resume(
+            pipeline=pipeline,
+            parent_manifest=parent_manifest,
+            parent_run_dir=parent_manifest_dir,
+            from_=from_,
+            kwargs=kwargs or {},
+        )
+
+        raw_parent_input = parent.get("input")
+        parent_input = cast(dict[str, Any], raw_parent_input) if isinstance(raw_parent_input, dict) else {}
+        child_kwargs = dict(parent_input.get("kwargs") or {})
+        if kwargs is not None:
+            child_kwargs.update(kwargs)
+        resume_payload = {
+            "parent_run_id": parent["id"],
+            "parent_run_dir": str(parent_manifest_dir),
+            "from": from_,
+            "kwargs": kwargs or {},
+        }
+        if adapters is not None:
+            resume_payload["adapters"] = adapters
+
+        state = self.store.create_run(
+            str(parent["object"]),
+            kwargs=child_kwargs,
+            output=output if output is not None else parent_input.get("output"),
+            timeout_seconds=timeout_seconds if timeout_seconds is not None else parent_input.get("timeout_seconds"),
+            object_version_id=object_record["version_id"],
+            function=parent.get("function"),
+            runtimes=runtimes if runtimes is not None else parent_input.get("runtimes"),
+            keep=keep,
+            parent_run_id=parent["id"],
+            resume=resume_payload,
+        )
         thread = threading.Thread(
             target=self._execute_run,
             args=(state["id"], report_local_run),
@@ -2068,54 +2167,137 @@ class DaemonRuntime:
 
                 if completed.returncode == 0 and result_path.exists():
                     result_payload = json.loads(result_path.read_text(encoding="utf-8"))
+                    manifest_payload = result_payload.pop("manifest", None)
                     if backend.process_result(ctx, result_payload):
                         write_json(result_path, result_payload)
+                    elif manifest_payload is not None:
+                        write_json(result_path, result_payload)
+                    success_changes: dict[str, Any] = {
+                        "status": "succeeded",
+                        "finished_at": utc_now(),
+                        "returncode": completed.returncode,
+                        "result": result_payload,
+                        "stdout_text": completed.stdout,
+                        "stderr_text": completed.stderr,
+                    }
+                    if isinstance(manifest_payload, dict):
+                        success_changes["manifest"] = self._daemon_manifest_payload(
+                            manifest_payload,
+                            run_id=run_id,
+                            parent_run_id=state.get("parent_run_id"),
+                            object_record=object_record,
+                        )
                     self._update_local_run(
                         run_id,
                         report_local_run=report_local_run,
-                        status="succeeded",
-                        finished_at=utc_now(),
-                        returncode=completed.returncode,
-                        result=result_payload,
-                        stdout_text=completed.stdout,
-                        stderr_text=completed.stderr,
+                        **success_changes,
                     )
                 else:
                     error = completed.stderr.strip() or completed.stdout.strip()
                     if completed.returncode == 0:
                         error = "worker finished without writing result.json"
+                    manifest_payload = self._read_worker_manifest(run_dir)
+                    failure_changes: dict[str, Any] = {
+                        "status": "failed",
+                        "finished_at": utc_now(),
+                        "returncode": completed.returncode,
+                        "error": error,
+                        "stdout_text": completed.stdout,
+                        "stderr_text": completed.stderr,
+                    }
+                    if manifest_payload is not None:
+                        failure_changes["manifest"] = self._daemon_manifest_payload(
+                            manifest_payload,
+                            run_id=run_id,
+                            parent_run_id=state.get("parent_run_id"),
+                            object_record=object_record,
+                        )
                     self._update_local_run(
                         run_id,
                         report_local_run=report_local_run,
-                        status="failed",
-                        finished_at=utc_now(),
-                        returncode=completed.returncode,
-                        error=error,
-                        stdout_text=completed.stdout,
-                        stderr_text=completed.stderr,
+                        **failure_changes,
                     )
         except subprocess.TimeoutExpired as exc:
             stdout = self._subprocess_text(exc.stdout)
             stderr = self._subprocess_text(exc.stderr)
             stdout_path.write_text(stdout, encoding="utf-8")
             stderr_path.write_text(stderr, encoding="utf-8")
-            self._update_local_run(
-                run_id,
-                report_local_run=report_local_run,
-                status="failed",
-                finished_at=utc_now(),
-                error=f"run timed out after {timeout} seconds",
-                stdout_text=stdout,
-                stderr_text=stderr,
-            )
+            timeout_changes: dict[str, Any] = {
+                "status": "failed",
+                "finished_at": utc_now(),
+                "error": f"run timed out after {timeout} seconds",
+                "stdout_text": stdout,
+                "stderr_text": stderr,
+            }
+            manifest_payload = self._read_worker_manifest(run_dir)
+            if manifest_payload is not None:
+                timeout_changes["manifest"] = self._daemon_manifest_payload(
+                    manifest_payload,
+                    run_id=run_id,
+                    parent_run_id=state.get("parent_run_id"),
+                    object_record=object_record,
+                )
+            self._update_local_run(run_id, report_local_run=report_local_run, **timeout_changes)
         except Exception as exc:
-            self._update_local_run(
-                run_id,
-                report_local_run=report_local_run,
-                status="failed",
-                finished_at=utc_now(),
-                error=repr(exc),
-            )
+            error_changes: dict[str, Any] = {
+                "status": "failed",
+                "finished_at": utc_now(),
+                "error": repr(exc),
+            }
+            manifest_payload = self._read_worker_manifest(run_dir)
+            if manifest_payload is not None:
+                error_changes["manifest"] = self._daemon_manifest_payload(
+                    manifest_payload,
+                    run_id=run_id,
+                    parent_run_id=state.get("parent_run_id"),
+                    object_record=object_record,
+                )
+            self._update_local_run(run_id, report_local_run=report_local_run, **error_changes)
+
+    def _worker_manifest_path(self, run_dir: Path) -> Path | None:
+        state_dir = run_dir / "pipeline-state"
+        if not state_dir.exists():
+            return None
+        manifests = sorted(
+            state_dir.glob("*/manifest.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        return manifests[0] if manifests else None
+
+    def _read_worker_manifest(self, run_dir: Path) -> dict[str, Any] | None:
+        manifest_path = self._worker_manifest_path(run_dir)
+        if manifest_path is None:
+            return None
+        try:
+            return cast(dict[str, Any], json.loads(manifest_path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _daemon_manifest_payload(
+        self,
+        manifest: dict[str, Any],
+        *,
+        run_id: str,
+        parent_run_id: Any,
+        object_record: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = dict(manifest)
+        payload["run_id"] = run_id
+        payload["parent_run_id"] = parent_run_id
+        pipeline = dict(payload.get("pipeline") or {})
+        pipeline["object_version_id"] = object_record["version_id"]
+        pipeline["content_hash"] = object_record.get("content_hash")
+        payload["pipeline"] = pipeline
+        return payload
+
+    def _load_pipeline_entrypoint(self, object_yaml_path: Path, entrypoint: str) -> Pipeline:
+        namespace: dict[str, Any] = {}
+        spl_import_from_file(object_yaml_path, namespace)
+        target = namespace.get(entrypoint)
+        if not isinstance(target, Pipeline):
+            raise RuntimeError("daemon resume is supported only for registered pipelines")
+        return target
 
     def _update_local_run(
         self,
