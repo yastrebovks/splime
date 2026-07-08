@@ -27,8 +27,7 @@ class DockerEnvironmentManager(BaseEnvironmentManager):
         records = [
             record
             for record in self.store.list_environment_builds()
-            if record.get("runtime_type") == "docker"
-            and (spec_hash is None or record["spec_hash"] == spec_hash)
+            if record.get("runtime_type") == "docker" and (spec_hash is None or record["spec_hash"] == spec_hash)
         ]
         pruned = []
         for record in records:
@@ -103,9 +102,7 @@ class DockerEnvironmentManager(BaseEnvironmentManager):
     def _spec_from_record(self, record: dict[str, Any]) -> dict[str, Any]:
         spec = dict(record["spec"])
         env_dir = self.store.environment_builds_dir / record["spec_hash"]
-        image_tag = record.get("image_tag") or (
-            f"splime-runtime:{record['spec_hash'][:24]}"
-        )
+        image_tag = record.get("image_tag") or (f"splime-runtime:{record['spec_hash'][:24]}")
         base_image = record.get("base_image") or record["base_python"]
         return {
             "spec_hash": record["spec_hash"],
@@ -204,11 +201,7 @@ class DockerEnvironmentManager(BaseEnvironmentManager):
 
     def _is_ready(self, record: dict[str, Any]) -> bool:
         image_tag = record.get("image_tag")
-        return (
-            record["status"] == READY
-            and bool(image_tag)
-            and self._image_exists(str(image_tag))
-        )
+        return record["status"] == READY and bool(image_tag) and self._image_exists(str(image_tag))
 
     def _validate_rebuild_record(
         self,
@@ -263,16 +256,10 @@ class DockerEnvironmentManager(BaseEnvironmentManager):
         return "cached Docker image is missing from local Docker daemon"
 
     def _build_failed_message(self, record: dict[str, Any]) -> str:
-        return (
-            "docker environment build failed: "
-            f"{record.get('error') or record['spec_hash']}"
-        )
+        return f"docker environment build failed: {record.get('error') or record['spec_hash']}"
 
     def _rebuild_failed_message(self, record: dict[str, Any]) -> str:
-        return (
-            "docker image rebuild failed: "
-            f"{record.get('error') or record['spec_hash']}"
-        )
+        return f"docker image rebuild failed: {record.get('error') or record['spec_hash']}"
 
     def _build_lock_timeout_message(self, lock_path: Path) -> str:
         return f"timed out waiting for Docker environment build lock: {lock_path}"
@@ -315,9 +302,7 @@ class DockerEnvironmentManager(BaseEnvironmentManager):
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            raise EnvironmentBuildError(
-                "Docker daemon did not respond to `docker info` within 15 seconds"
-            ) from exc
+            raise EnvironmentBuildError("Docker daemon did not respond to `docker info` within 15 seconds") from exc
         if completed.returncode != 0:
             detail = (completed.stderr or "").strip()
             message = "Docker daemon is not reachable"

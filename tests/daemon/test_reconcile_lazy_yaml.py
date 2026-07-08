@@ -42,9 +42,7 @@ class LazyYamlServerStub:
         if version is None:
             latest = self._versions[-1]
             return {**self._strip(latest), "id": REMOTE_OBJECT_ID}
-        matched = next(
-            item for item in self._versions if item["version"] == version
-        )
+        matched = next(item for item in self._versions if item["version"] == version)
         if include_yaml:
             self.yaml_fetches.append(version)
             return dict(matched)
@@ -106,13 +104,9 @@ def test_reconcile_fetches_yaml_only_for_unknown_versions(
     server = LazyYamlServerStub(
         [
             # v1 matches the local content: linking must not need its body.
-            _remote_version(
-                1, yaml_text=FUNCTION_YAML, content_hash=local["content_hash"]
-            ),
+            _remote_version(1, yaml_text=FUNCTION_YAML, content_hash=local["content_hash"]),
             # v2 is new to this daemon: its body is fetched lazily.
-            _remote_version(
-                2, yaml_text=FUNCTION_YAML_V2, content_hash="f" * 64
-            ),
+            _remote_version(2, yaml_text=FUNCTION_YAML_V2, content_hash="f" * 64),
         ]
     )
 
@@ -126,9 +120,7 @@ def test_reconcile_fetches_yaml_only_for_unknown_versions(
     assert first["conflicts"] == []
     assert set(server.yaml_fetches) <= {1, 2}
     assert 2 in server.yaml_fetches, "the genuinely new version needs its YAML"
-    versions = runtime.store.list_object_versions(
-        "demo_obj", owner_id=OWNER, library="default"
-    )
+    versions = runtime.store.list_object_versions("demo_obj", owner_id=OWNER, library="default")
     assert {int(item["version"]) for item in versions} == {1, 2}
 
     # Steady state: everything is linked — zero YAML round-trips.

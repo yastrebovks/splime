@@ -86,7 +86,7 @@ def pipeline_to_decomposition(pipeline: Any) -> dict[str, Any]:
     from spl.core.entities.node_remote import NodeRemote
     from spl.core.entities.scalar import Scalar
 
-    nodes = []
+    nodes: list[dict[str, Any]] = []
     functions = []
 
     for node in sorted(pipeline.nodes, key=lambda item: str(item.uuid)):
@@ -213,10 +213,7 @@ def render_pipeline_graph_html(
     theme_attr = html.escape(theme or "dark", quote=True)
     title = _escape(model["title"])
     stats = model["stats"]
-    stats_label = (
-        f"{stats['functionNodes']} functions / "
-        f"{len(model['links'])} links / {stats['portCount']} ports"
-    )
+    stats_label = f"{stats['functionNodes']} functions / {len(model['links'])} links / {stats['portCount']} ports"
 
     return f"""
 <div id="{html.escape(dom_id, quote=True)}" class="pipeline-graph-shell spl-pipeline-widget" data-spl-pipeline-widget data-theme="{theme_attr}">
@@ -312,7 +309,9 @@ def create_pipeline_graph_model(
         nodes.append(model_node)
 
     for index, item in enumerate(functions):
-        function_name = str(item.get("name") or item.get("function") or item.get("function_name") or f"function_{index + 1}")
+        function_name = str(
+            item.get("name") or item.get("function") or item.get("function_name") or f"function_{index + 1}"
+        )
         if function_name in nodes_by_function:
             continue
         raw_id = str(item.get("node_id") or item.get("id") or function_name)
@@ -370,9 +369,11 @@ def create_pipeline_graph_model(
         )
 
     for node in nodes:
-        node["inputs"] = _merge_ports(node.get("inputs"), [], "input")
-        node["outputs"] = _merge_ports(node.get("outputs"), [], "output")
-        node["height"] = _node_height(node["inputs"], node["outputs"])
+        inputs = _merge_ports(node.get("inputs"), [], "input")
+        outputs = _merge_ports(node.get("outputs"), [], "output")
+        node["inputs"] = inputs
+        node["outputs"] = outputs
+        node["height"] = _node_height(inputs, outputs)
 
     object_name = object_info.get("name") or object_info.get("id") or "pipeline"
     return {
@@ -384,7 +385,9 @@ def create_pipeline_graph_model(
         "stats": {
             "functionNodes": len([node for node in nodes if node.get("kind") != "external"]),
             "externalNodes": len([node for node in nodes if node.get("kind") == "external"]),
-            "portCount": sum(len(_visible_ports(node.get("inputs"))) + len(_visible_ports(node.get("outputs"))) for node in nodes),
+            "portCount": sum(
+                len(_visible_ports(node.get("inputs"))) + len(_visible_ports(node.get("outputs"))) for node in nodes
+            ),
         },
     }
 
@@ -480,12 +483,16 @@ def _ensure_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+def _dict_or_empty(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 def _node_id_for(node: dict[str, Any], index: int) -> str:
     return str(node.get("node_id") or node.get("id") or node.get("name") or f"node-{index + 1}")
 
 
 def _function_name_for(node: dict[str, Any]) -> str:
-    remote = node.get("remote") if isinstance(node.get("remote"), dict) else {}
+    remote = _dict_or_empty(node.get("remote"))
     return str(
         node.get("function")
         or node.get("function_name")
@@ -563,37 +570,37 @@ def _link_ports_for_node(links: list[Any], raw_id: str, role: str) -> list[dict[
 
 
 def _target_node_id(link: dict[str, Any]) -> str:
-    target = link.get("target") if isinstance(link.get("target"), dict) else {}
-    raw = link.get("raw") if isinstance(link.get("raw"), dict) else {}
-    raw_from = raw.get("from") if isinstance(raw.get("from"), dict) else {}
+    target = _dict_or_empty(link.get("target"))
+    raw = _dict_or_empty(link.get("raw"))
+    raw_from = _dict_or_empty(raw.get("from"))
     return str(link.get("target_node_id") or target.get("node_id") or raw_from.get("node_id") or "")
 
 
 def _target_port(link: dict[str, Any]) -> str:
-    target = link.get("target") if isinstance(link.get("target"), dict) else {}
-    raw = link.get("raw") if isinstance(link.get("raw"), dict) else {}
-    raw_from = raw.get("from") if isinstance(raw.get("from"), dict) else {}
+    target = _dict_or_empty(link.get("target"))
+    raw = _dict_or_empty(link.get("raw"))
+    raw_from = _dict_or_empty(raw.get("from"))
     return str(link.get("target_port") or target.get("port") or raw_from.get("port") or "default")
 
 
 def _source_node_id(link: dict[str, Any]) -> str:
-    source = link.get("source") if isinstance(link.get("source"), dict) else {}
-    raw = link.get("raw") if isinstance(link.get("raw"), dict) else {}
-    raw_to = raw.get("to") if isinstance(raw.get("to"), dict) else {}
+    source = _dict_or_empty(link.get("source"))
+    raw = _dict_or_empty(link.get("raw"))
+    raw_to = _dict_or_empty(raw.get("to"))
     return str(link.get("source_node_id") or source.get("node_id") or raw_to.get("node_id") or "")
 
 
 def _source_port(link: dict[str, Any]) -> str:
-    source = link.get("source") if isinstance(link.get("source"), dict) else {}
-    raw = link.get("raw") if isinstance(link.get("raw"), dict) else {}
-    raw_to = raw.get("to") if isinstance(raw.get("to"), dict) else {}
+    source = _dict_or_empty(link.get("source"))
+    raw = _dict_or_empty(link.get("raw"))
+    raw_to = _dict_or_empty(raw.get("to"))
     return str(link.get("source_port") or source.get("port") or raw_to.get("port") or "value")
 
 
 def _source_kind(link: dict[str, Any]) -> str:
-    source = link.get("source") if isinstance(link.get("source"), dict) else {}
-    raw = link.get("raw") if isinstance(link.get("raw"), dict) else {}
-    raw_to = raw.get("to") if isinstance(raw.get("to"), dict) else {}
+    source = _dict_or_empty(link.get("source"))
+    raw = _dict_or_empty(link.get("raw"))
+    raw_to = _dict_or_empty(raw.get("to"))
     return str(link.get("source_kind") or source.get("kind") or raw_to.get("kind") or "source")
 
 
@@ -636,9 +643,9 @@ def _resolve_source_node(
 
 
 def _source_value(link: dict[str, Any]) -> Any:
-    source = link.get("source") if isinstance(link.get("source"), dict) else {}
-    raw = link.get("raw") if isinstance(link.get("raw"), dict) else {}
-    raw_to = raw.get("to") if isinstance(raw.get("to"), dict) else {}
+    source = _dict_or_empty(link.get("source"))
+    raw = _dict_or_empty(link.get("raw"))
+    raw_to = _dict_or_empty(raw.get("to"))
     if "scalar_json" in link:
         return link.get("scalar_json")
     if "value" in source:
@@ -802,7 +809,9 @@ def _render_node(node: dict[str, Any], selected_node_id: str) -> str:
     selected = " selected" if node["id"] == selected_node_id else ""
     external = " external" if node.get("kind") == "external" else ""
     ports = _render_port_column(node.get("inputs"), "input") + _render_port_column(node.get("outputs"), "output")
-    dots = _render_port_dots(node.get("inputs"), "input", 0) + _render_port_dots(node.get("outputs"), "output", node["width"])
+    dots = _render_port_dots(node.get("inputs"), "input", 0) + _render_port_dots(
+        node.get("outputs"), "output", node["width"]
+    )
     return f"""
 <div class="pipeline-graph-node{external}{selected}" data-pipeline-node-id="{_escape(node["id"])}" tabindex="0" role="button" aria-label="{_escape(node.get("label"))}" style="left:{node["x"]}px;top:{node["y"]}px;width:{node["width"]}px;height:{node["height"]}px">
   <div class="pipeline-graph-node-head">
@@ -822,7 +831,7 @@ def _render_port_column(ports: Any, direction: str) -> str:
             f"""
 <span class="pipeline-port-row">
   <span>{_escape(port.get("name"))}</span>
-  {f'<small>{_escape(port.get("detail"))}</small>' if port.get("detail") else ""}
+  {f"<small>{_escape(port.get('detail'))}</small>" if port.get("detail") else ""}
 </span>
 """
             for port in visible
@@ -847,9 +856,7 @@ def _render_inspector(model: dict[str, Any], node_id: str) -> str:
     if node is None:
         return '<div class="pipeline-empty-slot">No node selected</div>'
     related = [
-        link
-        for link in model["links"]
-        if link["sourceNodeId"] == node["id"] or link["targetNodeId"] == node["id"]
+        link for link in model["links"] if link["sourceNodeId"] == node["id"] or link["targetNodeId"] == node["id"]
     ]
     return f"""
 <div class="pipeline-sidebar-head">
@@ -860,7 +867,7 @@ def _render_inspector(model: dict[str, Any], node_id: str) -> str:
   <div class="pipeline-inspector-meta">
     <span>Node <strong>{_escape(node.get("subtitle") or node.get("rawId"))}</strong></span>
     <span>Type <strong>{_escape(node.get("nodeKind") or node.get("kind"))}</strong></span>
-    {f'<span>Version <strong>{_escape(node.get("version"))}</strong></span>' if node.get("version") else ""}
+    {f"<span>Version <strong>{_escape(node.get('version'))}</strong></span>" if node.get("version") else ""}
   </div>
   <div class="pipeline-inspector-section">
     <span class="panel-label">Inputs</span>
@@ -879,15 +886,15 @@ def _render_inspector(model: dict[str, Any], node_id: str) -> str:
 
 
 def _render_port_chip(port: dict[str, Any]) -> str:
-    detail = f'<small>{_escape(port.get("detail"))}</small>' if port.get("detail") else ""
+    detail = f"<small>{_escape(port.get('detail'))}</small>" if port.get("detail") else ""
     return f'<span class="pipeline-port-chip">{_escape(port.get("name"))}{detail}</span>'
 
 
 def _render_mini_link(link: dict[str, Any], node_id: str) -> str:
     outgoing = link["sourceNodeId"] == node_id
     return f"""
-<span class="pipeline-mini-link {'outgoing' if outgoing else 'incoming'}">
-  <small>{'out' if outgoing else 'in'}</small>
+<span class="pipeline-mini-link {"outgoing" if outgoing else "incoming"}">
+  <small>{"out" if outgoing else "in"}</small>
   <strong>{_escape(link.get("sourceLabel"))} -> {_escape(link.get("targetLabel"))}</strong>
 </span>
 """

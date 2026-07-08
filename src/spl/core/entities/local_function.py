@@ -44,7 +44,7 @@ from functools import lru_cache
 from itertools import chain
 from pathlib import Path
 from types import FunctionType
-from typing import Any, Generator
+from typing import Any, Generator, cast
 
 import yaml
 
@@ -66,38 +66,36 @@ from spl.core.ir.unparse import ir_unparse
 # that alias rebound in its own scope: ``h = helper``.
 # --------------------------------------------------------------------------- #
 
-@dataclass(frozen = True)
+
+@dataclass(frozen=True)
 class DLocalAlias(DBase):
     alias: str
     target: str
 
 
-yaml.add_representer(
-    DLocalAlias,
-    lambda dumper, data: dumper.represent_mapping('!DLocalAlias', data.__dict__))
+yaml.add_representer(DLocalAlias, lambda dumper, data: dumper.represent_mapping("!DLocalAlias", data.__dict__))
 
 
 yaml.add_constructor(
-    '!DLocalAlias',
-    lambda loader, node: DLocalAlias(**loader.construct_mapping(node)))
+    "!DLocalAlias", lambda loader, node: DLocalAlias(**cast(dict[str, Any], loader.construct_mapping(cast(Any, node))))
+)
 
 
 @ir_unparse.register(lambda x: isinstance(x, DLocalAlias))
 def _ir_unparse__local_alias(x: DLocalAlias, source: Path) -> Generator[ast.stmt]:
-    yield ast.Assign(
-        targets = [ast.Name(id = x.alias, ctx = ast.Store())],
-        value = ast.Name(id = x.target, ctx = ast.Load()))
+    yield ast.Assign(targets=[ast.Name(id=x.alias, ctx=ast.Store())], value=ast.Name(id=x.target, ctx=ast.Load()))
 
 
 # --------------------------------------------------------------------------- #
 # Locality detection: is a module first-party user code, or third-party?
 # --------------------------------------------------------------------------- #
 
-@lru_cache(maxsize = None)
+
+@lru_cache(maxsize=None)
 def _environment_roots() -> tuple[Path, ...]:
     """Filesystem roots that mark an interpreter-managed / third-party module."""
     roots: set[Path] = set()
-    for key in ('stdlib', 'platstdlib', 'purelib', 'platlib'):
+    for key in ("stdlib", "platstdlib", "purelib", "platlib"):
         value = sysconfig.get_paths().get(key)
         if value:
             roots.add(Path(value))
@@ -128,7 +126,7 @@ def _is_within(path: Path, roots: tuple[Path, ...]) -> bool:
     return False
 
 
-@lru_cache(maxsize = None)
+@lru_cache(maxsize=None)
 def _module_is_local(module_name: str) -> bool:
     """Return ``True`` for first-party modules that we should inline.
 
@@ -151,22 +149,22 @@ def _module_is_local(module_name: str) -> bool:
     left to the import handlers so it can be referenced + pinned as a
     ``DDistribution``.
     """
-    if not module_name or module_name == '__main__':
+    if not module_name or module_name == "__main__":
         return False
 
-    top_level = module_name.split('.')[0]
+    top_level = module_name.split(".")[0]
     if top_level in sys.stdlib_module_names or top_level in sys.builtin_module_names:
         return False
 
     module = sys.modules.get(module_name)
-    file = getattr(module, '__file__', None) if module is not None else None
+    file = getattr(module, "__file__", None) if module is not None else None
     if not file:
         # No importable source on disk (builtin / namespace / C-extension):
         # we could not inline it anyway, so leave it to the import handlers.
         return False
 
     path = Path(file)
-    if 'site-packages' in path.parts or 'dist-packages' in path.parts:
+    if "site-packages" in path.parts or "dist-packages" in path.parts:
         return False
     if _is_within(path, _environment_roots()):
         return False
@@ -182,7 +180,8 @@ def _module_is_local(module_name: str) -> bool:
 # the names *it* references in *its own* module.
 # --------------------------------------------------------------------------- #
 
-@lru_cache(maxsize = None)
+
+@lru_cache(maxsize=None)
 def _function_def(func: FunctionType) -> ast.FunctionDef | None:
     """Parse a single ``def`` from a function's source, or ``None`` if unusable."""
     try:
@@ -208,8 +207,8 @@ def is_inlinable_local_function(x: Any) -> bool:
     try:
         if not isinstance(x, FunctionType):
             return False
-        module_name = getattr(x, '__module__', None)
-        if module_name in (None, '__main__'):
+        module_name = getattr(x, "__module__", None)
+        if module_name in (None, "__main__"):
             return False
         if not _module_is_local(module_name):
             return False
@@ -234,9 +233,7 @@ def _referenced_names(func: FunctionType, tree: ast.FunctionDef) -> list[str]:
     return sorted(name for name in names if name not in vars(builtins))
 
 
-def _local_dependencies(
-        func: FunctionType,
-        tree: ast.FunctionDef) -> Generator[Any]:
+def _local_dependencies(func: FunctionType, tree: ast.FunctionDef) -> Generator[Any]:
     """Yield IR for every name the function reads, resolved in its own module."""
     namespace = func.__globals__
     names = _referenced_names(func, tree)
@@ -244,8 +241,8 @@ def _local_dependencies(
     missing = [name for name in names if name not in namespace]
     if missing:
         raise ValueError(
-            'cannot inline local function {!r}: undefined names {}'.format(
-                func.__qualname__, ', '.join(missing)))
+            "cannot inline local function {!r}: undefined names {}".format(func.__qualname__, ", ".join(missing))
+        )
 
     for name in names:
         # Aliased imports are rebound by the handler below (which sees both the
@@ -257,10 +254,9 @@ def _local_dependencies(
 # ir_parse handler: inline the local function instead of importing it.
 # --------------------------------------------------------------------------- #
 
+
 @ir_parse.register(is_inlinable_local_function)
-def _ir_parse__local_function(
-        x: FunctionType,
-        name: str | None = None):
+def _ir_parse__local_function(x: FunctionType, name: str | None = None) -> _attach | _branch:
 
     if hasattr(x, LOCATION_DUNDER_NAME):
         # Already an spl-imported function: reference its source file, do not
@@ -268,10 +264,8 @@ def _ir_parse__local_function(
         return _attach(chain([DSPLImport(*getattr(x, LOCATION_DUNDER_NAME))]))
 
     tree = _function_def(x)
-    branch = _branch(
-        x,
-        lambda: serialize_function(x, tree),
-        lambda _frame_offset: _local_dependencies(x, tree))
+    tree = cast(ast.FunctionDef, tree)
+    branch = _branch(x, lambda: serialize_function(x, tree), lambda _frame_offset: _local_dependencies(x, tree))
 
     # When this helper is reached through an alias (``import helper as h``) the
     # calling body still refers to it as ``h``, yet it is inlined under its real
@@ -281,5 +275,5 @@ def _ir_parse__local_function(
     # caller, including a ``__main__`` entry function whose name resolution also
     # routes through ``ir_parse`` and therefore through this handler.
     if name is not None and name != tree.name:
-        return _attach([branch, DLocalAlias(alias = name, target = tree.name)])
+        return _attach([branch, DLocalAlias(alias=name, target=tree.name)])
     return branch

@@ -37,11 +37,7 @@ class SyncVisibilityService:
             created_at = event.get("created_at")
             if created_at and (oldest_pending_at is None or created_at < oldest_pending_at):
                 oldest_pending_at = created_at
-        retryable = [
-            event
-            for event in events
-            if event.get("status") in {"pending", "failed"}
-        ]
+        retryable = [event for event in events if event.get("status") in {"pending", "failed"}]
         return {
             "pending": len(events),
             "retryable": len(retryable),
@@ -50,11 +46,7 @@ class SyncVisibilityService:
             "max_attempts": max_attempts,
             "last_error": last_error,
             "oldest_pending_at": oldest_pending_at,
-            "next_action": (
-                "will_retry_on_next_sync"
-                if retryable
-                else "idle"
-            ),
+            "next_action": ("will_retry_on_next_sync" if retryable else "idle"),
         }
 
     def decorate_event(self, event: dict[str, Any]) -> dict[str, Any]:
@@ -70,7 +62,4 @@ class SyncVisibilityService:
         }
 
     def pending_events(self, *, limit: int = 200) -> list[dict[str, Any]]:
-        return [
-            self.decorate_event(event)
-            for event in self.store.list_pending_sync_events(limit=limit)
-        ]
+        return [self.decorate_event(event) for event in self.store.list_pending_sync_events(limit=limit)]

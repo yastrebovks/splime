@@ -253,9 +253,7 @@ def test_service_views_preserve_container_semantics_and_hide_raw_blobs() -> None
                 }
             ]
         ),
-        EnvironmentBuildListView(
-            [{"spec_hash": "abcdef123456", "status": "ready", "base_python": "/bin/python"}]
-        ),
+        EnvironmentBuildListView([{"spec_hash": "abcdef123456", "status": "ready", "base_python": "/bin/python"}]),
         InputListView(_SIGNATURE_PAYLOAD["inputs"]),
         OutputListView(_SIGNATURE_PAYLOAD["outputs"]),
         RunListView([_RUN_PAYLOAD]),

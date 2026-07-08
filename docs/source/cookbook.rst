@@ -53,6 +53,29 @@ receipt; the full daemon document stays in ``.raw``:
    result.output    # 42.0  — the unwrapped value
    result.value     # {'default': 42.0} — the raw port dict
 
+Environment resolution
+----------------------
+
+For server-origin objects, the stored ``env_python`` records provenance: the
+interpreter the author used when the version was defined. When a local daemon
+runs that version, it resolves the executable locally by env name, then by the
+local ``default`` env, then by the daemon interpreter. If that substitutes the
+authored interpreter, the daemon emits one ``interpreter_substitution`` log
+record and exposes the authored and resolved interpreter pair in run state and
+environment progress; ``spl-daemon doctor`` also warns when their Python
+major/minor versions differ.
+
+HTTP timeout model
+------------------
+
+Short daemon and SDK control-plane calls, such as register, list, status, and
+poll requests, use a 60 second HTTP timeout by default. Blocking execution
+calls are different: ``/remote-nodes/run`` and wait-style run requests hold the
+HTTP response open while the daemon or server polls the run to a terminal
+state. For those calls, ``timeout_seconds`` becomes the HTTP timeout when the
+caller provides it; without a user timeout, the client leaves the read
+unbounded so legitimate long runs are not cut off by the control-plane default.
+
 Versions without ceremony
 -------------------------
 

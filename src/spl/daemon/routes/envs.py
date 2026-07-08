@@ -5,12 +5,12 @@ from __future__ import annotations
 from http import HTTPStatus
 from typing import Any
 
-from spl.daemon.routes._helpers import RouteContext
+from spl.daemon.routes._helpers import RouteContext, RouteRegistrar
 from spl.daemon.store import validate_name
 
 
 def register_env_routes(
-    app: Any,
+    app: RouteRegistrar,
     *,
     runtime: Any,
     context: RouteContext,
@@ -76,7 +76,5 @@ def register_env_routes(
         body = await context.read_json_body()
         spec_hash = body.get("spec_hash")
         return json_response(
-            runtime.docker_environment_manager.prune_images(
-                validate_name(spec_hash) if spec_hash else None
-            )
+            runtime.docker_environment_manager.prune_images(validate_name(spec_hash) if spec_hash else None)
         )

@@ -85,9 +85,7 @@ def extract_metadata(
             "imports": imports,
         }
 
-    raise TypeError(
-        f"entrypoint must be a DFunction or DPipeline, got {type(root).__name__}"
-    )
+    raise TypeError(f"entrypoint must be a DFunction or DPipeline, got {type(root).__name__}")
 
 
 def _load_documents(yaml_text: str) -> list[tuple[Any, list[Any]]]:
@@ -107,15 +105,8 @@ def _find_entrypoint(documents: list[tuple[Any, list[Any]]], entrypoint: str) ->
     for root, _ in documents:
         if getattr(root, "name", None) == entrypoint:
             return root
-    available = sorted(
-        str(name)
-        for root, _ in documents
-        if (name := getattr(root, "name", None)) is not None
-    )
-    raise KeyError(
-        "entrypoint is not found in SPL YAML: "
-        f"{entrypoint}; available: {', '.join(available) or '<none>'}"
-    )
+    available = sorted(str(name) for root, _ in documents if (name := getattr(root, "name", None)) is not None)
+    raise KeyError(f"entrypoint is not found in SPL YAML: {entrypoint}; available: {', '.join(available) or '<none>'}")
 
 
 def _collect_functions(documents: list[tuple[Any, list[Any]]]) -> dict[str, DFunction]:
@@ -134,10 +125,7 @@ def _collect_distributions(documents: list[tuple[Any, list[Any]]]) -> list[dict[
         for item in dependencies
         if isinstance(item, DDistribution)
     }
-    return [
-        {"package": package, "version": version}
-        for package, version in sorted(unique)
-    ]
+    return [{"package": package, "version": version} for package, version in sorted(unique)]
 
 
 def _collect_imports(documents: list[tuple[Any, list[Any]]]) -> list[dict[str, Any]]:
@@ -145,6 +133,7 @@ def _collect_imports(documents: list[tuple[Any, list[Any]]]) -> list[dict[str, A
     seen: set[tuple[Any, ...]] = set()
     for _, dependencies in documents:
         for item in dependencies:
+            key: tuple[Any, ...]
             if isinstance(item, DImport):
                 key = ("import", item.module, item.alias)
                 payload = {
@@ -183,15 +172,10 @@ def _pipeline_metadata(
         for node in sorted(pipeline.nodes, key=lambda node: node.uuid)
     }
     nodes = [node_infos[node.uuid] for node in sorted(pipeline.nodes, key=lambda node: node.uuid)]
-    node_by_uuid = {
-        node.uuid: node_infos[node.uuid]
-        for node in pipeline.nodes
-    }
+    node_by_uuid = {node.uuid: node_infos[node.uuid] for node in pipeline.nodes}
 
     bound_inputs = {
-        (link_from.uuid, link_from.port)
-        for link_from, _ in pipeline.links
-        if isinstance(link_from, DNodeInputRef)
+        (link_from.uuid, link_from.port) for link_from, _ in pipeline.links if isinstance(link_from, DNodeInputRef)
     }
 
     free_inputs: list[dict[str, Any]] = []
@@ -209,13 +193,10 @@ def _pipeline_metadata(
                     payload["function"] = node_info.get("function")
                 else:
                     payload["remote"] = node_info.get("remote")
-                free_inputs.append(
-                    payload
-                )
+                free_inputs.append(payload)
 
     aliases = [
-        {"name": name, "node_id": node_uuid}
-        for name, node_uuid in sorted(pipeline.aliases, key=lambda item: item[0])
+        {"name": name, "node_id": node_uuid} for name, node_uuid in sorted(pipeline.aliases, key=lambda item: item[0])
     ]
 
     outputs = _pipeline_outputs(pipeline, node_by_uuid)
@@ -269,9 +250,7 @@ def _pipeline_outputs(
                 payload["function"] = node_info.get("function")
             elif node_info:
                 payload["remote"] = node_info.get("remote")
-            outputs.append(
-                payload
-            )
+            outputs.append(payload)
         return outputs
 
     outputs = []
@@ -302,13 +281,9 @@ def _pipeline_node_to_dict(
             "kind": "function",
             "function": node.func,
             "name": node.func,
-            "inputs": [
-                _input_port_to_dict(port)
-                for port in (function.inputs if function is not None else [])
-            ],
+            "inputs": [_input_port_to_dict(port) for port in (function.inputs if function is not None else [])],
             "outputs": [
-                _output_port_to_dict(port)
-                for port in ((function.outputs or []) if function is not None else [])
+                _output_port_to_dict(port) for port in ((function.outputs or []) if function is not None else [])
             ],
         }
     if isinstance(node, DNodeRemote):

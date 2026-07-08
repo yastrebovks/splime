@@ -189,9 +189,7 @@ def test_base_stale_creating_uses_started_at_and_lock_file(
         manager._is_stale_creating(
             {
                 "status": CREATING,
-                "started_at": (
-                    datetime.now(UTC) - timedelta(seconds=120)
-                ).isoformat(),
+                "started_at": (datetime.now(UTC) - timedelta(seconds=120)).isoformat(),
             },
             spec,
         )

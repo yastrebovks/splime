@@ -51,7 +51,9 @@ def test_scoped_signature_offline_keeps_local_error(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(client, "_json_request", lambda *a, **k: _raise(local_error))
     monkeypatch.setattr(
-        client, "resolve_remote_signature", lambda ref, **_: _raise(remote_error),
+        client,
+        "resolve_remote_signature",
+        lambda ref, **_: _raise(remote_error),
     )
 
     with pytest.raises(ClientError, match="is not registered"):

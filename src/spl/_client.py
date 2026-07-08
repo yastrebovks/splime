@@ -18,6 +18,7 @@ dependencies imported yet.
 
 from __future__ import annotations
 
+import builtins
 from dataclasses import dataclass, field, replace
 from html import escape
 from pathlib import Path
@@ -70,10 +71,7 @@ def _preview(value: Any, *, limit: int = 80) -> str:
 
 
 def _is_missing_server_connection(exc: Exception) -> bool:
-    return (
-        isinstance(exc, ClientError)
-        and _NO_SERVER_CONNECTION_MESSAGE in str(exc)
-    )
+    return isinstance(exc, ClientError) and _NO_SERVER_CONNECTION_MESSAGE in str(exc)
 
 
 def _progress_callback(progress: ProgressOption) -> RunStateCallback | None:
@@ -141,10 +139,7 @@ class PublishedObject:
             "entrypoint": self.entrypoint,
         }
         body = "".join(
-            "<tr>"
-            f"<th style='text-align:left'>{escape(key)}</th>"
-            f"<td><code>{escape(value)}</code></td>"
-            "</tr>"
+            f"<tr><th style='text-align:left'>{escape(key)}</th><td><code>{escape(value)}</code></td></tr>"
             for key, value in rows.items()
         )
         return f"<table><tbody>{body}</tbody></table>"
@@ -170,11 +165,7 @@ def _catalog_rows(
     rows: list[dict[str, str]] = []
     for record in records:
         library = record.get("library")
-        library_name = (
-            library.get("display_name") or library.get("slug")
-            if isinstance(library, dict)
-            else library
-        )
+        library_name = library.get("display_name") or library.get("slug") if isinstance(library, dict) else library
         version_value = record.get("version")
         if version_value is None:
             current = record.get("current_version")
@@ -197,28 +188,16 @@ def _catalog_rows(
 def _rows_to_text(rows: list[dict[str, str]], title: str) -> str:
     if not rows:
         return f"{title}: (empty)"
-    widths = {
-        header: max(len(header), *(len(row[header]) for row in rows))
-        for header in _CATALOG_HEADERS
-    }
+    widths = {header: max(len(header), *(len(row[header]) for row in rows)) for header in _CATALOG_HEADERS}
     head = "  ".join(header.ljust(widths[header]) for header in _CATALOG_HEADERS)
-    body = "\n".join(
-        "  ".join(row[header].ljust(widths[header]) for header in _CATALOG_HEADERS)
-        for row in rows
-    )
+    body = "\n".join("  ".join(row[header].ljust(widths[header]) for header in _CATALOG_HEADERS) for row in rows)
     return f"{title} ({len(rows)}):\n{head}\n{body}"
 
 
 def _rows_to_html(rows: list[dict[str, str]], title: str) -> str:
-    head = "".join(
-        f"<th style='text-align:left'>{escape(header)}</th>"
-        for header in _CATALOG_HEADERS
-    )
+    head = "".join(f"<th style='text-align:left'>{escape(header)}</th>" for header in _CATALOG_HEADERS)
     body = "".join(
-        "<tr>"
-        + "".join(f"<td>{escape(row[header])}</td>" for header in _CATALOG_HEADERS)
-        + "</tr>"
-        for row in rows
+        "<tr>" + "".join(f"<td>{escape(row[header])}</td>" for header in _CATALOG_HEADERS) + "</tr>" for row in rows
     )
     return (
         f"<div><b>{escape(title)}</b> ({len(rows)})"
@@ -258,14 +237,10 @@ class ObjectCatalog(dict[str, Any]):
     """Local+server catalog that prints per-scope tables; ``.raw`` is a plain dict."""
 
     def __repr__(self) -> str:
-        return "\n\n".join(
-            _rows_to_text(_catalog_rows(value), str(key)) for key, value in self.items()
-        )
+        return "\n\n".join(_rows_to_text(_catalog_rows(value), str(key)) for key, value in self.items())
 
     def _repr_html_(self) -> str:
-        return "".join(
-            _rows_to_html(_catalog_rows(value), str(key)) for key, value in self.items()
-        )
+        return "".join(_rows_to_html(_catalog_rows(value), str(key)) for key, value in self.items())
 
     @property
     def raw(self) -> dict[str, Any]:
@@ -343,10 +318,7 @@ class RemoteResult:
             "artifacts": str(len(self.artifacts)),
         }
         body = "".join(
-            "<tr>"
-            f"<th style='text-align:left'>{escape(key)}</th>"
-            f"<td><code>{escape(value)}</code></td>"
-            "</tr>"
+            f"<tr><th style='text-align:left'>{escape(key)}</th><td><code>{escape(value)}</code></td></tr>"
             for key, value in rows.items()
         )
         return f"<table><tbody>{body}</tbody></table>"
@@ -375,13 +347,13 @@ class RemoteRun:
     def id(self) -> str:
         """Return the daemon run id."""
 
-        return self.state["id"]
+        return cast(str, self.state["id"])
 
     @property
     def status(self) -> str:
         """Return the last known daemon status."""
 
-        return self.state["status"]
+        return cast(str, self.state["status"])
 
     @property
     def mode(self) -> str:
@@ -490,17 +462,10 @@ class RemoteRun:
         )
         if final_state["status"] != "succeeded":
             error = final_state.get("error") or "run returned no error message"
-            raise RuntimeError(
-                f"{self.mode} run {self.id!r} ended as "
-                f"{final_state.get('status')!r}: {error}"
-            )
+            raise RuntimeError(f"{self.mode} run {self.id!r} ended as {final_state.get('status')!r}: {error}")
 
         payload = self.result()
-        downloaded = (
-            self.download_artifacts(artifacts_dir)
-            if artifacts_dir is not None
-            else {}
-        )
+        downloaded = self.download_artifacts(artifacts_dir) if artifacts_dir is not None else {}
         return RemoteResult(
             run=final_state,
             payload=payload,
@@ -593,7 +558,7 @@ class _LibraryAdmin:
         grantee: str,
         *,
         grantee_type: str = "user",
-        scopes: list[str] | None = None,
+        scopes: builtins.list[str] | None = None,
     ) -> dict[str, Any]:
         """Grant a user or team access to one central-server library."""
 
@@ -779,11 +744,7 @@ class SPLClient:
             )
         conn = self.current_server_connection()
         connection = conn.get("connection")
-        nested_url = (
-            connection.get("server_url")
-            if isinstance(connection, dict)
-            else None
-        )
+        nested_url = connection.get("server_url") if isinstance(connection, dict) else None
         server_url = conn.get("server_url") or nested_url or DEFAULT_SERVER_URL
         return SPLServerClient(token=self._user_token, base_url=server_url)
 
@@ -800,9 +761,7 @@ class SPLClient:
             state = self._daemon.server_connection()
         except Exception as exc:
             if _is_missing_server_connection(exc):
-                return ConnectionStatusView(
-                    {"connected": False, "offline": False, "connection": None}
-                )
+                return ConnectionStatusView({"connected": False, "offline": False, "connection": None})
             raise
         state.setdefault("connected", bool(state.get("server_url")))
         return ConnectionStatusView(state)
@@ -819,9 +778,7 @@ class SPLClient:
 
         if not self._has_server_connection():
             return LibraryListView([])
-        return LibraryListView(
-            self._daemon.server_libraries(include_accessible=include_accessible)
-        )
+        return LibraryListView(self._daemon.server_libraries(include_accessible=include_accessible))
 
     # The flat library aliases (create_library, get_library, update_library,
     # delete_library, grant_library, revoke_library_grant, add_reference,
@@ -1018,11 +975,7 @@ class SPLClient:
         """
 
         if scope == "auto":
-            scope = (
-                "server"
-                if owner is not None or library is not None or self._has_server_connection()
-                else "local"
-            )
+            scope = "server" if owner is not None or library is not None or self._has_server_connection() else "local"
         if scope == "local":
             if owner is not None or library is not None:
                 raise ValueError("owner/library require scope='server', scope='all', or scope='auto'")
@@ -1220,9 +1173,7 @@ class SPLClient:
         """Return normalized function/node/link metadata for one object."""
 
         if self._is_node_remote(name):
-            return DecompositionView(
-                self._remote_decomposition_response(name, version=version)["decomposition"]
-            )
+            return DecompositionView(self._remote_decomposition_response(name, version=version)["decomposition"])
         if owner is not None or library is not None:
             response = self._remote_decomposition_response(
                 {
@@ -1269,11 +1220,7 @@ class SPLClient:
             record = response.get("object") or {}
             remote = response.get("remote") or {}
             object_name = (
-                title
-                or record.get("display_name")
-                or record.get("name")
-                or remote.get("name")
-                or pipeline.name
+                title or record.get("display_name") or record.get("name") or remote.get("name") or pipeline.name
             )
             return PipelineGraphWidget(
                 decomposition,
@@ -1328,10 +1275,7 @@ class SPLClient:
                 theme=theme,
             )
 
-        raise TypeError(
-            "pipeline_widget expects an object name, PublishedObject, "
-            "spl.core Pipeline, or NodeRemote"
-        )
+        raise TypeError("pipeline_widget expects an object name, PublishedObject, spl.core Pipeline, or NodeRemote")
 
     def draw_pipeline(
         self,
@@ -1371,20 +1315,11 @@ class SPLClient:
             function=function,
         )
         display_name = signature.get("display_name") or signature["name"]
-        lines = [
-            (
-                f"{display_name} "
-                f"v{signature['version']} ({signature['kind']})"
-            )
-        ]
+        lines = [(f"{display_name} v{signature['version']} ({signature['kind']})")]
         if signature.get("description"):
             lines.append(signature["description"])
 
-        if (
-            function is None
-            and signature.get("kind") == "pipeline"
-            and signature.get("internal_functions")
-        ):
+        if function is None and signature.get("kind") == "pipeline" and signature.get("internal_functions"):
             lines.append("Functions:")
             for item in signature["internal_functions"]:
                 lines.append(f"  - {item['name']}")
@@ -1393,29 +1328,16 @@ class SPLClient:
         if signature["inputs"]:
             for item in signature["inputs"]:
                 required = "required" if item["required"] else "optional"
-                default = (
-                    ""
-                    if item["default"] is None
-                    else f", default={item['default']}"
-                )
-                lines.append(
-                    f"  - {item['name']}: {item['type'] or 'Any'} "
-                    f"({required}{default})"
-                )
+                default = "" if item["default"] is None else f", default={item['default']}"
+                lines.append(f"  - {item['name']}: {item['type'] or 'Any'} ({required}{default})")
         else:
             lines.append("  - none")
 
         lines.append("Outputs:")
         if signature["outputs"]:
             for item in signature["outputs"]:
-                selector = (
-                    f'output="{item["selector"]}"'
-                    if item["selector"] is not None
-                    else "no output selector"
-                )
-                lines.append(
-                    f"  - {item['name']}: {selector}; read {item['read']}"
-                )
+                selector = f'output="{item["selector"]}"' if item["selector"] is not None else "no output selector"
+                lines.append(f"  - {item['name']}: {selector}; read {item['read']}")
         else:
             lines.append("  - none")
 
@@ -1628,11 +1550,7 @@ class SPLClient:
         *,
         version: int | None = None,
     ) -> dict[str, Any]:
-        ref = (
-            self._remote_node_payload(remote, version=version)
-            if self._is_node_remote(remote)
-            else dict(remote)
-        )
+        ref = self._remote_node_payload(remote, version=version) if self._is_node_remote(remote) else dict(remote)
         if version is not None:
             ref["version"] = version
         return self._daemon.resolve_remote_decomposition(ref)
@@ -1735,11 +1653,7 @@ def export_objects_to_yaml(xs: list[Any], *, frame_offset: int = 2) -> str:
 
     top_level_deps = get_top_level_deps(frame_offset, xs)
 
-    mapping = {
-        root: DSPLSelfImport(name=cast(Any, root).name)
-        for (root, _) in top_level_deps
-        if hasattr(root, "name")
-    }
+    mapping = {root: DSPLSelfImport(name=cast(Any, root).name) for (root, _) in top_level_deps if hasattr(root, "name")}
 
     normalized_deps = {
         root: [mapping.get(dependency, dependency) for dependency in dependencies]
@@ -1762,8 +1676,7 @@ def prepare_export_object(obj: Any, entrypoint: str | None) -> tuple[Any, str]:
         if entrypoint is None:
             if obj.name is None:
                 raise ValueError(
-                    "unnamed pipeline requires entrypoint; "
-                    "use pipeline.render(name) or publish(..., entrypoint='name')"
+                    "unnamed pipeline requires entrypoint; use pipeline.render(name) or publish(..., entrypoint='name')"
                 )
             return obj, obj.name
         return replace(obj, name=entrypoint), entrypoint

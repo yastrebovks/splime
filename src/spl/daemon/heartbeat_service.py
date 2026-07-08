@@ -99,11 +99,7 @@ class HeartbeatService:
             try:
                 self.sync_once(connection_id=connection_id)
             except ServerClientError as exc:
-                status = (
-                    "stale"
-                    if exc.status_code in {401, 403, 404, 409}
-                    else "heartbeat_failed"
-                )
+                status = "stale" if exc.status_code in {401, 403, 404, 409} else "heartbeat_failed"
                 self.store.record_server_connection_error(
                     connection_id,
                     status=status,

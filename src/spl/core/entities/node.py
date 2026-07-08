@@ -1,7 +1,7 @@
 import ast
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any, Generator, cast
 from uuid import UUID, uuid4
 
 import yaml
@@ -10,187 +10,186 @@ from spl.core.ir.common import DBase
 from spl.core.ir.parse import _branch, ir_parse
 from spl.core.ir.unparse import ir_unparse
 
-DEFAULT_PORT = 'default'
+DEFAULT_PORT = "default"
 
 
 def _validate_formatted_output_ref_string(name: str, value: str) -> None:
     if not isinstance(value, str):
-        raise TypeError('formatted output ref {} must be a string'.format(name))
+        raise TypeError("formatted output ref {} must be a string".format(name))
     if not value:
-        raise ValueError(
-            'formatted output ref {} must be a non-empty string'.format(name))
+        raise ValueError("formatted output ref {} must be a non-empty string".format(name))
 
 
-@dataclass(frozen = True)
+@dataclass(frozen=True)
 class Port:
     name: str
     typ_: str | None
 
 
-@dataclass(frozen = True)
+@dataclass(frozen=True)
 class InputPort(Port):
     default: str | None
 
 
-@dataclass(frozen = True)
+@dataclass(frozen=True)
 class OutputPort(Port):
     pass
 
 
-@dataclass(frozen = True)
+@dataclass(frozen=True)
 class Node:
     uuid: UUID
     inputs: list[InputPort]
     outputs: list[OutputPort]
 
-    def __init__(self, inputs, outputs, uuid: UUID | None = None):
+    def __init__(self, inputs: list[InputPort], outputs: list[OutputPort], uuid: UUID | None = None) -> None:
         uuid = uuid or uuid4()
         super().__init__()
-        object.__setattr__(self, 'uuid', uuid)
-        object.__setattr__(self, 'inputs', inputs)
-        object.__setattr__(self, 'outputs', outputs)
+        object.__setattr__(self, "uuid", uuid)
+        object.__setattr__(self, "inputs", inputs)
+        object.__setattr__(self, "outputs", outputs)
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return hash(self.uuid)
 
-    def get_input_port(self, port_name):
+    def get_input_port(self, port_name: str) -> InputPort:
         return next(iter(filter(lambda p: p.name == port_name, self.inputs)))
 
-    def get_output_port(self, port_name = DEFAULT_PORT):
+    def get_output_port(self, port_name: str = DEFAULT_PORT) -> OutputPort:
         return next(iter(filter(lambda p: p.name == port_name, self.outputs)))
 
 
-@dataclass(frozen = True)
+@dataclass(frozen=True)
 class NodeInputRef:
     node: Node
     port: InputPort
 
-    def __repr__(self):
-        return self.node.__repr__() + ':' + self.port.name
+    def __repr__(self) -> str:
+        return self.node.__repr__() + ":" + self.port.name
 
-@dataclass(frozen = True)
+
+@dataclass(frozen=True)
 class DNodeInputRef(DBase):
     uuid: str
     port: str
 
-yaml.add_representer(
-    DNodeInputRef,
-    lambda dumper, data: dumper.represent_mapping('!DNodeInputRef', data.__dict__))
+
+yaml.add_representer(DNodeInputRef, lambda dumper, data: dumper.represent_mapping("!DNodeInputRef", data.__dict__))
 
 yaml.add_constructor(
-    '!DNodeInputRef',
-    lambda loader, node: DNodeInputRef(**loader.construct_mapping(node)))
-
-@ir_parse.register(
-    lambda x: isinstance(x, NodeInputRef))
-def _ir_parse__node_input_ref(
-        x: NodeInputRef,
-        name: str | None = None):
-    return _branch(
-        x,
-        lambda: DNodeInputRef(
-            uuid = str(x.node.uuid),
-            port = str(x.port.name)),
-        lambda frame_offset: [])
+    "!DNodeInputRef",
+    lambda loader, node: DNodeInputRef(**cast(dict[str, Any], loader.construct_mapping(cast(Any, node)))),
+)
 
 
-@ir_unparse.register(
-    lambda x: isinstance(x, DNodeInputRef))
+@ir_parse.register(lambda x: isinstance(x, NodeInputRef))
+def _ir_parse__node_input_ref(x: NodeInputRef, name: str | None = None) -> _branch:
+    return _branch(x, lambda: DNodeInputRef(uuid=str(x.node.uuid), port=str(x.port.name)), lambda frame_offset: [])
+
+
+@ir_unparse.register(lambda x: isinstance(x, DNodeInputRef))
 def _ir_unparse__node_input_ref(x: DNodeInputRef, source: Path) -> Generator[ast.stmt]:
     yield ast.Assign(
-        targets = [ast.Name(id = '_link_from', ctx = ast.Store())],
-        value = ast.Call(
-            func = ast.Name(id = 'NodeInputRef', ctx = ast.Load()),
-            keywords = [
+        targets=[ast.Name(id="_link_from", ctx=ast.Store())],
+        value=ast.Call(
+            func=ast.Name(id="NodeInputRef", ctx=ast.Load()),
+            keywords=[
                 ast.keyword(
-                    arg = 'node',
-                    value = ast.Subscript(
-                        value = ast.Name(id = '_nodes', ctx = ast.Load()),
-                        slice = ast.Call(
-                            func = ast.Name(id = 'UUID', ctx = ast.Load()),
-                            args = [ast.Constant(value = x.uuid)]),
-                        ctx = ast.Load())),
+                    arg="node",
+                    value=ast.Subscript(
+                        value=ast.Name(id="_nodes", ctx=ast.Load()),
+                        slice=ast.Call(func=ast.Name(id="UUID", ctx=ast.Load()), args=[ast.Constant(value=x.uuid)]),
+                        ctx=ast.Load(),
+                    ),
+                ),
                 ast.keyword(
-                    arg = 'port',
-                    value = ast.Call(
-                        func = ast.Attribute(
-                            value = ast.Subscript(
-                                value = ast.Name(id = '_nodes', ctx = ast.Load()),
-                                slice = ast.Call(
-                                    func = ast.Name(id = 'UUID', ctx = ast.Load()),
-                                    args = [ast.Constant(value = x.uuid)]),
-                                ctx = ast.Load()),
-                            attr = 'get_input_port',
-                            ctx = ast.Load()),
-                        args = [ast.Constant(value = x.port)]))]))
+                    arg="port",
+                    value=ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Subscript(
+                                value=ast.Name(id="_nodes", ctx=ast.Load()),
+                                slice=ast.Call(
+                                    func=ast.Name(id="UUID", ctx=ast.Load()), args=[ast.Constant(value=x.uuid)]
+                                ),
+                                ctx=ast.Load(),
+                            ),
+                            attr="get_input_port",
+                            ctx=ast.Load(),
+                        ),
+                        args=[ast.Constant(value=x.port)],
+                    ),
+                ),
+            ],
+        ),
+    )
 
 
-@dataclass(frozen = True)
+@dataclass(frozen=True)
 class NodeOutputRef:
     node: Node
     port: OutputPort
 
-    def __repr__(self):
-        return self.node.__repr__() + ':' + self.port.name
+    def __repr__(self) -> str:
+        return self.node.__repr__() + ":" + self.port.name
 
-@dataclass(frozen = True)
+
+@dataclass(frozen=True)
 class DNodeOutputRef(DBase):
     uuid: str
     port: str
 
-yaml.add_representer(
-    DNodeOutputRef,
-    lambda dumper, data: dumper.represent_mapping('!DNodeOutputRef', data.__dict__))
+
+yaml.add_representer(DNodeOutputRef, lambda dumper, data: dumper.represent_mapping("!DNodeOutputRef", data.__dict__))
 
 yaml.add_constructor(
-    '!DNodeOutputRef',
-    lambda loader, node: DNodeOutputRef(**loader.construct_mapping(node)))
-
-@ir_parse.register(
-    lambda x: isinstance(x, NodeOutputRef))
-def _ir_parse__node_output_ref(
-        x: NodeOutputRef,
-        name: str | None = None):
-    return _branch(
-        x,
-        lambda: DNodeOutputRef(
-            uuid = str(x.node.uuid),
-            port = str(x.port.name)),
-        lambda frame_offset: [])
+    "!DNodeOutputRef",
+    lambda loader, node: DNodeOutputRef(**cast(dict[str, Any], loader.construct_mapping(cast(Any, node)))),
+)
 
 
-@ir_unparse.register(
-    lambda x: isinstance(x, DNodeOutputRef))
+@ir_parse.register(lambda x: isinstance(x, NodeOutputRef))
+def _ir_parse__node_output_ref(x: NodeOutputRef, name: str | None = None) -> _branch:
+    return _branch(x, lambda: DNodeOutputRef(uuid=str(x.node.uuid), port=str(x.port.name)), lambda frame_offset: [])
+
+
+@ir_unparse.register(lambda x: isinstance(x, DNodeOutputRef))
 def _ir_unparse__node_output_ref(x: DNodeOutputRef, source: Path) -> Generator[ast.stmt]:
     yield ast.Assign(
-        targets = [ast.Name(id = '_link_to', ctx = ast.Store())],
-        value = ast.Call(
-            func = ast.Name(id = 'NodeOutputRef', ctx = ast.Load()),
-            keywords = [
+        targets=[ast.Name(id="_link_to", ctx=ast.Store())],
+        value=ast.Call(
+            func=ast.Name(id="NodeOutputRef", ctx=ast.Load()),
+            keywords=[
                 ast.keyword(
-                    arg = 'node',
-                    value = ast.Subscript(
-                        value = ast.Name(id = '_nodes', ctx = ast.Load()),
-                        slice = ast.Call(
-                            func = ast.Name(id = 'UUID', ctx = ast.Load()),
-                            args = [ast.Constant(value = x.uuid)]),
-                        ctx = ast.Load())),
+                    arg="node",
+                    value=ast.Subscript(
+                        value=ast.Name(id="_nodes", ctx=ast.Load()),
+                        slice=ast.Call(func=ast.Name(id="UUID", ctx=ast.Load()), args=[ast.Constant(value=x.uuid)]),
+                        ctx=ast.Load(),
+                    ),
+                ),
                 ast.keyword(
-                    arg = 'port',
-                    value = ast.Call(
-                        func = ast.Attribute(
-                            value = ast.Subscript(
-                                value = ast.Name(id = '_nodes', ctx = ast.Load()),
-                                slice = ast.Call(
-                                    func = ast.Name(id = 'UUID', ctx = ast.Load()),
-                                    args = [ast.Constant(value = x.uuid)]),
-                                ctx = ast.Load()),
-                            attr = 'get_output_port',
-                            ctx = ast.Load()),
-                        args = [ast.Constant(value = x.port)]))]))
+                    arg="port",
+                    value=ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Subscript(
+                                value=ast.Name(id="_nodes", ctx=ast.Load()),
+                                slice=ast.Call(
+                                    func=ast.Name(id="UUID", ctx=ast.Load()), args=[ast.Constant(value=x.uuid)]
+                                ),
+                                ctx=ast.Load(),
+                            ),
+                            attr="get_output_port",
+                            ctx=ast.Load(),
+                        ),
+                        args=[ast.Constant(value=x.port)],
+                    ),
+                ),
+            ],
+        ),
+    )
 
 
-@dataclass(frozen = True)
+@dataclass(frozen=True)
 class FormattedOutputRef:
     """Output reference with an edge-local artifact format override."""
 
@@ -199,11 +198,11 @@ class FormattedOutputRef:
 
     def __post_init__(self) -> None:
         if not isinstance(self.out_ref, NodeOutputRef):
-            raise TypeError('formatted output ref out_ref must be NodeOutputRef')
-        _validate_formatted_output_ref_string('format', self.format)
+            raise TypeError("formatted output ref out_ref must be NodeOutputRef")
+        _validate_formatted_output_ref_string("format", self.format)
 
 
-@dataclass(frozen = True)
+@dataclass(frozen=True)
 class DFormattedOutputRef(DBase):
     """Serialized FormattedOutputRef value for pipeline YAML."""
 
@@ -212,75 +211,79 @@ class DFormattedOutputRef(DBase):
     format: str
 
     def __post_init__(self) -> None:
-        _validate_formatted_output_ref_string('uuid', self.uuid)
-        _validate_formatted_output_ref_string('port', self.port)
-        _validate_formatted_output_ref_string('format', self.format)
+        _validate_formatted_output_ref_string("uuid", self.uuid)
+        _validate_formatted_output_ref_string("port", self.port)
+        _validate_formatted_output_ref_string("format", self.format)
+
 
 yaml.add_representer(
-    DFormattedOutputRef,
-    lambda dumper, data: dumper.represent_mapping('!DFormattedOutputRef', data.__dict__))
+    DFormattedOutputRef, lambda dumper, data: dumper.represent_mapping("!DFormattedOutputRef", data.__dict__)
+)
+
 
 def _construct_dformatted_output_ref(loader: Any, node: Any) -> DFormattedOutputRef:
     return DFormattedOutputRef(**loader.construct_mapping(node))
 
 
-yaml.add_constructor(
-    '!DFormattedOutputRef',
-    _construct_dformatted_output_ref)
+yaml.add_constructor("!DFormattedOutputRef", _construct_dformatted_output_ref)
 
-@ir_parse.register(
-    lambda x: isinstance(x, FormattedOutputRef))
-def _ir_parse__formatted_output_ref(
-        x: FormattedOutputRef,
-        name: str | None = None) -> _branch:
+
+@ir_parse.register(lambda x: isinstance(x, FormattedOutputRef))
+def _ir_parse__formatted_output_ref(x: FormattedOutputRef, name: str | None = None) -> _branch:
     def mk_dependencies(frame_offset: int) -> Generator[Any]:
         yield from []
 
     return _branch(
         x,
-        lambda: DFormattedOutputRef(
-            uuid = str(x.out_ref.node.uuid),
-            port = str(x.out_ref.port.name),
-            format = x.format),
-        mk_dependencies)
+        lambda: DFormattedOutputRef(uuid=str(x.out_ref.node.uuid), port=str(x.out_ref.port.name), format=x.format),
+        mk_dependencies,
+    )
 
 
-@ir_unparse.register(
-    lambda x: isinstance(x, DFormattedOutputRef))
-def _ir_unparse__formatted_output_ref(
-        x: DFormattedOutputRef,
-        source: Path) -> Generator[ast.stmt]:
+@ir_unparse.register(lambda x: isinstance(x, DFormattedOutputRef))
+def _ir_unparse__formatted_output_ref(x: DFormattedOutputRef, source: Path) -> Generator[ast.stmt]:
     yield ast.Assign(
-        targets = [ast.Name(id = '_link_to', ctx = ast.Store())],
-        value = ast.Call(
-            func = ast.Name(id = 'FormattedOutputRef', ctx = ast.Load()),
-            keywords = [
+        targets=[ast.Name(id="_link_to", ctx=ast.Store())],
+        value=ast.Call(
+            func=ast.Name(id="FormattedOutputRef", ctx=ast.Load()),
+            keywords=[
                 ast.keyword(
-                    arg = 'out_ref',
-                    value = ast.Call(
-                        func = ast.Name(id = 'NodeOutputRef', ctx = ast.Load()),
-                        keywords = [
+                    arg="out_ref",
+                    value=ast.Call(
+                        func=ast.Name(id="NodeOutputRef", ctx=ast.Load()),
+                        keywords=[
                             ast.keyword(
-                                arg = 'node',
-                                value = ast.Subscript(
-                                    value = ast.Name(id = '_nodes', ctx = ast.Load()),
-                                    slice = ast.Call(
-                                        func = ast.Name(id = 'UUID', ctx = ast.Load()),
-                                        args = [ast.Constant(value = x.uuid)]),
-                                    ctx = ast.Load())),
+                                arg="node",
+                                value=ast.Subscript(
+                                    value=ast.Name(id="_nodes", ctx=ast.Load()),
+                                    slice=ast.Call(
+                                        func=ast.Name(id="UUID", ctx=ast.Load()), args=[ast.Constant(value=x.uuid)]
+                                    ),
+                                    ctx=ast.Load(),
+                                ),
+                            ),
                             ast.keyword(
-                                arg = 'port',
-                                value = ast.Call(
-                                    func = ast.Attribute(
-                                        value = ast.Subscript(
-                                            value = ast.Name(id = '_nodes', ctx = ast.Load()),
-                                            slice = ast.Call(
-                                                func = ast.Name(id = 'UUID', ctx = ast.Load()),
-                                                args = [ast.Constant(value = x.uuid)]),
-                                            ctx = ast.Load()),
-                                        attr = 'get_output_port',
-                                        ctx = ast.Load()),
-                                    args = [ast.Constant(value = x.port)]))])),
-                ast.keyword(
-                    arg = 'format',
-                    value = ast.Constant(value = x.format))]))
+                                arg="port",
+                                value=ast.Call(
+                                    func=ast.Attribute(
+                                        value=ast.Subscript(
+                                            value=ast.Name(id="_nodes", ctx=ast.Load()),
+                                            slice=ast.Call(
+                                                func=ast.Name(id="UUID", ctx=ast.Load()),
+                                                args=[ast.Constant(value=x.uuid)],
+                                            ),
+                                            ctx=ast.Load(),
+                                        ),
+                                        attr="get_output_port",
+                                        ctx=ast.Load(),
+                                    ),
+                                    args=[ast.Constant(value=x.port)],
+                                ),
+                            ),
+                        ],
+                    ),
+                ),
+                ast.keyword(arg="format", value=ast.Constant(value=x.format)),
+            ],
+        ),
+    )

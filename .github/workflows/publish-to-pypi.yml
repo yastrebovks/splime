@@ -37,6 +37,15 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[test]"
 
+      - name: Run Ruff lint
+        run: ruff check
+
+      - name: Check Ruff formatting
+        run: ruff format --check
+
+      - name: Run mypy
+        run: mypy --python-version 3.13 src
+
       - name: Run unit tests (smoke excluded)
         run: python -m pytest -m "not smoke" -q
 

@@ -15,6 +15,15 @@ from spl.daemon.runtime_dependencies import (
     EnvironmentManagerProtocol,
     RuntimeBackendProtocol,
 )
+from spl.daemon.interpreter_visibility import environment_record_interpreter_substitution
+from spl.daemon.spl_free_generator import (
+    LEGACY_WORKER_RUNTIME,
+    REASON_DOCKER_RUNTIME,
+    SPL_FREE_WORKER_RUNTIME,
+    WorkerRuntimePlan,
+    prepare_worker_runtime,
+    write_worker_runtime_marker,
+)
 from spl.daemon.store import validate_name
 
 
@@ -35,6 +44,9 @@ class RunContext:
     stdout_path: Path
     stderr_path: Path
     worker_path: Path
+    spl_free_runner_path: Path
+    generated_modules_dir: Path
+    worker_runtime_marker_path: Path
     entrypoint: str
     daemon_base_url: str
 
@@ -78,6 +90,31 @@ class VenvBackend:
 
     def build_command(self, ctx: RunContext) -> list[str]:
         environment_record = self._ready_record()
+        worker_plan = prepare_worker_runtime(
+            object_record=ctx.object_record,
+            object_yaml_path=ctx.object_yaml_path,
+            entrypoint=ctx.entrypoint,
+            run_dir=ctx.run_dir,
+            generated_modules_dir=ctx.generated_modules_dir,
+            runner_source_path=ctx.spl_free_runner_path,
+            marker_path=ctx.worker_runtime_marker_path,
+        )
+        if worker_plan.runtime == SPL_FREE_WORKER_RUNTIME:
+            if worker_plan.runner_path is None or worker_plan.module_path is None or worker_plan.module_name is None:
+                raise RuntimeError("SPL-free worker plan is incomplete")
+            return [
+                environment_record["python_path"],
+                str(worker_plan.runner_path),
+                *spl_free_runner_args(
+                    module_path=str(worker_plan.module_path),
+                    module_name=worker_plan.module_name,
+                    entrypoint=ctx.entrypoint,
+                    input_path=str(ctx.input_path),
+                    result_path=str(ctx.result_path),
+                    artifacts_dir=str(ctx.artifacts_dir),
+                    env_spec_path=str(ctx.env_spec_path),
+                ),
+            ]
         return [
             environment_record["python_path"],
             str(ctx.worker_path),
@@ -95,13 +132,17 @@ class VenvBackend:
 
     def run_state_fields(self) -> dict[str, Any]:
         environment_record = self._ready_record()
-        return {
+        fields = {
             "resolved_runtime": environment_record["python_path"],
             "runtime_backend": self.mode,
             "image_tag": None,
             "container_id": None,
             "resolved_python": environment_record["python_path"],
         }
+        substitution = environment_record_interpreter_substitution(environment_record)
+        if substitution is not None:
+            fields["interpreter_substitution"] = substitution
+        return fields
 
     def after_prepare(self, object_record: dict[str, Any]) -> None:
         return None
@@ -178,6 +219,13 @@ class DockerBackend:
     def build_command(self, ctx: RunContext) -> list[str]:
         environment_record = self._ready_record()
         runtime_config = ctx.object_record.get("runtime_config") or {"mode": "venv"}
+        write_worker_runtime_marker(
+            WorkerRuntimePlan(
+                runtime=LEGACY_WORKER_RUNTIME,
+                reason=REASON_DOCKER_RUNTIME,
+                marker_path=ctx.worker_runtime_marker_path,
+            )
+        )
         if self.docker_pool.can_use(ctx.run_dir, ctx.workdir):
             self._pool_record = self.docker_pool.ensure_container(
                 object_record=ctx.object_record,
@@ -211,13 +259,17 @@ class DockerBackend:
 
     def run_state_fields(self) -> dict[str, Any]:
         environment_record = self._ready_record()
-        return {
+        fields = {
             "resolved_runtime": environment_record["image_tag"],
             "runtime_backend": self.mode,
             "image_tag": environment_record["image_tag"],
             "container_id": self._container_id,
             "resolved_python": None,
         }
+        substitution = environment_record_interpreter_substitution(environment_record)
+        if substitution is not None:
+            fields["interpreter_substitution"] = substitution
+        return fields
 
     def after_prepare(self, object_record: dict[str, Any]) -> None:
         if self.docker_pool.should_prewarm:
@@ -235,10 +287,7 @@ class DockerBackend:
     ) -> bool:
         artifacts = result_payload.get("artifacts")
         if isinstance(artifacts, dict):
-            result_payload["artifacts"] = {
-                name: str(ctx.artifacts_dir / name)
-                for name in artifacts
-            }
+            result_payload["artifacts"] = {name: str(ctx.artifacts_dir / name) for name in artifacts}
         return True
 
     def _ready_record(self) -> dict[str, Any]:
@@ -248,10 +297,7 @@ class DockerBackend:
 
     def _assert_docker_available_for_run(self) -> None:
         if shutil.which("docker") is None:
-            raise RuntimeError(
-                "Docker runtime is selected, but the docker executable is not "
-                "available on PATH"
-            )
+            raise RuntimeError("Docker runtime is selected, but the docker executable is not available on PATH")
         try:
             completed = subprocess.run(
                 ["docker", "info"],
@@ -263,8 +309,7 @@ class DockerBackend:
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
-                "Docker runtime is selected, but `docker info` did not respond "
-                "within 15 seconds"
+                "Docker runtime is selected, but `docker info` did not respond within 15 seconds"
             ) from exc
         if completed.returncode != 0:
             detail = (completed.stderr or "").strip()
@@ -364,4 +409,32 @@ def worker_args(
         remote_signatures_path,
         "--daemon-url",
         daemon_url,
+    ]
+
+
+def spl_free_runner_args(
+    *,
+    module_path: str,
+    module_name: str,
+    entrypoint: str,
+    input_path: str,
+    result_path: str,
+    artifacts_dir: str,
+    env_spec_path: str,
+) -> list[str]:
+    return [
+        "--module",
+        module_path,
+        "--module-name",
+        module_name,
+        "--entrypoint",
+        entrypoint,
+        "--input",
+        input_path,
+        "--result",
+        result_path,
+        "--artifacts-dir",
+        artifacts_dir,
+        "--env-spec",
+        env_spec_path,
     ]

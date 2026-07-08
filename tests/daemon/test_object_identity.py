@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import random
 import re
 import shutil
@@ -145,10 +146,7 @@ def _unique_columns(conn: sqlite3.Connection, table: str) -> set[tuple[str, ...]
     for index in conn.execute(f"PRAGMA index_list({table})").fetchall():
         if not index[2]:
             continue
-        columns = tuple(
-            row[2]
-            for row in conn.execute(f"PRAGMA index_info({index[1]})").fetchall()
-        )
+        columns = tuple(row[2] for row in conn.execute(f"PRAGMA index_info({index[1]})").fetchall())
         uniques.add(columns)
     return uniques
 
@@ -322,14 +320,8 @@ def test_fresh_schema_uses_canonical_object_and_content_identity(tmp_path) -> No
     store.close()
 
     with sqlite3.connect(tmp_path / "daemon.sqlite3") as conn:
-        object_columns = {
-            row[1]: row
-            for row in conn.execute("PRAGMA table_xinfo(objects)").fetchall()
-        }
-        version_columns = {
-            row[1]
-            for row in conn.execute("PRAGMA table_xinfo(object_versions)").fetchall()
-        }
+        object_columns = {row[1]: row for row in conn.execute("PRAGMA table_xinfo(objects)").fetchall()}
+        version_columns = {row[1] for row in conn.execute("PRAGMA table_xinfo(object_versions)").fetchall()}
 
         assert {"owner_id", "library", "source_object_name"} <= set(object_columns)
         assert object_columns["remote_name"][6] != 0
@@ -385,10 +377,7 @@ def test_object_identity_migration_is_idempotent_and_restorable(tmp_path) -> Non
     restored_path = tmp_path / "restored.sqlite3"
     shutil.copy2(backups[0], restored_path)
     with sqlite3.connect(restored_path) as conn:
-        old_columns = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(objects)").fetchall()
-        }
+        old_columns = {row[1] for row in conn.execute("PRAGMA table_info(objects)").fetchall()}
         assert "owner_id" not in old_columns
         assert "remote_name" in old_columns
 
@@ -423,9 +412,7 @@ def test_object_identity_migration_dedupes_existing_content_versions(tmp_path) -
             """,
             (*row, created_at),
         )
-        conn.execute(
-            "UPDATE objects SET current_version_id = 'version2' WHERE id = 'object1'"
-        )
+        conn.execute("UPDATE objects SET current_version_id = 'version2' WHERE id = 'object1'")
 
     store = RegistryStore(tmp_path)
     try:
@@ -443,11 +430,7 @@ def test_object_identity_migration_dedupes_existing_content_versions(tmp_path) -
 def test_metadata_yaml_rejects_python_object_tags_before_execution(tmp_path) -> None:
     marker = tmp_path / "metadata-loader-executed"
     payload = "__import__('pathlib').Path({!r}).write_text('pwned')".format(str(marker))
-    yaml_text = (
-        "!!python/object/apply:builtins.eval\n"
-        "- |\n"
-        f"  {payload}\n"
-    )
+    yaml_text = f"!!python/object/apply:builtins.eval\n- |\n  {payload}\n"
 
     with pytest.raises(yaml.constructor.ConstructorError, match="python/object/apply"):
         metadata_module.extract_metadata(yaml_text, "demo_obj")
@@ -528,9 +511,7 @@ def test_identical_republish_property_keeps_one_version(
             for _ in range(publish_count)
         ]
 
-        assert {record["version_id"] for record in records} == {
-            records[0]["version_id"]
-        }
+        assert {record["version_id"] for record in records} == {records[0]["version_id"]}
         assert len(store.list_object_versions("demo_obj")) == 1
     finally:
         store.close()
@@ -644,9 +625,7 @@ def test_server_mirror_exposes_source_name_aliases(tmp_path) -> None:
         assert record["remote_identity"]["local_registry_name"] == "demo_obj"
         assert record["remote_identity"]["source_object_name"] == "demo_obj"
         assert record["remote_identity"]["storage_remote_name"] == "demo_obj"
-        assert record["compatibility"]["remote_name"]["replacement"] == (
-            "source_object_name"
-        )
+        assert record["compatibility"]["remote_name"]["replacement"] == ("source_object_name")
 
         resolved = store.get_object(
             "demo_obj",
@@ -657,6 +636,103 @@ def test_server_mirror_exposes_source_name_aliases(tmp_path) -> None:
         assert resolved["display_name"] == "demo_obj"
         with pytest.raises(KeyError, match="object is not registered"):
             store.get_object("demo_obj")
+    finally:
+        store.close()
+
+
+def test_dedup_keeps_remote_version_link_stable_on_ping_pong_sync(
+    tmp_path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        store.register_env("default", sys.executable)
+        first = store.register_object(
+            "demo_obj",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML,
+            owner_id="admin1",
+            library="default",
+            origin="server",
+            remote_owner_id="admin1",
+            remote_object_id="remote-object-1",
+            remote_version_id="remote-version-1",
+            source_object_name="demo_obj",
+        )
+
+        caplog.set_level(logging.WARNING, logger="spl.daemon.repositories.object")
+        second = store.register_object(
+            "demo_obj",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML,
+            owner_id="admin1",
+            library="default",
+            origin="server",
+            remote_owner_id="admin1",
+            remote_object_id="remote-object-1",
+            remote_version_id="remote-version-2",
+            source_object_name="demo_obj",
+        )
+
+        current = store.get_object_version(first["version_id"], include_yaml=False)
+        assert second["version_id"] == first["version_id"]
+        assert current["content_hash"] == first["content_hash"]
+        assert current["remote_version_id"] == "remote-version-1"
+        assert store.get_object_by_remote_version("remote-version-2") is None
+
+        warnings = [
+            record for record in caplog.records if getattr(record, "spl_event", None) == "remote_version_id_collision"
+        ]
+        assert len(warnings) == 1
+        warning_message = warnings[0].getMessage()
+        assert "remote-version-1" in warning_message
+        assert "remote-version-2" in warning_message
+        assert getattr(warnings[0], "remote_version_id_collision") == {
+            "event": "remote_version_id_collision",
+            "object_id": first["id"],
+            "content_hash": first["content_hash"],
+            "existing_remote_version_id": "remote-version-1",
+            "incoming_remote_version_id": "remote-version-2",
+        }
+    finally:
+        store.close()
+
+
+def test_dedup_fills_missing_remote_version_link(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        store.register_env("default", sys.executable)
+        first = store.register_object(
+            "demo_obj",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML,
+            owner_id="admin1",
+            library="default",
+            origin="server",
+            remote_owner_id="admin1",
+            remote_object_id="remote-object-1",
+            source_object_name="demo_obj",
+        )
+        second = store.register_object(
+            "demo_obj",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML,
+            owner_id="admin1",
+            library="default",
+            origin="server",
+            remote_owner_id="admin1",
+            remote_object_id="remote-object-1",
+            remote_version_id="remote-version-1",
+            source_object_name="demo_obj",
+        )
+
+        current = store.get_object_version(first["version_id"], include_yaml=False)
+        assert second["version_id"] == first["version_id"]
+        assert current["remote_version_id"] == "remote-version-1"
     finally:
         store.close()
 
@@ -845,9 +921,7 @@ def test_connected_publish_adopts_existing_server_object_identity(tmp_path) -> N
             yaml_text=FUNCTION_YAML_V2,
         )
 
-        assert ExistingObjectServerClient.requests == [
-            ("order_pipeline", "owner-1", "default")
-        ]
+        assert ExistingObjectServerClient.requests == [("order_pipeline", "owner-1", "default")]
         assert first["owner_id"] == "owner-1"
         assert first["object_remote_object_id"] == "remote-object-1"
         assert first["source_object_id"] == "remote-object-1"
@@ -1054,15 +1128,9 @@ def test_connect_reconcile_records_conflict_for_divergent_same_version(tmp_path)
         )
         assert len(versions) == 1
         assert versions[0]["remote_version_id"] is None
-        conflicts = [
-            event
-            for event in store.list_pending_sync_events()
-            if event["kind"] == "object_conflict"
-        ]
+        conflicts = [event for event in store.list_pending_sync_events() if event["kind"] == "object_conflict"]
         assert len(conflicts) == 1
-        assert conflicts[0]["payload"]["canonical_name"] == (
-            "owner-1/default/order_pipeline"
-        )
+        assert conflicts[0]["payload"]["canonical_name"] == ("owner-1/default/order_pipeline")
         objects = store.list_objects()
         assert objects["order_pipeline"]["conflicts"]
     finally:
@@ -1508,22 +1576,14 @@ def test_object_decomposition_persists_functions_nodes_and_links(tmp_path) -> No
             "default",
             yaml_text=FUNCTION_YAML,
         )
-        function_decomposition = store.get_object_decomposition(
-            function_record["version_id"]
-        )
+        function_decomposition = store.get_object_decomposition(function_record["version_id"])
 
-        assert [item["name"] for item in function_decomposition["functions"]] == [
-            "demo_obj"
-        ]
+        assert [item["name"] for item in function_decomposition["functions"]] == ["demo_obj"]
         assert function_decomposition["functions"][0]["role"] == "top_level"
         assert function_decomposition["nodes"] == []
         assert function_decomposition["links"] == []
 
-        bundle_path = (
-            Path(__file__).resolve().parent
-            / "demo"
-            / "_bundle.yaml"
-        )
+        bundle_path = Path(__file__).resolve().parent / "demo" / "_bundle.yaml"
         pipeline_record = store.register_object(
             "test_pipeline",
             "test_pipeline",

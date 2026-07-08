@@ -183,9 +183,7 @@ def test_server_connection_manager_persists_pending_connection_when_offline(
     )
 
     connection = result["connection"]
-    expected_machine_id = (
-        f"machine-{hashlib.sha256(machine_token.encode('utf-8')).hexdigest()[:12]}"
-    )
+    expected_machine_id = f"machine-{hashlib.sha256(machine_token.encode('utf-8')).hexdigest()[:12]}"
     assert result == {
         "connected": False,
         "offline": True,

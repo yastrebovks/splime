@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from spl.daemon.routes._helpers import RouteContext
+from spl.daemon.routes._helpers import RouteContext, RouteRegistrar
 
 
 def register_remote_routes(
-    app: Any,
+    app: RouteRegistrar,
     *,
     runtime: Any,
     context: RouteContext,

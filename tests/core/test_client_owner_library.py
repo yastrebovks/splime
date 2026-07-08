@@ -691,9 +691,7 @@ def test_spl_client_library_management_methods_use_daemon() -> None:
     fake_daemon.server_connected = True
     client._daemon = fake_daemon
 
-    assert client.libraries(include_accessible=False) == [
-        {"slug": "risk", "accessible": False}
-    ]
+    assert client.libraries(include_accessible=False) == [{"slug": "risk", "accessible": False}]
     assert client.library.create(
         "risk",
         display_name="Risk",

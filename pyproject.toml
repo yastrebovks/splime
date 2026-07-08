@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "splime"
-version = "0.2.5"
+version = "0.3.0"
 
 description = "Reuse Python functions across projects without rewriting or redeploying them."
 readme = "README.md"
@@ -55,7 +55,9 @@ test = [
   "pyexpect",
   "mypy==2.1.0",
   "pytest==9.1.1",
-  "pytest-asyncio"]
+  "pytest-asyncio",
+  "ruff==0.15.20",
+  "types-PyYAML==6.0.12.20260518"]
 
 docs = [
   "sphinx==9.1.0",
@@ -105,7 +107,7 @@ strict = true
 line-length = 120
 
 [tool.ruff.lint]
-select = []
+select = ["E4", "E7", "E9", "F"]
 ignore = []
 
 # Scoped, justified allowances. These silence rules only where the pattern is
@@ -125,6 +127,9 @@ ignore = []
     "S603", "S607", "S310", "S104", "S108", "S608",
     "S105", "B904", "S110", "S112", "N818",
 ]
+# The legacy worker must repair sys.path before importing packages that can be
+# shadowed by the daemon checkout injected through PYTHONPATH.
+"src/spl/daemon/worker.py" = ["E402"]
 # The CLI and daemon bootstrap print to the console on purpose.
 "src/spl/daemon/cli.py" = ["T201"]
 "src/spl/daemon/server.py" = ["T201"]

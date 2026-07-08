@@ -1,11 +1,14 @@
-import socket
 import asyncio
+import socket
 import sys
 import stat
+import threading
+import time
 
 import pytest
 
 import spl._client as spl_client_module
+import spl.daemon_client as daemon_client
 import spl.daemon.repositories.env as env_repository
 from spl import SPLClient
 import spl.daemon.server as daemon_server
@@ -159,6 +162,50 @@ def _reserved_port_with_free_next() -> tuple[socket.socket, int]:
     raise RuntimeError("could not find a reserved port with a free next port")
 
 
+def _serve_app_in_thread(app, port: int) -> tuple[threading.Event, threading.Thread, list[BaseException]]:
+    stop_event = threading.Event()
+    errors: list[BaseException] = []
+
+    def _run() -> None:
+        from hypercorn.asyncio import serve as hypercorn_serve
+        from hypercorn.config import Config
+
+        async def _shutdown_trigger() -> None:
+            while not stop_event.is_set():
+                await asyncio.sleep(0.05)
+
+        async def _serve() -> None:
+            config = Config()
+            config.bind = [f"127.0.0.1:{port}"]
+            config.use_reloader = False
+            config.accesslog = None
+            config.errorlog = None
+            await hypercorn_serve(app, config, shutdown_trigger=_shutdown_trigger)
+
+        try:
+            asyncio.run(_serve())
+        except BaseException as exc:  # pragma: no cover - re-raised by caller.
+            errors.append(exc)
+
+    thread = threading.Thread(target=_run, name=f"spl-test-daemon-{port}", daemon=True)
+    thread.start()
+
+    client = Client(f"http://127.0.0.1:{port}", api_token=app.api_token)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if errors:
+            raise RuntimeError("test daemon failed to start") from errors[0]
+        try:
+            client.health()
+            return stop_event, thread, errors
+        except Exception:
+            time.sleep(0.05)
+
+    stop_event.set()
+    thread.join(timeout=2.0)
+    raise TimeoutError(f"test daemon did not start on port {port}")
+
+
 def test_clients_accept_explicit_daemon_port() -> None:
     assert Client(daemon_port=9876).base_url == "http://127.0.0.1:9876"
     assert SPLClient(daemon_port=9877)._daemon.base_url == "http://127.0.0.1:9877"
@@ -294,9 +341,7 @@ def test_register_env_route_rejects_explicit_missing_python(tmp_path) -> None:
         )
 
         assert status == 400
-        assert body == {
-            "error": f"python executable is not found: {missing_python.absolute()}"
-        }
+        assert body == {"error": f"python executable is not found: {missing_python.absolute()}"}
     finally:
         _shutdown_app(app)
         store.close()
@@ -325,6 +370,57 @@ def test_select_daemon_port_can_require_the_exact_port() -> None:
                 preferred_port,
                 auto_port=False,
             )
+
+
+def test_blocking_remote_node_http_call_is_not_capped_by_default_timeout(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    reserved, port = _reserved_port_with_free_next()
+    reserved.close()
+    store = RegistryStore(tmp_path)
+    app = None
+    server_thread: threading.Thread | None = None
+    stop_server: threading.Event | None = None
+    server_errors: list[BaseException] = []
+    try:
+        app = create_app(store, api_token="test-token")
+
+        def slow_remote_node(
+            node: dict[str, object],
+            *,
+            kwargs: dict[str, object],
+            timeout_seconds: float | None = None,
+        ) -> dict[str, object]:
+            _ = node
+            time.sleep(0.15)
+            return {
+                "value": int(kwargs["value"]) + 1,
+                "timeout_seconds": timeout_seconds,
+            }
+
+        monkeypatch.setattr(app.runtime, "run_remote_node", slow_remote_node)
+        stop_server, server_thread, server_errors = _serve_app_in_thread(app, port)
+        monkeypatch.setattr(daemon_client, "DEFAULT_HTTP_TIMEOUT_SECONDS", 0.01)
+
+        result = Client(f"http://127.0.0.1:{port}", api_token=app.api_token).run_remote_node(
+            {"name": "slow_remote"},
+            kwargs={"value": 6},
+        )
+
+        assert result == {"value": 7, "timeout_seconds": None}
+    finally:
+        if stop_server is not None:
+            stop_server.set()
+        if server_thread is not None:
+            server_thread.join(timeout=5.0)
+        _shutdown_app(app)
+        store.close()
+
+    if server_thread is not None and server_thread.is_alive():
+        raise AssertionError("test daemon thread did not stop")
+    if server_errors:
+        raise AssertionError("test daemon failed") from server_errors[0]
 
 
 def test_health_and_diagnostics_include_sync_retry_visibility(tmp_path) -> None:
@@ -358,6 +454,44 @@ def test_health_and_diagnostics_include_sync_retry_visibility(tmp_path) -> None:
         store.close()
 
 
+def test_health_reports_server_origin_interpreter_substitutions(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        env = store.register_env("spl_core", sys.executable)
+        record = store.register_object(
+            "demo_obj",
+            "demo_obj",
+            "spl_core",
+            yaml_text=REMOTE_FUNCTION_YAML,
+            origin="server",
+            remote_owner_id="owner-1",
+            remote_object_id="remote-object-1",
+            remote_version_id="remote-version-1",
+            source_object_name="demo_obj",
+        )
+        author_python = str(tmp_path / "author-python")
+        with store._lock, store._conn:  # noqa: SLF001 - regression seeds server provenance.
+            store._conn.execute(
+                "UPDATE object_versions SET env_python = ? WHERE id = ?",
+                (author_python, record["version_id"]),
+            )
+
+        app = create_app(store)
+        status, health = _json_from_app(app, "/health")
+
+        assert status == 200
+        substitutions = health["interpreter_substitutions"]
+        assert substitutions["count"] == 1
+        assert substitutions["items"][0]["object"] == "demo_obj"
+        assert substitutions["items"][0]["authored_python"] == author_python
+        assert substitutions["items"][0]["resolved_python"] == env["python"]
+        assert substitutions["items"][0]["reason"] == "local_env"
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
 def test_signature_can_describe_pipeline_internal_function(tmp_path) -> None:
     store = RegistryStore(tmp_path)
     app = None
@@ -384,9 +518,7 @@ def test_signature_can_describe_pipeline_internal_function(tmp_path) -> None:
         assert body["kind"] == "function"
         assert body["function"] == "inner_add"
         assert body["parent_object"]["name"] == "demo_pipeline"
-        assert body["call"]["example"].startswith(
-            'result = client.call("demo_pipeline", '
-        )
+        assert body["call"]["example"].startswith('result = client.call("demo_pipeline", ')
         assert 'function="inner_add"' in body["call"]["example"]
         assert [item["name"] for item in body["inputs"]] == ["a", "b"]
         assert inline_status == 200
@@ -911,9 +1043,7 @@ def test_remote_decomposition_resolves_through_daemon_proxy(tmp_path, monkeypatc
         )
 
         assert status == 200
-        assert body["decomposition"]["nodes"] == [
-            {"node_id": "node-1", "kind": "remote"}
-        ]
+        assert body["decomposition"]["nodes"] == [{"node_id": "node-1", "kind": "remote"}]
         assert body["remote"] == {
             "url": "https://splime.io/api",
             "name": "demo_traktorist_pipeline",

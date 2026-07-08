@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from spl.daemon.interpreter_visibility import python_minor_mismatch
 from spl.daemon_client import default_daemon_home
 
 OK = "ok"
@@ -95,10 +96,7 @@ class DoctorReport:
         counts = {status: 0 for status in (OK, WARN, FAIL, SKIP)}
         for check in self.checks:
             counts[check.status] = counts.get(check.status, 0) + 1
-        lines.append(
-            f"\n{counts[OK]} ok, {counts[WARN]} warnings, "
-            f"{counts[FAIL]} failures, {counts[SKIP]} skipped"
-        )
+        lines.append(f"\n{counts[OK]} ok, {counts[WARN]} warnings, {counts[FAIL]} failures, {counts[SKIP]} skipped")
         return "\n".join(lines)
 
 
@@ -113,6 +111,7 @@ def run_doctor(
     checks = [
         check_python(),
         check_venv_tooling(),
+        check_uv_builder(),
         check_daemon_home(home_path),
         check_disk_space(home_path),
     ]
@@ -120,6 +119,7 @@ def run_doctor(
     checks.append(daemon_check)
     checks.append(check_server_connection(health))
     checks.append(check_environment_builds(health))
+    checks.append(check_interpreter_substitutions(health))
     checks.append(check_docker())
     return DoctorReport(checks=checks)
 
@@ -160,6 +160,24 @@ def check_venv_tooling() -> CheckResult:
         name="venv tooling",
         status=OK,
         detail="venv and ensurepip are available",
+    )
+
+
+def check_uv_builder() -> CheckResult:
+    """Report whether fast uv-based environment builds are available."""
+
+    uv_path = shutil.which("uv")
+    if uv_path is not None:
+        return CheckResult(
+            name="uv builder",
+            status=OK,
+            detail=f"available ({uv_path})",
+        )
+    return CheckResult(
+        name="uv builder",
+        status=WARN,
+        detail="uv not found; environment builds will use the slower pip fallback",
+        hint="install uv on PATH to enable fast relocatable environment builds",
     )
 
 
@@ -296,10 +314,7 @@ def check_environment_builds(health: dict[str, Any] | None) -> CheckResult:
             name=name,
             status=WARN,
             detail=f"{failed} of {total} cached builds failed",
-            hint=(
-                "inspect with `env-build-list`, then retry with "
-                "`env-build-rebuild <spec_hash>`"
-            ),
+            hint=("inspect with `env-build-list`, then retry with `env-build-rebuild <spec_hash>`"),
         )
     if total == 0:
         return CheckResult(
@@ -308,6 +323,53 @@ def check_environment_builds(health: dict[str, Any] | None) -> CheckResult:
             detail="no cached builds yet (they appear after the first run)",
         )
     return CheckResult(name=name, status=OK, detail=f"{total} cached builds healthy")
+
+
+def check_interpreter_substitutions(health: dict[str, Any] | None) -> CheckResult:
+    """Warn when server-origin objects resolve to a different Python minor."""
+
+    name = "interpreter versions"
+    if health is None:
+        return CheckResult(
+            name=name,
+            status=SKIP,
+            detail="skipped: daemon is not reachable",
+        )
+    substitutions = health.get("interpreter_substitutions") or {}
+    raw_items = substitutions.get("items") if isinstance(substitutions, dict) else []
+    items = raw_items if isinstance(raw_items, list) else []
+    mismatches = [
+        item
+        for item in items
+        if isinstance(item, dict)
+        and (
+            item.get("minor_mismatch")
+            or python_minor_mismatch(
+                item.get("authored_python_version"),
+                item.get("resolved_python_version"),
+            )
+        )
+    ]
+    if not mismatches:
+        return CheckResult(
+            name=name,
+            status=OK,
+            detail="no server-origin Python minor substitutions detected",
+        )
+
+    examples = ", ".join(
+        str(item.get("display_name") or item.get("object") or item.get("version_id") or "server object")
+        for item in mismatches[:3]
+    )
+    return CheckResult(
+        name=name,
+        status=WARN,
+        detail=(
+            f"{len(mismatches)} server-origin object version(s) resolve to a different Python minor"
+            + (f": {examples}" if examples else "")
+        ),
+        hint="register a matching local env or republish after validating behavior on this Python version",
+    )
 
 
 def _as_int(value: Any) -> int:
@@ -356,10 +418,7 @@ def check_docker() -> CheckResult:
         return CheckResult(
             name=name,
             status=WARN,
-            detail=(
-                "installed, but the Docker daemon is not reachable"
-                + (f": {detail[0]}" if detail else "")
-            ),
+            detail=("installed, but the Docker daemon is not reachable" + (f": {detail[0]}" if detail else "")),
             hint="start Docker Desktop (or dockerd) before running Docker objects",
         )
     return CheckResult(name=name, status=OK, detail=f"available ({docker_path})")

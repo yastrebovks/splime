@@ -10,6 +10,19 @@ from spl.daemon.environment_base import EnvironmentManagerProtocol
 if TYPE_CHECKING:
     from spl.daemon.runtime_backend import RunContext
 
+__all__ = [
+    "DockerEnvironmentBuilderProtocol",
+    "DockerEnvironmentManagerProtocol",
+    "DockerPoolRunnerProtocol",
+    "EnvironmentManagerProtocol",
+    "HeartbeatsProtocol",
+    "RuntimeBackendProtocol",
+    "ServerClientFactoryProtocol",
+    "ServerClientProtocol",
+    "ServerConnectionsProtocol",
+    "SyncVisibilityProtocol",
+]
+
 
 class DockerEnvironmentManagerProtocol(EnvironmentManagerProtocol, Protocol):
     """Docker environment manager surface used by the daemon runtime."""

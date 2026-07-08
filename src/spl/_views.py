@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from html import escape
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 _EMPTY = "—"
 _DEFAULT_CELL_LIMIT = 72
@@ -40,10 +40,7 @@ def details_to_text(title: str, rows: list[tuple[str, Any]]) -> str:
     if not rows:
         return f"{title}: (empty)"
     width = max(len(label) for label, _ in rows)
-    body = "\n".join(
-        f"{label.ljust(width)}: {preview(value, limit=100)}"
-        for label, value in rows
-    )
+    body = "\n".join(f"{label.ljust(width)}: {preview(value, limit=100)}" for label, value in rows)
     return f"{title}:\n{body}"
 
 
@@ -57,10 +54,7 @@ def details_to_html(title: str, rows: list[tuple[str, Any]]) -> str:
         "</tr>"
         for label, value in rows
     )
-    return (
-        f"<div><b>{escape(title)}</b>"
-        f"<table><tbody>{body}</tbody></table></div>"
-    )
+    return f"<div><b>{escape(title)}</b><table><tbody>{body}</tbody></table></div>"
 
 
 def table_to_text(
@@ -72,19 +66,10 @@ def table_to_text(
 
     if not rows:
         return f"{title}: (empty)"
-    normalized = [
-        {header: preview(row.get(header), limit=_DEFAULT_CELL_LIMIT) for header in headers}
-        for row in rows
-    ]
-    widths = {
-        header: max(len(header), *(len(row[header]) for row in normalized))
-        for header in headers
-    }
+    normalized = [{header: preview(row.get(header), limit=_DEFAULT_CELL_LIMIT) for header in headers} for row in rows]
+    widths = {header: max(len(header), *(len(row[header]) for row in normalized)) for header in headers}
     head = "  ".join(header.ljust(widths[header]) for header in headers)
-    body = "\n".join(
-        "  ".join(row[header].ljust(widths[header]) for header in headers)
-        for row in normalized
-    )
+    body = "\n".join("  ".join(row[header].ljust(widths[header]) for header in headers) for row in normalized)
     return f"{title} ({len(rows)}):\n{head}\n{body}"
 
 
@@ -95,16 +80,9 @@ def table_to_html(
 ) -> str:
     """Render a compact HTML table for notebooks."""
 
-    head = "".join(
-        f"<th style='text-align:left'>{escape(header)}</th>" for header in headers
-    )
+    head = "".join(f"<th style='text-align:left'>{escape(header)}</th>" for header in headers)
     body = "".join(
-        "<tr>"
-        + "".join(
-            f"<td>{escape(preview(row.get(header), limit=160))}</td>"
-            for header in headers
-        )
-        + "</tr>"
+        "<tr>" + "".join(f"<td>{escape(preview(row.get(header), limit=160))}</td>" for header in headers) + "</tr>"
         for row in rows
     )
     return (
@@ -169,7 +147,7 @@ class CompactDict(dict[str, Any]):
 
     @property
     def raw(self) -> dict[str, Any]:
-        return plain(dict(self))
+        return cast(dict[str, Any], plain(dict(self)))
 
     def _summary_rows(self) -> list[tuple[str, Any]]:
         return [(str(key), value) for key, value in list(self.items())[:8]]
@@ -193,7 +171,7 @@ class CompactList(list[Any]):
 
     @property
     def raw(self) -> list[Any]:
-        return plain(list(self))
+        return cast(list[Any], plain(list(self)))
 
     def _table_rows(self) -> list[dict[str, Any]]:
         return [{"item": item} for item in self]
@@ -209,32 +187,27 @@ class HealthView(CompactDict):
     title = "health"
 
     def _summary_rows(self) -> list[tuple[str, Any]]:
-        counts = self.get("counts") if isinstance(self.get("counts"), Mapping) else {}
-        db = self.get("db") if isinstance(self.get("db"), Mapping) else {}
-        server = self.get("server") if isinstance(self.get("server"), Mapping) else {}
-        builds = (
-            self.get("environment_builds")
-            if isinstance(self.get("environment_builds"), Mapping)
-            else {}
-        )
-        by_status = builds.get("by_status") if isinstance(builds, Mapping) else {}
+        counts_value = self.get("counts")
+        db_value = self.get("db")
+        server_value = self.get("server")
+        builds_value = self.get("environment_builds")
+        counts = counts_value if isinstance(counts_value, Mapping) else {}
+        db = db_value if isinstance(db_value, Mapping) else {}
+        server = server_value if isinstance(server_value, Mapping) else {}
+        builds = builds_value if isinstance(builds_value, Mapping) else {}
+        by_status_value = builds.get("by_status")
+        by_status = by_status_value if isinstance(by_status_value, Mapping) else {}
         return [
             ("ok", self.get("ok")),
             ("db", f"{db.get('path', _EMPTY)} (exists={db.get('exists', _EMPTY)})"),
             ("server", "connected" if server.get("connected") else "offline"),
             (
                 "counts",
-                ", ".join(
-                    f"{key}={value}" for key, value in sorted(counts.items())
-                )
-                or _EMPTY,
+                ", ".join(f"{key}={value}" for key, value in sorted(counts.items())) or _EMPTY,
             ),
             (
                 "env builds",
-                ", ".join(
-                    f"{key}={value}" for key, value in sorted((by_status or {}).items())
-                )
-                or _EMPTY,
+                ", ".join(f"{key}={value}" for key, value in sorted((by_status or {}).items())) or _EMPTY,
             ),
         ]
 
@@ -424,7 +397,8 @@ class SignatureView(CompactDict):
     title = "signature"
 
     def _summary_rows(self) -> list[tuple[str, Any]]:
-        call = self.get("call") if isinstance(self.get("call"), Mapping) else {}
+        call_value = self.get("call")
+        call = call_value if isinstance(call_value, Mapping) else {}
         return [
             ("name", _name(self)),
             ("kind", self.get("kind")),
@@ -489,11 +463,7 @@ class OutputListView(CompactList):
             ports = item.get("ports")
             output_type = None
             if isinstance(ports, list) and ports:
-                output_type = ",".join(
-                    str(port.get("type") or "Any")
-                    for port in ports
-                    if isinstance(port, Mapping)
-                )
+                output_type = ",".join(str(port.get("type") or "Any") for port in ports if isinstance(port, Mapping))
             rows.append(
                 {
                     "name": item.get("name"),
@@ -510,7 +480,8 @@ class DecompositionView(CompactDict):
     headers = ("node", "kind", "inputs", "outputs")
 
     def _node_rows(self) -> list[dict[str, Any]]:
-        nodes = self.get("nodes") if isinstance(self.get("nodes"), list) else []
+        nodes_value = self.get("nodes")
+        nodes = nodes_value if isinstance(nodes_value, list) else []
         return [
             {
                 "node": item.get("name") or item.get("function") or item.get("node_id"),
@@ -528,11 +499,7 @@ class DecompositionView(CompactDict):
             ("functions", len(self.get("functions") or [])),
             ("links", len(self.get("links") or [])),
         ]
-        return (
-            details_to_text(self.title, rows)
-            + "\n\n"
-            + table_to_text("nodes", self.headers, self._node_rows())
-        )
+        return details_to_text(self.title, rows) + "\n\n" + table_to_text("nodes", self.headers, self._node_rows())
 
     def _repr_html_(self) -> str:
         rows = [

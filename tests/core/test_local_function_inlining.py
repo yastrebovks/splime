@@ -43,22 +43,31 @@ def _forget_package(name: str) -> None:
 def test_inlines_local_functions_across_deep_files(tmp_path: Path) -> None:
     src = tmp_path / "src"
     package = _make_package(src, "proj_inline")
-    _write(package / "leaf.py", """
+    _write(
+        package / "leaf.py",
+        """
         def leaf(value):
             return value * 2
-    """)
-    _write(package / "mid.py", """
+    """,
+    )
+    _write(
+        package / "mid.py",
+        """
         from proj_inline.leaf import leaf as lf
 
         def mid(value):
             return lf(value) + 1
-    """)
-    _write(package / "top.py", """
+    """,
+    )
+    _write(
+        package / "top.py",
+        """
         from proj_inline.mid import mid
 
         def top(value):
             return mid(value) + 10
-    """)
+    """,
+    )
 
     out = tmp_path / "top.spl.yaml"
     sys.path.insert(0, str(src))
@@ -110,23 +119,28 @@ def test_unpublished_dev_package_is_gutted_not_referenced(tmp_path: Path) -> Non
 
     src = tmp_path / "src"
     package = _make_package(src, "devpkg")
-    _write(package / "helpers.py", """
+    _write(
+        package / "helpers.py",
+        """
         def boost(v):
             return v * 2
-    """)
-    _write(package / "core.py", """
+    """,
+    )
+    _write(
+        package / "core.py",
+        """
         from devpkg.helpers import boost
 
         def reticulate(value):
             return boost(value) + 100
-    """)
+    """,
+    )
 
     # Simulate an editable install: a .dist-info on the path makes the package a
     # registered distribution even though its source stays in the working tree.
     dist_info = src / "devpkg-9.9.9.dist-info"
     dist_info.mkdir()
-    (dist_info / "METADATA").write_text(
-        "Metadata-Version: 2.1\nName: devpkg\nVersion: 9.9.9\n", encoding="utf-8")
+    (dist_info / "METADATA").write_text("Metadata-Version: 2.1\nName: devpkg\nVersion: 9.9.9\n", encoding="utf-8")
     (dist_info / "top_level.txt").write_text("devpkg\n", encoding="utf-8")
     (dist_info / "RECORD").write_text("", encoding="utf-8")
 
@@ -162,12 +176,15 @@ def test_third_party_functions_are_imported_not_inlined(tmp_path: Path) -> None:
     package = _make_package(src, "proj_pip")
     # `yaml` (PyYAML) is a real installed distribution and `safe_load` is a
     # plain Python function -- exactly the case we must NOT inline.
-    _write(package / "use.py", """
+    _write(
+        package / "use.py",
+        """
         from yaml import safe_load
 
         def use(text):
             return safe_load(text)
-    """)
+    """,
+    )
 
     out = tmp_path / "use.spl.yaml"
     sys.path.insert(0, str(src))

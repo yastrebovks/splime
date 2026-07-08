@@ -8,7 +8,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from spl.daemon.storage_base import (
     RepositoryBase,
@@ -17,6 +17,8 @@ from spl.daemon.storage_base import (
     utc_now,
     validate_name,
 )
+
+ENVIRONMENT_BUILDERS = {"pip", "uv"}
 
 
 class EnvRepository(RepositoryBase):
@@ -54,9 +56,7 @@ class EnvRepository(RepositoryBase):
         """Return registered environments keyed by name."""
 
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM envs ORDER BY name"
-            ).fetchall()
+            rows = self._conn.execute("SELECT * FROM envs ORDER BY name").fetchall()
         return {row["name"]: dict(row) for row in rows}
 
     def get_env(self, name: str) -> dict[str, Any]:
@@ -88,9 +88,7 @@ class EnvRepository(RepositoryBase):
         """Return known environment builds, newest updates first."""
 
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM environment_builds ORDER BY updated_at DESC"
-            ).fetchall()
+            rows = self._conn.execute("SELECT * FROM environment_builds ORDER BY updated_at DESC").fetchall()
         return [self._environment_build_row_to_record(row) for row in rows]
 
     def upsert_environment_build(
@@ -106,6 +104,7 @@ class EnvRepository(RepositoryBase):
         python_path: Path,
         install_log_path: Path,
         status: str,
+        builder: str | None = None,
         runtime_type: str = "venv",
         image_tag: str | None = None,
         base_image: str | None = None,
@@ -113,6 +112,7 @@ class EnvRepository(RepositoryBase):
         """Create or update an environment build record."""
 
         spec_hash = validate_name(spec_hash)
+        builder = self._normalize_builder(builder)
         now = utc_now()
         with self._lock, self._conn:
             existing = self._conn.execute(
@@ -126,9 +126,9 @@ class EnvRepository(RepositoryBase):
                     spec_hash, base_python, python_version, distributions_json,
                     runtime_packages_json, spec_json, venv_path, python_path,
                     status, created_at, updated_at, install_log_path,
-                    runtime_type, image_tag, base_image
+                    builder, runtime_type, image_tag, base_image
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(spec_hash) DO UPDATE SET
                     base_python = excluded.base_python,
                     python_version = excluded.python_version,
@@ -140,6 +140,7 @@ class EnvRepository(RepositoryBase):
                     status = excluded.status,
                     updated_at = excluded.updated_at,
                     install_log_path = excluded.install_log_path,
+                    builder = excluded.builder,
                     runtime_type = excluded.runtime_type,
                     image_tag = excluded.image_tag,
                     base_image = excluded.base_image
@@ -157,6 +158,7 @@ class EnvRepository(RepositoryBase):
                     created_at,
                     now,
                     str(install_log_path),
+                    builder,
                     runtime_type,
                     image_tag,
                     base_image,
@@ -218,18 +220,16 @@ class EnvRepository(RepositoryBase):
         *,
         python_version: str | None = None,
         runtime_packages: list[dict[str, Any]] | None = None,
+        builder: str | None = None,
     ) -> str:
         """Return a stable hash for an interpreter and dependency list."""
 
+        builder = self._normalize_builder(builder)
         normalized = sorted(
             [
                 {
                     "package": str(item["package"]).casefold(),
-                    "version": (
-                        None
-                        if item.get("version") is None
-                        else str(item["version"])
-                    ),
+                    "version": (None if item.get("version") is None else str(item["version"])),
                 }
                 for item in distributions
             ],
@@ -242,11 +242,7 @@ class EnvRepository(RepositoryBase):
             [
                 {
                     "package": str(item["package"]).casefold(),
-                    "version": (
-                        None
-                        if item.get("version") is None
-                        else str(item["version"])
-                    ),
+                    "version": (None if item.get("version") is None else str(item["version"])),
                 }
                 for item in runtime
             ],
@@ -258,7 +254,17 @@ class EnvRepository(RepositoryBase):
             "distributions": normalized,
             "runtime_packages": runtime_normalized,
         }
+        if builder is not None:
+            spec["builder"] = builder
         return hashlib.sha256(json_dumps(spec).encode("utf-8")).hexdigest()
+
+    def _normalize_builder(self, builder: str | None) -> str | None:
+        if builder is None:
+            return None
+        builder = str(builder)
+        if builder not in ENVIRONMENT_BUILDERS:
+            raise ValueError(f"environment builder must be one of: {', '.join(sorted(ENVIRONMENT_BUILDERS))}")
+        return builder
 
     def environment_runtime_packages_for(
         self,
@@ -278,7 +284,7 @@ class EnvRepository(RepositoryBase):
     def _cached_python_version(self, python: str) -> str:
         path = str(Path(python).expanduser().absolute())
         if path in self._python_version_cache:
-            return self._python_version_cache[path]
+            return cast(str, self._python_version_cache[path])
         try:
             completed = subprocess.run(
                 [path, "--version"],
@@ -310,6 +316,7 @@ class EnvRepository(RepositoryBase):
             "finished_at": row["finished_at"],
             "error": row["error"],
             "install_log_path": row["install_log_path"],
+            "builder": row["builder"],
             "runtime_type": row["runtime_type"],
             "image_tag": row["image_tag"],
             "base_image": row["base_image"],

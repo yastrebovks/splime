@@ -1,5 +1,6 @@
 from dataclasses import dataclass
-from typing import Any, Callable, Generator
+from collections.abc import Iterable
+from typing import Any, Callable
 
 from spl.core.ir.common import DBase, mk_dispatcher
 
@@ -7,28 +8,28 @@ from spl.core.ir.common import DBase, mk_dispatcher
 ir_parse = mk_dispatcher()
 
 
-@dataclass(frozen = True)
+@dataclass(frozen=True)
 class _branch:  # noqa: N801
     x: Any
-    mk_root: Callable[[], Any]
-    mk_dependencies: Callable[[int], Generator[Any]] = lambda _: iter(int, int())
+    mk_root: Callable[[], DBase]
+    mk_dependencies: Callable[[int], Iterable[Any]] = lambda _: ()
 
 
-@dataclass(frozen = True)
+@dataclass(frozen=True)
 class _attach:  # noqa: N801
-    dependencies: Generator[Any]
+    dependencies: Iterable[Any]
 
 
-@dataclass(frozen = True)
+@dataclass(frozen=True)
 class _set_cursor:  # noqa: N801
-    cursor: str
+    cursor: Any | None
 
 
-def stack_push(stack, *vs):
+def stack_push(stack: list[Any], *vs: Any) -> list[Any]:
     return [*stack, *vs]
 
 
-def stack_pop(stack):
+def stack_pop(stack: list[Any]) -> tuple[list[Any], Any]:
     match stack:
         case []:
             raise StopIteration()
@@ -36,14 +37,16 @@ def stack_pop(stack):
         case [*new_stack, v]:
             return (new_stack, v)
 
+    raise AssertionError("unreachable stack pattern")
+
 
 def get_top_level_deps(frame_offset: int, xs: list[Any]) -> list[tuple[DBase, list[DBase]]]:
-    refs_root = {}
-    refs_dependencies = {}
+    refs_root: dict[Any, DBase] = {}
+    refs_dependencies: dict[Any, list[Any]] = {}
 
-    cursor = None
+    cursor: Any | None = None
 
-    stack = []
+    stack: list[Any] = []
     for x in xs:
         stack = stack_push(stack, ir_parse(x))
 
@@ -73,7 +76,4 @@ def get_top_level_deps(frame_offset: int, xs: list[Any]) -> list[tuple[DBase, li
                     refs_dependencies[cursor] = [*refs_dependencies[cursor], x]
 
     # python 3.7+ maintains order of insertions, we rely on it
-    return list(zip(
-        refs_root.values(),
-        refs_dependencies.values(),
-        strict = True))
+    return list(zip(refs_root.values(), refs_dependencies.values(), strict=True))

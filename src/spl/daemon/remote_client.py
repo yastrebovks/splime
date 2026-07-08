@@ -6,12 +6,12 @@ import hashlib
 import http.client
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request
 
-from spl._http import urlopen_verified, verified_https_context
+from spl._http import DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS, urlopen_verified, verified_https_context
 
 DEFAULT_SERVER_URL = "https://splime.io/api"
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60.0
@@ -29,6 +29,14 @@ class ServerClientError(RuntimeError):
         self.status_code = status_code
         self.message = message
         super().__init__(f"{status_code}: {message}")
+
+
+def _as_json_dict(value: Any) -> dict[str, Any]:
+    return cast(dict[str, Any], value)
+
+
+def _as_json_list(value: Any) -> list[dict[str, Any]]:
+    return cast(list[dict[str, Any]], value)
 
 
 class ServerClient:
@@ -93,18 +101,12 @@ class ServerClient:
                 message = json.loads(raw).get("error", raw)
             except json.JSONDecodeError:
                 message = raw
-            message = (
-                f"central SPL daemon server returned {exc.code} at "
-                f"{self.base_url}{path}: {message}"
-            )
+            message = f"central SPL daemon server returned {exc.code} at {self.base_url}{path}: {message}"
             raise ServerClientError(exc.code, message) from exc
         except URLError as exc:
             raise ServerClientError(
                 502,
-                (
-                    "central SPL daemon server is not reachable at "
-                    f"{self.base_url}: {exc.reason}"
-                ),
+                (f"central SPL daemon server is not reachable at {self.base_url}: {exc.reason}"),
             ) from exc
 
         if not raw:
@@ -114,26 +116,20 @@ class ServerClient:
     def _bytes_request(self, path: str) -> bytes:
         request = Request(f"{self.base_url}{path}", headers=self._headers())
         try:
-            with urlopen_verified(request) as response:
-                return response.read()
+            with urlopen_verified(request, timeout=DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS) as response:
+                return cast(bytes, response.read())
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")
             try:
                 message = json.loads(raw).get("error", raw)
             except json.JSONDecodeError:
                 message = raw
-            message = (
-                f"central SPL daemon server returned {exc.code} at "
-                f"{self.base_url}{path}: {message}"
-            )
+            message = f"central SPL daemon server returned {exc.code} at {self.base_url}{path}: {message}"
             raise ServerClientError(exc.code, message) from exc
         except URLError as exc:
             raise ServerClientError(
                 502,
-                (
-                    "central SPL daemon server is not reachable at "
-                    f"{self.base_url}: {exc.reason}"
-                ),
+                (f"central SPL daemon server is not reachable at {self.base_url}: {exc.reason}"),
             ) from exc
 
     def _streaming_file_request(
@@ -150,15 +146,16 @@ class ServerClient:
         host = url.hostname
         if not host:
             raise ServerClientError(400, f"invalid server URL: {self.base_url}")
+        connection: http.client.HTTPConnection
         if url.scheme == "https":
             connection = http.client.HTTPSConnection(
                 host,
                 url.port,
-                timeout=300,
+                timeout=DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS,
                 context=verified_https_context(),
             )
         else:
-            connection = http.client.HTTPConnection(host, url.port, timeout=300)
+            connection = http.client.HTTPConnection(host, url.port, timeout=DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS)
         request_path = f"{url.path.rstrip('/')}{path}"
         request_headers = {
             **self._headers(),
@@ -178,10 +175,7 @@ class ServerClient:
         except OSError as exc:
             raise ServerClientError(
                 502,
-                (
-                    "central SPL daemon server is not reachable at "
-                    f"{self.base_url}: {exc}"
-                ),
+                (f"central SPL daemon server is not reachable at {self.base_url}: {exc}"),
             )
         finally:
             connection.close()
@@ -193,10 +187,7 @@ class ServerClient:
                 message = raw
             raise ServerClientError(
                 response.status,
-                (
-                    f"central SPL daemon server returned {response.status} at "
-                    f"{self.base_url}{path}: {message}"
-                ),
+                (f"central SPL daemon server returned {response.status} at {self.base_url}{path}: {message}"),
             )
         if not raw:
             return None
@@ -218,7 +209,7 @@ class ServerClient:
             payload["machine_id"] = machine_id
         if heartbeat_interval_seconds is not None:
             payload["heartbeat_interval_seconds"] = heartbeat_interval_seconds
-        return self._json_request("POST", "/connections/connect", payload)
+        return _as_json_dict(self._json_request("POST", "/connections/connect", payload))
 
     def heartbeat_connection(
         self,
@@ -233,66 +224,78 @@ class ServerClient:
         }
         if heartbeat_interval_seconds is not None:
             payload["heartbeat_interval_seconds"] = heartbeat_interval_seconds
-        return self._json_request("POST", "/connections/heartbeat", payload)
+        return _as_json_dict(self._json_request("POST", "/connections/heartbeat", payload))
 
     def current_connection(self) -> dict[str, Any]:
-        return self._json_request("GET", "/connections/current")
+        return _as_json_dict(self._json_request("GET", "/connections/current"))
 
     def disconnect_machine(self) -> dict[str, Any]:
-        return self._json_request("POST", "/connections/disconnect")
+        return _as_json_dict(self._json_request("POST", "/connections/disconnect"))
 
     def list_machines(self) -> list[dict[str, Any]]:
-        return self._json_request("GET", "/machines")
+        return _as_json_list(self._json_request("GET", "/machines"))
 
     def list_libraries(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
         query = {"include_accessible": "1" if include_accessible else "0"}
-        return self._json_request(
-            "GET",
-            f"/libraries?{urlencode(query)}",
-            auth="user" if self.user_token else "machine",
+        return _as_json_list(
+            self._json_request(
+                "GET",
+                f"/libraries?{urlencode(query)}",
+                auth="user" if self.user_token else "machine",
+            )
         )
 
     def create_library(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._json_request("POST", "/libraries", payload, auth="user")
+        return _as_json_dict(self._json_request("POST", "/libraries", payload, auth="user"))
 
     def get_library(self, library_ref: str) -> dict[str, Any]:
-        return self._json_request(
-            "GET",
-            f"/libraries/{quote(library_ref)}",
-            auth="user" if self.user_token else "machine",
+        return _as_json_dict(
+            self._json_request(
+                "GET",
+                f"/libraries/{quote(library_ref)}",
+                auth="user" if self.user_token else "machine",
+            )
         )
 
     def update_library(self, library_ref: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._json_request(
-            "PUT",
-            f"/libraries/{quote(library_ref)}",
-            payload,
-            auth="user",
+        return _as_json_dict(
+            self._json_request(
+                "PUT",
+                f"/libraries/{quote(library_ref)}",
+                payload,
+                auth="user",
+            )
         )
 
     def delete_library(self, library_ref: str) -> dict[str, Any]:
         raise NotImplementedError(LIBRARY_DELETE_UNSUPPORTED_MESSAGE)
 
     def list_library_grants(self, library_ref: str) -> list[dict[str, Any]]:
-        return self._json_request(
-            "GET",
-            f"/libraries/{quote(library_ref)}/grants",
-            auth="user",
+        return _as_json_list(
+            self._json_request(
+                "GET",
+                f"/libraries/{quote(library_ref)}/grants",
+                auth="user",
+            )
         )
 
     def grant_library(self, library_ref: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._json_request(
-            "POST",
-            f"/libraries/{quote(library_ref)}/grants",
-            payload,
-            auth="user",
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/libraries/{quote(library_ref)}/grants",
+                payload,
+                auth="user",
+            )
         )
 
     def revoke_library_grant(self, library_ref: str, grantee: str) -> dict[str, Any]:
-        return self._json_request(
-            "POST",
-            f"/libraries/{quote(library_ref)}/grants/{quote(grantee)}/revoke",
-            auth="user",
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/libraries/{quote(library_ref)}/grants/{quote(grantee)}/revoke",
+                auth="user",
+            )
         )
 
     def add_library_reference(
@@ -300,11 +303,13 @@ class ServerClient:
         library_ref: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        return self._json_request(
-            "POST",
-            f"/libraries/{quote(library_ref)}/references",
-            payload,
-            auth="user",
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/libraries/{quote(library_ref)}/references",
+                payload,
+                auth="user",
+            )
         )
 
     def copy_object_into_library(
@@ -312,18 +317,22 @@ class ServerClient:
         library_ref: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        return self._json_request(
-            "POST",
-            f"/libraries/{quote(library_ref)}/copies",
-            payload,
-            auth="user",
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/libraries/{quote(library_ref)}/copies",
+                payload,
+                auth="user",
+            )
         )
 
     def remove_library_entry(self, library_ref: str, name: str) -> dict[str, Any]:
-        return self._json_request(
-            "DELETE",
-            f"/libraries/{quote(library_ref)}/entries/{quote(name)}",
-            auth="user",
+        return _as_json_dict(
+            self._json_request(
+                "DELETE",
+                f"/libraries/{quote(library_ref)}/entries/{quote(name)}",
+                auth="user",
+            )
         )
 
     def list_objects(
@@ -340,13 +349,10 @@ class ServerClient:
             query["view"] = "summary"
         suffix = f"?{urlencode(query)}" if query else ""
         if owner_id:
-            path = (
-                f"/owners/{quote(owner_id)}/libraries/"
-                f"{quote(library or 'default')}/objects"
-            )
+            path = f"/owners/{quote(owner_id)}/libraries/{quote(library or 'default')}/objects"
         else:
             path = "/objects"
-        return self._json_request("GET", f"{path}{suffix}")
+        return _as_json_list(self._json_request("GET", f"{path}{suffix}"))
 
     def latest_machine_library_snapshot(
         self,
@@ -355,9 +361,11 @@ class ServerClient:
         include_yaml: bool = False,
     ) -> dict[str, Any]:
         suffix = "?include_yaml=1" if include_yaml else ""
-        return self._json_request(
-            "GET",
-            f"/machines/{quote(machine_id)}/library-snapshots/latest{suffix}",
+        return _as_json_dict(
+            self._json_request(
+                "GET",
+                f"/machines/{quote(machine_id)}/library-snapshots/latest{suffix}",
+            )
         )
 
     def get_object(
@@ -378,13 +386,10 @@ class ServerClient:
             query.append(urlencode({"library": library}))
         suffix = f"?{'&'.join(query)}" if query else ""
         if owner_id:
-            path = (
-                f"/owners/{quote(owner_id)}/libraries/"
-                f"{quote(library or 'default')}/objects/{quote(name_or_id)}"
-            )
+            path = f"/owners/{quote(owner_id)}/libraries/{quote(library or 'default')}/objects/{quote(name_or_id)}"
         else:
             path = f"/objects/{quote(name_or_id)}"
-        return self._json_request("GET", f"{path}{suffix}")
+        return _as_json_dict(self._json_request("GET", f"{path}{suffix}"))
 
     def object_signature(
         self,
@@ -410,7 +415,7 @@ class ServerClient:
             )
         else:
             path = f"/objects/{quote(name_or_id)}/signature"
-        return self._json_request("GET", f"{path}{suffix}")
+        return _as_json_dict(self._json_request("GET", f"{path}{suffix}"))
 
     def list_object_versions(
         self,
@@ -433,9 +438,11 @@ class ServerClient:
             )
         else:
             path = f"/objects/{quote(name_or_id)}/versions"
-        return self._json_request(
-            "GET",
-            f"{path}{suffix}",
+        return _as_json_list(
+            self._json_request(
+                "GET",
+                f"{path}{suffix}",
+            )
         )
 
     def sync(
@@ -447,41 +454,43 @@ class ServerClient:
         events: list[dict[str, Any]],
         capabilities: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self._json_request(
-            "POST",
-            "/sync",
-            {
-                "connection_id": connection_id,
-                "machine_id": machine_id,
-                "heartbeat_interval_seconds": heartbeat_interval_seconds,
-                "capabilities": capabilities or {},
-                "events": events,
-            },
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                "/sync",
+                {
+                    "connection_id": connection_id,
+                    "machine_id": machine_id,
+                    "heartbeat_interval_seconds": heartbeat_interval_seconds,
+                    "capabilities": capabilities or {},
+                    "events": events,
+                },
+            )
         )
 
     def get_remote_run(self, run_id: str) -> dict[str, Any]:
-        return self._json_request("GET", f"/remote-runs/{quote(run_id)}")
+        return _as_json_dict(self._json_request("GET", f"/remote-runs/{quote(run_id)}"))
 
     def list_artifacts(self, run_id: str) -> list[dict[str, Any]]:
-        return self._json_request("GET", f"/remote-runs/{quote(run_id)}/artifacts")
+        return _as_json_list(self._json_request("GET", f"/remote-runs/{quote(run_id)}/artifacts"))
 
     def upload_artifact(self, run_id: str, name: str, path: str | Path) -> dict[str, Any]:
         artifact_path = Path(path)
-        return self._streaming_file_request(
-            "PUT",
-            f"/remote-runs/{quote(run_id)}/artifacts/{quote(name)}",
-            artifact_path,
-            headers={
-                "Content-Type": "application/octet-stream",
-                "X-SPL-Artifact-Sha256": _file_sha256(artifact_path),
-                "X-SPL-Artifact-Size": str(artifact_path.stat().st_size),
-            },
+        return _as_json_dict(
+            self._streaming_file_request(
+                "PUT",
+                f"/remote-runs/{quote(run_id)}/artifacts/{quote(name)}",
+                artifact_path,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "X-SPL-Artifact-Sha256": _file_sha256(artifact_path),
+                    "X-SPL-Artifact-Size": str(artifact_path.stat().st_size),
+                },
+            )
         )
 
     def artifact_bytes(self, run_id: str, name: str) -> bytes:
-        return self._bytes_request(
-            f"/remote-runs/{quote(run_id)}/artifacts/{quote(name)}"
-        )
+        return self._bytes_request(f"/remote-runs/{quote(run_id)}/artifacts/{quote(name)}")
 
     def download_artifact(self, run_id: str, name: str, target: str | Path) -> Path:
         target_path = Path(target)

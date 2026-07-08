@@ -7,13 +7,13 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
-from spl.daemon.routes._helpers import RouteContext
+from spl.daemon.routes._helpers import RouteContext, RouteRegistrar
 from spl.daemon.run_progress import environment_progress
 from spl.daemon.store import validate_name
 
 
 def register_run_routes(
-    app: Any,
+    app: RouteRegistrar,
     *,
     runtime: Any,
     context: RouteContext,
@@ -70,11 +70,7 @@ def register_run_routes(
     @route_errors
     async def get_remote_run(run_id: str) -> Any:
         credentials = runtime._require_connected_server_credentials()
-        return json_response(
-            runtime._server_client_for_credentials(credentials).get_remote_run(
-                validate_name(run_id)
-            )
-        )
+        return json_response(runtime._server_client_for_credentials(credentials).get_remote_run(validate_name(run_id)))
 
     @app.get("/runs/<run_id>")
     @route_errors

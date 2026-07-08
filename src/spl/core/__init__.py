@@ -16,9 +16,4 @@ import spl.core.entities.scalar  # noqa: F401
 from spl.core.entities.node_remote import NodeRemote
 from spl.core.ir.utils import spl_export_to_dir, spl_export_to_file, spl_import_from_file
 
-__all__ = [
-    'NodeRemote',
-    'spl_export_to_dir',
-    'spl_export_to_file',
-    'spl_import_from_file'
-]
+__all__ = ["NodeRemote", "spl_export_to_dir", "spl_export_to_file", "spl_import_from_file"]

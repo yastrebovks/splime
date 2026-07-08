@@ -89,9 +89,7 @@ class RegistryStore:
                 self.server_connections._migrate_server_connection_secrets_locked
             ),
             backfill_object_kinds_locked=self.objects._backfill_object_kinds_locked,
-            backfill_object_decomposition_locked=(
-                self.objects._backfill_object_decomposition_locked
-            ),
+            backfill_object_decomposition_locked=(self.objects._backfill_object_decomposition_locked),
         )
 
     def close(self) -> None:
@@ -133,6 +131,7 @@ class RegistryStore:
         python_path: Path,
         install_log_path: Path,
         status: str,
+        builder: str | None = None,
         runtime_type: str = "venv",
         image_tag: str | None = None,
         base_image: str | None = None,
@@ -148,6 +147,7 @@ class RegistryStore:
             python_path=python_path,
             install_log_path=install_log_path,
             status=status,
+            builder=builder,
             runtime_type=runtime_type,
             image_tag=image_tag,
             base_image=base_image,
@@ -177,12 +177,14 @@ class RegistryStore:
         *,
         python_version: str | None = None,
         runtime_packages: list[dict[str, Any]] | None = None,
+        builder: str | None = None,
     ) -> str:
         return self.envs.environment_spec_hash_for(
             base_python,
             distributions,
             python_version=python_version,
             runtime_packages=runtime_packages,
+            builder=builder,
         )
 
     def environment_runtime_packages_for(

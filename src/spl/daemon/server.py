@@ -48,6 +48,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -55,7 +56,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from urllib.parse import urlparse, urlunparse
 from uuid import uuid4
 
@@ -65,6 +66,7 @@ from spl.daemon.environment import EnvironmentBuildError
 from spl.daemon.environment import EnvironmentManager as VenvEnvironmentManager
 from spl.daemon.environment_base import EnvironmentManagerProtocol
 from spl.daemon.heartbeat_service import HeartbeatService
+from spl.daemon.interpreter_visibility import environment_record_interpreter_substitution
 from spl.daemon.remote_client import (
     ServerClient,
     ServerClientError,
@@ -82,6 +84,10 @@ from spl.daemon.runtime_backend import (
     RunContext,
     RuntimeBackendRegistry,
     RuntimeBackendServices,
+)
+from spl.daemon.spl_free_generator import (
+    LEGACY_WORKER_RUNTIME,
+    read_worker_runtime_marker,
 )
 from spl.daemon.runtime_dependencies import (
     DockerEnvironmentManagerProtocol,
@@ -113,6 +119,7 @@ from spl.daemon_client import (
     generate_daemon_api_token,
     write_daemon_endpoint,
 )
+from spl.daemon.worker_runtime_marker import WORKER_RUNTIME_MARKER_FILE
 
 LOCAL_RUN_TEXT_ARTIFACT_MAX_BYTES = 256 * 1024
 LOCAL_RUN_TEXT_ARTIFACT_EXTENSIONS = {
@@ -137,6 +144,7 @@ DEFAULT_INLINE_REMOTE_ARTIFACT_TOTAL_MAX_BYTES = int(
         str(20 * 1024 * 1024),
     )
 )
+LOGGER = logging.getLogger(__name__)
 
 
 EnvironmentManagerFactory = Callable[..., EnvironmentManagerProtocol]
@@ -244,28 +252,18 @@ class DaemonRuntime:
         sync_visibility: SyncVisibilityProtocol | None = None,
         server_connections: ServerConnectionsProtocol | None = None,
         heartbeat_service: HeartbeatsProtocol | None = None,
-        server_client_factory: ServerClientFactoryProtocol = (
-            _default_server_client_factory
-        ),
-        environment_manager_factory: EnvironmentManagerFactory = (
-            _default_environment_manager_factory
-        ),
+        server_client_factory: ServerClientFactoryProtocol = (_default_server_client_factory),
+        environment_manager_factory: EnvironmentManagerFactory = (_default_environment_manager_factory),
         docker_environment_manager_factory: DockerEnvironmentManagerFactory = (
             _default_docker_environment_manager_factory
         ),
         docker_pool_factory: DockerPoolFactory = _default_docker_pool_factory,
-        runtime_backend_registry_factory: RuntimeBackendRegistryFactory = (
-            _default_runtime_backend_registry_factory
-        ),
-        sync_visibility_factory: SyncVisibilityFactory = (
-            _default_sync_visibility_factory
-        ),
+        runtime_backend_registry_factory: RuntimeBackendRegistryFactory = (_default_runtime_backend_registry_factory),
+        sync_visibility_factory: SyncVisibilityFactory = (_default_sync_visibility_factory),
         server_connection_manager_factory: ServerConnectionManagerFactory = (
             _default_server_connection_manager_factory
         ),
-        heartbeat_service_factory: HeartbeatServiceFactory = (
-            _default_heartbeat_service_factory
-        ),
+        heartbeat_service_factory: HeartbeatServiceFactory = (_default_heartbeat_service_factory),
     ):
         self.store = store
         self.auto_build_envs = auto_build_envs
@@ -280,9 +278,8 @@ class DaemonRuntime:
             store,
             **manager_kwargs,
         )
-        self.docker_environment_manager = (
-            docker_environment_manager
-            or docker_environment_manager_factory(store, **manager_kwargs)
+        self.docker_environment_manager = docker_environment_manager or docker_environment_manager_factory(
+            store, **manager_kwargs
         )
         self.docker_pool = docker_pool or docker_pool_factory(
             store,
@@ -297,15 +294,10 @@ class DaemonRuntime:
             docker_environment_manager=self.docker_environment_manager,
             docker_pool=self.docker_pool,
         )
-        self.runtime_backends = runtime_backends or runtime_backend_registry_factory(
-            backend_services
-        )
+        self.runtime_backends = runtime_backends or runtime_backend_registry_factory(backend_services)
         self.sync_visibility = sync_visibility or sync_visibility_factory(store)
         self._server_sync_lock = threading.Lock()
-        self.server_connections = (
-            server_connections
-            or server_connection_manager_factory(store, server_client_factory)
-        )
+        self.server_connections = server_connections or server_connection_manager_factory(store, server_client_factory)
         self.heartbeat_service = heartbeat_service or heartbeat_service_factory(
             store,
             self.sync_once,
@@ -411,9 +403,7 @@ class DaemonRuntime:
         self,
         credentials: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self.server_connections.require_connected_server_credentials(
-            credentials
-        )
+        return self.server_connections.require_connected_server_credentials(credentials)
 
     def _remote_connection_snapshot(self, connection: dict[str, Any]) -> dict[str, Any]:
         """Build a server-like connection payload from the local cached row."""
@@ -482,6 +472,8 @@ class DaemonRuntime:
             "name": version["name"],
             "entrypoint": version["entrypoint"],
             "env": version["env"],
+            "env_python": version.get("env_python"),
+            "env_python_version": version.get("env_python_version"),
             "kind": version.get("kind") or version.get("type") or "unknown",
             "description": version.get("description") or "",
             "version_label": version.get("version_label"),
@@ -508,11 +500,7 @@ class DaemonRuntime:
         """Link local objects to the connected owner's server namespace."""
 
         credentials = credentials or self.store.current_server_connection_credentials()
-        if (
-            credentials is None
-            or not credentials.get("remote_connection_id")
-            or not credentials.get("owner_id")
-        ):
+        if credentials is None or not credentials.get("remote_connection_id") or not credentials.get("owner_id"):
             return {"skipped": True, "reason": "not_connected"}
 
         owner_id = validate_name(str(credentials["owner_id"]))
@@ -534,9 +522,7 @@ class DaemonRuntime:
             )
             report["objects"].append(object_report)
             report["conflicts"].extend(object_report.get("conflicts") or [])
-            report["pending_sync_events"].extend(
-                object_report.get("pending_sync_events") or []
-            )
+            report["pending_sync_events"].extend(object_report.get("pending_sync_events") or [])
         return report
 
     def _reconcile_connected_object(
@@ -601,17 +587,9 @@ class DaemonRuntime:
             owner_id=owner_id,
             library=library,
         )
-        local_by_hash = {
-            item["content_hash"]: item
-            for item in local_versions
-            if item.get("content_hash")
-        }
+        local_by_hash = {item["content_hash"]: item for item in local_versions if item.get("content_hash")}
         local_by_version = {int(item["version"]): item for item in local_versions}
-        remote_hashes = {
-            item.get("content_hash")
-            for item in remote_versions
-            if item.get("content_hash")
-        }
+        remote_hashes = {item.get("content_hash") for item in remote_versions if item.get("content_hash")}
         remote_max_version = max(
             (int(item.get("version") or 0) for item in remote_versions),
             default=0,
@@ -633,9 +611,7 @@ class DaemonRuntime:
                 if already_imported is not None:
                     # Steady state: the version is linked locally already —
                     # no conflict is possible and no YAML round-trip happens.
-                    report["imported_versions"].append(
-                        already_imported["version_id"]
-                    )
+                    report["imported_versions"].append(already_imported["version_id"])
                     continue
             local_at_version = local_by_version.get(remote_number)
             if (
@@ -714,9 +690,7 @@ class DaemonRuntime:
                 remote_number = remote_version.get("version")
                 fetched = server.get_object(
                     remote_version["name"],
-                    version=(
-                        int(remote_number) if remote_number is not None else None
-                    ),
+                    version=(int(remote_number) if remote_number is not None else None),
                     include_yaml=True,
                     owner_id=owner_id,
                     library=library,
@@ -725,10 +699,7 @@ class DaemonRuntime:
                     remote_version = {**remote_version, **fetched}
                     yaml_text = remote_version.get("yaml")
         if not yaml_text:
-            raise RuntimeError(
-                "server did not return YAML for object version "
-                f"{remote_version.get('version_id')}"
-            )
+            raise RuntimeError(f"server did not return YAML for object version {remote_version.get('version_id')}")
         return self.register_object(
             remote_version["name"],
             remote_version["entrypoint"],
@@ -772,9 +743,7 @@ class DaemonRuntime:
             version["version_id"],
             include_yaml=True,
         )
-        return self.store.enqueue_object_version_sync_once(
-            self._object_sync_payload_for_version(full_version)
-        )
+        return self.store.enqueue_object_version_sync_once(self._object_sync_payload_for_version(full_version))
 
     def _record_object_reconcile_conflict(
         self,
@@ -820,6 +789,8 @@ class DaemonRuntime:
                     "version_label": record.get("version_label"),
                     "entrypoint": record["entrypoint"],
                     "env": record.get("env"),
+                    "env_python": record.get("env_python"),
+                    "env_python_version": record.get("env_python_version"),
                     "kind": record.get("kind") or record.get("type") or "unknown",
                     "origin": record.get("origin") or "local",
                     "yaml_sha256": record["yaml_sha256"],
@@ -827,10 +798,8 @@ class DaemonRuntime:
                     "metadata": record.get("metadata") or {},
                     "distributions": record.get("distributions") or [],
                     "runtime_config": record.get("runtime_config") or {"mode": "venv"},
-                    "remote_owner_id": record.get("remote_owner_id")
-                    or record.get("object_remote_owner_id"),
-                    "remote_object_id": record.get("remote_object_id")
-                    or record.get("object_remote_object_id"),
+                    "remote_owner_id": record.get("remote_owner_id") or record.get("object_remote_owner_id"),
+                    "remote_object_id": record.get("remote_object_id") or record.get("object_remote_object_id"),
                     "remote_version_id": record.get("remote_version_id"),
                 }
             )
@@ -969,7 +938,7 @@ class DaemonRuntime:
         normalized = self._normalize_remote_ref(ref)
         cached = self.store.get_remote_signature(normalized)
         if cached is not None and cached["status"] == "resolved" and not force:
-            return cached["signature"]
+            return cast(dict[str, Any], cached["signature"])
 
         try:
             credentials = self._credentials_for_remote_ref(normalized)
@@ -988,8 +957,7 @@ class DaemonRuntime:
                 "requested_version": normalized.get("version"),
                 "version_id": signature.get("version_id"),
                 "owner_id": signature.get("owner_id"),
-                "library": normalized.get("library")
-                or (signature.get("library") or {}).get("slug"),
+                "library": normalized.get("library") or (signature.get("library") or {}).get("slug"),
             }
             self.store.save_remote_signature(normalized, signature)
             return signature
@@ -1024,8 +992,7 @@ class DaemonRuntime:
                 "function": normalized.get("function"),
                 "requested_version": normalized.get("version"),
                 "owner_id": normalized.get("owner_id") or record.get("owner_id"),
-                "library": normalized.get("library")
-                or (record.get("library") or {}).get("slug"),
+                "library": normalized.get("library") or (record.get("library") or {}).get("slug"),
                 "version_id": record.get("version_id"),
                 "object_id": record.get("id"),
             },
@@ -1034,12 +1001,7 @@ class DaemonRuntime:
     def _normalize_remote_ref(self, ref: dict[str, Any]) -> dict[str, Any]:
         raw_url = str(ref.get("server_url") or ref.get("url") or "").rstrip("/")
         url, path_owner, path_library = self._split_remote_url(raw_url)
-        object_name = str(
-            ref.get("object_name")
-            or ref.get("object")
-            or ref.get("name")
-            or ""
-        )
+        object_name = str(ref.get("object_name") or ref.get("object") or ref.get("name") or "")
         raw_function = ref.get("function") or ref.get("entrypoint")
         if not object_name:
             raise ValueError("remote node requires object name")
@@ -1060,8 +1022,7 @@ class DaemonRuntime:
             "function": function,
             "version": ref.get("version"),
             "version_id": ref.get("version_id"),
-            "target_machine": ref.get("target_machine")
-            or ref.get("target_machine_id"),
+            "target_machine": ref.get("target_machine") or ref.get("target_machine_id"),
         }
 
     def _split_remote_url(self, raw_url: str) -> tuple[str, str | None, str | None]:
@@ -1110,8 +1071,7 @@ class DaemonRuntime:
         credentials = self._require_connected_server_credentials(credentials)
         if credentials["server_url"].rstrip("/") != ref["server_url"].rstrip("/"):
             raise KeyError(
-                "remote node points to a different server than the active "
-                f"daemon connection: {ref['server_url']}"
+                f"remote node points to a different server than the active daemon connection: {ref['server_url']}"
             )
         return credentials
 
@@ -1152,13 +1112,8 @@ class DaemonRuntime:
 
         object_name, function = split_object_function_ref(object_name, function)
         credentials = self._require_connected_server_credentials()
-        resolved_offline_policy = (
-            offline_policy
-            or (
-                "fail_fast"
-                if target_machine and target_machine != credentials["machine_id"]
-                else "queue"
-            )
+        resolved_offline_policy = offline_policy or (
+            "fail_fast" if target_machine and target_machine != credentials["machine_id"] else "queue"
         )
         if resolved_offline_policy not in {"queue", "wait", "fail_fast"}:
             raise ValueError("offline_policy must be 'queue', 'wait', or 'fail_fast'")
@@ -1194,18 +1149,14 @@ class DaemonRuntime:
             "kind": "remote_run_request",
             "payload": payload,
         }
-        if (
-            resolved_offline_policy == "fail_fast"
-            and target_machine
-            and target_machine != credentials["machine_id"]
-        ):
+        if resolved_offline_policy == "fail_fast" and target_machine and target_machine != credentials["machine_id"]:
             self._raise_if_target_machine_offline(credentials, target_machine)
         response = self.sync_once(extra_events=[event])
         for result in response.get("event_results", []):
             if result.get("event_id") == event_id:
                 if result.get("status") != "ok":
                     raise RuntimeError(result.get("error") or "remote run request failed")
-                return result["result"]
+                return cast(dict[str, Any], result["result"])
         raise RuntimeError("server did not acknowledge remote run request")
 
     def _raise_if_target_machine_offline(
@@ -1248,10 +1199,7 @@ class DaemonRuntime:
 
         credentials = self.store.current_server_connection_credentials()
         if credentials is None:
-            raise KeyError(
-                "object is not registered locally and active server connection "
-                f"is not found: {object_name}"
-            )
+            raise KeyError(f"object is not registered locally and active server connection is not found: {object_name}")
         credentials = self._require_connected_server_credentials(credentials)
 
         server = self._server_client_for_credentials(credentials)
@@ -1317,10 +1265,7 @@ class DaemonRuntime:
 
             yaml_text = remote_version.get("yaml")
             if not yaml_text:
-                raise RuntimeError(
-                    "server did not return YAML for object version "
-                    f"{remote_version.get('version_id')}"
-                )
+                raise RuntimeError(f"server did not return YAML for object version {remote_version.get('version_id')}")
             imported.append(
                 self.register_object(
                     remote_version["name"],
@@ -1344,6 +1289,10 @@ class DaemonRuntime:
             remote_version_id,
             include_yaml=False,
         )
+        if current_version is None and imported:
+            # Identical-content server versions dedupe to one local row.  A
+            # colliding remote_version_id is logged and intentionally not linked.
+            current_version = imported[-1]
         if current_version is None:
             raise KeyError(f"server object version was not imported: {remote_version_id}")
 
@@ -1410,10 +1359,7 @@ class DaemonRuntime:
             return None
         except KeyError as exc:
             message = str(exc)
-            if (
-                "active server connection is not found" in message
-                or "object is not registered on server" in message
-            ):
+            if "active server connection is not found" in message or "object is not registered on server" in message:
                 return None
             raise
         except ServerClientError as exc:
@@ -1497,18 +1443,13 @@ class DaemonRuntime:
             events = []
             if snapshot_event is not None:
                 events.append(snapshot_event)
-            events.extend([
-                {"id": item["id"], "kind": item["kind"], "payload": item["payload"]}
-                for item in pending
-            ])
+            events.extend([{"id": item["id"], "kind": item["kind"], "payload": item["payload"]} for item in pending])
             events.extend(extra_events or [])
 
             response = server.sync(
                 connection_id=credentials["remote_connection_id"],
                 machine_id=credentials["machine_id"],
-                heartbeat_interval_seconds=float(
-                    credentials["heartbeat_interval_seconds"]
-                ),
+                heartbeat_interval_seconds=float(credentials["heartbeat_interval_seconds"]),
                 events=events,
             )
 
@@ -1714,9 +1655,7 @@ class DaemonRuntime:
             if state["status"] in {"succeeded", "failed", "cancelled", "stale"}:
                 return state
             if timeout_seconds is not None and time.monotonic() - started > timeout_seconds:
-                raise TimeoutError(
-                    f"remote node run did not finish within {timeout_seconds} seconds"
-                )
+                raise TimeoutError(f"remote node run did not finish within {timeout_seconds} seconds")
             time.sleep(0.5)
 
     def run_remote_node(
@@ -1798,9 +1737,7 @@ class DaemonRuntime:
 
     def _remote_node_output_selector(self, signature: dict[str, Any]) -> str | None:
         selectors = [
-            item.get("selector")
-            for item in signature.get("outputs") or []
-            if item.get("selector") is not None
+            item.get("selector") for item in signature.get("outputs") or [] if item.get("selector") is not None
         ]
         selectors = [str(item) for item in selectors]
         if len(selectors) > 1:
@@ -1876,8 +1813,7 @@ class DaemonRuntime:
             metadata = self._artifact_file_metadata(path)
             inline_allowed = (
                 metadata["size"] <= DEFAULT_INLINE_REMOTE_ARTIFACT_MAX_BYTES
-                and inline_bytes + metadata["size"]
-                <= DEFAULT_INLINE_REMOTE_ARTIFACT_TOTAL_MAX_BYTES
+                and inline_bytes + metadata["size"] <= DEFAULT_INLINE_REMOTE_ARTIFACT_TOTAL_MAX_BYTES
             )
             if inline_allowed:
                 inline_bytes += metadata["size"]
@@ -1922,8 +1858,7 @@ class DaemonRuntime:
     ) -> None:
         if uploaded.get("name") != expected["name"]:
             raise RuntimeError(
-                "uploaded artifact name mismatch: "
-                f"expected {expected['name']}, got {uploaded.get('name')}"
+                f"uploaded artifact name mismatch: expected {expected['name']}, got {uploaded.get('name')}"
             )
         if int(uploaded.get("size", -1)) != int(expected["size"]):
             raise RuntimeError(
@@ -1994,11 +1929,7 @@ class DaemonRuntime:
                 function=function,
             )
         except KeyError as exc:
-            can_import = (
-                source == "auto"
-                and resolved_version_id is None
-                and "object is not registered" in str(exc)
-            )
+            can_import = source == "auto" and resolved_version_id is None and "object is not registered" in str(exc)
             if not can_import:
                 raise
             # No local fallback exists, so this second import attempt is strict:
@@ -2044,18 +1975,14 @@ class DaemonRuntime:
         stdout_path = run_dir / "stdout.txt"
         stderr_path = run_dir / "stderr.txt"
         worker_path = Path(__file__).with_name("worker.py")
+        spl_free_runner_path = Path(__file__).with_name("spl_free_runner.py")
+        worker_runtime_marker_path = run_dir / WORKER_RUNTIME_MARKER_FILE
 
         object_yaml_path.write_text(object_record["yaml"], encoding="utf-8")
         write_json(env_spec_path, object_record["distributions"])
         write_json(
             remote_signatures_path,
-            {
-                "nodes": [
-                    node
-                    for node in object_record.get("pipeline_nodes") or []
-                    if node.get("kind") == "remote"
-                ]
-            },
+            {"nodes": [node for node in object_record.get("pipeline_nodes") or [] if node.get("kind") == "remote"]},
         )
 
         self._update_local_run(
@@ -2066,12 +1993,10 @@ class DaemonRuntime:
             stderr_path=str(stderr_path),
         )
 
-        env = os.environ.copy()
-        env["PYTHONPATH"] = self._worker_pythonpath(env)
-
         timeout = self._read_timeout(input_path)
         workdir = Path(object_record.get("workdir") or str(run_dir))
         workdir.mkdir(parents=True, exist_ok=True)
+        generated_modules_dir = self.store.home / "generated-modules"
         ctx = RunContext(
             object_record=object_record,
             run_id=run_id,
@@ -2086,15 +2011,32 @@ class DaemonRuntime:
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             worker_path=worker_path,
+            spl_free_runner_path=spl_free_runner_path,
+            generated_modules_dir=generated_modules_dir,
+            worker_runtime_marker_path=worker_runtime_marker_path,
             entrypoint=state["entrypoint"],
             daemon_base_url=self.daemon_base_url,
         )
 
         try:
             backend = self.runtime_backends.backend_for(object_record)
+            environment_status = backend.status_for_object(object_record)
+            if environment_status.get("spec_hash"):
+                self._update_local_run(
+                    run_id,
+                    report_local_run=report_local_run,
+                    env_build_hash=environment_status["spec_hash"],
+                    runtime_build_hash=environment_status["spec_hash"],
+                )
             with backend:
                 environment_record = backend.ensure_ready(object_record)
                 command = backend.build_command(ctx)
+                worker_runtime = read_worker_runtime_marker(worker_runtime_marker_path)
+                self._log_worker_runtime(object_record, worker_runtime)
+                env = os.environ.copy()
+                if worker_runtime is not None and worker_runtime.get("worker_runtime") == LEGACY_WORKER_RUNTIME:
+                    env["PYTHONPATH"] = self._worker_pythonpath(env)
+                self._log_interpreter_substitution(object_record, environment_record)
                 self._update_local_run(
                     run_id,
                     report_local_run=report_local_run,
@@ -2187,6 +2129,35 @@ class DaemonRuntime:
             self.enqueue_local_run_update(state)
         return state
 
+    def _log_interpreter_substitution(
+        self,
+        object_record: dict[str, Any],
+        environment_record: dict[str, Any],
+    ) -> None:
+        substitution = environment_record_interpreter_substitution(environment_record)
+        if substitution is None:
+            return
+        payload = {
+            "event": "interpreter_substitution",
+            "object": object_record.get("name"),
+            "version": object_record.get("version"),
+            "version_id": object_record.get("version_id"),
+            "authored_python": substitution.get("authored_python"),
+            "authored_python_version": substitution.get("authored_python_version"),
+            "resolved_python": substitution.get("resolved_python"),
+            "resolved_python_version": substitution.get("resolved_python_version"),
+            "reason": substitution.get("reason"),
+            "reason_detail": substitution.get("reason_detail"),
+        }
+        LOGGER.info(
+            "interpreter_substitution %s",
+            json.dumps(payload, sort_keys=True),
+            extra={
+                "spl_event": "interpreter_substitution",
+                "interpreter_substitution": payload,
+            },
+        )
+
     def enqueue_local_run_update(self, state: dict[str, Any]) -> None:
         """Queue a local-only run status for central-server observability."""
 
@@ -2235,8 +2206,11 @@ class DaemonRuntime:
             "entrypoint": state.get("entrypoint"),
             "env": state.get("env"),
             "runtime_backend": state.get("runtime_backend"),
+            "worker_runtime": state.get("worker_runtime"),
+            "worker_runtime_reason": state.get("worker_runtime_reason"),
             "runtime_build_hash": state.get("runtime_build_hash"),
             "resolved_runtime": state.get("resolved_runtime"),
+            "interpreter_substitution": state.get("interpreter_substitution"),
             "image_tag": state.get("image_tag"),
             "container_id": state.get("container_id"),
             "status": state.get("status"),
@@ -2265,16 +2239,10 @@ class DaemonRuntime:
         except KeyError:
             return label
         display_name = (
-            record.get("display_name")
-            or record.get("object_remote_name")
-            or record.get("name")
-            or local_name
+            record.get("display_name") or record.get("object_remote_name") or record.get("name") or local_name
         )
         label["display_name"] = display_name
-        label["remote_object_id"] = (
-            record.get("remote_object_id")
-            or record.get("object_remote_object_id")
-        )
+        label["remote_object_id"] = record.get("remote_object_id") or record.get("object_remote_object_id")
         label["remote_version_id"] = record.get("remote_version_id")
         return label
 
@@ -2394,6 +2362,30 @@ class DaemonRuntime:
         if current:
             return os.pathsep.join([str(src_dir), current])
         return str(src_dir)
+
+    def _log_worker_runtime(
+        self,
+        object_record: dict[str, Any],
+        worker_runtime: dict[str, Any] | None,
+    ) -> None:
+        if worker_runtime is None:
+            return
+        payload = {
+            "event": "worker_runtime",
+            "object": object_record.get("name"),
+            "version": object_record.get("version"),
+            "version_id": object_record.get("version_id"),
+            "worker_runtime": worker_runtime.get("worker_runtime"),
+            "worker_runtime_reason": worker_runtime.get("worker_runtime_reason"),
+        }
+        LOGGER.info(
+            "worker_runtime %s",
+            json.dumps(payload, sort_keys=True),
+            extra={
+                "spl_event": "worker_runtime",
+                "worker_runtime": payload,
+            },
+        )
 
     def shutdown(self) -> None:
         self.heartbeat_service.shutdown()
@@ -2543,9 +2535,7 @@ def select_daemon_port(
             return candidate
 
     if auto_port:
-        raise OSError(
-            f"no free daemon port found on {host} from {preferred_port} to {last_port}"
-        )
+        raise OSError(f"no free daemon port found on {host} from {preferred_port} to {last_port}")
     raise OSError(f"daemon port {preferred_port} is already busy on {host}")
 
 
@@ -2632,7 +2622,7 @@ def serve(
             clear_daemon_endpoint(store.home, base_url=base_url)
         if app is not None:
             try:
-                app.runtime.shutdown()  # type: ignore[attr-defined]
+                app.runtime.shutdown()
             except Exception:
                 pass
         store.close()

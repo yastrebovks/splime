@@ -6,13 +6,13 @@ from http import HTTPStatus
 from typing import Any
 
 from spl.daemon.remote_client import ServerClientError
-from spl.daemon.routes._helpers import RouteContext
+from spl.daemon.routes._helpers import RouteContext, RouteRegistrar
 from spl.daemon.signature import build_signature, summarize_object
 from spl.daemon.store import validate_name
 
 
 def register_object_routes(
-    app: Any,
+    app: RouteRegistrar,
     *,
     runtime: Any,
     context: RouteContext,
@@ -51,27 +51,18 @@ def register_object_routes(
         if query is None:
             records = runtime.store.list_objects()
             if view == "summary" or compact:
-                return json_response(
-                    {
-                        name: summarize_object(record)
-                        for name, record in records.items()
-                    }
-                )
+                return json_response({name: summarize_object(record) for name, record in records.items()})
             return json_response(records)
 
         search_records = runtime.store.search_objects(query)
         if view == "summary" or compact:
-            return json_response(
-                [summarize_object(record) for record in search_records]
-            )
+            return json_response([summarize_object(record) for record in search_records])
         return json_response(search_records)
 
     @app.get("/objects/search")
     @route_errors
     async def search_objects() -> Any:
-        return json_response(
-            runtime.store.search_objects(context.first_query_value("q", "query") or "")
-        )
+        return json_response(runtime.store.search_objects(context.first_query_value("q", "query") or ""))
 
     @app.post("/objects/prune-stale-mirrors")
     @route_errors
@@ -196,9 +187,12 @@ def register_object_routes(
     @route_errors
     async def register_object() -> Any:
         body = await context.read_json_body()
-        create_library = str(
-            body.get("create_library", body.get("create"))
-        ).strip().lower() in {"1", "true", "yes", "on"}
+        create_library = str(body.get("create_library", body.get("create"))).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         record = runtime.register_object(
             body["name"],
             body["entrypoint"],
@@ -218,10 +212,7 @@ def register_object_routes(
                 record,
                 library=body.get("library") or body.get("library_slug"),
                 create_library=create_library,
-                library_display_name=(
-                    body.get("library_display_name")
-                    or body.get("library_name")
-                ),
+                library_display_name=(body.get("library_display_name") or body.get("library_name")),
             )
             try:
                 record["sync"] = runtime.sync_once()

@@ -6,12 +6,12 @@ from http import HTTPStatus
 from typing import Any
 
 from spl.daemon_client import LIBRARY_DELETE_UNSUPPORTED_MESSAGE
-from spl.daemon.routes._helpers import RouteContext
+from spl.daemon.routes._helpers import RouteContext, RouteRegistrar
 from spl.daemon.store import validate_name
 
 
 def register_library_routes(
-    app: Any,
+    app: RouteRegistrar,
     *,
     runtime: Any,
     context: RouteContext,

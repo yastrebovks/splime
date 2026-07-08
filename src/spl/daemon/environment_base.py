@@ -18,12 +18,8 @@ ABSENT = "absent"
 CREATING = "creating"
 READY = "ready"
 FAILED = "failed"
-DEFAULT_BUILD_TIMEOUT_SECONDS = float(
-    os.environ.get("SPL_DAEMON_ENV_BUILD_TIMEOUT_SECONDS", "900")
-)
-DEFAULT_STALE_LOCK_SECONDS = float(
-    os.environ.get("SPL_DAEMON_ENV_STALE_LOCK_SECONDS", "1800")
-)
+DEFAULT_BUILD_TIMEOUT_SECONDS = float(os.environ.get("SPL_DAEMON_ENV_BUILD_TIMEOUT_SECONDS", "900"))
+DEFAULT_STALE_LOCK_SECONDS = float(os.environ.get("SPL_DAEMON_ENV_STALE_LOCK_SECONDS", "1800"))
 
 
 class EnvironmentBuildError(RuntimeError):
@@ -342,10 +338,7 @@ class BaseEnvironmentManager(ABC):
                 )
                 os.write(
                     fd,
-                    (
-                        f"pid={os.getpid()}\n"
-                        f"created_at={datetime.now(UTC).isoformat()}\n"
-                    ).encode("utf-8"),
+                    (f"pid={os.getpid()}\ncreated_at={datetime.now(UTC).isoformat()}\n").encode("utf-8"),
                 )
                 break
             except FileExistsError:
@@ -360,9 +353,7 @@ class BaseEnvironmentManager(ABC):
                 if current is not None and self._is_ready(current):
                     raise _ExternalBuildReady()
                 if time.monotonic() >= deadline:
-                    raise EnvironmentBuildError(
-                        self._build_lock_timeout_message(lock_path)
-                    )
+                    raise EnvironmentBuildError(self._build_lock_timeout_message(lock_path))
                 time.sleep(1.0)
 
         try:
@@ -395,13 +386,9 @@ class BaseEnvironmentManager(ABC):
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            raise EnvironmentBuildError(
-                self._command_timeout_message(command)
-            ) from exc
+            raise EnvironmentBuildError(self._command_timeout_message(command)) from exc
         if completed.returncode != 0:
-            raise EnvironmentBuildError(
-                self._command_failed_message(command, completed.returncode)
-            )
+            raise EnvironmentBuildError(self._command_failed_message(command, completed.returncode))
 
     def _assert_daemon_environment_path(self, path: Path) -> None:
         root = self.store.environment_builds_dir.resolve()

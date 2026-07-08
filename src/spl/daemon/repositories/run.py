@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from spl.daemon.runtime_config import normalize_runtime_config
@@ -17,6 +17,7 @@ from spl.daemon.storage_base import (
     validate_name,
     write_json,
 )
+from spl.daemon.worker_runtime_marker import WORKER_RUNTIME_MARKER_FILE
 
 
 class RunRepository(RepositoryBase):
@@ -104,7 +105,7 @@ class RunRepository(RepositoryBase):
         function: str | None,
     ) -> str:
         if function is None:
-            return object_record["entrypoint"]
+            return cast(str, object_record["entrypoint"])
 
         function = validate_name(function)
         for item in object_record.get("functions") or []:
@@ -170,9 +171,7 @@ class RunRepository(RepositoryBase):
         """Return all known runs, newest first by creation time."""
 
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM runs ORDER BY created_at DESC"
-            ).fetchall()
+            rows = self._conn.execute("SELECT * FROM runs ORDER BY created_at DESC").fetchall()
         return [self._run_row_to_state(row) for row in rows]
 
     def _run_row_to_state(self, row: sqlite3.Row) -> dict[str, Any]:
@@ -197,15 +196,14 @@ class RunRepository(RepositoryBase):
             "result": result,
             "artifacts_dir": row["artifacts_dir"],
             "env_build_hash": row["env_build_hash"],
-            "runtime_config": normalize_runtime_config(
-                json_loads(row["runtime_config_json"], {"mode": "venv"})
-            ),
+            "runtime_config": normalize_runtime_config(json_loads(row["runtime_config_json"], {"mode": "venv"})),
             "runtime_build_hash": row["runtime_build_hash"],
             "resolved_runtime": row["resolved_runtime"],
             "runtime_backend": row["runtime_backend"],
             "image_tag": row["image_tag"],
             "container_id": row["container_id"],
             "resolved_python": row["resolved_python"],
+            "interpreter_substitution": json_loads(row["interpreter_substitution_json"], None),
             "error": row["error"],
             "returncode": row["returncode"],
             "command": command,
@@ -214,6 +212,7 @@ class RunRepository(RepositoryBase):
             "stdout": row["stdout_text"],
             "stderr": row["stderr_text"],
         }
+        state.update(self._worker_runtime_marker(state))
         return state
 
     def _run_change_to_column(self, key: str, value: Any) -> tuple[str, Any]:
@@ -222,10 +221,12 @@ class RunRepository(RepositoryBase):
             "input": "input_json",
             "result": "result_json",
             "runtime_config": "runtime_config_json",
+            "interpreter_substitution": "interpreter_substitution_json",
         }
         json_columns = {
             "command_json",
             "input_json",
+            "interpreter_substitution_json",
             "result_json",
             "runtime_config_json",
         }
@@ -244,6 +245,7 @@ class RunRepository(RepositoryBase):
             "image_tag",
             "container_id",
             "resolved_python",
+            "interpreter_substitution_json",
             "error",
             "returncode",
             "command_json",
@@ -269,3 +271,25 @@ class RunRepository(RepositoryBase):
         run_dir = state.get("run_dir")
         if run_dir:
             write_json(Path(run_dir) / "state.json", state)
+
+    def _worker_runtime_marker(self, state: dict[str, Any]) -> dict[str, Any]:
+        run_dir = state.get("run_dir")
+        if not run_dir:
+            return {}
+        marker_path = Path(str(run_dir)) / WORKER_RUNTIME_MARKER_FILE
+        try:
+            marker = json_loads(marker_path.read_text(encoding="utf-8"), None)
+        except OSError:
+            marker = None
+        if not isinstance(marker, dict):
+            return {}
+        result: dict[str, Any] = {}
+        if marker.get("worker_runtime") is not None:
+            result["worker_runtime"] = marker["worker_runtime"]
+        if marker.get("worker_runtime_reason") is not None:
+            result["worker_runtime_reason"] = marker["worker_runtime_reason"]
+        if marker.get("generated_module") is not None:
+            result["generated_module"] = marker["generated_module"]
+        if marker.get("generated_module_name") is not None:
+            result["generated_module_name"] = marker["generated_module_name"]
+        return result

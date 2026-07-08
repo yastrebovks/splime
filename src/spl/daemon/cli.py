@@ -37,9 +37,7 @@ def parse_json_arg(value: str, expected_type: type) -> Any:
 
     parsed = json.loads(value)
     if not isinstance(parsed, expected_type):
-        raise argparse.ArgumentTypeError(
-            f"expected JSON {expected_type.__name__}, got {type(parsed).__name__}"
-        )
+        raise argparse.ArgumentTypeError(f"expected JSON {expected_type.__name__}, got {type(parsed).__name__}")
     return parsed
 
 
@@ -62,9 +60,7 @@ def read_runtime_config(
         elif isinstance(loaded, dict):
             config = loaded
         else:
-            raise argparse.ArgumentTypeError(
-                "--runtime-config must contain a YAML mapping"
-            )
+            raise argparse.ArgumentTypeError("--runtime-config must contain a YAML mapping")
 
     if "runtime" in config and isinstance(config["runtime"], dict):
         target = dict(config["runtime"])
@@ -274,7 +270,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     remote_signature_resolve.add_argument(
         "ref",
-        help="JSON object, for example {\"url\":\"https://splime.io/api\",\"name\":\"demo\"}",
+        help='JSON object, for example {"url":"https://splime.io/api","name":"demo"}',
     )
     remote_signature_resolve.add_argument(
         "--force",
@@ -465,9 +461,7 @@ def main(argv: list[str] | None = None) -> int:
                 client.connect_server(
                     machine_token=args.machine_token,
                     user_token=args.user_token,
-                    server_url=args.server_url
-                    if args.server_url is not None
-                    else DEFAULT_SERVER_URL,
+                    server_url=args.server_url if args.server_url is not None else DEFAULT_SERVER_URL,
                     machine_id=args.machine_id,
                     display_name=args.display_name,
                     capabilities=capabilities,
@@ -490,11 +484,7 @@ def main(argv: list[str] | None = None) -> int:
             print_json(client.list_environment_builds())
         elif args.command == "image-list":
             print_json(
-                [
-                    record
-                    for record in client.list_environment_builds()
-                    if record.get("runtime_type") == "docker"
-                ]
+                [record for record in client.list_environment_builds() if record.get("runtime_type") == "docker"]
             )
         elif args.command == "image-show":
             record = client.get_environment_build(args.spec_hash)

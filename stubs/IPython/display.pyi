@@ -1,0 +1,6 @@
+from typing import Any
+
+class HTML:
+    def __init__(self, data: Any = ...) -> None: ...
+
+def display(*objects: Any, **kwargs: Any) -> None: ...

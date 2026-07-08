@@ -74,10 +74,7 @@ class ServerConnectionManager:
             user_token=user_token,
             machine_id=machine_id,
         )
-        if (
-            existing is not None
-            and existing.get("remote_connection_id")
-        ):
+        if existing is not None and existing.get("remote_connection_id"):
             local_connection = self.store.get_server_connection(existing["id"])
             return {
                 "connected": local_connection["status"] == "connected",
@@ -167,9 +164,7 @@ class ServerConnectionManager:
                 "connection": local_connection,
                 "remote_connection": None,
             }
-        remote_connection = self.server_client_for_credentials(
-            credentials
-        ).disconnect_machine()
+        remote_connection = self.server_client_for_credentials(credentials).disconnect_machine()
         local_connection = self.store.mark_server_connection_disconnected(
             credentials["id"],
             remote_connection=remote_connection,

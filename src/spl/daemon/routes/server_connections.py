@@ -6,11 +6,11 @@ from http import HTTPStatus
 from typing import Any
 
 from spl.daemon.remote_client import DEFAULT_SERVER_URL
-from spl.daemon.routes._helpers import RouteContext
+from spl.daemon.routes._helpers import RouteContext, RouteRegistrar
 
 
 def register_server_connection_routes(
-    app: Any,
+    app: RouteRegistrar,
     *,
     runtime: Any,
     context: RouteContext,
@@ -29,10 +29,7 @@ def register_server_connection_routes(
                     and connection["status"] == "connected"
                     and bool(connection.get("remote_connection_id"))
                 ),
-                "offline": (
-                    connection is not None
-                    and connection["status"] in {"connect_failed", "heartbeat_failed"}
-                ),
+                "offline": (connection is not None and connection["status"] in {"connect_failed", "heartbeat_failed"}),
                 "connection": connection,
             }
         )

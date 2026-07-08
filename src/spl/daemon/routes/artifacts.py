@@ -6,12 +6,12 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
-from spl.daemon.routes._helpers import RouteContext
+from spl.daemon.routes._helpers import RouteContext, RouteRegistrar
 from spl.daemon.store import validate_name
 
 
 def register_artifact_routes(
-    app: Any,
+    app: RouteRegistrar,
     *,
     runtime: Any,
     context: RouteContext,
@@ -23,9 +23,7 @@ def register_artifact_routes(
     @route_errors
     async def list_remote_artifacts(run_id: str) -> Any:
         credentials = runtime._require_connected_server_credentials()
-        artifacts = runtime._server_client_for_credentials(credentials).list_artifacts(
-            validate_name(run_id)
-        )
+        artifacts = runtime._server_client_for_credentials(credentials).list_artifacts(validate_name(run_id))
         return json_response([artifact["name"] for artifact in artifacts])
 
     @app.get("/remote-runs/<run_id>/artifacts/<artifact_name>")
@@ -40,9 +38,7 @@ def register_artifact_routes(
             data,
             status=int(HTTPStatus.OK),
             content_type="application/octet-stream",
-            headers={
-                "Content-Disposition": f'attachment; filename="{artifact_name}"'
-            },
+            headers={"Content-Disposition": f'attachment; filename="{artifact_name}"'},
         )
 
     @app.get("/runs/<run_id>/artifacts")
@@ -69,9 +65,5 @@ def register_artifact_routes(
             artifact_path.read_bytes(),
             status=int(HTTPStatus.OK),
             content_type="application/octet-stream",
-            headers={
-                "Content-Disposition": (
-                    f'attachment; filename="{artifact_path.name}"'
-                )
-            },
+            headers={"Content-Disposition": (f'attachment; filename="{artifact_path.name}"')},
         )

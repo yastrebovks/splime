@@ -7,12 +7,28 @@ import secrets
 from dataclasses import dataclass
 from functools import wraps
 from http import HTTPStatus
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Protocol, TypeVar, cast
 
 from spl.daemon.remote_client import ServerClientError
 from spl.daemon.runtime_dependencies import ServerClientProtocol
 from spl.daemon.server_connection import ServerOfflineError
 from spl.daemon.store import split_object_function_ref
+
+RouteHandler = TypeVar("RouteHandler", bound=Callable[..., Awaitable[Any]])
+
+
+class RouteErrorDecorator(Protocol):
+    def __call__(self, handler: RouteHandler) -> RouteHandler: ...
+
+
+class RouteRegistrar(Protocol):
+    def get(self, path: str) -> Callable[[RouteHandler], RouteHandler]: ...
+
+    def post(self, path: str) -> Callable[[RouteHandler], RouteHandler]: ...
+
+    def put(self, path: str) -> Callable[[RouteHandler], RouteHandler]: ...
+
+    def delete(self, path: str) -> Callable[[RouteHandler], RouteHandler]: ...
 
 
 @dataclass(frozen=True)
@@ -38,8 +54,8 @@ class RouteContext:
 
     def route_errors(
         self,
-        handler: Callable[..., Awaitable[Any]],
-    ) -> Callable[..., Awaitable[Any]]:
+        handler: RouteHandler,
+    ) -> RouteHandler:
         @wraps(handler)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
             try:
@@ -75,16 +91,12 @@ class RouteContext:
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
-        return wrapper
+        return cast(RouteHandler, wrapper)
 
     async def require_local_api_auth(self) -> Any:
         auth_header = self.request.headers.get("Authorization") or ""
         scheme, _, token = auth_header.partition(" ")
-        if (
-            scheme.casefold() == "bearer"
-            and token
-            and secrets.compare_digest(token, self.local_api_token)
-        ):
+        if scheme.casefold() == "bearer" and token and secrets.compare_digest(token, self.local_api_token):
             return None
         return self.json_response(
             {"error": "missing or invalid local daemon API token"},
@@ -93,13 +105,13 @@ class RouteContext:
 
     async def read_json_body(self) -> dict[str, Any]:
         body = await self.request.get_json(silent=True)
-        return body or {}
+        return body if isinstance(body, dict) else {}
 
     def first_query_value(self, *names: str) -> str | None:
         for name in names:
             value = self.request.args.get(name)
             if value is not None:
-                return value
+                return str(value)
         return None
 
     def optional_int_query(self, name: str) -> int | None:
@@ -140,14 +152,20 @@ class RouteContext:
             library=library,
         )
         if refresh and refresh.get("current_version"):
-            return self.runtime.store.get_object_version(
-                refresh["current_version"]["version_id"],
-                include_yaml=include_yaml,
+            return cast(
+                dict[str, Any],
+                self.runtime.store.get_object_version(
+                    refresh["current_version"]["version_id"],
+                    include_yaml=include_yaml,
+                ),
             )
-        return self.runtime.store.get_object(
-            name_or_id,
-            version=version,
-            include_yaml=include_yaml,
-            owner_id=owner_id,
-            library=library,
+        return cast(
+            dict[str, Any],
+            self.runtime.store.get_object(
+                name_or_id,
+                version=version,
+                include_yaml=include_yaml,
+                owner_id=owner_id,
+                library=library,
+            ),
         )

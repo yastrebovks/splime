@@ -63,9 +63,7 @@ def test_connect_server_persists_pending_connection_when_server_is_offline(
         assert result["offline"] is True
         assert connection["status"] == "connect_failed"
         assert connection["remote_connection_id"] is None
-        expected_machine_id = (
-            f"machine-{hashlib.sha256(machine_token.encode('utf-8')).hexdigest()[:12]}"
-        )
+        expected_machine_id = f"machine-{hashlib.sha256(machine_token.encode('utf-8')).hexdigest()[:12]}"
         assert connection["machine_id"] == expected_machine_id
         assert connection["machine_id"] != "machine-x"
         assert store.current_server_connection_credentials() is not None
@@ -187,9 +185,7 @@ def test_server_connection_tokens_are_stored_outside_sqlite(tmp_path) -> None:
             user_token="next-user-token-secret",
             machine_id="machine-2",
         )
-        secret_values = json.loads(
-            (tmp_path / "daemon-secrets.json").read_text(encoding="utf-8")
-        ).values()
+        secret_values = json.loads((tmp_path / "daemon-secrets.json").read_text(encoding="utf-8")).values()
         assert "machine-token-secret" not in secret_values
         assert "user-token-secret" not in secret_values
         assert "next-machine-token-secret" in secret_values
@@ -208,9 +204,7 @@ def test_server_connection_tokens_are_stored_outside_sqlite(tmp_path) -> None:
 
         current = store.current_server_connection_credentials()
         store.mark_server_connection_disconnected(current["id"])
-        secret_values = json.loads(
-            (tmp_path / "daemon-secrets.json").read_text(encoding="utf-8")
-        ).values()
+        secret_values = json.loads((tmp_path / "daemon-secrets.json").read_text(encoding="utf-8")).values()
         assert "next-machine-token-secret" not in secret_values
         assert "next-user-token-secret" not in secret_values
     finally:

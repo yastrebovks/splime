@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from spl.daemon.storage_base import (
@@ -88,7 +88,7 @@ class ServerConnectionRepository(RepositoryBase):
             """,
             {"now": now},
         )
-        return rows
+        return cast(list[sqlite3.Row], rows)
 
     def _migrate_server_connection_secrets_locked(self) -> None:
         columns = self._table_columns_locked("server_connections")
@@ -103,9 +103,7 @@ class ServerConnectionRepository(RepositoryBase):
             select_columns.append("token")
         if "user_token" in columns:
             select_columns.append("user_token")
-        rows = self._conn.execute(
-            f"SELECT {', '.join(select_columns)} FROM server_connections"
-        ).fetchall()
+        rows = self._conn.execute(f"SELECT {', '.join(select_columns)} FROM server_connections").fetchall()
         for row in rows:
             token_ref = row["token_secret_ref"]
             user_token_ref = row["user_token_secret_ref"]
@@ -116,11 +114,7 @@ class ServerConnectionRepository(RepositoryBase):
                     self._secret_key(row["id"], "machine-token"),
                     token_value,
                 )
-            if (
-                not user_token_ref
-                and user_token_value
-                and user_token_value != REDACTED_SECRET_VALUE
-            ):
+            if not user_token_ref and user_token_value and user_token_value != REDACTED_SECRET_VALUE:
                 user_token_ref = self.secret_store.put(
                     self._secret_key(row["id"], "user-token"),
                     user_token_value,
@@ -148,7 +142,7 @@ class ServerConnectionRepository(RepositoryBase):
                 self._conn.execute(
                     f"""
                     UPDATE server_connections
-                    SET {', '.join(assignments)}
+                    SET {", ".join(assignments)}
                     WHERE id = ?
                     """,
                     values,
@@ -191,17 +185,15 @@ class ServerConnectionRepository(RepositoryBase):
             params["token"] = REDACTED_SECRET_VALUE
         if "user_token" in table_columns:
             columns.insert(columns.index("user_token_hint"), "user_token")
-            params["user_token"] = (
-                REDACTED_SECRET_VALUE if params.get("user_token_secret_ref") else None
-            )
+            params["user_token"] = REDACTED_SECRET_VALUE if params.get("user_token_secret_ref") else None
         placeholders = [f":{column}" for column in columns]
         self._conn.execute(
             f"""
             INSERT INTO server_connections(
-                {', '.join(columns)}
+                {", ".join(columns)}
             )
             VALUES(
-                {', '.join(placeholders)}
+                {", ".join(placeholders)}
             )
             """,
             params,
@@ -466,9 +458,7 @@ class ServerConnectionRepository(RepositoryBase):
         """Return stored central-server connection attempts, newest first."""
 
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM server_connections ORDER BY updated_at DESC"
-            ).fetchall()
+            rows = self._conn.execute("SELECT * FROM server_connections ORDER BY updated_at DESC").fetchall()
         return [self._server_connection_row(row) for row in rows]
 
     def record_server_connection_heartbeat(
@@ -480,9 +470,7 @@ class ServerConnectionRepository(RepositoryBase):
         """Persist a successful connection heartbeat."""
 
         connection_id = validate_name(connection_id)
-        interval = normalize_heartbeat_interval(
-            remote_connection.get("heartbeat_interval_seconds")
-        )
+        interval = normalize_heartbeat_interval(remote_connection.get("heartbeat_interval_seconds"))
         now = utc_now()
         with self._lock, self._conn:
             cursor = self._conn.execute(
@@ -636,9 +624,7 @@ class ServerConnectionRepository(RepositoryBase):
     def _server_connection_secret_row(self, row: sqlite3.Row) -> dict[str, Any]:
         record = self._server_connection_row(row)
         record["token"] = (
-            self.secret_store.get(row["token_secret_ref"])
-            if row["token_secret_ref"]
-            else self._row_value(row, "token")
+            self.secret_store.get(row["token_secret_ref"]) if row["token_secret_ref"] else self._row_value(row, "token")
         )
         record["user_token"] = (
             self.secret_store.get(row["user_token_secret_ref"])

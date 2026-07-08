@@ -19,6 +19,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
+from spl.daemon.interpreter_visibility import environment_record_interpreter_substitution
+
 PREPARING_ENVIRONMENT_STATUS = "preparing_environment"
 LOG_TAIL_MAX_BYTES = 8192
 
@@ -65,6 +67,9 @@ def environment_progress(
         "elapsed_seconds": _elapsed_seconds(record.get("started_at")),
         "error": record.get("error"),
     }
+    substitution = environment_record_interpreter_substitution(record)
+    if substitution is not None:
+        progress["interpreter_substitution"] = substitution
     log_path = record.get("install_log_path")
     if log_path:
         progress["log_path"] = str(log_path)

@@ -163,9 +163,7 @@ def test_yaml_import_rejects_python_object_tags_before_execution(tmp_path) -> No
     payload = "__import__('pathlib').Path({!r}).write_text('pwned')".format(str(marker))
     path = tmp_path / "malicious.yaml"
     path.write_text(
-        "!!python/object/apply:builtins.eval\n"
-        "- |\n"
-        f"  {payload}\n",
+        f"!!python/object/apply:builtins.eval\n- |\n  {payload}\n",
         encoding="utf-8",
     )
 

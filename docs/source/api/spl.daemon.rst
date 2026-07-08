@@ -104,6 +104,15 @@ spl.daemon.heartbeat\_service module
    :show-inheritance:
    :undoc-members:
 
+spl.daemon.interpreter\_visibility module
+-----------------------------------------
+
+.. automodule:: spl.daemon.interpreter_visibility
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.daemon.metadata module
 --------------------------
 
@@ -194,6 +203,24 @@ spl.daemon.signature module
    :show-inheritance:
    :undoc-members:
 
+spl.daemon.spl\_free\_generator module
+--------------------------------------
+
+.. automodule:: spl.daemon.spl_free_generator
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.spl\_free\_runner module
+-----------------------------------
+
+.. automodule:: spl.daemon.spl_free_runner
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.daemon.storage\_base module
 -------------------------------
 
@@ -216,6 +243,15 @@ spl.daemon.worker module
 ------------------------
 
 .. automodule:: spl.daemon.worker
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.worker\_runtime\_marker module
+-----------------------------------------
+
+.. automodule:: spl.daemon.worker_runtime_marker
    :members:
    :private-members:
    :show-inheritance:

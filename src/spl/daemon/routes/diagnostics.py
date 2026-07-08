@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
+from spl.daemon.interpreter_visibility import (
+    interpreter_substitution_from_resolution,
+    python_minor_mismatch,
+)
+from spl.daemon.routes._helpers import RouteErrorDecorator, RouteRegistrar
 from spl.daemon.services.sync import SyncVisibilityService
 from spl.daemon.store import utc_now
 
 
 def register_diagnostics_routes(
-    app: Any,
+    app: RouteRegistrar,
     *,
     runtime: Any,
     json_response: Callable[[Any], Any],
-    route_errors: Callable[[Callable[..., Awaitable[Any]]], Callable[..., Awaitable[Any]]],
+    route_errors: RouteErrorDecorator,
 ) -> None:
     sync_visibility = getattr(
         runtime,
@@ -29,6 +34,7 @@ def register_diagnostics_routes(
         runs = runtime.store.list_runs()
         environment_builds = runtime.store.list_environment_builds()
         remote_signatures = runtime.store.list_remote_signatures()
+        interpreter_substitutions = _interpreter_substitution_summary(runtime, objects)
         build_statuses: dict[str, int] = {}
         for build in environment_builds:
             status = str(build["status"])
@@ -58,21 +64,17 @@ def register_diagnostics_routes(
                         and bool(connection.get("remote_connection_id"))
                     ),
                     "offline": (
-                        connection is not None
-                        and connection["status"] in {"connect_failed", "heartbeat_failed"}
+                        connection is not None and connection["status"] in {"connect_failed", "heartbeat_failed"}
                     ),
                     "connection": connection,
                 },
                 "sync": sync_summary,
+                "interpreter_substitutions": interpreter_substitutions,
                 "environment_builds": {
                     "by_status": build_statuses,
                     "auto_build_envs": runtime.auto_build_envs,
-                    "build_timeout_seconds": (
-                        getattr(runtime.environment_manager, "build_timeout_seconds", None)
-                    ),
-                    "stale_lock_seconds": (
-                        getattr(runtime.environment_manager, "stale_lock_seconds", None)
-                    ),
+                    "build_timeout_seconds": (getattr(runtime.environment_manager, "build_timeout_seconds", None)),
+                    "stale_lock_seconds": (getattr(runtime.environment_manager, "stale_lock_seconds", None)),
                 },
             }
         )
@@ -112,3 +114,47 @@ def register_diagnostics_routes(
                 "objects": list(objects.values())[:100],
             }
         )
+
+
+def _interpreter_substitution_summary(
+    runtime: Any,
+    objects: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    for record in objects.values():
+        if record.get("origin") != "server":
+            continue
+        runtime_config = record.get("runtime_config") or {"mode": "venv"}
+        if runtime_config.get("mode") != "venv":
+            continue
+        try:
+            spec = runtime.environment_manager.build_spec(record)
+        except Exception:
+            continue
+        spec_payload = spec.get("spec")
+        if not isinstance(spec_payload, dict):
+            continue
+        resolution = spec_payload.get("interpreter_resolution")
+        if not isinstance(resolution, dict):
+            continue
+        substitution = interpreter_substitution_from_resolution(resolution)
+        if substitution is None:
+            continue
+        item = {
+            "object": record.get("name"),
+            "display_name": record.get("display_name"),
+            "version": record.get("version"),
+            "version_id": record.get("version_id"),
+            **substitution,
+        }
+        item["minor_mismatch"] = python_minor_mismatch(
+            item.get("authored_python_version"),
+            item.get("resolved_python_version"),
+        )
+        items.append(item)
+    minor_mismatches = sum(1 for item in items if item.get("minor_mismatch"))
+    return {
+        "items": items,
+        "count": len(items),
+        "minor_mismatches": minor_mismatches,
+    }

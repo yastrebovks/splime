@@ -66,10 +66,10 @@ def default_home() -> Path:
 def validate_name(name: str) -> str:
     """Validate a registry-safe name and return it unchanged."""
 
-    if not NAME_PATTERN.fullmatch(name):
-        raise ValueError(
-            "name must contain only letters, digits, underscore, dash, and dot"
-        )
+    # Keep this rule in sync with spl.daemon.spl_free_runner.validate_name;
+    # the runner duplicates it intentionally to stay stdlib-only.
+    if not NAME_PATTERN.fullmatch(name) or set(name) == {"."}:
+        raise ValueError("name must contain only letters, digits, underscore, dash, and dot, and not only dots")
     return name
 
 
@@ -85,10 +85,7 @@ def split_object_function_ref(
         if not parent or not inline_function:
             raise ValueError("function reference must look like object::function")
         if function is not None and str(function) != inline_function:
-            raise ValueError(
-                "function was provided twice with different values: "
-                f"{inline_function!r} and {function!r}"
-            )
+            raise ValueError(f"function was provided twice with different values: {inline_function!r} and {function!r}")
         object_name = parent
         function = inline_function
     object_name = validate_name(object_name)
@@ -308,6 +305,7 @@ class StorageBase:
                     finished_at TEXT,
                     error TEXT,
                     install_log_path TEXT,
+                    builder TEXT,
                     runtime_type TEXT NOT NULL DEFAULT 'venv',
                     image_tag TEXT,
                     base_image TEXT
@@ -339,6 +337,7 @@ class StorageBase:
                     image_tag TEXT,
                     container_id TEXT,
                     resolved_python TEXT,
+                    interpreter_substitution_json TEXT,
                     error TEXT,
                     returncode INTEGER,
                     command_json TEXT,
@@ -432,7 +431,7 @@ class StorageBase:
             self._ensure_column(
                 "runs",
                 "runtime_config_json",
-                "TEXT NOT NULL DEFAULT '{\"mode\":\"venv\"}'",
+                'TEXT NOT NULL DEFAULT \'{"mode":"venv"}\'',
             )
             self._ensure_column("runs", "runtime_build_hash", "TEXT")
             self._ensure_column("runs", "resolved_runtime", "TEXT")
@@ -440,6 +439,7 @@ class StorageBase:
             self._ensure_column("runs", "image_tag", "TEXT")
             self._ensure_column("runs", "container_id", "TEXT")
             self._ensure_column("runs", "resolved_python", "TEXT")
+            self._ensure_column("runs", "interpreter_substitution_json", "TEXT")
             self._ensure_column("server_connections", "user_token_hint", "TEXT")
             self._ensure_column("server_connections", "token_secret_ref", "TEXT")
             self._ensure_column("server_connections", "user_token_secret_ref", "TEXT")
@@ -488,13 +488,14 @@ class StorageBase:
             self._ensure_column(
                 "object_versions",
                 "runtime_config_json",
-                "TEXT NOT NULL DEFAULT '{\"mode\":\"venv\"}'",
+                'TEXT NOT NULL DEFAULT \'{"mode":"venv"}\'',
             )
             self._ensure_column(
                 "environment_builds",
                 "runtime_type",
                 "TEXT NOT NULL DEFAULT 'venv'",
             )
+            self._ensure_column("environment_builds", "builder", "TEXT")
             self._ensure_column("environment_builds", "image_tag", "TEXT")
             self._ensure_column("environment_builds", "base_image", "TEXT")
             self._ensure_column("sync_events", "attempts", "INTEGER NOT NULL DEFAULT 0")
@@ -537,9 +538,7 @@ class StorageBase:
                 """,
                 (OBJECT_IDENTITY_MIGRATION_ID, utc_now()),
             )
-            self._conn.execute(
-                f"PRAGMA user_version = {OBJECT_IDENTITY_SCHEMA_VERSION}"
-            )
+            self._conn.execute(f"PRAGMA user_version = {OBJECT_IDENTITY_SCHEMA_VERSION}")
             self._conn.commit()
 
     def close(self) -> None:
@@ -571,10 +570,7 @@ class StorageBase:
         return row[name] if name in row.keys() else None
 
     def _ensure_column(self, table: str, column: str, declaration: str) -> None:
-        existing = {
-            row["name"]
-            for row in self._conn.execute(f"PRAGMA table_xinfo({table})").fetchall()
-        }
+        existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_xinfo({table})").fetchall()}
         if column not in existing:
             self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
@@ -587,11 +583,7 @@ class StorageBase:
 
         with self._lock:
             plan = self._object_identity_migration_plan_locked()
-            migration_id = (
-                OBJECT_IDENTITY_MIGRATION_ID
-                if plan["schema_needed"]
-                else OBJECT_IDENTITY_HEAL_MIGRATION_ID
-            )
+            migration_id = OBJECT_IDENTITY_MIGRATION_ID if plan["schema_needed"] else OBJECT_IDENTITY_HEAL_MIGRATION_ID
             backup_path = self._object_identity_backup_path(migration_id)
             report = {
                 "id": OBJECT_IDENTITY_MIGRATION_ID,
@@ -610,9 +602,7 @@ class StorageBase:
             if self.db_path.exists() and not backup_path.exists():
                 shutil.copy2(self.db_path, backup_path)
 
-            foreign_keys_enabled = bool(
-                self._conn.execute("PRAGMA foreign_keys").fetchone()[0]
-            )
+            foreign_keys_enabled = bool(self._conn.execute("PRAGMA foreign_keys").fetchone()[0])
             self._conn.execute("PRAGMA foreign_keys = OFF")
             self._conn.execute("BEGIN")
             try:
@@ -644,16 +634,11 @@ class StorageBase:
                         """,
                         (OBJECT_IDENTITY_HEAL_MIGRATION_ID, utc_now()),
                     )
-                self._conn.execute(
-                    f"PRAGMA user_version = {OBJECT_IDENTITY_SCHEMA_VERSION}"
-                )
+                self._conn.execute(f"PRAGMA user_version = {OBJECT_IDENTITY_SCHEMA_VERSION}")
                 violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
                 if violations:
                     details = "; ".join(str(tuple(row)) for row in violations)
-                    raise RuntimeError(
-                        "object identity migration produced foreign-key violations: "
-                        f"{details}"
-                    )
+                    raise RuntimeError(f"object identity migration produced foreign-key violations: {details}")
             except Exception:
                 self._conn.rollback()
                 raise
@@ -671,16 +656,11 @@ class StorageBase:
         self,
         migration_id: str = OBJECT_IDENTITY_MIGRATION_ID,
     ) -> Path:
-        return self.db_path.with_name(
-            f"{self.db_path.name}.before-{migration_id}.bak"
-        )
+        return self.db_path.with_name(f"{self.db_path.name}.before-{migration_id}.bak")
 
     def _object_identity_migration_plan_locked(self) -> dict[str, Any]:
         tables = {
-            row["name"]
-            for row in self._conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
+            row["name"] for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
         }
         actions: list[str] = []
         objects_exists = "objects" in tables
@@ -694,8 +674,7 @@ class StorageBase:
                 ("owner_id", "library", "name"),
             )
             remote_name_generated = (
-                "remote_name" in object_columns
-                and int(object_columns["remote_name"]["hidden"]) != 0
+                "remote_name" in object_columns and int(object_columns["remote_name"]["hidden"]) != 0
             )
             if (
                 "owner_id" not in object_columns
@@ -709,21 +688,22 @@ class StorageBase:
 
         if object_versions_exists:
             version_columns = self._column_metadata_locked("object_versions")
-            if (
-                "content_hash" not in version_columns
-                or not self._has_unique_index_locked(
-                    "object_versions",
-                    ("object_id", "content_hash"),
-                )
+            if "content_hash" not in version_columns or not self._has_unique_index_locked(
+                "object_versions",
+                ("object_id", "content_hash"),
             ):
                 actions.append("rebuild object_versions with content_hash identity")
 
         schema_needed = bool(actions)
-        healing = self._object_identity_heal_plan_locked() if not schema_needed else {
-            "needed": False,
-            "merges": [],
-            "conflicts": [],
-        }
+        healing = (
+            self._object_identity_heal_plan_locked()
+            if not schema_needed
+            else {
+                "needed": False,
+                "merges": [],
+                "conflicts": [],
+            }
+        )
         if healing["needed"]:
             actions.append("heal synthetic server object identity collisions")
 
@@ -738,10 +718,7 @@ class StorageBase:
 
     def _object_identity_heal_plan_locked(self) -> dict[str, Any]:
         tables = {
-            row["name"]
-            for row in self._conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
+            row["name"] for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
         }
         if "objects" not in tables or "object_versions" not in tables:
             return {"needed": False, "merges": [], "conflicts": []}
@@ -835,15 +812,8 @@ class StorageBase:
             raise KeyError(f"target object is not found: {target_id}")
         if source is None:
             raise KeyError(f"source object is not found: {source_id}")
-        if (
-            target["kind"] is not None
-            and source["kind"] is not None
-            and target["kind"] != source["kind"]
-        ):
-            raise ValueError(
-                "object kind is stable and cannot merge "
-                f"{source['kind']!r} into {target['kind']!r}"
-            )
+        if target["kind"] is not None and source["kind"] is not None and target["kind"] != source["kind"]:
+            raise ValueError(f"object kind is stable and cannot merge {source['kind']!r} into {target['kind']!r}")
 
         target_versions = self._conn.execute(
             """
@@ -854,11 +824,7 @@ class StorageBase:
             """,
             (target_id,),
         ).fetchall()
-        target_by_hash = {
-            row["content_hash"]: row
-            for row in target_versions
-            if row["content_hash"] is not None
-        }
+        target_by_hash = {row["content_hash"]: row for row in target_versions if row["content_hash"] is not None}
         max_version = max((int(row["version"]) for row in target_versions), default=0)
         next_version = max_version + 1
         version_map: dict[str, str] = {}
@@ -1010,9 +976,7 @@ class StorageBase:
         ):
             if table not in {
                 row["name"]
-                for row in self._conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                ).fetchall()
+                for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
             }:
                 continue
             if column not in self._table_columns_locked(table):
@@ -1045,23 +1009,16 @@ class StorageBase:
 
     def _column_metadata_locked(self, table: str) -> dict[str, sqlite3.Row]:
         return {
-            row["name"]: row
-            for row in self._conn.execute(
-                f"PRAGMA table_xinfo({validate_name(table)})"
-            ).fetchall()
+            row["name"]: row for row in self._conn.execute(f"PRAGMA table_xinfo({validate_name(table)})").fetchall()
         }
 
     def _has_unique_index_locked(self, table: str, columns: tuple[str, ...]) -> bool:
-        for index in self._conn.execute(
-            f"PRAGMA index_list({validate_name(table)})"
-        ).fetchall():
+        for index in self._conn.execute(f"PRAGMA index_list({validate_name(table)})").fetchall():
             if not index["unique"]:
                 continue
             indexed_columns = tuple(
                 row["name"]
-                for row in self._conn.execute(
-                    f"PRAGMA index_info({validate_name(index['name'])})"
-                ).fetchall()
+                for row in self._conn.execute(f"PRAGMA index_info({validate_name(index['name'])})").fetchall()
             )
             if indexed_columns == columns:
                 return True
@@ -1125,9 +1082,7 @@ class StorageBase:
             """
         )
         self._conn.execute("DROP TABLE objects")
-        self._conn.execute(
-            "ALTER TABLE objects__object_identity_v1 RENAME TO objects"
-        )
+        self._conn.execute("ALTER TABLE objects__object_identity_v1 RENAME TO objects")
 
     def _rebuild_object_versions_for_identity_locked(self) -> None:
         columns = self._column_metadata_locked("object_versions")
@@ -1140,9 +1095,7 @@ class StorageBase:
             columns,
             content_hash_expr,
         )
-        self._conn.execute(
-            "DROP TABLE IF EXISTS object_versions__object_identity_v1"
-        )
+        self._conn.execute("DROP TABLE IF EXISTS object_versions__object_identity_v1")
         self._conn.execute(
             """
             CREATE TABLE object_versions__object_identity_v1 (
@@ -1274,10 +1227,7 @@ class StorageBase:
 
     def _repoint_duplicate_object_version_references_locked(self) -> None:
         tables = {
-            row["name"]
-            for row in self._conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
+            row["name"] for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
         }
         if "objects" in tables:
             self._repoint_duplicate_object_version_reference_locked(

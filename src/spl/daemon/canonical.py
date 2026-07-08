@@ -78,9 +78,7 @@ def _canonical_spl_documents(yaml_text: str) -> list[dict[str, Any]]:
         documents.append(
             {
                 "root": _canonical_ir(root),
-                "dependencies": _sorted_canonical(
-                    _canonical_ir(item) for item in dependencies
-                ),
+                "dependencies": _sorted_canonical(_canonical_ir(item) for item in dependencies),
             }
         )
     if not documents:
@@ -95,9 +93,7 @@ def _canonical_ir(value: Any) -> Any:
             "name": value.name,
             "body": _normalize_text(value.body),
             "inputs": [_canonical_ir(item) for item in value.inputs],
-            "outputs": None
-            if value.outputs is None
-            else [_canonical_ir(item) for item in value.outputs],
+            "outputs": None if value.outputs is None else [_canonical_ir(item) for item in value.outputs],
         }
     if isinstance(value, DPipeline):
         return {
@@ -106,9 +102,7 @@ def _canonical_ir(value: Any) -> Any:
             "nodes": _sorted_canonical(_canonical_ir(item) for item in value.nodes),
             "links": _sorted_canonical(_canonical_ir(item) for item in value.links),
             "aliases": _sorted_canonical(_canonical_ir(item) for item in value.aliases),
-            "adapters": _sorted_canonical(
-                _canonical_ir(item) for item in value.adapters
-            ),
+            "adapters": _sorted_canonical(_canonical_ir(item) for item in value.adapters),
         }
     if isinstance(value, DAdapter):
         return {
@@ -117,9 +111,7 @@ def _canonical_ir(value: Any) -> Any:
             "format": value.key.rpartition("@")[2],
             "save": value.save,
             "load": value.load,
-            "distributions": _sorted_canonical(
-                _canonical_ir(item) for item in value.distributions
-            ),
+            "distributions": _sorted_canonical(_canonical_ir(item) for item in value.distributions),
         }
     if isinstance(value, DDistribution):
         return {
@@ -143,16 +135,10 @@ def _canonical_ir(value: Any) -> Any:
     if is_dataclass(value):
         return {
             "tag": type(value).__name__,
-            **{
-                field.name: _canonical_ir(getattr(value, field.name))
-                for field in fields(value)
-            },
+            **{field.name: _canonical_ir(getattr(value, field.name)) for field in fields(value)},
         }
     if isinstance(value, Mapping):
-        return {
-            str(key): _canonical_ir(item)
-            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
-        }
+        return {str(key): _canonical_ir(item) for key, item in sorted(value.items(), key=lambda item: str(item[0]))}
     if isinstance(value, tuple | list):
         return [_canonical_ir(item) for item in value]
     if isinstance(value, Path):

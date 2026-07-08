@@ -84,13 +84,16 @@ def test_repositories_are_directly_usable_behind_facade(tmp_path) -> None:
         assert store.get_object_version(obj["version_id"], include_yaml=False) == obj
         assert store.get_run(run["id"]) == run
         assert store.get_sync_event(event["id"]) == event
-        assert store.get_remote_signature(
-            {
-                "server_url": "https://splime.io/api",
-                "object_name": "demo_obj",
-                "library": "research",
-            }
-        ) == signature
+        assert (
+            store.get_remote_signature(
+                {
+                    "server_url": "https://splime.io/api",
+                    "object_name": "demo_obj",
+                    "library": "research",
+                }
+            )
+            == signature
+        )
         assert store.current_server_connection()["id"] == connection["id"]
     finally:
         store.close()

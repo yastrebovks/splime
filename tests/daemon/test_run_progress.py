@@ -21,6 +21,7 @@ from spl.daemon.run_progress import (
     _last_log_line,
     environment_progress,
 )
+from spl.daemon.interpreter_visibility import INTERPRETER_RESOLUTION_KEY
 from spl.daemon.store import RegistryStore
 
 from .test_object_identity import FUNCTION_YAML
@@ -42,6 +43,7 @@ def _upsert_build(
     spec_hash: str = "hash-1",
     status: str = "creating",
     log_lines: list[str] | None = None,
+    spec: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     env_dir = tmp_path / "env-builds" / spec_hash
     env_dir.mkdir(parents=True, exist_ok=True)
@@ -54,7 +56,7 @@ def _upsert_build(
         python_version="Python 3.13",
         distributions=[],
         runtime_packages=[],
-        spec={},
+        spec=spec or {},
         venv_path=env_dir / "venv",
         python_path=env_dir / "venv" / "bin" / "python",
         install_log_path=install_log_path,
@@ -127,6 +129,41 @@ class TestEnvironmentProgress:
         assert progress is not None
         assert "log_tail" not in progress
         assert progress["log_path"].endswith("install.log")
+
+    def test_preparing_payload_exposes_interpreter_substitution(
+        self,
+        store: RegistryStore,
+        tmp_path: Path,
+    ) -> None:
+        _upsert_build(
+            store,
+            tmp_path,
+            spec={
+                INTERPRETER_RESOLUTION_KEY: {
+                    "authored_python": "/author/bin/python",
+                    "authored_python_version": "Python 3.11.9",
+                    "resolved_python": "/local/bin/python",
+                    "resolved_python_version": "Python 3.13.0",
+                    "reason": "local_env",
+                    "reason_detail": "spl_core",
+                    "substituted": True,
+                }
+            },
+        )
+        state = {"status": "preparing_environment", "env_build_hash": "hash-1"}
+
+        progress = environment_progress(store, state)
+
+        assert progress is not None
+        assert progress["interpreter_substitution"] == {
+            "authored_python": "/author/bin/python",
+            "authored_python_version": "Python 3.11.9",
+            "resolved_python": "/local/bin/python",
+            "resolved_python_version": "Python 3.13.0",
+            "reason": "local_env",
+            "reason_detail": "spl_core",
+            "minor_mismatch": True,
+        }
 
 
 class TestHelpers:

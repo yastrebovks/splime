@@ -25,8 +25,10 @@ from spl.daemon.doctor import (
     check_daemon_home,
     check_disk_space,
     check_environment_builds,
+    check_interpreter_substitutions,
     check_python,
     check_server_connection,
+    check_uv_builder,
     check_venv_tooling,
     run_doctor,
 )
@@ -57,6 +59,7 @@ def _healthy_payload(**overrides: Any) -> dict[str, Any]:
         "counts": {"objects": 3, "runs": 7, "environment_builds": 2},
         "server": {"connected": False, "offline": False, "connection": None},
         "environment_builds": {"by_status": {"ready": 2}},
+        "interpreter_substitutions": {"items": [], "count": 0, "minor_mismatches": 0},
     }
     payload.update(overrides)
     return payload
@@ -89,6 +92,21 @@ class TestIndividualChecks:
         assert result.status == FAIL
         assert "ensurepip" in result.detail
         assert "python3-venv" in (result.hint or "")
+
+    def test_uv_builder_missing_is_warn(self) -> None:
+        result = check_uv_builder()
+        assert result.status == WARN
+        assert "uv not found" in result.detail
+        assert result.hint is not None
+
+    def test_uv_builder_available_is_ok(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(doctor_module.shutil, "which", lambda name: "/usr/bin/uv")
+        result = check_uv_builder()
+        assert result.status == OK
+        assert "/usr/bin/uv" in result.detail
 
     def test_daemon_home_missing_is_warn_with_hint(self, tmp_path: Path) -> None:
         result = check_daemon_home(tmp_path / "absent")
@@ -193,20 +211,56 @@ class TestIndividualChecks:
         healthy = check_environment_builds(_healthy_payload())
         assert healthy.status == OK
 
-        empty = check_environment_builds(
-            _healthy_payload(environment_builds={"by_status": {}})
-        )
+        empty = check_environment_builds(_healthy_payload(environment_builds={"by_status": {}}))
         assert empty.status == OK
         assert "no cached builds" in empty.detail
 
-        failed = check_environment_builds(
-            _healthy_payload(
-                environment_builds={"by_status": {"ready": 1, "failed": 2}}
-            )
-        )
+        failed = check_environment_builds(_healthy_payload(environment_builds={"by_status": {"ready": 1, "failed": 2}}))
         assert failed.status == WARN
         assert "2 of 3" in failed.detail
         assert "env-build-rebuild" in (failed.hint or "")
+
+    def test_interpreter_substitution_states(self) -> None:
+        assert check_interpreter_substitutions(None).status == SKIP
+
+        healthy = check_interpreter_substitutions(_healthy_payload())
+        assert healthy.status == OK
+
+        same_minor = check_interpreter_substitutions(
+            _healthy_payload(
+                interpreter_substitutions={
+                    "items": [
+                        {
+                            "object": "demo_obj",
+                            "authored_python_version": "Python 3.13.0",
+                            "resolved_python_version": "Python 3.13.2",
+                        }
+                    ],
+                    "count": 1,
+                    "minor_mismatches": 0,
+                }
+            )
+        )
+        assert same_minor.status == OK
+
+        mismatch = check_interpreter_substitutions(
+            _healthy_payload(
+                interpreter_substitutions={
+                    "items": [
+                        {
+                            "object": "demo_obj",
+                            "authored_python_version": "Python 3.11.9",
+                            "resolved_python_version": "Python 3.13.0",
+                        }
+                    ],
+                    "count": 1,
+                    "minor_mismatches": 1,
+                }
+            )
+        )
+        assert mismatch.status == WARN
+        assert "demo_obj" in mismatch.detail
+        assert "matching local env" in (mismatch.hint or "")
 
 
 class TestDockerCheck:
@@ -219,9 +273,7 @@ class TestDockerCheck:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(
-            doctor_module.shutil, "which", lambda name: "/usr/bin/docker"
-        )
+        monkeypatch.setattr(doctor_module.shutil, "which", lambda name: "/usr/bin/docker")
 
         class Completed:
             returncode = 1
@@ -240,9 +292,7 @@ class TestDockerCheck:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(
-            doctor_module.shutil, "which", lambda name: "/usr/bin/docker"
-        )
+        monkeypatch.setattr(doctor_module.shutil, "which", lambda name: "/usr/bin/docker")
 
         class Completed:
             returncode = 0
@@ -261,9 +311,7 @@ class TestDockerCheck:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(
-            doctor_module.shutil, "which", lambda name: "/usr/bin/docker"
-        )
+        monkeypatch.setattr(doctor_module.shutil, "which", lambda name: "/usr/bin/docker")
 
         def raise_timeout(*args: Any, **kwargs: Any) -> None:
             raise doctor_module.subprocess.TimeoutExpired(cmd="docker", timeout=10)
@@ -286,9 +334,7 @@ class TestReport:
         assert report.exit_code == 0
 
     def test_exit_code_one_with_failure(self) -> None:
-        report = DoctorReport(
-            checks=[CheckResult(name="a", status=FAIL, detail="broken", hint="fix")]
-        )
+        report = DoctorReport(checks=[CheckResult(name="a", status=FAIL, detail="broken", hint="fix")])
         assert report.exit_code == 1
 
     def test_render_lists_checks_hints_and_summary(self) -> None:
@@ -310,11 +356,13 @@ class TestReport:
         assert {check["name"] for check in payload["checks"]} >= {
             "python",
             "venv tooling",
+            "uv builder",
             "daemon home",
             "disk space",
             "daemon",
             "server connection",
             "environment builds",
+            "interpreter versions",
             "docker",
         }
 
@@ -341,7 +389,7 @@ class TestRunDoctor:
     ) -> None:
         report = run_doctor(FakeClient({"counts": None, "server": None}), home=tmp_path)
         assert isinstance(report, DoctorReport)
-        assert len(report.checks) == 8
+        assert len(report.checks) == 10
 
 
 class TestCli:
@@ -358,9 +406,7 @@ class TestCli:
             "Client",
             lambda url=None: FakeClient(_healthy_payload()),
         )
-        exit_code = cli_module.main(
-            ["doctor", "--home", str(tmp_path), "--json"]
-        )
+        exit_code = cli_module.main(["doctor", "--home", str(tmp_path), "--json"])
         payload = json.loads(capsys.readouterr().out)
         assert exit_code == 0
         assert payload["ok"] is True

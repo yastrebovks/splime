@@ -27,23 +27,13 @@ def _prefer_runtime_env_over_pythonpath_site_packages() -> None:
     version = f"python{sys.version_info.major}.{sys.version_info.minor}"
     protected_candidates = [
         os.path.normcase(os.path.abspath(os.path.join(sys.base_prefix, "Lib"))),
-        os.path.normcase(
-            os.path.abspath(os.path.join(sys.prefix, "Lib", "site-packages"))
-        ),
-        os.path.normcase(
-            os.path.abspath(os.path.join(sys.base_prefix, "lib", version))
-        ),
-        os.path.normcase(
-            os.path.abspath(os.path.join(sys.prefix, "lib", version, "site-packages"))
-        ),
-        os.path.normcase(
-            os.path.abspath(os.path.join(sys.prefix, "lib64", version, "site-packages"))
-        ),
+        os.path.normcase(os.path.abspath(os.path.join(sys.prefix, "Lib", "site-packages"))),
+        os.path.normcase(os.path.abspath(os.path.join(sys.base_prefix, "lib", version))),
+        os.path.normcase(os.path.abspath(os.path.join(sys.prefix, "lib", version, "site-packages"))),
+        os.path.normcase(os.path.abspath(os.path.join(sys.prefix, "lib64", version, "site-packages"))),
     ]
     protected_indexes = [
-        index
-        for index, item in enumerate(sys.path)
-        if os.path.normcase(os.path.abspath(item)) in protected_candidates
+        index for index, item in enumerate(sys.path) if os.path.normcase(os.path.abspath(item)) in protected_candidates
     ]
     if not protected_indexes:
         return
@@ -59,13 +49,9 @@ def _prefer_runtime_env_over_pythonpath_site_packages() -> None:
     if not early_external_site_packages:
         return
 
-    sys.path[:] = [
-        item for item in sys.path if item not in early_external_site_packages
-    ]
+    sys.path[:] = [item for item in sys.path if item not in early_external_site_packages]
     last_protected_index = max(
-        index
-        for index, item in enumerate(sys.path)
-        if os.path.normcase(os.path.abspath(item)) in protected_candidates
+        index for index, item in enumerate(sys.path) if os.path.normcase(os.path.abspath(item)) in protected_candidates
     )
     for item in reversed(early_external_site_packages):
         sys.path.insert(last_protected_index + 1, item)
@@ -78,10 +64,10 @@ import importlib.metadata
 import json
 import re
 import shutil
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -92,6 +78,7 @@ ARTIFACT_REF_KEY = "__spl_artifact_ref__"
 RESULT_KEY = "__spl_result__"
 _JSON_SCALAR_TYPES = (str, int, float, bool)
 _ARTIFACT_NAME_TOKEN_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
+DEFAULT_REMOTE_NODE_HTTP_TIMEOUT_SECONDS: float | None = None
 
 
 def read_json(path: Path) -> Any:
@@ -123,25 +110,26 @@ class RemoteNodeClient:
         self.timeout_seconds = timeout_seconds
 
     def run_node(self, node: Any, kwargs: dict[str, Any]) -> Any:
-        payload = {
-            "node": {
-                "uuid": str(node.uuid),
-                "url": node.url,
-                "name": node.name,
-                "version": node.version,
-            },
+        node_payload: dict[str, Any] = {
+            "uuid": str(node.uuid),
+            "url": node.url,
+            "name": node.name,
+            "version": node.version,
+        }
+        payload: dict[str, Any] = {
+            "node": node_payload,
             "kwargs": kwargs,
             "timeout_seconds": self.timeout_seconds,
         }
         target_machine = getattr(node, "target_machine", None)
         if target_machine is not None:
-            payload["node"]["target_machine"] = target_machine
+            node_payload["target_machine"] = target_machine
         owner_id = getattr(node, "owner_id", None)
         if owner_id is not None:
-            payload["node"]["owner_id"] = owner_id
+            node_payload["owner_id"] = owner_id
         library = getattr(node, "library", None)
         if library is not None:
-            payload["node"]["library"] = library
+            node_payload["library"] = library
         request = Request(
             f"{self.daemon_url}/remote-nodes/run",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -152,7 +140,14 @@ class RemoteNodeClient:
             method="POST",
         )
         try:
-            with urlopen(request) as response:  # noqa: S310 - local daemon URL.
+            # /remote-nodes/run is a blocking call: the daemon polls the
+            # server-side run until the node reaches a terminal state.  urllib
+            # exposes one socket timeout for both connect and read, so an
+            # unbounded run must not inherit the short control-plane default.
+            timeout = (
+                self.timeout_seconds if self.timeout_seconds is not None else DEFAULT_REMOTE_NODE_HTTP_TIMEOUT_SECONDS
+            )
+            with urlopen(request, timeout=timeout) as response:  # noqa: S310 - local daemon URL.
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")
@@ -162,9 +157,7 @@ class RemoteNodeClient:
                 message = raw
             raise RuntimeError(f"remote node call failed: {message}") from exc
         except URLError as exc:
-            raise RuntimeError(
-                f"local daemon is not reachable for remote node call: {exc.reason}"
-            ) from exc
+            raise RuntimeError(f"local daemon is not reachable for remote node call: {exc.reason}") from exc
         return json.loads(raw).get("value")
 
 
@@ -187,15 +180,10 @@ def validate_environment(distributions: list[dict[str, str]]) -> None:
             mismatches.append(f"{package}=={expected} is not installed")
             continue
         if actual != expected:
-            mismatches.append(
-                f"{package}=={expected} is required, actual version is {actual}"
-            )
+            mismatches.append(f"{package}=={expected} is required, actual version is {actual}")
 
     if mismatches:
-        raise RuntimeError(
-            "worker environment does not match SPL metadata: "
-            + "; ".join(mismatches)
-        )
+        raise RuntimeError("worker environment does not match SPL metadata: " + "; ".join(mismatches))
 
 
 def to_jsonable(value: Any) -> Any:
@@ -217,9 +205,7 @@ def to_jsonable(value: Any) -> Any:
         return [to_jsonable(item) for item in value]
     if isinstance(value, set):
         return [to_jsonable(item) for item in sorted(value, key=repr)]
-    raise TypeError(
-        "result is not JSON serializable; return JSON-like data or declare artifacts"
-    )
+    raise TypeError("result is not JSON serializable; return JSON-like data or declare artifacts")
 
 
 def safe_artifact_name(name: str) -> str:
@@ -261,12 +247,9 @@ def collect_artifacts(value: Any, artifacts_dir: Path) -> tuple[Any, dict[str, s
     if RESULT_KEY in value:
         result = value[RESULT_KEY]
     else:
-        result = {
-            key: item
-            for key, item in value.items()
-            if key not in {ARTIFACTS_KEY, RESULT_KEY}
-        }
+        result = {key: item for key, item in value.items() if key not in {ARTIFACTS_KEY, RESULT_KEY}}
 
+    items: Iterable[tuple[Any, Any]]
     if isinstance(artifact_spec, Mapping):
         items = artifact_spec.items()
     elif isinstance(artifact_spec, Sequence) and not isinstance(artifact_spec, str):
@@ -328,33 +311,21 @@ class PipelineResultNormalizer:
                 result = self._result_from_explicit_artifact_mapping(value)
                 self._copy_declared_artifacts(value[ARTIFACTS_KEY])
                 return self.normalize(result, path)
-            return {
-                str(key): self.normalize(item, (*path, str(key)))
-                for key, item in value.items()
-            }
+            return {str(key): self.normalize(item, (*path, str(key))) for key, item in value.items()}
         if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
-            return [
-                self.normalize(item, (*path, str(index)))
-                for index, item in enumerate(value)
-            ]
+            return [self.normalize(item, (*path, str(index))) for index, item in enumerate(value)]
         if isinstance(value, set):
-            return [
-                self.normalize(item, (*path, str(index)))
-                for index, item in enumerate(sorted(value, key=repr))
-            ]
+            return [self.normalize(item, (*path, str(index))) for index, item in enumerate(sorted(value, key=repr))]
         return self._materialize_adapter_artifact(value, path)
 
     @staticmethod
     def _result_from_explicit_artifact_mapping(value: Mapping[Any, Any]) -> Any:
         if RESULT_KEY in value:
             return value[RESULT_KEY]
-        return {
-            key: item
-            for key, item in value.items()
-            if key not in {ARTIFACTS_KEY, RESULT_KEY}
-        }
+        return {key: item for key, item in value.items() if key not in {ARTIFACTS_KEY, RESULT_KEY}}
 
     def _copy_declared_artifacts(self, artifact_spec: Any) -> None:
+        items: Iterable[tuple[Any, Any]]
         if isinstance(artifact_spec, Mapping):
             items = artifact_spec.items()
         elif isinstance(artifact_spec, Sequence) and not isinstance(
@@ -489,9 +460,7 @@ def run_pipeline(
             [node] = list(pipeline.nodes)
             return normalizer.normalize(run[node]), normalizer.artifacts
 
-    raise ValueError(
-        "pipeline has multiple nodes and no aliases; pass output or register aliases"
-    )
+    raise ValueError("pipeline has multiple nodes and no aliases; pass output or register aliases")
 
 
 def load_entrypoint(
@@ -555,11 +524,12 @@ def _install_node_remote_hydration(remote_ports: dict[str, dict[str, Any]]) -> N
     from spl.core.entities.node import InputPort, OutputPort
     from spl.core.entities.node_remote import NodeRemote
 
-    if getattr(NodeRemote, "__spl_daemon_hydrated__", False):
-        NodeRemote.__spl_daemon_remote_ports__ = remote_ports
+    node_remote_type = cast(Any, NodeRemote)
+    if getattr(node_remote_type, "__spl_daemon_hydrated__", False):
+        node_remote_type.__spl_daemon_remote_ports__ = remote_ports
         return
 
-    original_init = NodeRemote.__init__
+    original_init = node_remote_type.__init__
 
     def hydrated_init(
         self: Any,
@@ -571,7 +541,7 @@ def _install_node_remote_hydration(remote_ports: dict[str, dict[str, Any]]) -> N
         uuid: Any = None,
         **kwargs: Any,
     ) -> None:
-        current_ports = getattr(NodeRemote, "__spl_daemon_remote_ports__", {})
+        current_ports = getattr(node_remote_type, "__spl_daemon_remote_ports__", {})
         metadata = current_ports.get(str(uuid))
         if metadata is not None and not inputs and not outputs:
             inputs = [
@@ -596,9 +566,9 @@ def _install_node_remote_hydration(remote_ports: dict[str, dict[str, Any]]) -> N
                 if remote.get(attr) is not None:
                     object.__setattr__(self, attr, remote[attr])
 
-    NodeRemote.__spl_daemon_hydrated__ = True
-    NodeRemote.__spl_daemon_remote_ports__ = remote_ports
-    NodeRemote.__init__ = hydrated_init
+    node_remote_type.__spl_daemon_hydrated__ = True
+    node_remote_type.__spl_daemon_remote_ports__ = remote_ports
+    node_remote_type.__init__ = hydrated_init
 
 
 def execute(

@@ -14,7 +14,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Literal, TextIO
+from typing import Any, Literal, TextIO, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -23,6 +23,7 @@ DEFAULT_DAEMON_HOST = "127.0.0.1"
 DEFAULT_DAEMON_PORT = 8765
 DEFAULT_URL = f"http://{DEFAULT_DAEMON_HOST}:{DEFAULT_DAEMON_PORT}"
 DEFAULT_SERVER_URL = "https://splime.io/api"
+DEFAULT_HTTP_TIMEOUT_SECONDS = 60.0
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60.0
 DAEMON_ENDPOINT_FILENAME = "daemon-endpoint.json"
 DAEMON_API_TOKEN_ENV = "SPL_DAEMON_API_TOKEN"
@@ -93,6 +94,22 @@ def _write_json_file(path: Path, value: dict[str, Any]) -> None:
         path.chmod(0o600)
     except OSError:
         pass
+
+
+def _as_json_dict(value: Any) -> dict[str, Any]:
+    return cast(dict[str, Any], value)
+
+
+def _as_json_dict_list(value: Any) -> list[dict[str, Any]]:
+    return cast(list[dict[str, Any]], value)
+
+
+def _as_json_str_list(value: Any) -> list[str]:
+    return cast(list[str], value)
+
+
+def _as_object_listing(value: Any) -> dict[str, Any] | list[dict[str, Any]]:
+    return cast(dict[str, Any] | list[dict[str, Any]], value)
 
 
 def generate_daemon_api_token() -> str:
@@ -288,10 +305,7 @@ class RunProgressPrinter:
         building = phase == _ENVIRONMENT_BUILD_PHASE
         if not building and now - self._phase_started_at < self._interval:
             return
-        if (
-            self._last_printed_at is not None
-            and now - self._last_printed_at < self._interval
-        ):
+        if self._last_printed_at is not None and now - self._last_printed_at < self._interval:
             return
 
         self._last_printed_at = now
@@ -388,8 +402,15 @@ class Client:
         method: str,
         path: str,
         payload: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = DEFAULT_HTTP_TIMEOUT_SECONDS,
     ) -> Any:
-        """Send one JSON request and decode the JSON response."""
+        """Send one JSON request and decode the JSON response.
+
+        Control-plane calls use the 60 second default.  Blocking execution
+        calls pass ``None`` here when the user did not set ``timeout_seconds``
+        because urllib cannot split connect and read timeouts.
+        """
 
         body = None
         headers = self._headers()
@@ -405,7 +426,7 @@ class Client:
         )
 
         try:
-            with urlopen(request) as response:  # noqa: S310 - local daemon URL.
+            with urlopen(request, timeout=timeout) as response:  # noqa: S310 - local daemon URL.
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")
@@ -430,8 +451,8 @@ class Client:
             method="GET",
         )
         try:
-            with urlopen(request) as response:  # noqa: S310 - local daemon URL.
-                return response.read()
+            with urlopen(request, timeout=DEFAULT_HTTP_TIMEOUT_SECONDS) as response:  # noqa: S310 - local daemon URL.
+                return cast(bytes, response.read())
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")
             try:
@@ -445,7 +466,7 @@ class Client:
     def health(self) -> dict[str, Any]:
         """Check that the daemon is reachable."""
 
-        return self._json_request("GET", "/health")
+        return _as_json_dict(self._json_request("GET", "/health"))
 
     def connect_server(
         self,
@@ -471,27 +492,27 @@ class Client:
             payload["machine_id"] = machine_id
         if heartbeat_interval_seconds is not None:
             payload["heartbeat_interval_seconds"] = heartbeat_interval_seconds
-        return self._json_request("POST", "/server/connect", payload)
+        return _as_json_dict(self._json_request("POST", "/server/connect", payload))
 
     def disconnect_server(self) -> dict[str, Any]:
         """Ask the local daemon to gracefully disconnect from the central server."""
 
-        return self._json_request("POST", "/server/disconnect")
+        return _as_json_dict(self._json_request("POST", "/server/disconnect"))
 
     def server_connection(self) -> dict[str, Any]:
         """Return the local daemon's current central-server connection state."""
 
-        return self._json_request("GET", "/server/connection")
+        return _as_json_dict(self._json_request("GET", "/server/connection"))
 
     def server_connections(self) -> list[dict[str, Any]]:
         """Return stored central-server connection attempts."""
 
-        return self._json_request("GET", "/server/connections")
+        return _as_json_dict_list(self._json_request("GET", "/server/connections"))
 
     def server_machines(self) -> dict[str, Any]:
         """Return machines visible to the connected user."""
 
-        return self._json_request("GET", "/server/machines")
+        return _as_json_dict(self._json_request("GET", "/server/machines"))
 
     def server_objects(
         self,
@@ -510,7 +531,7 @@ class Client:
         if compact:
             query.append("view=summary")
         suffix = f"?{'&'.join(query)}" if query else ""
-        return self._json_request("GET", f"/server/objects{suffix}")
+        return _as_json_dict_list(self._json_request("GET", f"/server/objects{suffix}"))
 
     def server_libraries(
         self,
@@ -520,20 +541,22 @@ class Client:
         """Return libraries visible to the connected central-server user."""
 
         include = "1" if include_accessible else "0"
-        return self._json_request(
-            "GET",
-            f"/server/libraries?include_accessible={include}",
+        return _as_json_dict_list(
+            self._json_request(
+                "GET",
+                f"/server/libraries?include_accessible={include}",
+            )
         )
 
     def create_server_library(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Create a library through the connected central server."""
 
-        return self._json_request("POST", "/server/libraries", payload)
+        return _as_json_dict(self._json_request("POST", "/server/libraries", payload))
 
     def get_server_library(self, library_ref: str) -> dict[str, Any]:
         """Return one central-server library."""
 
-        return self._json_request("GET", f"/server/libraries/{quote(library_ref)}")
+        return _as_json_dict(self._json_request("GET", f"/server/libraries/{quote(library_ref)}"))
 
     def update_server_library(
         self,
@@ -542,10 +565,12 @@ class Client:
     ) -> dict[str, Any]:
         """Update one central-server library."""
 
-        return self._json_request(
-            "PUT",
-            f"/server/libraries/{quote(library_ref)}",
-            payload,
+        return _as_json_dict(
+            self._json_request(
+                "PUT",
+                f"/server/libraries/{quote(library_ref)}",
+                payload,
+            )
         )
 
     def delete_server_library(self, library_ref: str) -> dict[str, Any]:
@@ -556,9 +581,11 @@ class Client:
     def server_library_grants(self, library_ref: str) -> list[dict[str, Any]]:
         """Return grants for one central-server library."""
 
-        return self._json_request(
-            "GET",
-            f"/server/libraries/{quote(library_ref)}/grants",
+        return _as_json_dict_list(
+            self._json_request(
+                "GET",
+                f"/server/libraries/{quote(library_ref)}/grants",
+            )
         )
 
     def grant_server_library(
@@ -568,10 +595,12 @@ class Client:
     ) -> dict[str, Any]:
         """Grant access to one central-server library."""
 
-        return self._json_request(
-            "POST",
-            f"/server/libraries/{quote(library_ref)}/grants",
-            payload,
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/server/libraries/{quote(library_ref)}/grants",
+                payload,
+            )
         )
 
     def revoke_server_library_grant(
@@ -581,9 +610,11 @@ class Client:
     ) -> dict[str, Any]:
         """Revoke a grantee's access to one central-server library."""
 
-        return self._json_request(
-            "POST",
-            f"/server/libraries/{quote(library_ref)}/grants/{quote(grantee)}/revoke",
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/server/libraries/{quote(library_ref)}/grants/{quote(grantee)}/revoke",
+            )
         )
 
     def add_server_library_reference(
@@ -593,10 +624,12 @@ class Client:
     ) -> dict[str, Any]:
         """Add a live reference entry to one central-server library."""
 
-        return self._json_request(
-            "POST",
-            f"/server/libraries/{quote(library_ref)}/references",
-            payload,
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/server/libraries/{quote(library_ref)}/references",
+                payload,
+            )
         )
 
     def copy_server_library_object(
@@ -606,10 +639,12 @@ class Client:
     ) -> dict[str, Any]:
         """Copy an object snapshot into one central-server library."""
 
-        return self._json_request(
-            "POST",
-            f"/server/libraries/{quote(library_ref)}/copies",
-            payload,
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/server/libraries/{quote(library_ref)}/copies",
+                payload,
+            )
         )
 
     def remove_server_library_entry(
@@ -619,9 +654,11 @@ class Client:
     ) -> dict[str, Any]:
         """Remove an owned object or reference entry from one library."""
 
-        return self._json_request(
-            "DELETE",
-            f"/server/libraries/{quote(library_ref)}/entries/{quote(name)}",
+        return _as_json_dict(
+            self._json_request(
+                "DELETE",
+                f"/server/libraries/{quote(library_ref)}/entries/{quote(name)}",
+            )
         )
 
     def register_env(self, name: str, python: str | None = None) -> dict[str, Any]:
@@ -630,26 +667,28 @@ class Client:
         payload = {"name": name}
         if python is not None:
             payload["python"] = python
-        return self._json_request(
-            "POST",
-            "/envs",
-            payload,
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                "/envs",
+                payload,
+            )
         )
 
     def list_envs(self) -> dict[str, Any]:
         """List daemon environments."""
 
-        return self._json_request("GET", "/envs")
+        return _as_json_dict(self._json_request("GET", "/envs"))
 
     def list_environment_builds(self) -> list[dict[str, Any]]:
         """List cached virtual environment builds."""
 
-        return self._json_request("GET", "/environment-builds")
+        return _as_json_dict_list(self._json_request("GET", "/environment-builds"))
 
     def get_environment_build(self, spec_hash: str) -> dict[str, Any]:
         """Return one cached virtual environment build."""
 
-        return self._json_request("GET", f"/environment-builds/{quote(spec_hash)}")
+        return _as_json_dict(self._json_request("GET", f"/environment-builds/{quote(spec_hash)}"))
 
     def rebuild_environment_build(
         self,
@@ -659,10 +698,19 @@ class Client:
     ) -> dict[str, Any]:
         """Force a cached virtual environment to be rebuilt."""
 
-        return self._json_request(
-            "POST",
-            f"/environment-builds/{quote(spec_hash)}/rebuild",
-            {"wait": wait},
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/environment-builds/{quote(spec_hash)}/rebuild",
+                {"wait": wait},
+                timeout=None,
+            )
+            if wait
+            else self._json_request(
+                "POST",
+                f"/environment-builds/{quote(spec_hash)}/rebuild",
+                {"wait": wait},
+            )
         )
 
     def prune_docker_images(
@@ -675,12 +723,12 @@ class Client:
         payload: dict[str, Any] = {}
         if spec_hash is not None:
             payload["spec_hash"] = spec_hash
-        return self._json_request("POST", "/docker-images/prune", payload)
+        return _as_json_dict_list(self._json_request("POST", "/docker-images/prune", payload))
 
     def list_remote_signatures(self) -> list[dict[str, Any]]:
         """List cached remote object signatures."""
 
-        return self._json_request("GET", "/remote-signatures")
+        return _as_json_dict_list(self._json_request("GET", "/remote-signatures"))
 
     def resolve_remote_signature(
         self,
@@ -690,10 +738,12 @@ class Client:
     ) -> dict[str, Any]:
         """Resolve and cache a remote object signature through the daemon."""
 
-        return self._json_request(
-            "POST",
-            "/remote-signatures/resolve",
-            {"ref": ref, "force": force},
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                "/remote-signatures/resolve",
+                {"ref": ref, "force": force},
+            )
         )
 
     def resolve_remote_decomposition(
@@ -702,10 +752,12 @@ class Client:
     ) -> dict[str, Any]:
         """Resolve a remote pipeline decomposition through the daemon."""
 
-        return self._json_request(
-            "POST",
-            "/remote-decompositions/resolve",
-            {"ref": ref},
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                "/remote-decompositions/resolve",
+                {"ref": ref},
+            )
         )
 
     def run_remote_node(
@@ -715,16 +767,25 @@ class Client:
         kwargs: dict[str, Any] | None = None,
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
-        """Run one NodeRemote-like reference through the daemon."""
+        """Run one NodeRemote-like reference through the daemon.
 
-        return self._json_request(
-            "POST",
-            "/remote-nodes/run",
-            {
-                "node": node,
-                "kwargs": kwargs or {},
-                "timeout_seconds": timeout_seconds,
-            },
+        The daemon endpoint is intentionally blocking: it polls the server-side
+        run until completion.  Without a user ``timeout_seconds`` limit, keep
+        the HTTP read unbounded instead of applying the short control-plane
+        default.
+        """
+
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                "/remote-nodes/run",
+                {
+                    "node": node,
+                    "kwargs": kwargs or {},
+                    "timeout_seconds": timeout_seconds,
+                },
+                timeout=timeout_seconds,
+            )
         )
 
     def register_object(
@@ -779,7 +840,7 @@ class Client:
             payload["create_library"] = True
         if library_display_name is not None:
             payload["library_display_name"] = library_display_name
-        return self._json_request("POST", "/objects", payload)
+        return _as_json_dict(self._json_request("POST", "/objects", payload))
 
     def list_objects(
         self,
@@ -792,16 +853,16 @@ class Client:
         view = "summary" if compact else None
         if query is None:
             suffix = "?view=summary" if view else ""
-            return self._json_request("GET", f"/objects{suffix}")
+            return _as_object_listing(self._json_request("GET", f"/objects{suffix}"))
         query_parts = [f"query={quote(query)}"]
         if view:
             query_parts.append("view=summary")
-        return self._json_request("GET", f"/objects?{'&'.join(query_parts)}")
+        return _as_object_listing(self._json_request("GET", f"/objects?{'&'.join(query_parts)}"))
 
     def search_objects(self, query: str) -> list[dict[str, Any]]:
         """Search registered objects by name, description, and metadata."""
 
-        return self._json_request("GET", f"/objects/search?q={quote(query)}")
+        return _as_json_dict_list(self._json_request("GET", f"/objects/search?q={quote(query)}"))
 
     def get_object(
         self,
@@ -826,7 +887,7 @@ class Client:
             query["library"] = library
         if query:
             path = f"{path}?{urlencode(query)}"
-        return self._json_request("GET", path)
+        return _as_json_dict(self._json_request("GET", path))
 
     def signature(
         self,
@@ -858,7 +919,7 @@ class Client:
         if query:
             path = f"{path}?{'&'.join(query)}"
         try:
-            return self._json_request("GET", path)
+            return _as_json_dict(self._json_request("GET", path))
         except ClientError as local_error:
             if owner_id is None and library is None:
                 raise
@@ -874,7 +935,7 @@ class Client:
             if function is not None:
                 ref["function"] = function
             try:
-                return self.resolve_remote_signature(ref)["signature"]
+                return _as_json_dict(self.resolve_remote_signature(ref)["signature"])
             except ClientError as remote_error:
                 # Offline: the local "is not registered" message is the
                 # useful one; "no server connection" would only mislead.
@@ -894,13 +955,15 @@ class Client:
         """Return the required/optional inputs for one object."""
 
         if owner_id is not None or library is not None:
-            return self.signature(
-                name_or_id,
-                version=version,
-                owner_id=owner_id,
-                library=library,
-                function=function,
-            )["inputs"]
+            return _as_json_dict_list(
+                self.signature(
+                    name_or_id,
+                    version=version,
+                    owner_id=owner_id,
+                    library=library,
+                    function=function,
+                )["inputs"]
+            )
 
         path = f"/objects/{quote(name_or_id)}/inputs"
         query = []
@@ -910,7 +973,7 @@ class Client:
             query.append(f"function={quote(function)}")
         if query:
             path = f"{path}?{'&'.join(query)}"
-        return self._json_request("GET", path)
+        return _as_json_dict_list(self._json_request("GET", path))
 
     def outputs(
         self,
@@ -924,13 +987,15 @@ class Client:
         """Return supported output selectors and result accessors."""
 
         if owner_id is not None or library is not None:
-            return self.signature(
-                name_or_id,
-                version=version,
-                owner_id=owner_id,
-                library=library,
-                function=function,
-            )["outputs"]
+            return _as_json_dict_list(
+                self.signature(
+                    name_or_id,
+                    version=version,
+                    owner_id=owner_id,
+                    library=library,
+                    function=function,
+                )["outputs"]
+            )
 
         path = f"/objects/{quote(name_or_id)}/outputs"
         query = []
@@ -940,7 +1005,7 @@ class Client:
             query.append(f"function={quote(function)}")
         if query:
             path = f"{path}?{'&'.join(query)}"
-        return self._json_request("GET", path)
+        return _as_json_dict_list(self._json_request("GET", path))
 
     def decomposition(
         self,
@@ -953,7 +1018,7 @@ class Client:
         path = f"/objects/{quote(name_or_id)}/decomposition"
         if version is not None:
             path = f"{path}?version={version}"
-        return self._json_request("GET", path)
+        return _as_json_dict(self._json_request("GET", path))
 
     def object_versions(
         self,
@@ -972,7 +1037,7 @@ class Client:
             query["library"] = library
         if query:
             path = f"{path}?{urlencode(query)}"
-        return self._json_request("GET", path)
+        return _as_json_dict_list(self._json_request("GET", path))
 
     def forget(
         self,
@@ -991,7 +1056,7 @@ class Client:
             query["library"] = library
         if query:
             path = f"{path}?{urlencode(query)}"
-        return self._json_request("DELETE", path)
+        return _as_json_dict(self._json_request("DELETE", path))
 
     def remove_local(
         self,
@@ -1022,7 +1087,7 @@ class Client:
             query["library"] = library
         if query:
             path = f"{path}?{urlencode(query)}"
-        return self._json_request("DELETE", path)
+        return _as_json_dict(self._json_request("DELETE", path))
 
     def prune_stale_mirrors(
         self,
@@ -1040,7 +1105,7 @@ class Client:
             query["library"] = library
         if query:
             path = f"{path}?{urlencode(query)}"
-        return self._json_request("POST", path)
+        return _as_json_dict(self._json_request("POST", path))
 
     def run(
         self,
@@ -1059,6 +1124,7 @@ class Client:
         offline_policy: OfflinePolicy | None = None,
         source: RunSource = "auto",
         remote: bool | None = None,
+        wait: bool = False,
     ) -> dict[str, Any]:
         """Start a daemon run and return its initial state."""
 
@@ -1089,17 +1155,25 @@ class Client:
             payload["remote"] = remote
         elif object_owner_id is not None or library is not None:
             payload["remote"] = True
-        return self._json_request("POST", "/runs", payload)
+        if wait:
+            payload["wait"] = True
+        # Some compatibility daemon routes may honor wait=True by holding the
+        # request open until the run finishes.  urllib cannot set separate
+        # connect/read timeouts, so an unbounded run must not inherit the
+        # control-plane 60-second read cap.
+        if wait:
+            return _as_json_dict(self._json_request("POST", "/runs", payload, timeout=timeout_seconds))
+        return _as_json_dict(self._json_request("POST", "/runs", payload))
 
     def get_remote_run(self, run_id: str) -> dict[str, Any]:
         """Read one server-side remote run state through the local daemon."""
 
-        return self._json_request("GET", f"/remote-runs/{quote(run_id)}")
+        return _as_json_dict(self._json_request("GET", f"/remote-runs/{quote(run_id)}"))
 
     def list_remote_artifacts(self, run_id: str) -> list[str]:
         """List artifact names for a server-side remote run."""
 
-        return self._json_request("GET", f"/remote-runs/{quote(run_id)}/artifacts")
+        return _as_json_str_list(self._json_request("GET", f"/remote-runs/{quote(run_id)}/artifacts"))
 
     def download_remote_artifact(
         self,
@@ -1113,9 +1187,7 @@ class Client:
         if target_path.is_dir():
             target_path = target_path / artifact_name
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        data = self._bytes_request(
-            f"/remote-runs/{quote(run_id)}/artifacts/{quote(artifact_name)}"
-        )
+        data = self._bytes_request(f"/remote-runs/{quote(run_id)}/artifacts/{quote(artifact_name)}")
         target_path.write_bytes(data)
         return target_path
 
@@ -1141,20 +1213,18 @@ class Client:
             if state["status"] in {"succeeded", "failed", "cancelled", "stale"}:
                 return state
             if timeout_seconds is not None and time.monotonic() - started > timeout_seconds:
-                raise TimeoutError(
-                    f"remote run did not finish within {timeout_seconds} seconds"
-                )
+                raise TimeoutError(f"remote run did not finish within {timeout_seconds} seconds")
             time.sleep(poll_interval)
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         """Read one run state."""
 
-        return self._json_request("GET", f"/runs/{quote(run_id)}")
+        return _as_json_dict(self._json_request("GET", f"/runs/{quote(run_id)}"))
 
     def list_runs(self) -> list[dict[str, Any]]:
         """List known runs."""
 
-        return self._json_request("GET", "/runs")
+        return _as_json_dict_list(self._json_request("GET", "/runs"))
 
     def wait_run(
         self,
@@ -1184,12 +1254,12 @@ class Client:
     def result(self, run_id: str) -> dict[str, Any]:
         """Return a completed run's result payload."""
 
-        return self._json_request("GET", f"/runs/{quote(run_id)}/result")
+        return _as_json_dict(self._json_request("GET", f"/runs/{quote(run_id)}/result"))
 
     def list_artifacts(self, run_id: str) -> list[str]:
         """List artifact names for a run."""
 
-        return self._json_request("GET", f"/runs/{quote(run_id)}/artifacts")
+        return _as_json_str_list(self._json_request("GET", f"/runs/{quote(run_id)}/artifacts"))
 
     def download_artifact(
         self,
@@ -1203,8 +1273,6 @@ class Client:
         if target_path.is_dir():
             target_path = target_path / artifact_name
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        data = self._bytes_request(
-            f"/runs/{quote(run_id)}/artifacts/{quote(artifact_name)}"
-        )
+        data = self._bytes_request(f"/runs/{quote(run_id)}/artifacts/{quote(artifact_name)}")
         target_path.write_bytes(data)
         return target_path

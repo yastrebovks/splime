@@ -348,11 +348,7 @@ class DockerPool:
 
     def evict_excess_locked(self, *, reserve: int = 0) -> None:
         while len(self._containers) + reserve > self.pool_size and self._containers:
-            candidates = {
-                key: record
-                for key, record in self._containers.items()
-                if not record.get("in_use")
-            }
+            candidates = {key: record for key, record in self._containers.items() if not record.get("in_use")}
             if not candidates:
                 return
             key, record = min(
@@ -392,11 +388,7 @@ class DockerPool:
         )
         if completed.returncode != 0:
             return
-        container_ids = [
-            item.strip()
-            for item in completed.stdout.splitlines()
-            if item.strip()
-        ]
+        container_ids = [item.strip() for item in completed.stdout.splitlines() if item.strip()]
         if not container_ids:
             return
         subprocess.run(
@@ -467,20 +459,13 @@ class DockerPool:
         runtime_config: dict[str, Any],
     ) -> tuple[list[str], str]:
         mode = runtime_config.get("network", "auto")
-        has_remote_nodes = any(
-            node.get("kind") == "remote"
-            for node in object_record.get("pipeline_nodes") or []
-        )
+        has_remote_nodes = any(node.get("kind") == "remote" for node in object_record.get("pipeline_nodes") or [])
         if mode == "none" and has_remote_nodes:
-            raise RuntimeError(
-                "docker runtime network='none' cannot run pipelines with remote nodes"
-            )
+            raise RuntimeError("docker runtime network='none' cannot run pipelines with remote nodes")
         if mode == "none" or (mode == "auto" and not has_remote_nodes):
             return ["--network", "none"], self.daemon_base_url
         if platform.system().lower() == "linux":
-            return ["--add-host", "host.docker.internal:host-gateway"], (
-                self.host_daemon_url()
-            )
+            return ["--add-host", "host.docker.internal:host-gateway"], (self.host_daemon_url())
         return [], self.host_daemon_url()
 
     def host_daemon_url(self) -> str:

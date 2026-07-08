@@ -94,9 +94,7 @@ class TestRemovedAliases:
     def test_legacy_client_aliases_are_gone(self) -> None:
         client, _ = _client()
         for alias in REMOVED_CLIENT_ALIASES:
-            assert not hasattr(client, alias), (
-                f"SPLClient.{alias} was removed in 0.2.0 and must not come back"
-            )
+            assert not hasattr(client, alias), f"SPLClient.{alias} was removed in 0.2.0 and must not come back"
 
     def test_canonical_library_namespace_is_silent(self) -> None:
         client, _ = _client()

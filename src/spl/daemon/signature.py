@@ -59,16 +59,15 @@ def build_signature(
         "id": record["id"],
         "version": record["version"],
         "version_id": record["version_id"],
+        "env": record.get("env"),
+        "env_python": record.get("env_python"),
+        "env_python_version": record.get("env_python_version"),
         "kind": kind,
         "description": record.get("description") or "",
         "inputs": inputs,
         "outputs": outputs,
         "pipeline_nodes": record.get("pipeline_nodes") or [],
-        "remote_nodes": [
-            node
-            for node in record.get("pipeline_nodes") or []
-            if node.get("kind") == "remote"
-        ],
+        "remote_nodes": [node for node in record.get("pipeline_nodes") or [] if node.get("kind") == "remote"],
         "internal_objects": record.get("internal_objects") or [],
         "internal_functions": _internal_functions(record),
         "call": _call_help(display_name, kind, inputs, outputs),
@@ -93,6 +92,9 @@ def _build_internal_function_signature(
         "id": record["id"],
         "version": record["version"],
         "version_id": record["version_id"],
+        "env": record.get("env"),
+        "env_python": record.get("env_python"),
+        "env_python_version": record.get("env_python_version"),
         "kind": "function",
         "description": record.get("description") or "",
         "inputs": inputs,
@@ -167,10 +169,7 @@ def _find_internal_function(
         if item["name"] == function:
             return item
     available = ", ".join(item["name"] for item in _internal_functions(record))
-    raise KeyError(
-        f"function is not found in object {record['name']}: "
-        f"{function}; available: {available or '<none>'}"
-    )
+    raise KeyError(f"function is not found in object {record['name']}: {function}; available: {available or '<none>'}")
 
 
 def _normalize_inputs(inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -193,9 +192,7 @@ def _normalize_inputs(inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "port": item.get("name"),
             }
         )
-        by_name[name]["required"] = by_name[name]["required"] or bool(
-            item.get("required", item.get("default") is None)
-        )
+        by_name[name]["required"] = by_name[name]["required"] or bool(item.get("required", item.get("default") is None))
     return [by_name[name] for name in sorted(by_name)]
 
 
@@ -245,9 +242,7 @@ def _pipeline_outputs(outputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "read": f'result.value["{default_port}"]',
                     "result_accessor": f'result.value["{default_port}"]',
                     "value_path": [default_port],
-                    "read_without_output_selector": (
-                        f'result.value["{alias}"]["{default_port}"]'
-                    ),
+                    "read_without_output_selector": (f'result.value["{alias}"]["{default_port}"]'),
                     "notes": (
                         f'Pass output="{alias}". SPL pipeline nodes return a '
                         "port map; for the common single-output case read the "
@@ -330,21 +325,10 @@ def _call_help(
     *,
     function: str | None = None,
 ) -> dict[str, Any]:
-    kwargs_template = {
-        item["name"]: f"<{item['type'] or 'value'}>"
-        for item in inputs
-    }
-    output_values = [
-        item["selector"]
-        for item in outputs
-        if item.get("selector") is not None
-    ]
+    kwargs_template = {item["name"]: f"<{item['type'] or 'value'}>" for item in inputs}
+    output_values = [item["selector"] for item in outputs if item.get("selector") is not None]
     first_output = outputs[0] if outputs else None
-    output_arg = (
-        f', output="{first_output["selector"]}"'
-        if first_output and first_output.get("selector")
-        else ""
-    )
+    output_arg = f', output="{first_output["selector"]}"' if first_output and first_output.get("selector") else ""
     function_arg = f', function="{function}"' if function is not None else ""
     return {
         "kwargs": kwargs_template,
@@ -363,14 +347,7 @@ def _call_help(
             "outputs": output_values,
             "raw_json_template": kwargs_template,
         },
-        "example": (
-            f'result = client.call("{name}", '
-            f'kwargs={kwargs_template}{output_arg}{function_arg})'
-        ),
+        "example": (f'result = client.call("{name}", kwargs={kwargs_template}{output_arg}{function_arg})'),
         "read": first_output.get("read") if first_output else "result.value",
-        "result_shape": (
-            "pipeline_node_port_map"
-            if kind == "pipeline"
-            else "function_value"
-        ),
+        "result_shape": ("pipeline_node_port_map" if kind == "pipeline" else "function_value"),
     }

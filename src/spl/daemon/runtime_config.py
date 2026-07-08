@@ -36,18 +36,10 @@ def normalize_runtime_config(value: dict[str, Any] | None) -> dict[str, Any]:
     if mode == "venv":
         return {"mode": "venv"}
 
-    python = str(
-        raw.get("python")
-        or raw.get("python_version")
-        or DEFAULT_DOCKER_PYTHON
-    )
+    python = str(raw.get("python") or raw.get("python_version") or DEFAULT_DOCKER_PYTHON)
     _validate_python_version(python)
     distro = str(raw.get("distro") or DEFAULT_DOCKER_DISTRO).lower()
-    base_image = str(
-        raw.get("base_image")
-        or raw.get("image")
-        or f"python:{python}-slim-{distro}"
-    )
+    base_image = str(raw.get("base_image") or raw.get("image") or f"python:{python}-slim-{distro}")
     network = str(raw.get("network") or "auto").lower()
     if network not in SUPPORTED_DOCKER_NETWORK_MODES:
         raise ValueError("docker runtime network must be 'auto', 'none', or 'enabled'")
@@ -127,6 +119,5 @@ def _bool_value(value: Any, default: bool) -> bool:
 def _validate_python_version(value: str) -> None:
     if not re.fullmatch(r"3\.(?:1[3-9]|[2-9][0-9])(?:\.\d+)?", value):
         raise ValueError(
-            "docker runtime python must be 3.13 or newer because SPL packages "
-            "currently require Python >= 3.13"
+            "docker runtime python must be 3.13 or newer because SPL packages currently require Python >= 3.13"
         )

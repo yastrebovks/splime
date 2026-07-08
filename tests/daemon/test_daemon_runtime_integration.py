@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,7 @@ import pytest
 import spl.daemon.server as daemon_server
 from spl import lift
 from spl.core.ir.utils import spl_export_to_file
+from spl.daemon.environment import EnvironmentBuildError
 from spl.daemon.server import DaemonRuntime
 from spl.daemon.store import RegistryStore, utc_now
 from spl.daemon.worker import ARTIFACT_REF_KEY, run_pipeline
@@ -244,10 +246,7 @@ def test_pipeline_output_normalizer_reports_missing_adapter_path(tmp_path) -> No
             artifacts_dir=tmp_path / "artifacts",
         )
 
-    assert str(exc_info.value) == (
-        "result.thumbnail.default bytes is not JSON serializable; "
-        "add_adapter(bytes, ...)"
-    )
+    assert str(exc_info.value) == ("result.thumbnail.default bytes is not JSON serializable; add_adapter(bytes, ...)")
 
 
 def test_publish_run_environment_and_artifact_flow(tmp_path) -> None:
@@ -288,8 +287,7 @@ def test_publish_run_environment_and_artifact_flow(tmp_path) -> None:
         ]
         text_artifacts = runtime._local_run_text_artifacts(final)
         assert any(
-            item["name"] == "artifact.artifact.txt"
-            and item["content_text"] == "daemon artifact"
+            item["name"] == "artifact.artifact.txt" and item["content_text"] == "daemon artifact"
             for item in text_artifacts
         )
     finally:
@@ -672,9 +670,7 @@ def test_docker_run_reports_clear_error_when_executable_is_missing(
         monkeypatch.setattr("spl.daemon.runtime_backend.shutil.which", lambda _: None)
 
         try:
-            runtime.runtime_backends.backend_for(
-                {"runtime_config": {"mode": "docker"}}
-            ).ensure_ready({})
+            runtime.runtime_backends.backend_for({"runtime_config": {"mode": "docker"}}).ensure_ready({})
         except RuntimeError as exc:
             assert "docker executable is not available" in str(exc)
         else:
@@ -1057,7 +1053,7 @@ def test_remote_import_mirrors_server_versions_with_source_identity(
         assert current["source_owner_id"] == "owner-1"
         assert current["source_object_id"] == "remote-object-1"
         assert current["source_object_name"] == "demo_obj"
-        assert current["remote_identity"]["source_version_id"] == "remote-version-2"
+        assert current["remote_identity"]["source_version_id"] == "remote-version-1"
         assert current["remote_name"] == "demo_obj"
     finally:
         store.close()
@@ -1190,174 +1186,120 @@ def test_remote_import_auto_registers_missing_server_env(
         store.close()
 
 
-def test_remote_import_repairs_stale_server_env_python(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    class ImportServerClient:
-        def __init__(self, *args, **kwargs) -> None:
-            pass
-
-        def get_object(self, name_or_id, *, version=None, include_yaml=False):
-            assert name_or_id == "demo_obj"
-            assert include_yaml is False
-            return {
-                "id": "remote-object-1",
-                "owner_id": "owner-1",
-                "name": "demo_obj",
-                "version": 1,
-                "version_id": "remote-version-1",
-                "entrypoint": "demo_obj",
-                "env": "spl_core",
-            }
-
-        def list_object_versions(self, name_or_id, *, include_yaml=False):
-            assert name_or_id == "demo_obj"
-            assert include_yaml is True
-            return [
-                {
-                    "id": "remote-object-1",
-                    "owner_id": "owner-1",
-                    "name": "demo_obj",
-                    "version": 1,
-                    "version_id": "remote-version-1",
-                    "entrypoint": "demo_obj",
-                    "env": "spl_core",
-                    "description": "first",
-                    "version_label": "v1",
-                    "yaml": REMOTE_FUNCTION_YAML,
-                },
-            ]
-
-    store = RegistryStore(tmp_path)
-    monkeypatch.setattr(daemon_server, "ServerClient", ImportServerClient)
-    try:
-        default_env = store.register_env("default", sys.executable)
-        store.register_env("spl_core", sys.executable)
-        stale_python = str(tmp_path / "missing-python")
-        with store._lock, store._conn:  # noqa: SLF001 - regression seeds stale local state.
-            store._conn.execute(
-                "UPDATE envs SET python = ? WHERE name = ?",
-                (stale_python, "spl_core"),
-            )
-        store.save_server_connection(
-            server_url="https://splime.io/api",
-            token="machine-token-123456",
-            user_token="user-token-123456",
-            connection={
-                "id": "remote-connection-1",
-                "owner_id": "owner-1",
-                "subject_type": "machine",
-                "subject_id": "machine-1",
-                "machine_id": "machine-1",
-                "display_name": "lab-machine",
-                "status": "connected",
-                "capabilities": {},
-            },
-            heartbeat_interval_seconds=60,
-        )
-        runtime = DaemonRuntime(store, heartbeat_service=_NoopHeartbeats())
-
-        imported = runtime.import_server_object("demo_obj")
-
-        assert store.get_env("spl_core")["python"] == default_env["python"]
-        assert imported["current_version"]["env_python"] == default_env["python"]
-    finally:
-        store.close()
+def _existing_python(path: Path) -> str:
+    path.write_text("", encoding="utf-8")
+    return str(path)
 
 
-def test_remote_import_repairs_stale_env_for_existing_mirror(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    class ImportServerClient:
-        def __init__(self, *args, **kwargs) -> None:
-            pass
-
-        def get_object(self, name_or_id, *, version=None, include_yaml=False):
-            assert name_or_id == "demo_obj"
-            assert include_yaml is False
-            return {
-                "id": "remote-object-1",
-                "owner_id": "owner-1",
-                "name": "demo_obj",
-                "version": 1,
-                "version_id": "remote-version-1",
-                "entrypoint": "demo_obj",
-                "env": "spl_core",
-            }
-
-    store = RegistryStore(tmp_path)
-    monkeypatch.setattr(daemon_server, "ServerClient", ImportServerClient)
-    try:
-        default_env = store.register_env("default", sys.executable)
-        store.register_env("spl_core", sys.executable)
-        store.register_object(
-            "demo_obj",
-            "demo_obj",
-            "spl_core",
-            yaml_text=REMOTE_FUNCTION_YAML,
-            owner_id="owner-1",
-            library="default",
-            origin="server",
-            remote_owner_id="owner-1",
-            remote_object_id="remote-object-1",
-            remote_version_id="remote-version-1",
-            source_object_name="demo_obj",
-        )
-        stale_python = str(tmp_path / "missing-python")
-        with store._lock, store._conn:  # noqa: SLF001 - regression seeds stale local state.
-            store._conn.execute(
-                "UPDATE envs SET python = ? WHERE name = ?",
-                (stale_python, "spl_core"),
-            )
-        store.save_server_connection(
-            server_url="https://splime.io/api",
-            token="machine-token-123456",
-            user_token="user-token-123456",
-            connection={
-                "id": "remote-connection-1",
-                "owner_id": "owner-1",
-                "subject_type": "machine",
-                "subject_id": "machine-1",
-                "machine_id": "machine-1",
-                "display_name": "lab-machine",
-                "status": "connected",
-                "capabilities": {},
-            },
-            heartbeat_interval_seconds=60,
-        )
-        runtime = DaemonRuntime(store, heartbeat_service=_NoopHeartbeats())
-
-        imported = runtime.import_server_object("demo_obj")
-
-        assert imported["refreshed"] is False
-        assert store.get_env("spl_core")["python"] == default_env["python"]
-    finally:
-        store.close()
-
-
-def test_venv_build_spec_uses_current_env_when_stored_python_is_missing(
+def test_server_origin_resolver_uses_local_env_by_name_before_provenance(
     tmp_path,
 ) -> None:
     store = RegistryStore(tmp_path)
     try:
-        env = store.register_env("spl_core", sys.executable)
+        local_python = store.register_env("spl_core", _existing_python(tmp_path / "local-python"))["python"]
         runtime = DaemonRuntime(store, auto_build_envs=False)
         record = {
+            "origin": "server",
             "env": "spl_core",
-            "env_python": str(tmp_path / "missing-python"),
+            "env_python": sys.executable,
             "distributions": [],
         }
 
         spec = runtime.environment_manager.build_spec(record)
 
-        assert spec["base_python"] == env["python"]
+        assert spec["base_python"] == local_python
     finally:
         store.close()
 
 
-def test_server_mirror_reregister_repairs_existing_version_env_python(
+def test_server_origin_resolver_falls_back_to_default_env_when_named_env_is_missing(
+    tmp_path,
+) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        default_python = store.register_env("default", _existing_python(tmp_path / "default-python"))["python"]
+        runtime = DaemonRuntime(store, auto_build_envs=False)
+        record = {
+            "origin": "server",
+            "env": "spl_core",
+            "env_python": str(tmp_path / "author-python"),
+            "distributions": [],
+        }
+
+        spec = runtime.environment_manager.build_spec(record)
+
+        assert spec["base_python"] == default_python
+    finally:
+        store.close()
+
+
+def test_server_origin_resolver_falls_back_to_daemon_python_without_local_envs(
+    tmp_path,
+) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        runtime = DaemonRuntime(store, auto_build_envs=False)
+        record = {
+            "origin": "server",
+            "env": "spl_core",
+            "env_python": str(tmp_path / "author-python"),
+            "distributions": [],
+        }
+
+        spec = runtime.environment_manager.build_spec(record)
+
+        assert spec["base_python"] == str(Path(sys.executable).expanduser().absolute())
+    finally:
+        store.close()
+
+
+def test_local_origin_resolver_uses_stored_python_when_live(
+    tmp_path,
+) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        local_python = _existing_python(tmp_path / "local-python")
+        runtime = DaemonRuntime(store, auto_build_envs=False)
+        record = {
+            "origin": "local",
+            "env": "spl_core",
+            "env_python": local_python,
+            "distributions": [],
+        }
+
+        spec = runtime.environment_manager.build_spec(record)
+
+        assert spec["base_python"] == str(Path(local_python).expanduser().absolute())
+    finally:
+        store.close()
+
+
+def test_local_origin_dead_python_fails_without_default_substitution(
+    tmp_path,
+) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        default_env = store.register_env("default", sys.executable)
+        runtime = DaemonRuntime(store, auto_build_envs=False)
+        missing_python = str(tmp_path / "missing-python")
+        record = {
+            "origin": "local",
+            "env": "default",
+            "env_python": missing_python,
+            "distributions": [],
+        }
+
+        spec = runtime.environment_manager.build_spec(record)
+
+        assert spec["base_python"] != default_env["python"]
+        assert spec["base_python"] == str(Path(missing_python).expanduser().absolute())
+        with pytest.raises(EnvironmentBuildError):
+            runtime.environment_manager.ensure_ready(record, wait=True)
+    finally:
+        store.close()
+
+
+def test_server_mirror_reregister_keeps_env_python_provenance_and_resolves_locally(
     tmp_path,
 ) -> None:
     store = RegistryStore(tmp_path)
@@ -1382,19 +1324,19 @@ def test_server_mirror_reregister_repairs_existing_version_env_python(
             remote_version_id="remote-version-1",
             source_object_name="demo_obj",
         )
-        stale_python = str(tmp_path / "missing-python")
-        with store._lock, store._conn:  # noqa: SLF001 - regression seeds stale local state.
+        author_python = str(tmp_path / "author-python")
+        with store._lock, store._conn:  # noqa: SLF001 - regression seeds server provenance.
             store._conn.execute(
                 "UPDATE envs SET python = ? WHERE name = ?",
-                (stale_python, "default1"),
+                (str(tmp_path / "missing-local-python"), "default1"),
             )
             store._conn.execute(
                 "UPDATE object_versions SET env_python = ? WHERE id = ?",
-                (stale_python, first["version_id"]),
+                (author_python, first["version_id"]),
             )
         runtime._ensure_server_object_envs([{"env": "default1"}])
 
-        repaired = runtime.register_object(
+        mirrored = runtime.register_object(
             "demo_obj",
             "demo_obj",
             "default1",
@@ -1407,29 +1349,74 @@ def test_server_mirror_reregister_repairs_existing_version_env_python(
             remote_version_id="remote-version-1",
             source_object_name="demo_obj",
         )
+        spec = runtime.environment_manager.build_spec(mirrored)
 
-        assert repaired["version_id"] == first["version_id"]
-        assert repaired["env_python"] == default_env["python"]
+        assert mirrored["version_id"] == first["version_id"]
+        assert mirrored["env_python"] == author_python
+        assert spec["base_python"] == default_env["python"]
     finally:
         store.close()
 
 
-def test_venv_build_spec_uses_default_env_for_stale_server_mirror(
+def test_server_origin_interpreter_substitution_is_logged_and_reported(
     tmp_path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     store = RegistryStore(tmp_path)
     try:
-        default_env = store.register_env("default", sys.executable)
-        runtime = DaemonRuntime(store, auto_build_envs=False)
-        record = {
-            "origin": "server",
-            "env": "spl_core",
-            "env_python": str(tmp_path / "missing-python"),
-            "distributions": [],
-        }
+        local_env = store.register_env("spl_core", sys.executable)
+        runtime = DaemonRuntime(
+            store,
+            auto_build_envs=False,
+            heartbeat_service=_NoopHeartbeats(),
+        )
+        record = runtime.register_object(
+            "demo_obj",
+            "demo_obj",
+            "spl_core",
+            yaml_text=REMOTE_FUNCTION_YAML,
+            owner_id="owner-1",
+            library="default",
+            origin="server",
+            remote_owner_id="owner-1",
+            remote_object_id="remote-object-1",
+            remote_version_id="remote-version-1",
+            source_object_name="demo_obj",
+        )
+        author_python = str(tmp_path / "author-python")
+        with store._lock, store._conn:  # noqa: SLF001 - regression seeds server provenance.
+            store._conn.execute(
+                "UPDATE object_versions SET env_python = ? WHERE id = ?",
+                (author_python, record["version_id"]),
+            )
+        record = store.get_object_version(record["version_id"])
+        _mark_object_environment_ready(runtime, record)
 
-        spec = runtime.environment_manager.build_spec(record)
+        caplog.set_level(logging.INFO, logger="spl.daemon.server")
+        started = runtime.start_run(
+            "demo_obj",
+            source="local",
+            object_version_id=record["version_id"],
+            report_local_run=False,
+            timeout_seconds=30,
+        )
+        final = _wait_for_run(store, started["id"])
 
-        assert spec["base_python"] == default_env["python"]
+        assert final["status"] == "succeeded"
+        assert final["interpreter_substitution"] is not None
+        assert final["interpreter_substitution"]["authored_python"] == author_python
+        assert final["interpreter_substitution"]["resolved_python"] == local_env["python"]
+        assert final["interpreter_substitution"]["reason"] == "local_env"
+        records = [
+            log_record
+            for log_record in caplog.records
+            if getattr(log_record, "spl_event", None) == "interpreter_substitution"
+        ]
+        assert len(records) == 1
+        payload = records[0].interpreter_substitution
+        assert payload["object"] == "demo_obj"
+        assert payload["version_id"] == record["version_id"]
+        assert payload["authored_python"] == author_python
+        assert payload["resolved_python"] == local_env["python"]
     finally:
         store.close()

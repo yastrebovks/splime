@@ -41,9 +41,7 @@ class LibraryRepository(RepositoryBase):
         """Return cached remote signatures, newest updates first."""
 
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM remote_signatures ORDER BY updated_at DESC"
-            ).fetchall()
+            rows = self._conn.execute("SELECT * FROM remote_signatures ORDER BY updated_at DESC").fetchall()
         return [self._remote_signature_row(row) for row in rows]
 
     def save_remote_signature(
@@ -135,12 +133,7 @@ class LibraryRepository(RepositoryBase):
 
     def _normalize_remote_signature_ref(self, ref: dict[str, Any]) -> dict[str, Any]:
         server_url = str(ref.get("server_url") or ref.get("url") or "").rstrip("/")
-        object_name = str(
-            ref.get("object_name")
-            or ref.get("object")
-            or ref.get("name")
-            or ""
-        )
+        object_name = str(ref.get("object_name") or ref.get("object") or ref.get("name") or "")
         raw_function = ref.get("function") or ref.get("entrypoint")
         if not server_url:
             raise ValueError("remote signature ref requires url/server_url")
@@ -155,9 +148,7 @@ class LibraryRepository(RepositoryBase):
         normalized_owner = None if owner_id is None or owner_id == "" else str(owner_id)
         normalized_library = None if library is None or library == "" else str(library)
         normalized_version = None if version is None or version == "" else str(version)
-        normalized_version_id = (
-            None if version_id is None or version_id == "" else str(version_id)
-        )
+        normalized_version_id = None if version_id is None or version_id == "" else str(version_id)
         return {
             "server_url": server_url,
             "owner_id": normalized_owner,

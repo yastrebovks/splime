@@ -11,12 +11,12 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request
 
-from spl._http import urlopen_verified
+from spl._http import DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS, urlopen_verified
 from spl._views import (
     ArtifactListView,
     DecompositionView,
@@ -54,12 +54,12 @@ class ServerClientError(RuntimeError):
         super().__init__(f"{status_code}: {message}")
 
 
-def _view_dict(payload: Any, view_type: type[dict[str, Any]]) -> Any:
-    return view_type(payload) if isinstance(payload, dict) else payload
+def _view_dict(payload: Any, view_type: type[dict[str, Any]]) -> dict[str, Any]:
+    return cast(dict[str, Any], view_type(payload) if isinstance(payload, dict) else payload)
 
 
-def _view_list(payload: Any, view_type: type[list[Any]]) -> Any:
-    return view_type(payload) if isinstance(payload, list) else payload
+def _view_list(payload: Any, view_type: type[list[Any]]) -> list[dict[str, Any]]:
+    return cast(list[dict[str, Any]], view_type(payload) if isinstance(payload, list) else payload)
 
 
 @dataclass(frozen=True, repr=False)
@@ -114,19 +114,17 @@ class ServerRemoteRun:
 
     def __init__(self, client: "SPLServerClient", state: dict[str, Any]):
         self._client = client
-        self.state = (
-            state
-            if isinstance(state, RunRecordView)
-            else RunRecordView(state if isinstance(state, dict) else {})
+        self.state: dict[str, Any] = (
+            state if isinstance(state, RunRecordView) else RunRecordView(state if isinstance(state, dict) else {})
         )
 
     @property
     def id(self) -> str:
-        return self.state["id"]
+        return cast(str, self.state["id"])
 
     @property
     def status(self) -> str:
-        return self.state["status"]
+        return cast(str, self.state["status"])
 
     @property
     def mode(self) -> str:
@@ -169,10 +167,7 @@ class ServerRemoteRun:
     def download_artifacts(self, target_dir: str | Path) -> dict[str, Path]:
         target_path = Path(target_dir)
         target_path.mkdir(parents=True, exist_ok=True)
-        return {
-            name: self._client.download_artifact(self.id, name, target_path)
-            for name in self.artifact_names()
-        }
+        return {name: self._client.download_artifact(self.id, name, target_path) for name in self.artifact_names()}
 
     def cancel(self) -> dict[str, Any]:
         self.state = _view_dict(self._client.cancel_run(self.id), RunRecordView)
@@ -194,16 +189,9 @@ class ServerRemoteRun:
         )
         if final_state["status"] != "succeeded":
             error = final_state.get("error") or "remote run returned no error message"
-            raise RuntimeError(
-                f"server run {self.id!r} ended as "
-                f"{final_state.get('status')!r}: {error}"
-            )
+            raise RuntimeError(f"server run {self.id!r} ended as {final_state.get('status')!r}: {error}")
         detail = self.detail()
-        downloaded = (
-            self.download_artifacts(artifacts_dir)
-            if artifacts_dir is not None
-            else {}
-        )
+        downloaded = self.download_artifacts(artifacts_dir) if artifacts_dir is not None else {}
         return ServerCallResult(
             run=final_state,
             detail=detail,
@@ -284,8 +272,8 @@ class SPLServerClient:
     def _bytes_request(self, path: str) -> bytes:
         request = Request(f"{self.base_url}{path}", headers=self._headers())
         try:
-            with urlopen_verified(request) as response:
-                return response.read()
+            with urlopen_verified(request, timeout=DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS) as response:
+                return cast(bytes, response.read())
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")
             try:
@@ -310,9 +298,7 @@ class SPLServerClient:
         compact: bool = False,
     ) -> list[dict[str, Any]]:
         path = (
-            f"/owners/{_url_part(owner)}/libraries/{_url_part(library or 'default')}/objects"
-            if owner
-            else "/objects"
+            f"/owners/{_url_part(owner)}/libraries/{_url_part(library or 'default')}/objects" if owner else "/objects"
         )
         query = {}
         if library and owner is None:
@@ -590,9 +576,7 @@ class SPLServerClient:
         )
 
     def artifact_bytes(self, run_id: str, name: str) -> bytes:
-        return self._bytes_request(
-            f"/remote-runs/{_url_part(run_id)}/artifacts/{_url_part(name)}"
-        )
+        return self._bytes_request(f"/remote-runs/{_url_part(run_id)}/artifacts/{_url_part(name)}")
 
     def download_artifact(self, run_id: str, name: str, target: str | Path) -> Path:
         target_path = Path(target)
