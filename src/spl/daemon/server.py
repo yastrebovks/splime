@@ -304,6 +304,10 @@ class DaemonRuntime:
         self.runtime_backends = runtime_backends or runtime_backend_registry_factory(backend_services)
         self.sync_visibility = sync_visibility or sync_visibility_factory(store)
         self._server_sync_lock = threading.Lock()
+        self._run_threads_lock = threading.Lock()
+        self._run_threads: list[threading.Thread] = []
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_complete = False
         self.server_connections = server_connections or server_connection_manager_factory(store, server_client_factory)
         self.heartbeat_service = heartbeat_service or heartbeat_service_factory(
             store,
@@ -1964,13 +1968,7 @@ class DaemonRuntime:
             state = self._prepare_node_runtime_environments_for_run(state, report_local_run=report_local_run)
         except Exception as exc:
             return self._fail_run_before_worker(state, report_local_run=report_local_run, error=str(exc) or repr(exc))
-        thread = threading.Thread(
-            target=self._execute_run,
-            args=(state["id"], report_local_run),
-            name=f"spl-run-{state['id']}",
-            daemon=True,
-        )
-        thread.start()
+        self._start_run_thread(state["id"], report_local_run)
         return self._update_local_run(
             state["id"],
             report_local_run=report_local_run,
@@ -2064,18 +2062,24 @@ class DaemonRuntime:
             state = self._prepare_node_runtime_environments_for_run(state, report_local_run=report_local_run)
         except Exception as exc:
             return self._fail_run_before_worker(state, report_local_run=report_local_run, error=str(exc) or repr(exc))
-        thread = threading.Thread(
-            target=self._execute_run,
-            args=(state["id"], report_local_run),
-            name=f"spl-run-{state['id']}",
-            daemon=True,
-        )
-        thread.start()
+        self._start_run_thread(state["id"], report_local_run)
         return self._update_local_run(
             state["id"],
             report_local_run=report_local_run,
             status="starting",
         )
+
+    def _start_run_thread(self, run_id: str, report_local_run: bool) -> None:
+        thread = threading.Thread(
+            target=self._execute_run,
+            args=(run_id, report_local_run),
+            name=f"spl-run-{run_id}",
+            daemon=True,
+        )
+        with self._run_threads_lock:
+            self._run_threads = [candidate for candidate in self._run_threads if candidate.is_alive()]
+            self._run_threads.append(thread)
+        thread.start()
 
     def _fail_run_before_worker(
         self,
@@ -2352,7 +2356,8 @@ class DaemonRuntime:
                             parent_run_id=state.get("parent_run_id"),
                             object_record=object_record,
                         )
-                    self._update_local_run(
+                    # Terminal writes are the final store access in the run thread.
+                    self._update_local_run_terminal(
                         run_id,
                         report_local_run=report_local_run,
                         **success_changes,
@@ -2377,7 +2382,8 @@ class DaemonRuntime:
                             parent_run_id=state.get("parent_run_id"),
                             object_record=object_record,
                         )
-                    self._update_local_run(
+                    # Terminal writes are the final store access in the run thread.
+                    self._update_local_run_terminal(
                         run_id,
                         report_local_run=report_local_run,
                         **failure_changes,
@@ -2402,7 +2408,8 @@ class DaemonRuntime:
                     parent_run_id=state.get("parent_run_id"),
                     object_record=object_record,
                 )
-            self._update_local_run(run_id, report_local_run=report_local_run, **timeout_changes)
+            # Terminal writes are the final store access in the run thread.
+            self._update_local_run_terminal(run_id, report_local_run=report_local_run, **timeout_changes)
         except Exception as exc:
             error_changes: dict[str, Any] = {
                 "status": "failed",
@@ -2417,7 +2424,8 @@ class DaemonRuntime:
                     parent_run_id=state.get("parent_run_id"),
                     object_record=object_record,
                 )
-            self._update_local_run(run_id, report_local_run=report_local_run, **error_changes)
+            # Terminal writes are the final store access in the run thread.
+            self._update_local_run_terminal(run_id, report_local_run=report_local_run, **error_changes)
 
     def _worker_manifest_path(self, run_dir: Path) -> Path | None:
         state_dir = run_dir / "pipeline-state"
@@ -2475,6 +2483,25 @@ class DaemonRuntime:
         if report_local_run:
             self.enqueue_local_run_update(state)
         return state
+
+    def _update_local_run_terminal(
+        self,
+        run_id: str,
+        *,
+        report_local_run: bool,
+        **changes: Any,
+    ) -> dict[str, Any] | None:
+        try:
+            return self._update_local_run(
+                run_id,
+                report_local_run=report_local_run,
+                **changes,
+            )
+        except RuntimeError as exc:
+            if str(exc) != "store is closed":
+                raise
+            LOGGER.warning("run state write skipped: store closed during shutdown")
+            return None
 
     def _log_interpreter_substitution(
         self,
@@ -2735,8 +2762,32 @@ class DaemonRuntime:
         )
 
     def shutdown(self) -> None:
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            self._shutdown_complete = True
         self.heartbeat_service.shutdown()
+        self._join_run_threads(timeout_seconds=30.0)
         self.docker_pool.shutdown()
+
+    def _join_run_threads(self, *, timeout_seconds: float) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        with self._run_threads_lock:
+            threads = [thread for thread in self._run_threads if thread.is_alive()]
+            self._run_threads = threads
+        for thread in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(remaining)
+        with self._run_threads_lock:
+            alive = [thread for thread in self._run_threads if thread.is_alive()]
+            self._run_threads = alive
+        if alive:
+            LOGGER.warning(
+                "run threads still alive during shutdown: %s",
+                ", ".join(thread.name for thread in alive),
+            )
 
     def _read_timeout(self, input_path: Path) -> float | None:
         """Read an optional run timeout from the stored input payload."""

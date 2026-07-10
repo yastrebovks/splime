@@ -3,7 +3,10 @@ from __future__ import annotations
 import os
 import stat
 import sys
+import threading
 from pathlib import Path
+
+import pytest
 
 from spl.core import manifest as m_manifest
 import spl.daemon.repositories.env as env_repository
@@ -39,6 +42,12 @@ def _tag_stats_edge(save_tag: str, load_tags: list[str]) -> dict[str, object]:
     }
 
 
+def _seed_demo_run(store: RegistryStore) -> dict[str, object]:
+    store.register_env("default", sys.executable)
+    store.register_object("demo_obj", "demo_obj", "default", yaml_text=FUNCTION_YAML)
+    return store.create_run("demo_obj", keep=True)
+
+
 def test_storage_base_owns_paths_and_json_helpers(tmp_path) -> None:
     storage = StorageBase(tmp_path)
     try:
@@ -57,6 +66,58 @@ def test_storage_base_owns_paths_and_json_helpers(tmp_path) -> None:
             assert _mode(path) == 0o600
     finally:
         storage.close()
+
+
+def test_storage_base_close_is_idempotent(tmp_path) -> None:
+    storage = StorageBase(tmp_path)
+
+    storage.close()
+    storage.close()
+
+
+def test_store_operation_after_close_raises_clean_runtime_error(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    store.close()
+
+    with pytest.raises(RuntimeError, match="store is closed"):
+        store.list_envs()
+    store.close()
+
+
+def test_store_close_serializes_against_run_updates(tmp_path) -> None:
+    for index in range(50):
+        store = RegistryStore(tmp_path / f"store-{index}")
+        run = _seed_demo_run(store)
+        first_update = threading.Event()
+        stop = threading.Event()
+        errors: list[BaseException] = []
+
+        def update_loop() -> None:
+            status = "running"
+            while not stop.is_set():
+                try:
+                    store.update_run(str(run["id"]), status=status)
+                    first_update.set()
+                    status = "queued" if status == "running" else "running"
+                except RuntimeError as exc:
+                    if str(exc) == "store is closed":
+                        return
+                    errors.append(exc)
+                    return
+                except BaseException as exc:  # pragma: no cover - assertion reports the concrete failure.
+                    errors.append(exc)
+                    return
+
+        thread = threading.Thread(target=update_loop, name=f"store-close-race-{index}")
+        thread.start()
+        assert first_update.wait(2)
+        store.close()
+        stop.set()
+        thread.join(2)
+
+        assert not thread.is_alive()
+        assert errors == []
+        store.close()
 
 
 def test_register_env_defaults_to_daemon_interpreter(tmp_path, monkeypatch) -> None:

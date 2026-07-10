@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import stat
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -947,6 +948,90 @@ def test_publish_run_environment_and_artifact_flow(tmp_path) -> None:
             for item in text_artifacts
         )
     finally:
+        store.close()
+
+
+def test_runtime_shutdown_joins_run_threads_before_store_close(tmp_path, monkeypatch) -> None:
+    store = RegistryStore(tmp_path)
+    runtime: DaemonRuntime | None = None
+    release_run = threading.Event()
+    try:
+        store.register_env("default", sys.executable)
+        runtime = DaemonRuntime(store, auto_build_envs=False)
+        record = runtime.register_object(
+            "artifact_func",
+            "artifact_func",
+            "default",
+            yaml_text=ARTIFACT_FUNCTION_YAML,
+        )
+        _mark_object_environment_ready(runtime, record)
+
+        run_started = threading.Event()
+        run_finished = threading.Event()
+        shutdown_finished = threading.Event()
+        active_runtime = runtime
+
+        def slow_execute_run(run_id: str, report_local_run: bool = True) -> None:
+            run_started.set()
+            assert release_run.wait(2)
+            active_runtime._update_local_run(
+                run_id,
+                report_local_run=report_local_run,
+                status="succeeded",
+                finished_at=utc_now(),
+                result={"result": "finished"},
+            )
+            run_finished.set()
+
+        monkeypatch.setattr(runtime, "_execute_run", slow_execute_run)
+        started = runtime.start_run(
+            "artifact_func",
+            source="local",
+            report_local_run=False,
+            timeout_seconds=30,
+        )
+        assert run_started.wait(2)
+
+        shutdown_thread = threading.Thread(
+            target=lambda: (runtime.shutdown(), shutdown_finished.set()),
+            name="shutdown-join-test",
+        )
+        shutdown_thread.start()
+        assert not shutdown_finished.wait(0.1)
+
+        release_run.set()
+        assert shutdown_finished.wait(2)
+        shutdown_thread.join(2)
+        assert run_finished.is_set()
+        assert not any(thread.name.startswith("spl-run-") for thread in threading.enumerate())
+
+        assert store.get_run(started["id"])["status"] == "succeeded"
+        store.close()
+        store.close()
+    finally:
+        release_run.set()
+        if runtime is not None:
+            runtime.shutdown()
+        store.close()
+
+
+def test_terminal_run_update_skips_store_closed_during_shutdown(tmp_path, caplog) -> None:
+    store = RegistryStore(tmp_path)
+    runtime = DaemonRuntime(store, auto_build_envs=False)
+    try:
+        store.close()
+        caplog.set_level(logging.WARNING, logger="spl.daemon.server")
+
+        updated = runtime._update_local_run_terminal(
+            "closed-store-run",
+            report_local_run=False,
+            status="failed",
+        )
+
+        assert updated is None
+        assert "run state write skipped: store closed during shutdown" in caplog.text
+    finally:
+        runtime.shutdown()
         store.close()
 
 

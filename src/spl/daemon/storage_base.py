@@ -164,15 +164,25 @@ class StorageBase:
         self.environment_builds_dir = self.home / "environment-builds"
         self.secret_store = SecretStore(self.home)
         self._lock = RLock()
+        self._closed = False
         self._python_version_cache: dict[str, str] = {}
         # SQLite cannot create the database file when the parent directory is
         # absent.  Create the daemon home before opening the connection so a new
         # --home path works on the first run.
         self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
         _chmod_owner_dir(self.home)
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
+        self._connection = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._connection.row_factory = sqlite3.Row
         _chmod_owner_file(self.db_path)
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        self._ensure_open_locked()
+        return self._connection
+
+    def _ensure_open_locked(self) -> None:
+        if self._closed:
+            raise RuntimeError("store is closed")
 
     def register_repositories(self, *repositories: object) -> None:
         """Register aggregate repositories for private cross-aggregate helpers."""
@@ -576,7 +586,11 @@ class StorageBase:
     def close(self) -> None:
         """Close the SQLite connection held by this store."""
 
-        self._conn.close()
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._connection.close()
 
     def __enter__(self) -> "StorageBase":
         return self
