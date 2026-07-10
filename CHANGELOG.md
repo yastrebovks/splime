@@ -5,6 +5,66 @@ All notable changes to the `splime` package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-07-10
+
+Docker-line follow-up for the 0.4 runtime release. No migration is required:
+public APIs, YAML, daemon HTTP contracts, object-level `RUNTIME_BACKENDS`, and
+non-Docker pipelines remain compatible.
+
+### Added
+
+- Per-node `docker` runtime for Python function nodes, using the existing
+  SPL-free work-dir protocol (`input.json`, `result.json`, generated module,
+  stdlib runner, stdout/stderr files, artifacts).
+- Daemon-side image delivery for Docker nodes: the daemon pre-ensures the
+  object environment image or passes explicit `runtime_config.docker.image`
+  through `node_runtime_environments`; local client runs require the explicit
+  image.
+- `spl-daemon doctor` now reports per-node Docker availability with actions for
+  missing Docker CLI, unreachable daemon, local client runs without an image,
+  and nested object-Docker worker contexts.
+- Cookbook guidance for choosing `native`, `venv-subprocess`, or `docker`
+  node runtimes, including an opt-in explicit-image Docker example.
+
+### Changed
+
+- Docker nodes use shared hardening and user-option helpers plus a dedicated
+  node-network helper: `auto` and `none` run with `--network none`, while
+  explicit images that need runtime network access can set
+  `runtime_config.docker.network` to `enabled`.
+- Per-node Docker manifest records use `resolved.image_tag` instead of a
+  Python interpreter path; explicit images now get the same stable
+  `config_hash` in daemon and local runs.
+- Object-level Docker workers set an additive environment marker so nested
+  per-node Docker is rejected before execution.
+- Docker node container names include a short random suffix to avoid retry
+  collisions with containers left behind by hard Docker daemon failures.
+- Connected `SPLClient.signature()`, `describe()`, `inputs()`, and `outputs()`
+  now auto-resolve a bare local miss through the accessible server catalog when
+  there is exactly one matching server object; duplicate names require explicit
+  `owner=`/`library=` instead of assuming a default library.
+- `SPLClient.run_show(id)` now auto-routes local retained-run ids to the local
+  manifest store when `local` is not set; daemon 404s report the detected id
+  namespace, `runs()` hints at `runs(local=True)` when local retained runs
+  exist, and `client.resume()` rejects local run ids with the `Deployment.resume`
+  remediation.
+- `SPLClient.decomposition()` and `draw_pipeline()` now use the same connected
+  bare-name server catalog fallback as `signature()`; object list reprs label
+  local/server/catalog scope, `describe()` warns when a newer server version is
+  visible, and `forget()` receipts say that only the local cache was changed.
+
+### Fixed
+
+- Object-level Docker runs are covered against retained manifests, `run-show`,
+  `run-prune`, owner-only retained-state permissions, and daemon resume.
+- Object-level Docker resume stages parent retained state into the mounted run
+  directory before the container worker starts and resolves that staged path
+  against the run root instead of the worker current directory.
+- Docker node failures report non-zero exits, missing `result.json`, and
+  timeout cleanup in the same node-scoped error family as `venv-subprocess`.
+- The daemon worker's legacy `Deployment` fallback preserves the node
+  environment provider so Docker node image metadata is not dropped.
+
 ## [0.4.0] - 2026-07-09
 
 Preparation release for multilingual pipelines, implemented on Python only:

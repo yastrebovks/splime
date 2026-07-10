@@ -18,6 +18,126 @@ from urllib.parse import urlparse, urlunparse
 from spl.daemon.runtime_dependencies import DockerEnvironmentBuilderProtocol
 from spl.daemon.store import RegistryStore, utc_now, validate_name
 
+OBJECT_DOCKER_RUNTIME_ENV = "SPL_OBJECT_RUNTIME_BACKEND"
+OBJECT_DOCKER_RUNTIME_VALUE = "docker"
+OBJECT_DOCKER_WORKER_ENV = "SPL_OBJECT_DOCKER_WORKER"
+OBJECT_DOCKER_WORKER_VALUE = "1"
+
+
+def docker_hardening_args(runtime_config: dict[str, Any]) -> list[str]:
+    """Return Docker hardening and resource-limit CLI arguments."""
+
+    args: list[str] = []
+    if runtime_config.get("init", True):
+        args.append("--init")
+    cap_drop = runtime_config.get("cap_drop")
+    if cap_drop:
+        args.extend(["--cap-drop", str(cap_drop)])
+    if runtime_config.get("no_new_privileges", True):
+        args.extend(["--security-opt", "no-new-privileges"])
+    limits = runtime_config.get("limits") or {}
+    if limits.get("memory"):
+        args.extend(["--memory", str(limits["memory"])])
+    if limits.get("cpus"):
+        args.extend(["--cpus", str(limits["cpus"])])
+    if limits.get("pids_limit"):
+        args.extend(["--pids-limit", str(limits["pids_limit"])])
+    if runtime_config.get("read_only", True):
+        args.append("--read-only")
+    tmpfs = runtime_config.get("tmpfs")
+    if tmpfs:
+        args.extend(["--tmpfs", str(tmpfs)])
+    return args
+
+
+def docker_env_args(runtime_config: dict[str, Any]) -> list[str]:
+    """Return deterministic Docker environment CLI arguments."""
+
+    env_values = {
+        "HOME": "/tmp",
+        "XDG_CACHE_HOME": "/tmp/.cache",
+        "MPLCONFIGDIR": "/tmp/.cache/matplotlib",
+        **(runtime_config.get("env") or {}),
+    }
+    args: list[str] = []
+    for key, value in sorted(env_values.items()):
+        args.extend(["-e", f"{key}={value}"])
+    return args
+
+
+def docker_user_args() -> list[str]:
+    """Return host user mapping arguments when supported by the platform."""
+
+    if os.name == "nt" or not hasattr(os, "getuid") or not hasattr(os, "getgid"):
+        return []
+    return ["--user", f"{os.getuid()}:{os.getgid()}"]
+
+
+def docker_network_args(
+    object_record: dict[str, Any],
+    runtime_config: dict[str, Any],
+    *,
+    daemon_base_url: str,
+) -> tuple[list[str], str]:
+    """Return Docker network arguments and the daemon URL visible from Docker."""
+
+    mode = runtime_config.get("network", "auto")
+    has_remote_nodes = any(node.get("kind") == "remote" for node in object_record.get("pipeline_nodes") or [])
+    if mode == "none" and has_remote_nodes:
+        raise RuntimeError("docker runtime network='none' cannot run pipelines with remote nodes")
+    if mode == "none" or (mode == "auto" and not has_remote_nodes):
+        return ["--network", "none"], daemon_base_url
+    daemon_url = docker_host_daemon_url(daemon_base_url)
+    if platform.system().lower() == "linux":
+        return ["--add-host", "host.docker.internal:host-gateway"], daemon_url
+    return [], daemon_url
+
+
+def docker_node_network_args(runtime_config: dict[str, Any]) -> list[str]:
+    """Return network CLI arguments for per-node Docker containers.
+
+    Node containers never call back into the SPL daemon, so ``auto`` keeps them
+    isolated and ``enabled`` does not add host daemon reachability helpers.
+    """
+
+    mode = runtime_config.get("network", "auto")
+    if mode in {"none", "auto"}:
+        return ["--network", "none"]
+    return []
+
+
+def docker_host_daemon_url(daemon_base_url: str) -> str:
+    """Return a daemon URL reachable from a Docker container."""
+
+    parsed = urlparse(daemon_base_url)
+    if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        return daemon_base_url
+    host = "host.docker.internal"
+    netloc = host
+    if parsed.port is not None:
+        netloc = f"{host}:{parsed.port}"
+    return urlunparse(
+        (
+            parsed.scheme,
+            netloc,
+            parsed.path,
+            parsed.params,
+            parsed.query,
+            parsed.fragment,
+        )
+    )
+
+
+def object_docker_worker_env_args() -> list[str]:
+    """Return env markers used to reject nested per-node Docker."""
+
+    return [
+        "-e",
+        f"{OBJECT_DOCKER_RUNTIME_ENV}={OBJECT_DOCKER_RUNTIME_VALUE}",
+        "-e",
+        f"{OBJECT_DOCKER_WORKER_ENV}={OBJECT_DOCKER_WORKER_VALUE}",
+    ]
+
 
 class DockerPool:
     """Own warm Docker runtime containers and pool-specific Docker commands."""
@@ -101,6 +221,7 @@ class DockerPool:
             container_workdir,
             "-e",
             f"PYTHONPATH={':'.join(pythonpath_entries)}",
+            *object_docker_worker_env_args(),
             *self.env_args(runtime_config),
             image_tag,
             "python",
@@ -140,6 +261,7 @@ class DockerPool:
         return [
             "docker",
             "exec",
+            *object_docker_worker_env_args(),
             "-w",
             run_path,
             container_name,
@@ -287,6 +409,7 @@ class DockerPool:
             "/runs",
             "-e",
             f"PYTHONPATH={':'.join(pythonpath_entries)}",
+            *object_docker_worker_env_args(),
             *self.env_args(runtime_config),
             image_tag,
             "python",
@@ -407,39 +530,10 @@ class DockerPool:
             self._containers.clear()
 
     def hardening_args(self, runtime_config: dict[str, Any]) -> list[str]:
-        args: list[str] = []
-        if runtime_config.get("init", True):
-            args.append("--init")
-        cap_drop = runtime_config.get("cap_drop")
-        if cap_drop:
-            args.extend(["--cap-drop", str(cap_drop)])
-        if runtime_config.get("no_new_privileges", True):
-            args.extend(["--security-opt", "no-new-privileges"])
-        limits = runtime_config.get("limits") or {}
-        if limits.get("memory"):
-            args.extend(["--memory", str(limits["memory"])])
-        if limits.get("cpus"):
-            args.extend(["--cpus", str(limits["cpus"])])
-        if limits.get("pids_limit"):
-            args.extend(["--pids-limit", str(limits["pids_limit"])])
-        if runtime_config.get("read_only", True):
-            args.append("--read-only")
-        tmpfs = runtime_config.get("tmpfs")
-        if tmpfs:
-            args.extend(["--tmpfs", str(tmpfs)])
-        return args
+        return docker_hardening_args(runtime_config)
 
     def env_args(self, runtime_config: dict[str, Any]) -> list[str]:
-        env_values = {
-            "HOME": "/tmp",
-            "XDG_CACHE_HOME": "/tmp/.cache",
-            "MPLCONFIGDIR": "/tmp/.cache/matplotlib",
-            **(runtime_config.get("env") or {}),
-        }
-        args: list[str] = []
-        for key, value in sorted(env_values.items()):
-            args.extend(["-e", f"{key}={value}"])
-        return args
+        return docker_env_args(runtime_config)
 
     def source_roots(self) -> list[tuple[str, Path]]:
         roots = [("daemon", Path(__file__).parents[2].resolve())]
@@ -458,39 +552,13 @@ class DockerPool:
         object_record: dict[str, Any],
         runtime_config: dict[str, Any],
     ) -> tuple[list[str], str]:
-        mode = runtime_config.get("network", "auto")
-        has_remote_nodes = any(node.get("kind") == "remote" for node in object_record.get("pipeline_nodes") or [])
-        if mode == "none" and has_remote_nodes:
-            raise RuntimeError("docker runtime network='none' cannot run pipelines with remote nodes")
-        if mode == "none" or (mode == "auto" and not has_remote_nodes):
-            return ["--network", "none"], self.daemon_base_url
-        if platform.system().lower() == "linux":
-            return ["--add-host", "host.docker.internal:host-gateway"], (self.host_daemon_url())
-        return [], self.host_daemon_url()
+        return docker_network_args(object_record, runtime_config, daemon_base_url=self.daemon_base_url)
 
     def host_daemon_url(self) -> str:
-        parsed = urlparse(self.daemon_base_url)
-        if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
-            return self.daemon_base_url
-        host = "host.docker.internal"
-        netloc = host
-        if parsed.port is not None:
-            netloc = f"{host}:{parsed.port}"
-        return urlunparse(
-            (
-                parsed.scheme,
-                netloc,
-                parsed.path,
-                parsed.params,
-                parsed.query,
-                parsed.fragment,
-            )
-        )
+        return docker_host_daemon_url(self.daemon_base_url)
 
     def user_args(self) -> list[str]:
-        if os.name == "nt" or not hasattr(os, "getuid") or not hasattr(os, "getgid"):
-            return []
-        return ["--user", f"{os.getuid()}:{os.getgid()}"]
+        return docker_user_args()
 
     def remove_container(self, name: str) -> None:
         subprocess.run(

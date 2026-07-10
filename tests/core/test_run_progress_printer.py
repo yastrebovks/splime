@@ -117,15 +117,20 @@ class TestRunProgressPrinter:
             "run_progress": {
                 "node_runtimes": [
                     {"alias": "producer", "name": "native", "source": "default"},
-                    {"alias": "consumer", "name": "venv-subprocess", "source": "node-tag"},
+                    {
+                        "alias": "consumer",
+                        "name": "docker",
+                        "source": "node-tag",
+                        "resolved": {"image_tag": "python:3.13-slim"},
+                    },
                 ],
                 "edge_adapters": [
                     {
                         "source": "producer.default",
                         "target": "consumer.value",
-                        "tag": "txt",
-                        "save": "save_text",
-                        "load": "load_text",
+                        "tag": "json",
+                        "save": "json",
+                        "load": "json",
                         "source_level": "pipeline",
                     }
                 ],
@@ -138,9 +143,10 @@ class TestRunProgressPrinter:
         lines = stream.getvalue().splitlines()
         assert len(lines) == 1
         assert "producer=native/default" in lines[0]
-        assert "consumer=venv-subprocess/node-tag" in lines[0]
+        assert "consumer=docker/node-tag (image_tag=python:3.13-slim)" in lines[0]
         assert "producer.default -> consumer.value" in lines[0]
-        assert "tag=txt" in lines[0]
+        assert "tag=json" in lines[0]
+        assert "adapter=json" in lines[0]
         assert "source=pipeline" in lines[0]
 
     def test_slow_waiting_phase_reports_after_interval(self) -> None:

@@ -113,6 +113,18 @@ def _side() -> str:
     return "side"
 
 
+def _parse_seed(seed: str) -> int:
+    _count("parse")
+    if seed == "bad":
+        raise RuntimeError("parse boom")
+    return int(seed)
+
+
+def _total(value: int) -> int:
+    _count("total")
+    return value + 10
+
+
 def _diamond_pipeline() -> Pipeline:
     lift_any = cast(Any, lift)
     source = lift_any(_source).alias("source")
@@ -121,6 +133,12 @@ def _diamond_pipeline() -> Pipeline:
     join = lift_any(_join).bind(left=left, right=right).alias("join")
     side = lift_any(_side).alias("side")
     return dataclass_replace(join.pipeline | side.pipeline, name="resume_diamond")
+
+
+def _parse_total_pipeline() -> Pipeline:
+    lift_any = cast(Any, lift)
+    parse = lift_any(_parse_seed).alias("parse")
+    return lift_any(_total).bind(value=parse).alias("total").render("resume_upstream_failed")
 
 
 def _read_manifest(run: Run) -> dict[str, Any]:
@@ -254,6 +272,54 @@ def test_resume_from_middle_recalculates_descendants_and_freezes_siblings(
     assert _node_by_alias(manifest, "right")["status"] == "frozen"
     assert _node_by_alias(manifest, "left")["status"] == "succeeded"
     assert _node_by_alias(manifest, "join")["status"] == "succeeded"
+
+
+def test_failed_dependency_records_upstream_failed_and_resume_recalculates_descendant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SPL_RUNS_HOME", str(tmp_path / "runs"))
+    _reset_calls("parse", "total")
+    pipeline = _parse_total_pipeline()
+    run = Deployment(pipeline).run(seed="bad")
+
+    with pytest.raises(RuntimeError, match="parse boom"):
+        run.value("total")
+
+    manifest = _read_manifest(run)
+    parse = _node_by_alias(manifest, "parse")
+    total = _node_by_alias(manifest, "total")
+    assert manifest["status"] == "failed"
+    assert parse["status"] == "failed"
+    assert total["status"] == "upstream-failed"
+    assert "upstream node `parse` failed" in total["error"]
+    assert "parse boom" in total["error"]
+    assert _calls == {"parse": 1, "total": 0}
+
+    resumed = run.resume(from_="parse", kwargs={"seed": "4"}, keep=True)
+    with resumed:
+        assert resumed.value("total") == 14
+
+    resumed_manifest = _read_manifest(resumed)
+    assert resumed_manifest["parent_run_id"] == run.run_id
+    assert _node_by_alias(resumed_manifest, "parse")["status"] == "succeeded"
+    assert _node_by_alias(resumed_manifest, "total")["status"] == "succeeded"
+    assert _calls == {"parse": 2, "total": 1}
+
+
+def test_resume_refuses_to_freeze_upstream_failed_node(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SPL_RUNS_HOME", str(tmp_path / "runs"))
+    _reset_calls("parse", "total")
+    run = Deployment(_parse_total_pipeline()).run(seed="bad")
+
+    with pytest.raises(RuntimeError, match="parse boom"):
+        run.value("total")
+
+    with pytest.raises(m_resume.ResumeValidationError) as exc_info:
+        run.resume(from_=[], keep=True)
+
+    message = str(exc_info.value)
+    assert "total: node status is `upstream-failed`" in message
+    assert "from_='total'" in message
 
 
 def test_resume_reports_corrupted_frozen_artifact_before_execution(

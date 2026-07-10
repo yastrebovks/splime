@@ -184,24 +184,27 @@ def test_object_views_preserve_container_semantics() -> None:
 
 def test_object_views_render_compact_tables() -> None:
     table_text = repr(ObjectTable(_LOCAL_PAYLOAD))
+    assert table_text.startswith("local objects (2):")
     assert "daily_total" in table_text
     assert "order_pipeline" in table_text
     assert "kind" in table_text
     assert len(table_text) < 1_000
 
     listing_text = repr(ObjectList(_SERVER_PAYLOAD))
+    assert listing_text.startswith("server objects (1):")
     assert "risk_score" in listing_text
     assert "Risk" in listing_text
 
     catalog = ObjectCatalog({"local": _LOCAL_PAYLOAD, "server": _SERVER_PAYLOAD})
     catalog_text = repr(catalog)
-    assert "local" in catalog_text
-    assert "server" in catalog_text
+    assert "objects (3 = 2 local + 1 server)" in catalog_text
+    assert "local objects (2):" in catalog_text
+    assert "server objects (1):" in catalog_text
     assert hasattr(catalog, "_repr_html_")
 
 
 def test_empty_views_render_placeholders() -> None:
-    assert repr(ObjectList([])) == "objects: (empty)"
+    assert repr(ObjectList([])) == "server objects: (empty)"
     assert "(empty)" in repr(ObjectCatalog({"local": {}, "server": []}))
 
 
@@ -291,7 +294,12 @@ def test_run_record_view_shows_observability_tables() -> None:
         **_RUN_PAYLOAD,
         "node_runtimes": [
             {"alias": "producer", "name": "native", "source": "default"},
-            {"alias": "consumer", "name": "venv-subprocess", "source": "node-tag"},
+            {
+                "alias": "consumer",
+                "name": "docker",
+                "source": "node-tag",
+                "resolved": {"image_tag": "python:3.13-slim"},
+            },
         ],
         "edge_adapters": [
             {
@@ -311,7 +319,8 @@ def test_run_record_view_shows_observability_tables() -> None:
     assert "node runtimes" in rendered
     assert "producer.default -> consumer.value" in rendered
     assert "save_text -> load_text" in rendered
-    assert "venv-subprocess" in rendered
+    assert "docker" in rendered
+    assert "image_tag=python:3.13-slim" in rendered
     assert "edge adapters" not in listed
     assert "producer.default" not in listed
 

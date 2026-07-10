@@ -932,8 +932,10 @@ class Run:
                 return self._results[node]
             kwargs: dict[InputPort, Any] = {}
             input_records: dict[str, Any] = {}
+            input_value_ref: Any = None
             try:
                 for port in node.inputs:
+                    input_value_ref = None
                     if port.name not in self._kwargs:
                         continue
                     value = self._round_trip_artifact(self._kwargs[port.name])
@@ -943,11 +945,19 @@ class Run:
 
                 if node in self._deps:
                     for port, value_ref in self._deps[node].items():
+                        input_value_ref = value_ref
                         value = self._get_input(value_ref)
                         kwargs[port] = value
                         if self._manifest_writer is not None:
                             input_records[port.name] = self._record_link_input(node, port, value_ref, value)
+            except BaseException as exc:
+                error = self._upstream_failure_error(input_value_ref, exc)
+                status = "upstream-failed" if error is not None else "failed"
+                self._write_node_manifest(node, status=status, inputs=input_records, error=error or repr(exc))
+                self._finish_manifest(status="failed", error=error or repr(exc))
+                raise
 
+            try:
                 self._node_inputs[node] = input_records
                 result = self._execute_node_with_runtime(node, kwargs, input_records)
             except BaseException as exc:
@@ -964,6 +974,16 @@ class Run:
                 outputs=self._output_records(node, result),
             )
         return self._results[node]
+
+    def _upstream_failure_error(self, value_ref: Any, exc: BaseException) -> str | None:
+        source_ref = self._source_ref(value_ref)
+        if source_ref is None:
+            return None
+        source_status = self._node_status(source_ref.node)
+        if source_status not in {"failed", "upstream-failed"}:
+            return None
+        label = self._node_alias(source_ref.node) or self._node_name(source_ref.node)
+        return "upstream node `{}` failed: {}".format(label, repr(exc))
 
     def _execute_node_with_runtime(
         self,

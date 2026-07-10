@@ -33,6 +33,7 @@ from spl.daemon.doctor import (
     check_disk_space,
     check_environment_builds,
     check_interpreter_substitutions,
+    check_node_docker,
     check_pipeline_adapter_probe,
     check_pipeline_adapter_tags,
     check_python,
@@ -513,6 +514,93 @@ class TestDockerCheck:
         assert result.status == WARN
         assert result.hint is not None
 
+    def test_node_docker_missing_cli_is_unavailable(self) -> None:
+        result = check_node_docker(daemon_available=True)
+
+        assert result.status == WARN
+        assert "unavailable" in result.detail
+        assert "docker CLI" in result.detail
+        assert "Docker Desktop" in (result.hint or "")
+
+    def test_node_docker_unreachable_daemon_is_unavailable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(doctor_module.shutil, "which", lambda name: "/usr/bin/docker")
+
+        class Completed:
+            returncode = 1
+            stderr = "Cannot connect to the Docker daemon"
+
+        monkeypatch.setattr(
+            doctor_module.subprocess,
+            "run",
+            lambda *args, **kwargs: Completed(),
+        )
+
+        result = check_node_docker(daemon_available=True)
+
+        assert result.status == WARN
+        assert "unavailable" in result.detail
+        assert "Cannot connect" in result.detail
+        assert "start Docker Desktop" in (result.hint or "")
+
+    def test_node_docker_local_without_daemon_or_image_is_unavailable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(doctor_module.shutil, "which", lambda name: "/usr/bin/docker")
+
+        class Completed:
+            returncode = 0
+            stderr = ""
+
+        monkeypatch.setattr(
+            doctor_module.subprocess,
+            "run",
+            lambda *args, **kwargs: Completed(),
+        )
+
+        result = check_node_docker(daemon_available=False)
+
+        assert result.status == WARN
+        assert "runtime_config.docker.image" in result.detail
+        assert result.hint == "set runtime_config.docker.image or run via the daemon"
+
+    def test_node_docker_explicit_image_without_daemon_is_available(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(doctor_module.shutil, "which", lambda name: "/usr/bin/docker")
+
+        class Completed:
+            returncode = 0
+            stderr = ""
+
+        monkeypatch.setattr(
+            doctor_module.subprocess,
+            "run",
+            lambda *args, **kwargs: Completed(),
+        )
+
+        result = check_node_docker(daemon_available=False, explicit_image="python:3.13-slim")
+
+        assert result.status == OK
+        assert "available" in result.detail
+        assert "python:3.13-slim" in result.detail
+
+    def test_node_docker_nested_object_worker_is_unavailable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SPL_OBJECT_DOCKER_WORKER", "1")
+
+        result = check_node_docker(daemon_available=True, explicit_image="python:3.13-slim")
+
+        assert result.status == WARN
+        assert "nested Docker runtimes" in result.detail
+        assert "keep the object runtime on venv" in (result.hint or "")
+
 
 class TestReport:
     def test_exit_code_zero_without_failures(self) -> None:
@@ -556,6 +644,7 @@ class TestReport:
             "environment builds",
             "interpreter versions",
             "docker",
+            "per-node docker",
         }
 
 
@@ -581,7 +670,7 @@ class TestRunDoctor:
     ) -> None:
         report = run_doctor(FakeClient({"counts": None, "server": None}), home=tmp_path)
         assert isinstance(report, DoctorReport)
-        assert len(report.checks) == 10
+        assert len(report.checks) == 11
 
 
 class TestCli:

@@ -71,6 +71,7 @@ from typing import Any, Literal, cast, overload
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from spl.core import node_runtime as m_node_runtime
 from spl.core.entities.adapter import Adapter
 from spl.core.entities.distribution import DDistribution
 from spl.daemon.store import validate_name
@@ -176,6 +177,40 @@ class RemoteNodeClient:
         except URLError as exc:
             raise RuntimeError(f"local daemon is not reachable for remote node call: {exc.reason}") from exc
         return json.loads(raw).get("value")
+
+
+class WorkerNodeEnvironmentProvider:
+    """Resolve worker-provided node runtime environments."""
+
+    def __init__(self, node_runtime_environments: Mapping[str, Any] | None = None):
+        self.node_runtime_environments = dict(node_runtime_environments or {})
+        self.default_provider = m_node_runtime.CurrentPythonEnvironmentProvider()
+
+    def prepare(
+        self,
+        spec: Mapping[str, Any],
+        *,
+        wait: bool = True,
+        retry_failed: bool = False,
+    ) -> m_node_runtime.PreparedNodeEnvironment:
+        runtime_name = spec.get("node_runtime")
+        if runtime_name != m_node_runtime.DOCKER_NODE_RUNTIME:
+            return self.default_provider.prepare(spec, wait=wait, retry_failed=retry_failed)
+
+        docker_environment = self.node_runtime_environments.get(m_node_runtime.DOCKER_NODE_RUNTIME)
+        metadata = docker_environment if isinstance(docker_environment, Mapping) else {}
+        image_tag = metadata.get("image_tag")
+        if not isinstance(image_tag, str) or not image_tag:
+            return m_node_runtime.PreparedNodeEnvironment(name="docker-image", python_path=None, metadata={})
+        return m_node_runtime.PreparedNodeEnvironment(
+            name="docker-image",
+            python_path=None,
+            metadata={
+                "image_tag": image_tag,
+                "spec_hash": metadata.get("spec_hash"),
+                "source": metadata.get("source"),
+            },
+        )
 
 
 def validate_environment(distributions: list[dict[str, str]]) -> None:
@@ -460,6 +495,7 @@ def run_pipeline(
     namespace: Mapping[str, Any] | None = None,
     runtime_config: dict[str, Any] | None = None,
     runtime_env_spec: list[dict[str, Any]] | None = None,
+    node_runtime_environments: Mapping[str, Any] | None = None,
     runtimes: dict[str, str] | None = None,
     resume: Mapping[str, Any] | None = None,
     include_manifest: Literal[False] = False,
@@ -478,6 +514,7 @@ def run_pipeline(
     namespace: Mapping[str, Any] | None = None,
     runtime_config: dict[str, Any] | None = None,
     runtime_env_spec: list[dict[str, Any]] | None = None,
+    node_runtime_environments: Mapping[str, Any] | None = None,
     runtimes: dict[str, str] | None = None,
     resume: Mapping[str, Any] | None = None,
     include_manifest: Literal[True],
@@ -495,6 +532,7 @@ def run_pipeline(
     namespace: Mapping[str, Any] | None = None,
     runtime_config: dict[str, Any] | None = None,
     runtime_env_spec: list[dict[str, Any]] | None = None,
+    node_runtime_environments: Mapping[str, Any] | None = None,
     runtimes: dict[str, str] | None = None,
     resume: Mapping[str, Any] | None = None,
     include_manifest: bool = False,
@@ -514,19 +552,23 @@ def run_pipeline(
     from spl.core._common import Deployment
 
     client = RemoteNodeClient(daemon_url, timeout_seconds=timeout_seconds)
+    node_environment_provider = WorkerNodeEnvironmentProvider(node_runtime_environments)
     try:
         deployment = Deployment(
             client,
             pipeline,
             runtime_config=runtime_config,
+            node_environment_provider=node_environment_provider,
             runtime_env_spec=runtime_env_spec,
         )
     except TypeError:
         # Older framework builds did not require a client for local-only
         # pipelines.  Keep the worker tolerant while NodeRemote is still moving.
+        # The provider still carries daemon-prepared node Docker environments.
         deployment = Deployment(
             pipeline,
             runtime_config=runtime_config,
+            node_environment_provider=node_environment_provider,
             runtime_env_spec=runtime_env_spec,
         )
     normalizer = PipelineResultNormalizer(pipeline, artifacts_dir)
@@ -537,7 +579,7 @@ def run_pipeline(
             run = deployment.run(runtimes=runtimes, keep=True, **kwargs)
         else:
             run = deployment.resume(
-                _resume_parent_run_dir(resume),
+                _resume_parent_run_dir(resume, artifacts_dir=artifacts_dir),
                 from_=_resume_from_selection(resume),
                 adapters=_adapter_overrides_from_payload(pipeline, namespace or {}, resume.get("adapters")),
                 runtimes=runtimes,
@@ -579,11 +621,14 @@ def run_pipeline(
     return normalized, normalizer.artifacts
 
 
-def _resume_parent_run_dir(resume: Mapping[str, Any]) -> str:
+def _resume_parent_run_dir(resume: Mapping[str, Any], *, artifacts_dir: Path) -> str:
     value = resume.get("parent_run_dir")
     if not isinstance(value, str) or not value:
         raise ValueError("resume parent_run_dir must be a non-empty string")
-    return value
+    path = Path(value)
+    if path.is_absolute():
+        return value
+    return str(artifacts_dir.parent / path)
 
 
 def _resume_from_selection(resume: Mapping[str, Any]) -> Any:
@@ -847,6 +892,11 @@ def execute(
             namespace=namespace,
             runtime_config=runtime_config if isinstance(runtime_config, dict) else None,
             runtime_env_spec=runtime_env_spec,
+            node_runtime_environments=(
+                payload.get("node_runtime_environments")
+                if isinstance(payload.get("node_runtime_environments"), Mapping)
+                else None
+            ),
             runtimes=runtimes if isinstance(runtimes, dict) else None,
             resume=payload.get("resume") if isinstance(payload.get("resume"), Mapping) else None,
             include_manifest=True,

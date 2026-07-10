@@ -23,6 +23,7 @@ from spl.daemon_client import (
     read_daemon_endpoint,
     write_daemon_endpoint,
 )
+from spl.core.entities.adapter import JSON_ADAPTER_KEY
 from spl.daemon.server import create_app, select_daemon_port
 from spl.daemon.store import RegistryStore
 
@@ -1308,6 +1309,7 @@ def test_run_management_routes_list_show_prune_and_delete(tmp_path) -> None:
                     "name": "venv-subprocess",
                     "source": "node-tag",
                     "config_hash": "abc123",
+                    "resolved": {"python": "/venv/bin/python"},
                 },
                 "outputs": {
                     "default": {
@@ -1321,7 +1323,7 @@ def test_run_management_routes_list_show_prune_and_delete(tmp_path) -> None:
         }
         adapter = {
             "identity": {
-                "key": "builtins.dict@json",
+                "key": JSON_ADAPTER_KEY,
                 "tag": "json",
                 "accepted_tags": ["json"],
                 "save": "spl.core.entities.adapter._json_save",
@@ -1340,6 +1342,7 @@ def test_run_management_routes_list_show_prune_and_delete(tmp_path) -> None:
                 "name": "native",
                 "source": "default",
                 "config_hash": None,
+                "resolved": {"python": sys.executable},
             },
             "inputs": {},
             "outputs": {},
@@ -1366,6 +1369,7 @@ def test_run_management_routes_list_show_prune_and_delete(tmp_path) -> None:
                 "name": "native",
                 "source": "default",
                 "config_hash": None,
+                "resolved": {"python": sys.executable},
             },
             {
                 "node_id": "node-1",
@@ -1373,6 +1377,7 @@ def test_run_management_routes_list_show_prune_and_delete(tmp_path) -> None:
                 "name": "venv-subprocess",
                 "source": "node-tag",
                 "config_hash": "abc123",
+                "resolved": {"python": "/venv/bin/python"},
             },
         ]
         assert listed[0]["edge_adapters"] == [
@@ -1384,8 +1389,8 @@ def test_run_management_routes_list_show_prune_and_delete(tmp_path) -> None:
                 "target_node_id": "node-2",
                 "target_port": "value",
                 "tag": "json",
-                "save": "spl.core.entities.adapter._json_save / spl.core.entities.adapter._json_load",
-                "load": "spl.core.entities.adapter._json_save / spl.core.entities.adapter._json_load",
+                "save": "json",
+                "load": "json",
                 "source_level": "port-default",
             }
         ]
@@ -1518,6 +1523,7 @@ def test_daemon_pipeline_venv_subprocess_uses_ir_source_for_yaml_functions(tmp_p
             "name": "venv-subprocess",
             "source": "node-tag",
             "config_hash": consumer["runtime"]["config_hash"],
+            "resolved": consumer["runtime"]["resolved"],
         } in observed["run_progress"]["node_runtimes"]
     finally:
         _shutdown_app(app)

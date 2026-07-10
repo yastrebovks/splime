@@ -91,6 +91,23 @@ def table_to_html(
     )
 
 
+def object_scope_title(scope: str) -> str:
+    """Return object-list title stems; rendered server tables start with ``server objects (``."""
+
+    if scope == "local":
+        return "local objects"
+    if scope == "server":
+        return "server objects"
+    return "objects"
+
+
+def object_catalog_title(local_count: int, server_count: int) -> str:
+    """Return the combined local/server object catalog title."""
+
+    total = local_count + server_count
+    return "objects ({} = {} local + {} server)".format(total, local_count, server_count)
+
+
 def plain(value: Any) -> Any:
     """Return plain containers from view objects, recursively."""
 
@@ -148,6 +165,35 @@ def _adapter_label(row: Mapping[str, Any]) -> str:
     if save and load and save != load:
         return "{} -> {}".format(save, load)
     return _EMPTY if save is None and load is None else str(save or load)
+
+
+def _runtime_resolved_label(row: Mapping[str, Any]) -> str:
+    resolved = row.get("resolved")
+    if not isinstance(resolved, Mapping):
+        return _EMPTY
+    for key in ("image_tag", "python"):
+        value = resolved.get(key)
+        if isinstance(value, str) and value:
+            return "{}={}".format(key, value)
+    parts = [
+        "{}={}".format(key, value)
+        for key, value in sorted(resolved.items())
+        if isinstance(key, str) and isinstance(value, str) and value
+    ]
+    return ", ".join(parts) if parts else _EMPTY
+
+
+def _server_resolution_label(value: Any) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    parts = []
+    library = value.get("library")
+    owner = value.get("owner_id")
+    if isinstance(library, str) and library:
+        parts.append("library {!r}".format(library))
+    if isinstance(owner, str) and owner:
+        parts.append("owner {}".format(owner))
+    return ", ".join(parts) if parts else "server catalog"
 
 
 class CompactDict(dict[str, Any]):
@@ -342,6 +388,7 @@ class ActionReceiptView(CompactDict):
         keys = (
             "status",
             "action",
+            "warning",
             "name",
             "display_name",
             "slug",
@@ -413,7 +460,7 @@ class SignatureView(CompactDict):
     def _summary_rows(self) -> list[tuple[str, Any]]:
         call_value = self.get("call")
         call = call_value if isinstance(call_value, Mapping) else {}
-        return [
+        rows = [
             ("name", _name(self)),
             ("kind", self.get("kind")),
             ("version", self.get("version")),
@@ -423,6 +470,10 @@ class SignatureView(CompactDict):
             ("example", call.get("example")),
             ("read", call.get("read")),
         ]
+        resolved = _server_resolution_label(self.get("resolved_from_server"))
+        if resolved is not None:
+            rows.append(("resolved from server", resolved))
+        return rows
 
     def __repr__(self) -> str:
         lines = [details_to_text(self.title, self._summary_rows())]
@@ -493,6 +544,17 @@ class DecompositionView(CompactDict):
     title = "decomposition"
     headers = ("node", "kind", "inputs", "outputs")
 
+    def _summary_rows(self) -> list[tuple[str, Any]]:
+        rows: list[tuple[str, Any]] = [
+            ("nodes", len(self.get("nodes") or [])),
+            ("functions", len(self.get("functions") or [])),
+            ("links", len(self.get("links") or [])),
+        ]
+        resolved = _server_resolution_label(self.get("resolved_from_server"))
+        if resolved is not None:
+            rows.append(("resolved from server", resolved))
+        return rows
+
     def _node_rows(self) -> list[dict[str, Any]]:
         nodes_value = self.get("nodes")
         nodes = nodes_value if isinstance(nodes_value, list) else []
@@ -508,20 +570,18 @@ class DecompositionView(CompactDict):
         ]
 
     def __repr__(self) -> str:
-        rows = [
-            ("nodes", len(self.get("nodes") or [])),
-            ("functions", len(self.get("functions") or [])),
-            ("links", len(self.get("links") or [])),
-        ]
-        return details_to_text(self.title, rows) + "\n\n" + table_to_text("nodes", self.headers, self._node_rows())
+        return (
+            details_to_text(self.title, self._summary_rows())
+            + "\n\n"
+            + table_to_text(
+                "nodes",
+                self.headers,
+                self._node_rows(),
+            )
+        )
 
     def _repr_html_(self) -> str:
-        rows = [
-            ("nodes", len(self.get("nodes") or [])),
-            ("functions", len(self.get("functions") or [])),
-            ("links", len(self.get("links") or [])),
-        ]
-        return details_to_html(self.title, rows) + table_to_html(
+        return details_to_html(self.title, self._summary_rows()) + table_to_html(
             "nodes",
             self.headers,
             self._node_rows(),
@@ -530,7 +590,7 @@ class DecompositionView(CompactDict):
 
 class RunRecordView(CompactDict):
     title = "run"
-    runtime_headers = ("node", "runtime", "source")
+    runtime_headers = ("node", "runtime", "source", "resolved")
     edge_headers = ("edge", "tag", "adapter", "source")
 
     def _summary_rows(self) -> list[tuple[str, Any]]:
@@ -562,6 +622,7 @@ class RunRecordView(CompactDict):
                 "node": item.get("alias") or short_id(item.get("node_id")),
                 "runtime": item.get("name"),
                 "source": item.get("source"),
+                "resolved": _runtime_resolved_label(item),
             }
             for item in _mapping_rows(self.get("node_runtimes"))
         ]
@@ -602,7 +663,13 @@ class RunListView(CompactList):
     title = "runs"
     headers = ("id", "status", "keep", "manifest", "parent", "size", "object", "created")
 
-    def __init__(self, payload: list[Any] | None = None, *, title: str | None = None):
+    def __init__(
+        self,
+        payload: list[Any] | None = None,
+        *,
+        title: str | None = None,
+        local_retained_count: int = 0,
+    ):
         super().__init__(
             [
                 item if isinstance(item, RunRecordView) else RunRecordView(item)
@@ -611,6 +678,7 @@ class RunListView(CompactList):
             ],
             title=title,
         )
+        self._local_retained_count = local_retained_count
 
     def _table_rows(self) -> list[dict[str, Any]]:
         return [
@@ -627,6 +695,23 @@ class RunListView(CompactList):
             for item in self
             if isinstance(item, Mapping)
         ]
+
+    def _local_retained_footer(self) -> str | None:
+        if self._local_retained_count <= 0:
+            return None
+        return "+ {} local retained runs - runs(local=True)".format(self._local_retained_count)
+
+    def __repr__(self) -> str:
+        text = super().__repr__()
+        footer = self._local_retained_footer()
+        return text if footer is None else "{}\n{}".format(text, footer)
+
+    def _repr_html_(self) -> str:
+        html = super()._repr_html_()
+        footer = self._local_retained_footer()
+        if footer is None:
+            return html
+        return "{}<div><code>{}</code></div>".format(html, escape(footer))
 
 
 class EventRecordView(CompactDict):

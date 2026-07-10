@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import json
 import logging
 import shutil
 import subprocess
 import sys
+import stat
 import time
 from pathlib import Path
 from typing import Any
@@ -13,12 +16,16 @@ from typing import Any
 import pytest
 
 import spl.daemon.server as daemon_server
-from spl import lift
+from spl import Deployment, lift
+from spl.core import node_runtime as m_node_runtime
+from spl.core.entities.node import DEFAULT_PORT
+from spl.core.entities.node_function import NodeFunction
 from spl.core.ir.utils import spl_export_to_file
 from spl.daemon.environment import EnvironmentBuildError
-from spl.daemon.server import DaemonRuntime
+from spl.daemon.server import DaemonRuntime, create_app
 from spl.daemon.store import RegistryStore, utc_now
-from spl.daemon.worker import ARTIFACT_REF_KEY, run_pipeline
+from spl.daemon import worker as worker_module
+from spl.daemon.worker import ARTIFACT_REF_KEY, WorkerNodeEnvironmentProvider, run_pipeline
 
 
 ARTIFACT_FUNCTION_YAML = """\
@@ -83,6 +90,127 @@ def _worker_slow_marker(marker_path: str) -> str:
 
 def _worker_final_unadapted_bytes() -> bytes:
     return b"missing adapter"
+
+
+def _worker_save_text(path: str, value: str) -> None:
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(value)
+
+
+def _worker_load_text(path: str) -> str:
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def _worker_node_docker_seed() -> str:
+    return "seed"
+
+
+def _worker_node_docker_consumer(value: str) -> str:
+    return f"docker:{value}"
+
+
+def _worker_object_docker_seed(seed: str = "seed") -> str:
+    return seed
+
+
+def _worker_object_docker_consumer(value: str) -> str:
+    return f"consumed:{value}"
+
+
+def _worker_object_docker_resume_seed(seed: str = "seed") -> str:
+    return seed
+
+
+def _worker_object_docker_resume_consumer(value: str, should_fail: bool = True) -> str:
+    if should_fail:
+        raise RuntimeError("intentional object docker resume failure")
+    return f"resumed:{value}"
+
+
+def _node_docker_pipeline(name: str = "node_docker_pipeline", *, tag_consumer: bool = True):
+    producer = lift(_worker_node_docker_seed).alias("producer")
+    pipeline = lift(_worker_node_docker_consumer).bind(value=producer).alias("consumer").render(name)
+    return pipeline.with_node_runtime("consumer", "docker") if tag_consumer else pipeline
+
+
+def _object_docker_manifest_pipeline(name: str = "object_docker_manifest_pipeline"):
+    producer = lift(_worker_object_docker_seed).alias("producer")
+    pipeline = lift(_worker_object_docker_consumer).bind(value=producer.as_format("txt")).alias("consumer").render(name)
+    return pipeline.add_adapter(str, "txt", save=_worker_save_text, load=_worker_load_text)
+
+
+def _object_docker_resume_pipeline(name: str = "object_docker_resume_pipeline"):
+    producer = lift(_worker_object_docker_resume_seed).alias("producer")
+    return lift(_worker_object_docker_resume_consumer).bind(value=producer).alias("consumer").render(name)
+
+
+def _local_node_docker_environment(
+    tmp_path: Path,
+    runtime_config: dict[str, Any],
+) -> m_node_runtime.PreparedNodeEnvironment:
+    node = NodeFunction(_worker_node_docker_consumer)
+    [input_port] = node.inputs
+    context = m_node_runtime.NodeRuntimeContext(
+        node=node,
+        node_label="consumer",
+        inputs={input_port: "seed"},
+        output_port=node.get_output_port(DEFAULT_PORT),
+        callback=lambda _node, _inputs: {DEFAULT_PORT: "docker:seed"},
+        work_dir=tmp_path / "local-node-docker",
+        environment_provider=m_node_runtime.CurrentPythonEnvironmentProvider(),
+        runtime_config=runtime_config,
+        environment_spec=[],
+    )
+    return m_node_runtime.DockerNodeRuntime().prepare(context)
+
+
+def _manifest_node_by_alias(manifest: dict[str, Any], alias: str) -> dict[str, Any]:
+    return next(node for node in manifest["nodes"].values() if node["alias"] == alias)
+
+
+def _worker_manifest_paths(run_dir: str | Path) -> list[Path]:
+    return sorted((Path(run_dir) / "pipeline-state").glob("*/manifest.json"))
+
+
+def _worker_manifest_dir(run_dir: str | Path) -> Path:
+    manifests = _worker_manifest_paths(run_dir)
+    assert manifests
+    return manifests[0].parent
+
+
+def _docker_container_names_for_run_ids(run_ids: list[str]) -> list[str]:
+    completed = subprocess.run(
+        ["docker", "ps", "-a", "--format", "{{.Names}}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("docker ps failed: {}".format((completed.stderr or "").strip()))
+    names = set(completed.stdout.splitlines())
+    return [f"splime-run-{run_id[:32]}" for run_id in run_ids if f"splime-run-{run_id[:32]}" in names]
+
+
+def _manifest_key_paths(value: Any, prefix: tuple[str, ...] = ()) -> set[tuple[str, ...]]:
+    paths: set[tuple[str, ...]] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_path = (*prefix, str(key))
+            paths.add(key_path)
+            paths.update(_manifest_key_paths(item, key_path))
+    elif isinstance(value, list):
+        list_path = (*prefix, "[]")
+        paths.add(list_path)
+        for item in value:
+            paths.update(_manifest_key_paths(item, list_path))
+    return paths
+
+
+def _assert_owner_only(path: Path) -> None:
+    mode = stat.S_IMODE(path.stat().st_mode)
+    assert mode & 0o077 == 0, f"{path} has non-owner permissions {mode:o}"
 
 
 class _NoopHeartbeats:
@@ -166,6 +294,127 @@ def _wait_for_run(
             return state
         time.sleep(0.1)
     raise TimeoutError(f"run did not finish: {run_id}")
+
+
+def _json_from_app(app: Any, path: str) -> tuple[int, Any]:
+    async def _request() -> tuple[int, Any]:
+        client = app.test_client()
+        response = await client.get(
+            path,
+            headers={"Authorization": f"Bearer {app.api_token}"},
+        )
+        return response.status_code, await response.get_json()
+
+    return asyncio.run(_request())
+
+
+def _post_json_from_app(app: Any, path: str, payload: dict[str, Any]) -> tuple[int, Any]:
+    async def _request() -> tuple[int, Any]:
+        client = app.test_client()
+        response = await client.post(
+            path,
+            json=payload,
+            headers={"Authorization": f"Bearer {app.api_token}"},
+        )
+        return response.status_code, await response.get_json()
+
+    return asyncio.run(_request())
+
+
+def _shutdown_app(app: Any) -> None:
+    if app is not None:
+        app.runtime.shutdown()
+
+
+class _FakeDockerEnvironmentManager:
+    def __init__(
+        self,
+        *,
+        image_tag: str = "splime-runtime:node-test",
+        spec_hash: str = "node-docker-spec",
+        error: BaseException | None = None,
+    ) -> None:
+        self.image_tag = image_tag
+        self.spec_hash = spec_hash
+        self.error = error
+        self.calls: list[dict[str, Any]] = []
+
+    def status_for_object(self, object_record: dict[str, Any]) -> dict[str, Any]:
+        return {"status": "absent", "spec_hash": self.spec_hash}
+
+    def ensure_ready(
+        self,
+        object_record: dict[str, Any],
+        *,
+        wait: bool,
+        retry_failed: bool = False,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            {
+                "object_record": object_record,
+                "wait": wait,
+                "retry_failed": retry_failed,
+            }
+        )
+        if self.error is not None:
+            raise self.error
+        return {
+            "status": "ready",
+            "spec_hash": self.spec_hash,
+            "image_tag": self.image_tag,
+        }
+
+    def prune_images(self, spec_hash: str | None = None) -> list[dict[str, Any]]:
+        return []
+
+
+def _daemon_resume_parent_with_worker_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    runtime_config: dict[str, Any],
+) -> tuple[RegistryStore, DaemonRuntime, dict[str, Any], Path]:
+    store = RegistryStore(tmp_path / "daemon-store")
+    store.register_env("default", sys.executable)
+    runtime = DaemonRuntime(store, auto_build_envs=False)
+    pipeline = _object_docker_resume_pipeline("object_docker_resume_staging")
+    yaml_path = tmp_path / "object_docker_resume_staging.yaml"
+    spl_export_to_file(yaml_path, [pipeline])
+    yaml_text = yaml_path.read_text(encoding="utf-8")
+    record = runtime.register_object(
+        "object_docker_resume_staging",
+        "object_docker_resume_staging",
+        "default",
+        yaml_text=yaml_text,
+        runtime_config=runtime_config,
+    )
+
+    monkeypatch.setenv("SPL_RUNS_HOME", str(tmp_path / "local-runs"))
+    retained_parent = Deployment(pipeline).run(keep=True, seed="seed", should_fail=True)
+    with pytest.raises(RuntimeError, match="intentional object docker resume failure"):
+        with retained_parent:
+            retained_parent.value("consumer")
+    assert retained_parent.run_dir is not None
+
+    parent = store.create_run(
+        "object_docker_resume_staging",
+        kwargs={"seed": "seed", "should_fail": True},
+        output="consumer",
+        object_version_id=record["version_id"],
+        keep=True,
+    )
+    parent_run_dir = Path(parent["run_dir"])
+    (parent_run_dir / "object.yaml").write_text(yaml_text, encoding="utf-8")
+    parent_manifest_dir = parent_run_dir / "pipeline-state" / retained_parent.run_id
+    shutil.copytree(retained_parent.run_dir, parent_manifest_dir)
+    parent_manifest = json.loads((parent_manifest_dir / "manifest.json").read_text(encoding="utf-8"))
+    parent = store.update_run(
+        parent["id"],
+        status="failed",
+        finished_at=utc_now(),
+        manifest=parent_manifest,
+    )
+    return store, runtime, parent, parent_manifest_dir
 
 
 def _final_png_pipeline():
@@ -280,6 +529,380 @@ def test_pipeline_node_timeout_runtime_config_reaches_daemon_worker(tmp_path) ->
 
     time.sleep(0.7)
     assert not marker_path.exists()
+
+
+def test_node_docker_start_run_prepares_image_from_pipeline_tag(tmp_path, monkeypatch) -> None:
+    store = RegistryStore(tmp_path)
+    docker_manager = _FakeDockerEnvironmentManager(image_tag="splime-runtime:from-tag")
+    try:
+        store.register_env("default", sys.executable)
+        runtime = DaemonRuntime(store, auto_build_envs=False, docker_environment_manager=docker_manager)
+        monkeypatch.setattr(runtime, "_execute_run", lambda run_id, report_local_run=True: None)
+        pipeline = _node_docker_pipeline()
+        yaml_path = tmp_path / "node_docker_pipeline.yaml"
+        spl_export_to_file(yaml_path, [pipeline])
+        runtime.register_object(
+            "node_docker_pipeline",
+            "node_docker_pipeline",
+            "default",
+            yaml_text=yaml_path.read_text(encoding="utf-8"),
+        )
+
+        started = runtime.start_run(
+            "node_docker_pipeline",
+            output="consumer",
+            source="local",
+            report_local_run=False,
+        )
+
+        state = store.get_run(started["id"])
+        assert started["status"] == "starting"
+        assert len(docker_manager.calls) == 1
+        assert docker_manager.calls[0]["wait"] is True
+        assert docker_manager.calls[0]["object_record"]["runtime_config"] == {"mode": "docker"}
+        assert state["input"]["node_runtime_environments"]["docker"] == {
+            "image_tag": "splime-runtime:from-tag",
+            "spec_hash": "node-docker-spec",
+            "source": "object-env-spec",
+        }
+    finally:
+        store.close()
+
+
+def test_node_docker_start_run_without_docker_selection_is_zero_cost(tmp_path, monkeypatch) -> None:
+    store = RegistryStore(tmp_path)
+    docker_manager = _FakeDockerEnvironmentManager()
+    try:
+        store.register_env("default", sys.executable)
+        runtime = DaemonRuntime(store, auto_build_envs=False, docker_environment_manager=docker_manager)
+        monkeypatch.setattr(runtime, "_execute_run", lambda run_id, report_local_run=True: None)
+        pipeline = _node_docker_pipeline("node_native_pipeline", tag_consumer=False)
+        yaml_path = tmp_path / "node_native_pipeline.yaml"
+        spl_export_to_file(yaml_path, [pipeline])
+        runtime.register_object(
+            "node_native_pipeline",
+            "node_native_pipeline",
+            "default",
+            yaml_text=yaml_path.read_text(encoding="utf-8"),
+        )
+
+        started = runtime.start_run(
+            "node_native_pipeline",
+            output="consumer",
+            source="local",
+            report_local_run=False,
+        )
+
+        state = store.get_run(started["id"])
+        assert started["status"] == "starting"
+        assert docker_manager.calls == []
+        assert "node_runtime_environments" not in state["input"]
+    finally:
+        store.close()
+
+
+def test_node_docker_explicit_image_bypasses_daemon_build(tmp_path, monkeypatch) -> None:
+    runtime_config = {"docker": {"image": "python:3.13-slim", "network": "none"}}
+    local_environment = _local_node_docker_environment(tmp_path, runtime_config)
+    store = RegistryStore(tmp_path)
+    docker_manager = _FakeDockerEnvironmentManager()
+    try:
+        store.register_env("default", sys.executable)
+        runtime = DaemonRuntime(store, auto_build_envs=False, docker_environment_manager=docker_manager)
+        monkeypatch.setattr(runtime, "_execute_run", lambda run_id, report_local_run=True: None)
+        pipeline = _node_docker_pipeline("node_docker_explicit")
+        yaml_path = tmp_path / "node_docker_explicit.yaml"
+        spl_export_to_file(yaml_path, [pipeline])
+        runtime.register_object(
+            "node_docker_explicit",
+            "node_docker_explicit",
+            "default",
+            yaml_text=yaml_path.read_text(encoding="utf-8"),
+            runtime_config=runtime_config,
+        )
+
+        started = runtime.start_run(
+            "node_docker_explicit",
+            output="consumer",
+            source="local",
+            report_local_run=False,
+        )
+
+        state = store.get_run(started["id"])
+        server_environment = state["input"]["node_runtime_environments"]["docker"]
+        expected_hash = m_node_runtime.explicit_docker_image_spec_hash("python:3.13-slim")
+        resolution = m_node_runtime.NodeRuntimeResolution(
+            m_node_runtime.DOCKER_NODE_RUNTIME,
+            m_node_runtime.NodeRuntimeResolutionSource.NODE_TAG,
+        )
+        local_record = m_node_runtime.runtime_manifest_record(resolution, local_environment)
+        server_record = m_node_runtime.runtime_manifest_record(
+            resolution,
+            m_node_runtime.PreparedNodeEnvironment(
+                name="docker-image",
+                python_path=None,
+                metadata=server_environment,
+            ),
+        )
+        assert started["status"] == "starting"
+        assert docker_manager.calls == []
+        assert server_environment == {
+            "image_tag": "python:3.13-slim",
+            "spec_hash": expected_hash,
+            "source": "runtime_config.docker.image",
+        }
+        assert server_environment["spec_hash"] == local_environment.metadata["spec_hash"]
+        assert server_record["config_hash"] == local_record["config_hash"] == expected_hash
+    finally:
+        store.close()
+
+
+def test_node_docker_run_override_prepares_image(tmp_path, monkeypatch) -> None:
+    store = RegistryStore(tmp_path)
+    docker_manager = _FakeDockerEnvironmentManager(image_tag="splime-runtime:from-override")
+    try:
+        store.register_env("default", sys.executable)
+        runtime = DaemonRuntime(store, auto_build_envs=False, docker_environment_manager=docker_manager)
+        monkeypatch.setattr(runtime, "_execute_run", lambda run_id, report_local_run=True: None)
+        pipeline = _node_docker_pipeline("node_override_pipeline", tag_consumer=False)
+        yaml_path = tmp_path / "node_override_pipeline.yaml"
+        spl_export_to_file(yaml_path, [pipeline])
+        runtime.register_object(
+            "node_override_pipeline",
+            "node_override_pipeline",
+            "default",
+            yaml_text=yaml_path.read_text(encoding="utf-8"),
+        )
+
+        started = runtime.start_run(
+            "node_override_pipeline",
+            output="consumer",
+            source="local",
+            report_local_run=False,
+            runtimes={"consumer": "docker"},
+        )
+
+        state = store.get_run(started["id"])
+        assert len(docker_manager.calls) == 1
+        assert state["input"]["node_runtime_environments"]["docker"]["image_tag"] == "splime-runtime:from-override"
+    finally:
+        store.close()
+
+
+def test_node_docker_preensure_failure_marks_run_failed_before_worker(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = RegistryStore(tmp_path)
+    docker_manager = _FakeDockerEnvironmentManager(error=RuntimeError("docker build exploded"))
+    worker_calls: list[str] = []
+    try:
+        store.register_env("default", sys.executable)
+        runtime = DaemonRuntime(store, auto_build_envs=False, docker_environment_manager=docker_manager)
+        monkeypatch.setattr(runtime, "_execute_run", lambda run_id, report_local_run=True: worker_calls.append(run_id))
+        pipeline = _node_docker_pipeline("node_docker_failure")
+        yaml_path = tmp_path / "node_docker_failure.yaml"
+        spl_export_to_file(yaml_path, [pipeline])
+        runtime.register_object(
+            "node_docker_failure",
+            "node_docker_failure",
+            "default",
+            yaml_text=yaml_path.read_text(encoding="utf-8"),
+        )
+
+        started = runtime.start_run(
+            "node_docker_failure",
+            output="consumer",
+            source="local",
+            report_local_run=False,
+        )
+
+        assert started["status"] == "failed"
+        assert "docker build exploded" in started["error"]
+        assert worker_calls == []
+    finally:
+        store.close()
+
+
+def test_worker_node_environment_provider_returns_daemon_node_docker_image_tag() -> None:
+    provider = WorkerNodeEnvironmentProvider(
+        {
+            "docker": {
+                "image_tag": "splime-runtime:from-worker-input",
+                "spec_hash": "node-docker-spec",
+                "source": "object-env-spec",
+            }
+        }
+    )
+
+    environment = provider.prepare({"node_runtime": m_node_runtime.DOCKER_NODE_RUNTIME})
+
+    assert environment.python_path is None
+    assert environment.metadata == {
+        "image_tag": "splime-runtime:from-worker-input",
+        "spec_hash": "node-docker-spec",
+        "source": "object-env-spec",
+    }
+
+
+def test_node_docker_resume_override_prepares_image(tmp_path, monkeypatch) -> None:
+    store = RegistryStore(tmp_path)
+    docker_manager = _FakeDockerEnvironmentManager(image_tag="splime-runtime:from-resume")
+    try:
+        store.register_env("default", sys.executable)
+        runtime = DaemonRuntime(store, auto_build_envs=False, docker_environment_manager=docker_manager)
+        pipeline = _node_docker_pipeline("node_resume_pipeline", tag_consumer=False)
+        yaml_path = tmp_path / "node_resume_pipeline.yaml"
+        spl_export_to_file(yaml_path, [pipeline])
+        record = runtime.register_object(
+            "node_resume_pipeline",
+            "node_resume_pipeline",
+            "default",
+            yaml_text=yaml_path.read_text(encoding="utf-8"),
+        )
+        _mark_object_environment_ready(runtime, record)
+        parent = runtime.start_run(
+            "node_resume_pipeline",
+            output="consumer",
+            source="local",
+            report_local_run=False,
+            keep=True,
+        )
+        parent_final = _wait_for_run(store, parent["id"])
+        assert parent_final["status"] == "succeeded"
+        assert docker_manager.calls == []
+
+        monkeypatch.setattr(runtime, "_execute_run", lambda run_id, report_local_run=True: None)
+        resumed = runtime.resume_run(
+            parent["id"],
+            from_="consumer",
+            output="consumer",
+            report_local_run=False,
+            runtimes={"consumer": "docker"},
+        )
+
+        state = store.get_run(resumed["id"])
+        assert resumed["status"] == "starting"
+        assert len(docker_manager.calls) == 1
+        assert state["input"]["node_runtime_environments"]["docker"]["image_tag"] == "splime-runtime:from-resume"
+    finally:
+        store.close()
+
+
+def test_object_docker_resume_stages_parent_manifest_dir(tmp_path, monkeypatch) -> None:
+    store, runtime, parent, parent_manifest_dir = _daemon_resume_parent_with_worker_manifest(
+        tmp_path,
+        monkeypatch,
+        runtime_config={"mode": "docker", "python": "3.13"},
+    )
+    try:
+        monkeypatch.setattr(runtime, "_execute_run", lambda run_id, report_local_run=True: None)
+
+        resumed = runtime.resume_run(
+            parent["id"],
+            from_="consumer",
+            output="consumer",
+            kwargs={"should_fail": False},
+            report_local_run=False,
+            keep=True,
+        )
+
+        state = store.get_run(resumed["id"])
+        run_dir = Path(state["run_dir"])
+        staged_dir = run_dir / "resume-parent"
+        assert staged_dir.is_dir()
+        assert (staged_dir / "manifest.json").read_text(encoding="utf-8") == (
+            parent_manifest_dir / "manifest.json"
+        ).read_text(encoding="utf-8")
+        assert state["input"]["resume"]["parent_run_dir"] == "resume-parent"
+        input_payload = json.loads((run_dir / "input.json").read_text(encoding="utf-8"))
+        assert input_payload["resume"]["parent_run_dir"] == "resume-parent"
+    finally:
+        runtime.shutdown()
+        store.close()
+
+
+def test_object_venv_resume_does_not_stage_parent_manifest_dir(tmp_path, monkeypatch) -> None:
+    store, runtime, parent, parent_manifest_dir = _daemon_resume_parent_with_worker_manifest(
+        tmp_path,
+        monkeypatch,
+        runtime_config={"mode": "venv"},
+    )
+    try:
+        monkeypatch.setattr(runtime, "_execute_run", lambda run_id, report_local_run=True: None)
+
+        resumed = runtime.resume_run(
+            parent["id"],
+            from_="consumer",
+            output="consumer",
+            kwargs={"should_fail": False},
+            report_local_run=False,
+            keep=True,
+        )
+
+        state = store.get_run(resumed["id"])
+        run_dir = Path(state["run_dir"])
+        parent_run_dir = state["input"]["resume"]["parent_run_dir"]
+        assert parent_run_dir == str(parent_manifest_dir)
+        assert Path(parent_run_dir).is_absolute()
+        assert not (run_dir / "resume-parent").exists()
+    finally:
+        runtime.shutdown()
+        store.close()
+
+
+def test_object_docker_resume_parent_staging_is_idempotent(tmp_path, monkeypatch) -> None:
+    store, runtime, parent, parent_manifest_dir = _daemon_resume_parent_with_worker_manifest(
+        tmp_path,
+        monkeypatch,
+        runtime_config={"mode": "docker", "python": "3.13"},
+    )
+    try:
+        monkeypatch.setattr(runtime, "_execute_run", lambda run_id, report_local_run=True: None)
+        resumed = runtime.resume_run(
+            parent["id"],
+            from_="consumer",
+            output="consumer",
+            kwargs={"should_fail": False},
+            report_local_run=False,
+            keep=True,
+        )
+        state = store.get_run(resumed["id"])
+        object_record = store.get_object_version(state["object_version_id"])
+        staged_dir = Path(state["run_dir"]) / "resume-parent"
+        stale_path = staged_dir / "stale.txt"
+        stale_path.write_text("old copy", encoding="utf-8")
+
+        restaged = runtime._stage_object_docker_resume_parent(
+            state,
+            object_record=object_record,
+            parent_manifest_dir=parent_manifest_dir,
+            report_local_run=False,
+        )
+
+        assert restaged["input"]["resume"]["parent_run_dir"] == "resume-parent"
+        assert not stale_path.exists()
+        assert (staged_dir / "manifest.json").exists()
+    finally:
+        runtime.shutdown()
+        store.close()
+
+
+def test_worker_resume_parent_dir_resolves_relative_path_from_run_dir(tmp_path, monkeypatch) -> None:
+    unrelated_cwd = tmp_path / "cwd with spaces"
+    unrelated_cwd.mkdir()
+    monkeypatch.chdir(unrelated_cwd)
+    artifacts_dir = tmp_path / "worker-run" / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+
+    resolved = worker_module._resume_parent_run_dir({"parent_run_dir": "resume-parent"}, artifacts_dir=artifacts_dir)
+
+    assert Path(resolved) == artifacts_dir.parent / "resume-parent"
+    absolute_parent = str(tmp_path / "absolute-parent")
+    assert (
+        worker_module._resume_parent_run_dir({"parent_run_dir": absolute_parent}, artifacts_dir=artifacts_dir)
+        == absolute_parent
+    )
 
 
 def test_publish_run_environment_and_artifact_flow(tmp_path) -> None:
@@ -399,6 +1022,8 @@ def test_docker_runtime_config_is_persisted_and_command_is_constructed(
         assert f"{run_dir.resolve()}:/work" in command
         assert f"{workdir.resolve()}:/workspace" in command
         assert "PYTHONPATH=/opt/splime/src0:/opt/splime/src1" in command
+        assert "SPL_OBJECT_RUNTIME_BACKEND=docker" in command
+        assert "SPL_OBJECT_DOCKER_WORKER=1" in command
         assert "HOME=/tmp" in command
         assert "XDG_CACHE_HOME=/tmp/.cache" in command
         assert "MPLCONFIGDIR=/tmp/.cache/matplotlib" in command
@@ -477,7 +1102,10 @@ def test_docker_pool_exec_command_uses_runs_mount(tmp_path) -> None:
             runtime_config={"mode": "docker", "network": "auto"},
         )
 
-        assert command[:4] == ["docker", "exec", "-w", "/runs/abc123"]
+        assert command[:2] == ["docker", "exec"]
+        assert command[command.index("-w") + 1] == "/runs/abc123"
+        assert "SPL_OBJECT_RUNTIME_BACKEND=docker" in command
+        assert "SPL_OBJECT_DOCKER_WORKER=1" in command
         assert "splime-pool-test" in command
         assert "/runs/abc123/object.yaml" in command
         assert "/runs/abc123/result.json" in command
@@ -728,6 +1356,7 @@ def _docker_available() -> bool:
     return completed.returncode == 0
 
 
+@pytest.mark.docker
 @pytest.mark.skipif(not _docker_available(), reason="Docker is not available")
 def test_docker_runtime_end_to_end_runs_function_in_a_container(tmp_path) -> None:
     """End-to-end: build a Docker image and run an object inside a container.
@@ -769,11 +1398,303 @@ def test_docker_runtime_end_to_end_runs_function_in_a_container(tmp_path) -> Non
 
         artifact_path = Path(final["artifacts_dir"]) / "artifact.txt"
         assert artifact_path.read_text(encoding="utf-8") == "daemon artifact"
+        _assert_owner_only(Path(final["run_dir"]))
+        _assert_owner_only(Path(final["result_path"]))
+        _assert_owner_only(Path(final["artifacts_dir"]))
+        _assert_owner_only(artifact_path)
     finally:
         runtime.shutdown()
         store.close()
 
 
+@pytest.mark.docker
+@pytest.mark.skipif(not _docker_available(), reason="Docker is not available")
+def test_object_docker_pipeline_manifest_show_prune_permissions_and_schema(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        store.register_env("default", sys.executable)
+        app = create_app(store, auto_build_envs=False)
+        pipeline = _object_docker_manifest_pipeline()
+        yaml_path = tmp_path / "object_docker_manifest_pipeline.yaml"
+        spl_export_to_file(yaml_path, [pipeline])
+        yaml_text = yaml_path.read_text(encoding="utf-8")
+        venv_record = app.runtime.register_object(
+            "object_docker_manifest_venv",
+            "object_docker_manifest_pipeline",
+            "default",
+            yaml_text=yaml_text,
+        )
+        docker_record = app.runtime.register_object(
+            "object_docker_manifest_docker",
+            "object_docker_manifest_pipeline",
+            "default",
+            yaml_text=yaml_text,
+            runtime_config={"mode": "docker", "python": "3.13"},
+        )
+        _mark_object_environment_ready(app.runtime, venv_record)
+        build = app.runtime.docker_environment_manager.ensure_ready(docker_record, wait=True)
+        assert build["status"] == "ready", build.get("error")
+
+        status, venv_started = _post_json_from_app(
+            app,
+            "/runs",
+            {
+                "object": "object_docker_manifest_venv",
+                "output": "consumer",
+                "source": "local",
+                "keep": True,
+                "kwargs": {"seed": "seed"},
+            },
+        )
+        assert status == 202
+        venv_final = _wait_for_run(store, venv_started["id"], timeout_seconds=60)
+        assert venv_final["status"] == "succeeded", venv_final.get("error")
+
+        docker_runs = []
+        for seed in ("seed", "again"):
+            status, started = _post_json_from_app(
+                app,
+                "/runs",
+                {
+                    "object": "object_docker_manifest_docker",
+                    "output": "consumer",
+                    "source": "local",
+                    "keep": True,
+                    "timeout_seconds": 600,
+                    "kwargs": {"seed": seed},
+                },
+            )
+            assert status == 202
+            final = _wait_for_run(store, started["id"], timeout_seconds=600)
+            assert final["status"] == "succeeded", final.get("error")
+            assert final["runtime_backend"] == "docker"
+            assert final["result"]["result"] == {"default": f"consumed:{seed}"}
+            docker_runs.append(final)
+
+        first, second = docker_runs
+        assert first["run_dir"] != second["run_dir"]
+        assert len(_worker_manifest_paths(first["run_dir"])) == 1
+        assert len(_worker_manifest_paths(second["run_dir"])) == 1
+        manifest_dir = _worker_manifest_dir(first["run_dir"])
+        manifest_path = manifest_dir / "manifest.json"
+        worker_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert worker_manifest["status"] == "succeeded"
+        assert _manifest_key_paths(venv_final["manifest"]) == _manifest_key_paths(first["manifest"])
+
+        consumer = _manifest_node_by_alias(first["manifest"], "consumer")
+        producer = _manifest_node_by_alias(first["manifest"], "producer")
+        assert consumer["status"] == "succeeded"
+        assert producer["status"] == "succeeded"
+        [edge] = first["manifest"]["edges"]
+        assert edge["adapter"]["save"]["tag"] == "txt"
+        artifact_uri = edge["artifact"]["ref"]["uri"]
+        assert not Path(artifact_uri).is_absolute()
+        edge_artifact_path = manifest_dir / artifact_uri
+        assert edge_artifact_path.read_text(encoding="utf-8") == "seed"
+
+        status, observed = _json_from_app(app, f"/runs/{first['id']}")
+        assert status == 200
+        assert {"alias": "producer", "node_id": producer["id"], "status": "succeeded"} in observed["run_progress"][
+            "nodes"
+        ]
+        assert {"alias": "consumer", "node_id": consumer["id"], "status": "succeeded"} in observed["run_progress"][
+            "nodes"
+        ]
+        assert observed["run_progress"]["edge_adapters"]
+        assert observed["run_progress"]["node_runtimes"]
+
+        status, shown = _json_from_app(app, f"/runs/{first['id']}?view=show")
+        assert status == 200
+        assert shown["edge_adapters"]
+        assert shown["node_runtimes"]
+        assert _manifest_node_by_alias(shown["manifest"], "consumer")["status"] == "succeeded"
+
+        _assert_owner_only(Path(first["run_dir"]))
+        _assert_owner_only(Path(first["result_path"]))
+        if Path(first["artifacts_dir"]).exists():
+            _assert_owner_only(Path(first["artifacts_dir"]))
+        _assert_owner_only(Path(first["run_dir"]) / "input.json")
+        _assert_owner_only(manifest_dir)
+        _assert_owner_only(manifest_path)
+        _assert_owner_only(edge_artifact_path)
+
+        status, preview = _post_json_from_app(app, "/runs/prune", {"run_id": first["id"], "dry_run": True})
+        assert status == 200
+        assert preview["count"] == 1
+        assert preview["pruned"][0]["disk_size_bytes"] > 0
+        status, pruned = _post_json_from_app(app, "/runs/prune", {"run_id": first["id"]})
+        assert status == 200
+        assert pruned["count"] == 1
+        assert not Path(first["run_dir"]).exists()
+        with pytest.raises(KeyError):
+            store.get_run(first["id"])
+        assert Path(second["run_dir"]).exists()
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+@pytest.mark.docker
+@pytest.mark.skipif(not _docker_available(), reason="Docker is not available")
+def test_object_docker_pipeline_resume_via_http(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    run_ids: list[str] = []
+    try:
+        store.register_env("default", sys.executable)
+        app = create_app(store, auto_build_envs=False)
+        pipeline = _object_docker_resume_pipeline()
+        yaml_path = tmp_path / "object_docker_resume_pipeline.yaml"
+        spl_export_to_file(yaml_path, [pipeline])
+        record = app.runtime.register_object(
+            "object_docker_resume_pipeline",
+            "object_docker_resume_pipeline",
+            "default",
+            yaml_text=yaml_path.read_text(encoding="utf-8"),
+            runtime_config={"mode": "docker", "python": "3.13", "base_image": "python:3.13-slim"},
+        )
+        build = app.runtime.docker_environment_manager.ensure_ready(record, wait=True)
+        assert build["status"] == "ready", build.get("error")
+
+        status, started = _post_json_from_app(
+            app,
+            "/runs",
+            {
+                "object": "object_docker_resume_pipeline",
+                "output": "consumer",
+                "source": "local",
+                "keep": True,
+                "timeout_seconds": 600,
+                "kwargs": {"seed": "seed", "should_fail": True},
+            },
+        )
+        assert status == 202
+        failed = _wait_for_run(store, started["id"], timeout_seconds=600)
+        assert failed["status"] == "failed"
+        assert _manifest_node_by_alias(failed["manifest"], "producer")["status"] == "succeeded"
+        assert _manifest_node_by_alias(failed["manifest"], "consumer")["status"] == "failed"
+
+        status, resumed = _post_json_from_app(
+            app,
+            f"/runs/{failed['id']}/resume",
+            {
+                "from": "consumer",
+                "output": "consumer",
+                "timeout_seconds": 600,
+                "kwargs": {"should_fail": False},
+                "keep": True,
+            },
+        )
+        assert status == 202
+        child = _wait_for_run(store, resumed["id"], timeout_seconds=600)
+
+        assert child["status"] == "succeeded", child.get("error")
+        assert child["runtime_backend"] == "docker"
+        assert child["parent_run_id"] == failed["id"]
+        assert child["manifest"]["parent_run_id"] == failed["id"]
+        assert child["result"]["result"] == {"default": "resumed:seed"}
+        run_ids = [failed["id"], child["id"]]
+        parent_producer = _manifest_node_by_alias(failed["manifest"], "producer")
+        child_producer = _manifest_node_by_alias(child["manifest"], "producer")
+        assert _manifest_node_by_alias(child["manifest"], "producer")["status"] == "frozen"
+        assert child_producer["outputs"] == parent_producer["outputs"]
+        assert _manifest_node_by_alias(child["manifest"], "consumer")["status"] == "succeeded"
+    finally:
+        _shutdown_app(app)
+        store.close()
+    assert _docker_container_names_for_run_ids(run_ids) == []
+
+
+@pytest.mark.docker
+@pytest.mark.skipif(not _docker_available(), reason="Docker is not available")
+def test_daemon_node_docker_runtime_end_to_end_and_resume_override(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    runtime = DaemonRuntime(store, auto_build_envs=False)
+    try:
+        store.register_env("default", sys.executable)
+
+        tagged_pipeline = _node_docker_pipeline("daemon_node_docker_tagged")
+        tagged_yaml_path = tmp_path / "daemon_node_docker_tagged.yaml"
+        spl_export_to_file(tagged_yaml_path, [tagged_pipeline])
+        tagged_record = runtime.register_object(
+            "daemon_node_docker_tagged",
+            "daemon_node_docker_tagged",
+            "default",
+            yaml_text=tagged_yaml_path.read_text(encoding="utf-8"),
+        )
+        _mark_object_environment_ready(runtime, tagged_record)
+
+        started = runtime.start_run(
+            "daemon_node_docker_tagged",
+            output="consumer",
+            source="local",
+            report_local_run=False,
+            timeout_seconds=600,
+            keep=True,
+        )
+        final = _wait_for_run(store, started["id"], timeout_seconds=600)
+
+        assert final["status"] == "succeeded", final.get("error")
+        assert final["result"]["result"] == {"default": "docker:seed"}
+        consumer = _manifest_node_by_alias(final["manifest"], "consumer")
+        assert consumer["runtime"]["name"] == "docker"
+        assert consumer["runtime"]["source"] == "node-tag"
+        image_tag = consumer["runtime"]["resolved"]["image_tag"]
+        assert image_tag.startswith("splime-runtime:")
+        assert "python" not in consumer["runtime"]["resolved"]
+        shown = store.show_run(final["id"])
+        assert _manifest_node_by_alias(shown["manifest"], "consumer")["runtime"]["resolved"]["image_tag"] == image_tag
+        assert any(
+            runtime.get("alias") == "consumer" and runtime.get("resolved") == {"image_tag": image_tag}
+            for runtime in shown["node_runtimes"]
+        )
+
+        resume_pipeline = _node_docker_pipeline("daemon_node_docker_resume", tag_consumer=False)
+        resume_yaml_path = tmp_path / "daemon_node_docker_resume.yaml"
+        spl_export_to_file(resume_yaml_path, [resume_pipeline])
+        resume_record = runtime.register_object(
+            "daemon_node_docker_resume",
+            "daemon_node_docker_resume",
+            "default",
+            yaml_text=resume_yaml_path.read_text(encoding="utf-8"),
+        )
+        _mark_object_environment_ready(runtime, resume_record)
+
+        parent = runtime.start_run(
+            "daemon_node_docker_resume",
+            output="consumer",
+            source="local",
+            report_local_run=False,
+            timeout_seconds=600,
+            keep=True,
+        )
+        parent_final = _wait_for_run(store, parent["id"], timeout_seconds=600)
+        assert parent_final["status"] == "succeeded", parent_final.get("error")
+
+        resumed = runtime.resume_run(
+            parent["id"],
+            from_="consumer",
+            output="consumer",
+            report_local_run=False,
+            timeout_seconds=600,
+            runtimes={"consumer": "docker"},
+            keep=True,
+        )
+        child = _wait_for_run(store, resumed["id"], timeout_seconds=600)
+
+        assert child["status"] == "succeeded", child.get("error")
+        assert child["result"]["result"] == {"default": "docker:seed"}
+        resumed_consumer = _manifest_node_by_alias(child["manifest"], "consumer")
+        assert resumed_consumer["runtime"]["name"] == "docker"
+        assert resumed_consumer["runtime"]["source"] == "run-override"
+        assert resumed_consumer["runtime"]["resolved"]["image_tag"].startswith("splime-runtime:")
+    finally:
+        runtime.shutdown()
+        store.close()
+
+
+@pytest.mark.docker
 @pytest.mark.skipif(not _docker_available(), reason="Docker is not available")
 def test_docker_runtime_reuses_warm_pool_container(tmp_path) -> None:
     """A pooled run uses `docker exec` into a reusable warm container."""

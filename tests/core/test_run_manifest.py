@@ -177,6 +177,10 @@ def test_failed_default_json_run_materializes_deferred_manifest(
     assert consumer["inputs"]["value"]["kind"] == "json"
     assert consumer["inputs"]["value"]["value"] == 7
     assert "cannot consume 7" in consumer["error"]
+    edge_summary = m_manifest.manifest_summary(manifest)["edge_adapters"]
+    assert edge_summary[0]["tag"] == "json"
+    assert edge_summary[0]["save"] == "json"
+    assert edge_summary[0]["load"] == "json"
 
 
 def test_local_tag_stats_reads_fixture_manifests_and_empty_catalog(tmp_path: Path) -> None:

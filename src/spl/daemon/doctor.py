@@ -25,6 +25,12 @@ from typing import Any, Protocol
 from spl.core.entities.pipeline import Pipeline
 from spl.core.ir.utils import spl_import_from_file
 from spl.core.adapter_compat import find_pipeline_adapter_compatibility_issues, probe_pipeline_adapters
+from spl.daemon.docker_pool import (
+    OBJECT_DOCKER_RUNTIME_ENV,
+    OBJECT_DOCKER_RUNTIME_VALUE,
+    OBJECT_DOCKER_WORKER_ENV,
+    OBJECT_DOCKER_WORKER_VALUE,
+)
 from spl.daemon.interpreter_visibility import python_minor_mismatch
 from spl.daemon_client import default_daemon_home
 
@@ -56,6 +62,16 @@ class CheckResult:
 
     name: str
     status: str
+    detail: str
+    hint: str | None = None
+
+
+@dataclass(frozen=True)
+class _DockerProbeResult:
+    """Local Docker CLI/daemon probe shared by object and per-node checks."""
+
+    docker_path: str | None
+    available: bool
     detail: str
     hint: str | None = None
 
@@ -130,6 +146,7 @@ def run_doctor(
         if probe_pipeline:
             checks.append(check_pipeline_adapter_probe(pipeline))
     checks.append(check_docker())
+    checks.append(check_node_docker(daemon_available=daemon_check.status == OK))
     return DoctorReport(checks=checks)
 
 
@@ -457,12 +474,93 @@ def check_docker() -> CheckResult:
     """Probe Docker only as far as the optional Docker runtime needs it."""
 
     name = "docker"
-    docker_path = shutil.which("docker")
-    if docker_path is None:
+    probe = _probe_docker_daemon()
+    if probe.docker_path is None:
         return CheckResult(
             name=name,
             status=OK,
             detail="not installed (needed only for objects with the Docker runtime)",
+        )
+    if not probe.available:
+        return CheckResult(
+            name=name,
+            status=WARN,
+            detail=f"installed, but {probe.detail}",
+            hint=probe.hint or "start Docker Desktop (or dockerd) before running Docker objects",
+        )
+    return CheckResult(name=name, status=OK, detail=probe.detail)
+
+
+def check_node_docker(
+    *,
+    daemon_available: bool = False,
+    explicit_image: str | None = None,
+    inside_object_docker_worker: bool | None = None,
+) -> CheckResult:
+    """Report whether the per-node Docker runtime can run in this context."""
+
+    name = "per-node docker"
+    if inside_object_docker_worker is None:
+        inside_object_docker_worker = _inside_object_docker_worker()
+    if inside_object_docker_worker:
+        return CheckResult(
+            name=name,
+            status=WARN,
+            detail="unavailable: nested Docker runtimes are not supported inside an object Docker worker",
+            hint="keep the object runtime on venv or drop the node tag",
+        )
+
+    image = explicit_image.strip() if explicit_image else None
+    probe = _probe_docker_daemon()
+    if probe.docker_path is None:
+        return CheckResult(
+            name=name,
+            status=WARN,
+            detail="unavailable: docker CLI is not on PATH",
+            hint="install Docker Desktop and ensure the `docker` command is on PATH",
+        )
+    if not probe.available:
+        return CheckResult(
+            name=name,
+            status=WARN,
+            detail=f"unavailable: {probe.detail}",
+            hint=probe.hint,
+        )
+    if not daemon_available and image is None:
+        return CheckResult(
+            name=name,
+            status=WARN,
+            detail="unavailable: no daemon-provided image_tag and no runtime_config.docker.image is set",
+            hint="set runtime_config.docker.image or run via the daemon",
+        )
+
+    source = f"explicit image {image}" if image is not None else "daemon-provided image_tag"
+    return CheckResult(
+        name=name,
+        status=OK,
+        detail=f"available: docker CLI and daemon are ready; per-node image source is {source}",
+    )
+
+
+def _inside_object_docker_worker() -> bool:
+    """Return True inside the object-level Docker worker container."""
+
+    return (
+        os.environ.get(OBJECT_DOCKER_RUNTIME_ENV) == OBJECT_DOCKER_RUNTIME_VALUE
+        or os.environ.get(OBJECT_DOCKER_WORKER_ENV) == OBJECT_DOCKER_WORKER_VALUE
+    )
+
+
+def _probe_docker_daemon() -> _DockerProbeResult:
+    """Probe local Docker without raising."""
+
+    docker_path = shutil.which("docker")
+    if docker_path is None:
+        return _DockerProbeResult(
+            docker_path=None,
+            available=False,
+            detail="docker CLI is not on PATH",
+            hint="install Docker Desktop and ensure the `docker` command is on PATH",
         )
     try:
         completed = subprocess.run(
@@ -473,19 +571,30 @@ def check_docker() -> CheckResult:
             timeout=DOCKER_INFO_TIMEOUT_SECONDS,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return CheckResult(
-            name=name,
-            status=WARN,
-            detail=f"`docker info` did not answer: {exc}",
-            hint="Docker runtime objects will fail until the Docker daemon responds",
+    except subprocess.TimeoutExpired as exc:
+        return _DockerProbeResult(
+            docker_path=docker_path,
+            available=False,
+            detail=f"`docker info` timed out after {DOCKER_INFO_TIMEOUT_SECONDS:g}s: {exc}",
+            hint="start Docker Desktop (or dockerd) and wait until `docker info` succeeds",
+        )
+    except OSError as exc:
+        return _DockerProbeResult(
+            docker_path=docker_path,
+            available=False,
+            detail=f"`docker info` failed to start: {exc}",
+            hint="start Docker Desktop (or dockerd) and wait until `docker info` succeeds",
         )
     if completed.returncode != 0:
         detail = (completed.stderr or "").strip().splitlines()
-        return CheckResult(
-            name=name,
-            status=WARN,
-            detail=("installed, but the Docker daemon is not reachable" + (f": {detail[0]}" if detail else "")),
-            hint="start Docker Desktop (or dockerd) before running Docker objects",
+        return _DockerProbeResult(
+            docker_path=docker_path,
+            available=False,
+            detail=("the Docker daemon is not reachable" + (f": {detail[0]}" if detail else "")),
+            hint="start Docker Desktop (or dockerd) and wait until `docker info` succeeds",
         )
-    return CheckResult(name=name, status=OK, detail=f"available ({docker_path})")
+    return _DockerProbeResult(
+        docker_path=docker_path,
+        available=True,
+        detail=f"available ({docker_path})",
+    )

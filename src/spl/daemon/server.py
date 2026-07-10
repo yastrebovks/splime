@@ -50,17 +50,20 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any, Callable, cast
 from urllib.parse import urlparse, urlunparse
 from uuid import uuid4
 
 from spl.core import resume as m_resume
+from spl.core.node_runtime import DOCKER_NODE_RUNTIME, RUNTIME_TAG_NAME, explicit_docker_image_spec_hash
 from spl.core.entities.pipeline import Pipeline
 from spl.core.ir.utils import spl_import_from_file
 from spl.daemon.docker_environment import DockerEnvironmentManager
@@ -88,6 +91,7 @@ from spl.daemon.runtime_backend import (
     RuntimeBackendRegistry,
     RuntimeBackendServices,
 )
+from spl.daemon.runtime_config import normalize_runtime_config
 from spl.daemon.spl_free_generator import (
     LEGACY_WORKER_RUNTIME,
     read_worker_runtime_marker,
@@ -1956,6 +1960,10 @@ class DaemonRuntime:
                 runtimes=runtimes,
                 keep=keep,
             )
+        try:
+            state = self._prepare_node_runtime_environments_for_run(state, report_local_run=report_local_run)
+        except Exception as exc:
+            return self._fail_run_before_worker(state, report_local_run=report_local_run, error=str(exc) or repr(exc))
         thread = threading.Thread(
             target=self._execute_run,
             args=(state["id"], report_local_run),
@@ -2046,6 +2054,16 @@ class DaemonRuntime:
             parent_run_id=parent["id"],
             resume=resume_payload,
         )
+        state = self._stage_object_docker_resume_parent(
+            state,
+            object_record=object_record,
+            parent_manifest_dir=parent_manifest_dir,
+            report_local_run=report_local_run,
+        )
+        try:
+            state = self._prepare_node_runtime_environments_for_run(state, report_local_run=report_local_run)
+        except Exception as exc:
+            return self._fail_run_before_worker(state, report_local_run=report_local_run, error=str(exc) or repr(exc))
         thread = threading.Thread(
             target=self._execute_run,
             args=(state["id"], report_local_run),
@@ -2058,6 +2076,153 @@ class DaemonRuntime:
             report_local_run=report_local_run,
             status="starting",
         )
+
+    def _fail_run_before_worker(
+        self,
+        state: dict[str, Any],
+        *,
+        report_local_run: bool,
+        error: str,
+    ) -> dict[str, Any]:
+        return self._update_local_run(
+            state["id"],
+            report_local_run=report_local_run,
+            status="failed",
+            finished_at=utc_now(),
+            error=error,
+        )
+
+    def _stage_object_docker_resume_parent(
+        self,
+        state: dict[str, Any],
+        *,
+        object_record: dict[str, Any],
+        parent_manifest_dir: Path,
+        report_local_run: bool,
+    ) -> dict[str, Any]:
+        runtime_config = normalize_runtime_config(object_record.get("runtime_config"))
+        if runtime_config.get("mode") != "docker":
+            return state
+        input_payload = dict(state.get("input") or {})
+        raw_resume = input_payload.get("resume")
+        if not isinstance(raw_resume, dict):
+            return state
+
+        staged_name = "resume-parent"
+        run_dir = Path(state["run_dir"])
+        staged_parent_dir = run_dir / staged_name
+        shutil.rmtree(staged_parent_dir, ignore_errors=True)
+        shutil.copytree(parent_manifest_dir, staged_parent_dir)
+
+        resume_payload = dict(raw_resume)
+        resume_payload["parent_run_dir"] = staged_name
+        input_payload["resume"] = resume_payload
+        write_json(run_dir / "input.json", input_payload)
+        return self._update_local_run(
+            state["id"],
+            report_local_run=report_local_run,
+            input=input_payload,
+        )
+
+    def _prepare_node_runtime_environments_for_run(
+        self,
+        state: dict[str, Any],
+        *,
+        report_local_run: bool,
+    ) -> dict[str, Any]:
+        input_payload = dict(state.get("input") or {})
+        object_record = self.store.get_object_version(state["object_version_id"])
+        pipeline = self._load_optional_pipeline_entrypoint(object_record, str(state["entrypoint"]))
+        if not self._run_selects_node_docker(
+            pipeline,
+            runtime_config=input_payload.get("runtime_config"),
+            runtimes=input_payload.get("runtimes"),
+        ):
+            return state
+
+        raw_node_runtime_environments = input_payload.get("node_runtime_environments")
+        node_runtime_environments = (
+            dict(raw_node_runtime_environments) if isinstance(raw_node_runtime_environments, dict) else {}
+        )
+        node_runtime_environments[DOCKER_NODE_RUNTIME] = self._resolve_node_docker_environment(object_record)
+        input_payload["node_runtime_environments"] = node_runtime_environments
+        run_dir = Path(state["run_dir"])
+        write_json(run_dir / "input.json", input_payload)
+        return self._update_local_run(
+            state["id"],
+            report_local_run=report_local_run,
+            input=input_payload,
+        )
+
+    def _load_optional_pipeline_entrypoint(self, object_record: dict[str, Any], entrypoint: str) -> Pipeline | None:
+        namespace: dict[str, Any] = {}
+        with NamedTemporaryFile("w", encoding="utf-8", suffix=".yaml") as handle:
+            handle.write(str(object_record["yaml"]))
+            handle.flush()
+            spl_import_from_file(Path(handle.name), namespace)
+        target = namespace.get(entrypoint)
+        return target if isinstance(target, Pipeline) else None
+
+    def _run_selects_node_docker(
+        self,
+        pipeline: Pipeline | None,
+        *,
+        runtime_config: Any,
+        runtimes: Any,
+    ) -> bool:
+        config = runtime_config if isinstance(runtime_config, dict) else {}
+        if config.get("node_runtime") == DOCKER_NODE_RUNTIME:
+            return True
+        if isinstance(runtimes, dict) and any(value == DOCKER_NODE_RUNTIME for value in runtimes.values()):
+            return True
+        if pipeline is None:
+            return False
+        return any(
+            node_tags.get(RUNTIME_TAG_NAME) == DOCKER_NODE_RUNTIME for node_tags in (pipeline.tags or {}).values()
+        )
+
+    def _resolve_node_docker_environment(self, object_record: dict[str, Any]) -> dict[str, Any]:
+        runtime_config = normalize_runtime_config(object_record.get("runtime_config"))
+        explicit_image = self._explicit_node_docker_image(runtime_config)
+        if explicit_image is not None:
+            return {
+                "image_tag": explicit_image,
+                "spec_hash": explicit_docker_image_spec_hash(explicit_image),
+                "source": "runtime_config.docker.image",
+            }
+
+        docker_record = self._node_docker_build_record(object_record, runtime_config)
+        environment_record = self.docker_environment_manager.ensure_ready(docker_record, wait=True)
+        return {
+            "image_tag": environment_record["image_tag"],
+            "spec_hash": environment_record.get("spec_hash"),
+            "source": "object-env-spec",
+        }
+
+    def _explicit_node_docker_image(self, runtime_config: dict[str, Any]) -> str | None:
+        docker_config = runtime_config.get("docker")
+        if not isinstance(docker_config, dict):
+            return None
+        image = docker_config.get("image")
+        if image is None:
+            return None
+        image_tag = str(image)
+        if not image_tag:
+            raise ValueError('runtime_config["docker"]["image"] must be a non-empty string')
+        return image_tag
+
+    def _node_docker_build_record(
+        self,
+        object_record: dict[str, Any],
+        runtime_config: dict[str, Any],
+    ) -> dict[str, Any]:
+        if runtime_config.get("mode") == "docker":
+            return object_record
+        raw_docker_config = runtime_config.get("docker")
+        docker_config: dict[str, Any] = dict(raw_docker_config) if isinstance(raw_docker_config, dict) else {}
+        build_config = {"mode": "docker", **dict(docker_config)}
+        build_config.pop("image", None)
+        return {**object_record, "runtime_config": build_config}
 
     def _execute_run(self, run_id: str, report_local_run: bool = True) -> None:
         """Launch the worker process and persist the final run state."""

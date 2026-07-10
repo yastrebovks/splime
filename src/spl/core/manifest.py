@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, cast
 
+from spl.core.entities.adapter import JSON_ADAPTER_KEY
 from spl.core.entities.artifact import ArtifactRef
 from spl.core.fingerprint import FINGERPRINT_FORMAT_VERSION, inline_value_sha256
 
@@ -378,15 +379,17 @@ def node_runtime_summary(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
         runtime = raw_record.get("runtime")
         if not isinstance(runtime, Mapping):
             continue
-        rows.append(
-            {
-                "node_id": str(node_id),
-                "alias": raw_record.get("alias"),
-                "name": runtime.get("name"),
-                "source": runtime.get("source"),
-                "config_hash": runtime.get("config_hash"),
-            }
-        )
+        row = {
+            "node_id": str(node_id),
+            "alias": raw_record.get("alias"),
+            "name": runtime.get("name"),
+            "source": runtime.get("source"),
+            "config_hash": runtime.get("config_hash"),
+        }
+        resolved = runtime.get("resolved")
+        if isinstance(resolved, Mapping):
+            row["resolved"] = dict(resolved)
+        rows.append(row)
     return sorted(rows, key=lambda item: (str(item.get("alias") or ""), item["node_id"]))
 
 
@@ -410,6 +413,8 @@ def _adapter_name(adapter: Mapping[str, Any]) -> str | None:
     identity = adapter.get("identity")
     if not isinstance(identity, Mapping):
         return None
+    if identity.get("key") == JSON_ADAPTER_KEY:
+        return "json"
     save = identity.get("save")
     load = identity.get("load")
     key = identity.get("key")

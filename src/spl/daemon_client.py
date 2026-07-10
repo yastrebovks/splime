@@ -261,6 +261,21 @@ def _append_remaining(items: list[str], total: int) -> list[str]:
     return items
 
 
+def _runtime_resolved_label(value: Any) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    for key in ("image_tag", "python"):
+        resolved = value.get(key)
+        if isinstance(resolved, str) and resolved:
+            return "{}={}".format(key, resolved)
+    parts = [
+        "{}={}".format(key, item)
+        for key, item in sorted(value.items())
+        if isinstance(key, str) and isinstance(item, str) and item
+    ]
+    return ", ".join(parts) if parts else None
+
+
 class RunProgressPrinter:
     """Print progress lines for run phases that can stay silent for minutes.
 
@@ -402,7 +417,11 @@ class RunProgressPrinter:
             node = item.get("alias") or _short(item.get("node_id"))
             runtime = item.get("name")
             source = item.get("source")
-            items.append("{}={}/{}".format(node or "node", runtime or "runtime", source or "unknown"))
+            summary = "{}={}/{}".format(node or "node", runtime or "runtime", source or "unknown")
+            resolved = _runtime_resolved_label(item.get("resolved"))
+            if resolved is not None:
+                summary = "{} ({})".format(summary, resolved)
+            items.append(summary)
         return _append_remaining(items, len(rows))
 
     def _edge_resolution_summary(self, value: Any) -> list[str]:

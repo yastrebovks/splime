@@ -3,11 +3,14 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import re
+import shutil
+import subprocess
 import sys
 import textwrap
 import time
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Mapping, cast
 
 import pytest
 import yaml
@@ -23,6 +26,21 @@ from spl.core.ir.parse import ir_parse
 from spl.core.ir.utils import SPLSafeLoader
 from spl.daemon.canonical import _canonical_spl_documents
 from spl.daemon.spl_free_generator import filter_spl_runtime_scaffolding
+
+
+class _StaticNodeEnvironmentProvider:
+    def __init__(self, metadata: dict[str, Any] | None = None):
+        self.metadata = metadata or {}
+
+    def prepare(
+        self,
+        spec: Mapping[str, Any],
+        *,
+        wait: bool = True,
+        retry_failed: bool = False,
+    ) -> m_node_runtime.PreparedNodeEnvironment:
+        del spec, wait, retry_failed
+        return m_node_runtime.PreparedNodeEnvironment(name="test-env", python_path=None, metadata=dict(self.metadata))
 
 
 def _seed_text() -> str:
@@ -81,6 +99,27 @@ def _runtime_pipeline(*, tag_consumer: bool = True) -> Pipeline:
     pipeline = lift_any(_upper_text).bind(value=producer.as_format("txt")).alias("consumer").render("node_runtime")
     pipeline = pipeline.add_adapter(str, "txt", save=_save_text, load=_load_text)
     return pipeline.with_node_runtime("consumer", "venv-subprocess") if tag_consumer else pipeline
+
+
+def _docker_runtime_context(
+    tmp_path: Path,
+    *,
+    runtime_config: dict[str, Any] | None = None,
+    provider: m_node_runtime.NodeEnvironmentProvider | None = None,
+) -> m_node_runtime.NodeRuntimeContext:
+    node = NodeFunction(_double_value)
+    [input_port] = node.inputs
+    return m_node_runtime.NodeRuntimeContext(
+        node=node,
+        node_label="double",
+        inputs={input_port: 21},
+        output_port=node.get_output_port(DEFAULT_PORT),
+        callback=lambda _node, _inputs: {"default": 42},
+        work_dir=tmp_path / "runs" / "run-123" / "node-runtimes" / str(node.uuid),
+        environment_provider=provider or _StaticNodeEnvironmentProvider(),
+        runtime_config=runtime_config or {},
+        environment_spec=[],
+    )
 
 
 def _read_manifest(run: Any) -> dict[str, Any]:
@@ -152,6 +191,7 @@ def test_node_runtime_tag_runs_in_subprocess_and_records_manifest(
             "name": "venv-subprocess",
             "source": "node-tag",
             "config_hash": consumer["runtime"]["config_hash"],
+            "resolved": {"python": sys.executable},
         },
         {
             "node_id": producer["id"],
@@ -159,6 +199,7 @@ def test_node_runtime_tag_runs_in_subprocess_and_records_manifest(
             "name": "native",
             "source": "default",
             "config_hash": None,
+            "resolved": {"python": sys.executable},
         },
     ]
 
@@ -366,6 +407,230 @@ def test_venv_subprocess_node_timeout_records_failure_and_stops_child(
     assert (runtime_dir / "stdout.txt").read_text(encoding="utf-8") == "started\n"
     assert (runtime_dir / "stderr.txt").read_text(encoding="utf-8") == ""
     time.sleep(0.7)
+    assert not marker_path.exists()
+
+
+def test_docker_node_runtime_builds_spl_free_docker_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = m_node_runtime.DockerNodeRuntime()
+    context = _docker_runtime_context(
+        tmp_path,
+        runtime_config={"docker": {"image": "python:3.13-slim", "network": "none"}},
+    )
+    environment = runtime.prepare(context)
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        (context.work_dir / "result.json").write_text('{"result": 42}', encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="node stdout\n", stderr="")
+
+    monkeypatch.setattr(m_node_runtime.subprocess, "run", fake_run)
+
+    assert runtime.execute(context, environment) == {DEFAULT_PORT: 42}
+    assert runtime.execute(context, environment) == {DEFAULT_PORT: 42}
+
+    first_command, second_command = commands
+    first_name = first_command[first_command.index("--name") + 1]
+    second_name = second_command[second_command.index("--name") + 1]
+    for container_name in (first_name, second_name):
+        assert re.fullmatch(r"spl-node-run-123-[0-9a-f]{8}-[0-9a-f]{6}", container_name)
+        assert len(container_name) <= 63
+    assert first_name != second_name
+
+    command = first_command
+    assert command[:5] == ["docker", "run", "--rm", "--name", command[4]]
+    assert command[command.index("--cidfile") + 1] == str(context.work_dir / "container.cid")
+    assert command[command.index("-v") + 1] == "{}:/spl-node".format(context.work_dir.resolve())
+    assert command[command.index("-w") + 1] == "/spl-node"
+    assert command[command.index("--network") + 1] == "none"
+    assert "--read-only" in command
+    assert command[command.index("--pids-limit") + 1] == "256"
+    assert "PYTHONPATH" not in " ".join(command)
+    image_index = command.index("python:3.13-slim")
+    assert command[image_index + 1 : image_index + 3] == ["python", "/spl-node/spl_free_runner.py"]
+    assert command[command.index("--module") + 1] == "/spl-node/node_module.py"
+    assert command[command.index("--input") + 1] == "/spl-node/input.json"
+    assert command[command.index("--result") + 1] == "/spl-node/result.json"
+    assert command[command.index("--artifacts-dir") + 1] == "/spl-node/artifacts"
+    assert command[command.index("--env-spec") + 1] == "/spl-node/env-spec.json"
+    assert (context.work_dir / "stdout.txt").read_text(encoding="utf-8") == "node stdout\n"
+    assert (context.work_dir / "stderr.txt").read_text(encoding="utf-8") == ""
+
+
+def test_docker_node_runtime_timeout_kills_container(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = m_node_runtime.DockerNodeRuntime()
+    context = _docker_runtime_context(
+        tmp_path,
+        runtime_config={
+            "docker": {"image": "python:3.13-slim", "network": "none"},
+            "node_timeout_seconds": 0.25,
+        },
+    )
+    environment = runtime.prepare(context)
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        if command[:2] == ["docker", "kill"]:
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        raise subprocess.TimeoutExpired(command, 0.25, output="started\n", stderr="")
+
+    monkeypatch.setattr(m_node_runtime.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match=r"node runtime `docker` timed out after 0.25s for node `double`"):
+        runtime.execute(context, environment)
+
+    run_command, kill_command = commands
+    assert kill_command == ["docker", "kill", run_command[run_command.index("--name") + 1]]
+    assert (context.work_dir / "stdout.txt").read_text(encoding="utf-8") == "started\n"
+    assert (context.work_dir / "stderr.txt").read_text(encoding="utf-8") == ""
+
+
+def test_docker_node_runtime_rejects_nested_object_docker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SPL_OBJECT_RUNTIME_BACKEND", "docker")
+    runtime = m_node_runtime.DockerNodeRuntime()
+    context = _docker_runtime_context(
+        tmp_path,
+        runtime_config={"docker": {"image": "python:3.13-slim"}},
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="nested docker runtimes are not supported; keep the object runtime on venv or drop the node tag",
+    ):
+        runtime.prepare(context)
+
+
+def test_docker_node_runtime_requires_image_tag_without_daemon(tmp_path: Path) -> None:
+    runtime = m_node_runtime.DockerNodeRuntime()
+    context = _docker_runtime_context(tmp_path)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        runtime.prepare(context)
+
+    message = str(exc_info.value)
+    assert 'runtime_config["docker"]["image"]' in message
+    assert "run the object through the daemon" in message
+
+
+def test_docker_runtime_manifest_uses_image_tag() -> None:
+    environment = m_node_runtime.PreparedNodeEnvironment(
+        name="docker-image",
+        python_path=None,
+        metadata={"image_tag": "python:3.13-slim", "spec_hash": "docker-hash"},
+    )
+    record = m_node_runtime.runtime_manifest_record(
+        m_node_runtime.NodeRuntimeResolution(
+            m_node_runtime.DOCKER_NODE_RUNTIME,
+            m_node_runtime.NodeRuntimeResolutionSource.NODE_TAG,
+        ),
+        environment,
+    )
+
+    assert record["name"] == "docker"
+    assert record["config_hash"] == "docker-hash"
+    assert record["resolved"] == {"image_tag": "python:3.13-slim"}
+
+
+def _docker_available() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    completed = subprocess.run(
+        ["docker", "info"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    return completed.returncode == 0
+
+
+def _ensure_docker_image(image: str) -> None:
+    inspected = subprocess.run(
+        ["docker", "image", "inspect", image],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if inspected.returncode == 0:
+        return
+    pulled = subprocess.run(
+        ["docker", "pull", image],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    if pulled.returncode != 0:
+        pytest.skip("Docker image is not available for e2e: {}".format((pulled.stderr or "").strip() or image))
+
+
+@pytest.mark.docker
+@pytest.mark.skipif(not _docker_available(), reason="Docker is not available")
+def test_docker_node_runtime_explicit_image_local_deployment_e2e(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    image = "python:3.13-slim"
+    _ensure_docker_image(image)
+    monkeypatch.setenv("SPL_RUNS_HOME", str(tmp_path / "runs"))
+    pipeline = _runtime_pipeline(tag_consumer=False).with_node_runtime("consumer", "docker")
+    run = Deployment(
+        pipeline,
+        runtime_config={"docker": {"image": image, "network": "none"}},
+    ).run(keep=True)
+
+    with run:
+        assert run.value("consumer") == "SEED"
+
+    consumer = _node_by_alias(_read_manifest(run), "consumer")
+    assert consumer["runtime"]["name"] == "docker"
+    assert consumer["runtime"]["source"] == "node-tag"
+    assert consumer["runtime"]["resolved"] == {"image_tag": image}
+
+
+@pytest.mark.docker
+@pytest.mark.skipif(not _docker_available(), reason="Docker is not available")
+def test_docker_node_runtime_timeout_removes_container(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    image = "python:3.13-slim"
+    _ensure_docker_image(image)
+    monkeypatch.setenv("SPL_RUNS_HOME", str(tmp_path / "runs"))
+    marker_path = tmp_path / "marker.txt"
+    lift_any = cast(Any, lift)
+    pipeline = lift_any(_slow_marker).alias("slow").render("slow_timeout").with_node_runtime("slow", "docker")
+    run = Deployment(
+        pipeline,
+        runtime_config={"docker": {"image": image, "network": "none"}, "node_timeout_seconds": 0.5},
+    ).run(keep=True, marker_path=str(marker_path))
+    node = pipeline.aliases["slow"]
+    container_name_prefix = "spl-node-{}-{}-".format(
+        m_node_runtime._docker_name_token(run.run_id)[:32],
+        str(node.uuid).replace("-", "")[:8],
+    )
+
+    with pytest.raises(RuntimeError, match=r"node runtime `docker` timed out after 0.5s for node `slow`"):
+        run.value("slow")
+
+    matching_names: list[str] = []
+    for _ in range(25):
+        completed = subprocess.run(
+            ["docker", "ps", "-a", "--format", "{{.Names}}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        matching_names = [name for name in completed.stdout.splitlines() if name.startswith(container_name_prefix)]
+        if not matching_names:
+            break
+        time.sleep(0.2)
+    else:
+        raise AssertionError("timed-out Docker node container was not removed: {}".format(", ".join(matching_names)))
+    time.sleep(0.8)
     assert not marker_path.exists()
 
 

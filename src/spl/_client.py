@@ -19,6 +19,8 @@ dependencies imported yet.
 from __future__ import annotations
 
 import builtins
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from html import escape
 from pathlib import Path
@@ -37,6 +39,8 @@ from spl._views import (
     RunListView,
     RunRecordView,
     SignatureView,
+    object_catalog_title,
+    object_scope_title,
     wrap_action,
 )
 from spl.core import manifest as m_manifest
@@ -55,6 +59,7 @@ from spl.server_client import SPLServerClient
 OfflinePolicy = Literal["queue", "wait", "fail_fast"]
 ObjectScope = Literal["auto", "local", "server", "all"]
 RunSource = Literal["auto", "local"]
+RunIdNamespace = Literal["local", "daemon", "unknown"]
 ProgressOption = bool | RunStateCallback
 _NO_SERVER_CONNECTION_MESSAGE = "active server connection is not found"
 _LIBRARY_DELETE_UNSUPPORTED_MESSAGE = (
@@ -62,6 +67,9 @@ _LIBRARY_DELETE_UNSUPPORTED_MESSAGE = (
     "Use the Console archive action to hide a library, or remove individual "
     "entries with client.library.remove_entry()."
 )
+_LOCAL_CACHE_ONLY_WARNING = "local cache only; server copies (if any) stay visible in objects() while connected"
+_LOCAL_RUN_ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-fA-F]{12}")
+_DAEMON_RUN_ID_RE = re.compile(r"[0-9a-fA-F]{32}")
 
 
 def _preview(value: Any, *, limit: int = 80) -> str:
@@ -74,6 +82,48 @@ def _preview(value: Any, *, limit: int = 80) -> str:
 def _is_missing_server_connection(exc: Exception) -> bool:
     message = str(exc)
     return isinstance(exc, ClientError) and _NO_SERVER_CONNECTION_MESSAGE in message
+
+
+def _is_404_error(exc: Exception) -> bool:
+    return isinstance(exc, ClientError) and str(exc).startswith("404:")
+
+
+def _run_id_namespace(run_id: str) -> RunIdNamespace:
+    """Return the syntactic namespace for a retained-run id."""
+
+    if _LOCAL_RUN_ID_RE.fullmatch(run_id):
+        return "local"
+    if _DAEMON_RUN_ID_RE.fullmatch(run_id):
+        return "daemon"
+    return "unknown"
+
+
+def _run_show_not_found_message(run_id: str, namespace: RunIdNamespace) -> str:
+    if namespace == "local":
+        hint = "This looks like a local retained run id; try `run_show({!r}, local=True)`.".format(run_id)
+    elif namespace == "daemon":
+        hint = "This looks like a daemon run id; check that the daemon is using the expected run store."
+    else:
+        hint = (
+            "This run id does not match the local or daemon id format; check the daemon run id, "
+            "or use `runs(local=True)` for local retained runs."
+        )
+    return "404: run {!r} was not found by the daemon (run id namespace: {}). {}".format(
+        run_id,
+        namespace,
+        hint,
+    )
+
+
+def _local_retained_run_count() -> int:
+    try:
+        return len(m_manifest.list_local_runs())
+    except OSError:
+        return 0
+
+
+def _with_local_cache_warning(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return {**dict(payload), "warning": _LOCAL_CACHE_ONLY_WARNING}
 
 
 def _progress_callback(progress: ProgressOption) -> RunStateCallback | None:
@@ -147,6 +197,13 @@ class PublishedObject:
         return f"<table><tbody>{body}</tbody></table>"
 
 
+@dataclass(frozen=True)
+class _BareServerRef:
+    name: str
+    owner_id: str | None
+    library: str | None
+
+
 _CATALOG_HEADERS = ("name", "kind", "version", "library", "inputs")
 
 
@@ -207,14 +264,138 @@ def _rows_to_html(rows: list[dict[str, str]], title: str) -> str:
     )
 
 
+def _record_string(value: Any, *keys: str) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, Mapping):
+        for key in keys:
+            item = value.get(key)
+            if item is not None and str(item):
+                return str(item)
+    return None
+
+
+def _server_record_names(record: Mapping[str, Any]) -> set[str]:
+    names = {record.get("display_name"), record.get("name"), record.get("object_name")}
+    return {str(name) for name in names if isinstance(name, str) and name}
+
+
+def _server_record_owner(record: Mapping[str, Any]) -> str | None:
+    return _record_string(record.get("owner_id")) or _record_string(record.get("owner"), "id", "owner_id", "name")
+
+
+def _server_record_library(record: Mapping[str, Any]) -> str | None:
+    return _record_string(record.get("library"), "slug", "name", "display_name")
+
+
+def _server_record_version(record: Mapping[str, Any]) -> str | None:
+    current = record.get("current_version")
+    if isinstance(current, Mapping):
+        for key in ("version", "number", "label", "name"):
+            value = current.get(key)
+            if value is not None and str(value):
+                return str(value)
+    for key in ("version", "version_label"):
+        value = record.get(key)
+        if value is not None and str(value):
+            return str(value)
+    return None
+
+
+def _server_candidate_label(record: Mapping[str, Any]) -> str:
+    library = _server_record_library(record) or "<unknown library>"
+    owner = _server_record_owner(record)
+    version = _server_record_version(record)
+    details = []
+    if owner is not None:
+        details.append("owner {}".format(owner))
+    if version is not None:
+        details.append("v{}".format(version))
+    return "{} ({})".format(library, ", ".join(details)) if details else library
+
+
+def _resolved_from_server_record(ref: _BareServerRef) -> dict[str, str]:
+    record = {"name": ref.name}
+    if ref.library is not None:
+        record["library"] = ref.library
+    if ref.owner_id is not None:
+        record["owner_id"] = ref.owner_id
+    return record
+
+
+def _server_resolution_label(value: Any) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    parts = []
+    library = value.get("library")
+    owner = value.get("owner_id")
+    if isinstance(library, str) and library:
+        parts.append("library {!r}".format(library))
+    if isinstance(owner, str) and owner:
+        parts.append("owner {}".format(owner))
+    return ", ".join(parts) if parts else "server catalog"
+
+
+def _int_version(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _server_freshness_line(
+    signature: Mapping[str, Any],
+    server_records: list[dict[str, Any]],
+    *,
+    owner: str | None,
+    library: str | None,
+) -> str | None:
+    local_version = _int_version(signature.get("version"))
+    name = signature.get("name")
+    if local_version is None or not isinstance(name, str) or not name:
+        return None
+    candidates = [
+        record
+        for record in server_records
+        if isinstance(record, Mapping)
+        and name in _server_record_names(record)
+        and (owner is None or _server_record_owner(record) == owner)
+        and (library is None or _server_record_library(record) == library)
+    ]
+    if len(candidates) != 1:
+        return None
+    candidate = candidates[0]
+    server_version = _int_version(_server_record_version(candidate))
+    if server_version is None or server_version <= local_version:
+        return None
+    server_library = _server_record_library(candidate)
+    library_label = "library {!r}".format(server_library) if server_library else "library <unknown>"
+    return "local v{}; server has v{} ({}) - run/call resolves via source='auto'".format(
+        local_version,
+        server_version,
+        library_label,
+    )
+
+
+def _local_object_missing(exc: Exception) -> bool:
+    message = str(exc)
+    return isinstance(exc, ClientError) and message.startswith("404:") and "object is not registered" in message
+
+
 class ObjectList(list[dict[str, Any]]):
     """Object records that print as a compact table; ``.raw`` is a plain list."""
 
+    def __init__(self, payload: list[dict[str, Any]] | None = None, *, title: str | None = None):
+        super().__init__(payload or [])
+        self._title = title or object_scope_title("server")
+
     def __repr__(self) -> str:
-        return _rows_to_text(_catalog_rows(list(self)), "objects")
+        return _rows_to_text(_catalog_rows(list(self)), self._title)
 
     def _repr_html_(self) -> str:
-        return _rows_to_html(_catalog_rows(list(self)), "objects")
+        return _rows_to_html(_catalog_rows(list(self)), self._title)
 
     @property
     def raw(self) -> list[dict[str, Any]]:
@@ -224,11 +405,15 @@ class ObjectList(list[dict[str, Any]]):
 class ObjectTable(dict[str, Any]):
     """Name-keyed object records with a compact table ``repr``; ``.raw`` is a plain dict."""
 
+    def __init__(self, payload: dict[str, Any] | None = None, *, title: str | None = None):
+        super().__init__(payload or {})
+        self._title = title or object_scope_title("local")
+
     def __repr__(self) -> str:
-        return _rows_to_text(_catalog_rows(dict(self)), "objects")
+        return _rows_to_text(_catalog_rows(dict(self)), self._title)
 
     def _repr_html_(self) -> str:
-        return _rows_to_html(_catalog_rows(dict(self)), "objects")
+        return _rows_to_html(_catalog_rows(dict(self)), self._title)
 
     @property
     def raw(self) -> dict[str, Any]:
@@ -239,10 +424,24 @@ class ObjectCatalog(dict[str, Any]):
     """Local+server catalog that prints per-scope tables; ``.raw`` is a plain dict."""
 
     def __repr__(self) -> str:
-        return "\n\n".join(_rows_to_text(_catalog_rows(value), str(key)) for key, value in self.items())
+        local_rows = _catalog_rows(self.get("local") or {})
+        server_rows = _catalog_rows(self.get("server") or [])
+        return "\n\n".join(
+            [
+                "{}:".format(object_catalog_title(len(local_rows), len(server_rows))),
+                _rows_to_text(local_rows, object_scope_title("local")),
+                _rows_to_text(server_rows, object_scope_title("server")),
+            ]
+        )
 
     def _repr_html_(self) -> str:
-        return "".join(_rows_to_html(_catalog_rows(value), str(key)) for key, value in self.items())
+        local_rows = _catalog_rows(self.get("local") or {})
+        server_rows = _catalog_rows(self.get("server") or [])
+        return (
+            "<div><b>{}</b></div>".format(escape(object_catalog_title(len(local_rows), len(server_rows))))
+            + _rows_to_html(local_rows, object_scope_title("local"))
+            + _rows_to_html(server_rows, object_scope_title("server"))
+        )
 
     @property
     def raw(self) -> dict[str, Any]:
@@ -251,10 +450,12 @@ class ObjectCatalog(dict[str, Any]):
 
 def _wrap_objects(
     value: dict[str, Any] | list[dict[str, Any]],
+    *,
+    title: str | None = None,
 ) -> ObjectTable | ObjectList:
     """Wrap a payload in a view type, preserving its runtime shape."""
 
-    return ObjectTable(value) if isinstance(value, dict) else ObjectList(value)
+    return ObjectTable(value, title=title) if isinstance(value, dict) else ObjectList(value, title=title)
 
 
 @dataclass(frozen=True)
@@ -991,7 +1192,8 @@ class SPLClient:
 
         The returned views subclass ``dict``/``list``, so indexing, iteration,
         and ``json.dumps`` keep working; they only add a compact ``repr`` and a
-        ``.raw`` property with the plain payload.
+        ``.raw`` property with the plain payload. ``scope="auto"`` means the
+        accessible server catalog when connected and local-only when offline.
         """
 
         if scope == "auto":
@@ -999,16 +1201,17 @@ class SPLClient:
         if scope == "local":
             if owner is not None or library is not None:
                 raise ValueError("owner/library require scope='server', scope='all', or scope='auto'")
-            return _wrap_objects(self._daemon.list_objects(compact=compact))
+            return _wrap_objects(self._daemon.list_objects(compact=compact), title=object_scope_title("local"))
         if scope == "server":
             if owner is None and library is None and not self._has_server_connection():
-                return ObjectList([])
+                return ObjectList([], title=object_scope_title("server"))
             return _wrap_objects(
                 self._daemon.server_objects(
                     owner_id=owner,
                     library=library,
                     compact=compact,
-                )
+                ),
+                title=object_scope_title("server"),
             )
         if scope == "all":
             local_objects = self._daemon.list_objects(compact=compact)
@@ -1039,7 +1242,7 @@ class SPLClient:
         """Remove one local daemon object without requiring a server connection."""
 
         return wrap_action(
-            self._daemon.forget(name, owner_id=owner, library=library),
+            _with_local_cache_warning(self._daemon.forget(name, owner_id=owner, library=library)),
             "object forgotten",
         )
 
@@ -1065,11 +1268,13 @@ class SPLClient:
         """Remove one local object version without contacting the server."""
 
         return wrap_action(
-            self._daemon.forget_version(
-                name,
-                version,
-                owner_id=owner,
-                library=library,
+            _with_local_cache_warning(
+                self._daemon.forget_version(
+                    name,
+                    version,
+                    owner_id=owner,
+                    library=library,
+                )
             ),
             "object version forgotten",
         )
@@ -1101,6 +1306,98 @@ class SPLClient:
         connection = state.get("connection") or state.get("remote_connection") or {}
         return connection.get("status") == "connected"
 
+    def _server_connection_label(self) -> str:
+        state = self.server_connection
+        if state is None:
+            try:
+                state = self._daemon.server_connection()
+            except Exception:
+                state = None
+        connection = (
+            state.get("connection") or state.get("remote_connection") or state if isinstance(state, dict) else {}
+        )
+        if isinstance(connection, Mapping):
+            for key in ("display_name", "machine_id", "id", "user_id", "server_url"):
+                value = connection.get(key)
+                if value is not None and str(value):
+                    return str(value)
+        return "the active server connection"
+
+    def _resolve_bare_server_ref(self, name: str) -> _BareServerRef | None:
+        """Resolve a bare object name through the visible server catalog after a local 404.
+
+        This is intentionally catalog-driven: no default library is assumed.
+        Ambiguous server names fail loudly and ask the caller to pass
+        ``owner=``/``library=`` explicitly.
+        """
+
+        if not self._has_server_connection():
+            return None
+        candidates = [
+            record
+            for record in self._daemon.server_objects(compact=True)
+            if isinstance(record, Mapping) and name in _server_record_names(record)
+        ]
+        if len(candidates) == 1:
+            record = candidates[0]
+            record_name = _record_string(record.get("name")) or name
+            return _BareServerRef(
+                name=record_name,
+                owner_id=_server_record_owner(record),
+                library=_server_record_library(record),
+            )
+        if candidates:
+            choices = ", ".join(_server_candidate_label(record) for record in candidates)
+            raise ClientError(
+                "{!r} is not registered locally; found on the server in: {}. "
+                "Pass library=... and owner=... to disambiguate, for example "
+                "client.signature({!r}, library='...').".format(name, choices, name)
+            )
+        raise ClientError(
+            "{!r} is not registered locally; no accessible server object named {!r} (connected as {}). "
+            "Run client.objects(scope='server') to inspect the accessible catalog, or pass "
+            "owner=... and library=... if you know the server scope.".format(
+                name,
+                name,
+                self._server_connection_label(),
+            )
+        )
+
+    def _signature_payload(
+        self,
+        name: str,
+        *,
+        version: int | None,
+        owner: str | None,
+        library: str | None,
+        function: str | None,
+    ) -> dict[str, Any]:
+        try:
+            return self._daemon.signature(
+                name,
+                version=version,
+                owner_id=owner,
+                library=library,
+                function=function,
+            )
+        except ClientError as exc:
+            if owner is not None or library is not None or not _local_object_missing(exc):
+                raise
+            ref = self._resolve_bare_server_ref(name)
+            if ref is None:
+                raise
+            signature = dict(
+                self._daemon.signature(
+                    ref.name,
+                    version=version,
+                    owner_id=ref.owner_id,
+                    library=ref.library,
+                    function=function,
+                )
+            )
+            signature["resolved_from_server"] = _resolved_from_server_record(ref)
+            return signature
+
     def _require_server_connection(self, operation: str) -> None:
         try:
             state = self._daemon.server_connection()
@@ -1128,13 +1425,19 @@ class SPLClient:
         library: str | None = None,
         function: str | None = None,
     ) -> dict[str, Any]:
-        """Return a concise call/read signature for one daemon object."""
+        """Return a concise call/read signature for one daemon object.
+
+        Bare names still resolve locally first. When connected to the server and
+        the local registry returns 404, the client looks up the exact name in the
+        accessible server catalog and retries only if that catalog has a single
+        unambiguous match.
+        """
 
         return SignatureView(
-            self._daemon.signature(
+            self._signature_payload(
                 name,
                 version=version,
-                owner_id=owner,
+                owner=owner,
                 library=library,
                 function=function,
             )
@@ -1151,15 +1454,27 @@ class SPLClient:
     ) -> list[dict[str, Any]]:
         """Return the inputs that can be passed through ``kwargs``."""
 
-        return InputListView(
-            self._daemon.inputs(
+        try:
+            return InputListView(
+                self._daemon.inputs(
+                    name,
+                    version=version,
+                    owner_id=owner,
+                    library=library,
+                    function=function,
+                )
+            )
+        except ClientError as exc:
+            if owner is not None or library is not None or not _local_object_missing(exc):
+                raise
+            signature = self._signature_payload(
                 name,
                 version=version,
-                owner_id=owner,
+                owner=owner,
                 library=library,
                 function=function,
             )
-        )
+            return InputListView(signature["inputs"])
 
     def outputs(
         self,
@@ -1172,15 +1487,27 @@ class SPLClient:
     ) -> list[dict[str, Any]]:
         """Return output selectors and how to read ``result.value``."""
 
-        return OutputListView(
-            self._daemon.outputs(
+        try:
+            return OutputListView(
+                self._daemon.outputs(
+                    name,
+                    version=version,
+                    owner_id=owner,
+                    library=library,
+                    function=function,
+                )
+            )
+        except ClientError as exc:
+            if owner is not None or library is not None or not _local_object_missing(exc):
+                raise
+            signature = self._signature_payload(
                 name,
                 version=version,
-                owner_id=owner,
+                owner=owner,
                 library=library,
                 function=function,
             )
-        )
+            return OutputListView(signature["outputs"])
 
     def decomposition(
         self,
@@ -1204,7 +1531,25 @@ class SPLClient:
                 }
             )
             return DecompositionView(response["decomposition"])
-        return DecompositionView(self._daemon.decomposition(str(name), version=version))
+        try:
+            return DecompositionView(self._daemon.decomposition(str(name), version=version))
+        except ClientError as exc:
+            if not _local_object_missing(exc):
+                raise
+            ref = self._resolve_bare_server_ref(str(name))
+            if ref is None:
+                raise
+            response = self._remote_decomposition_response(
+                {
+                    "name": ref.name,
+                    "version": version,
+                    "owner_id": ref.owner_id,
+                    "library": ref.library,
+                }
+            )
+            decomposition = dict(response["decomposition"])
+            decomposition["resolved_from_server"] = _resolved_from_server_record(ref)
+            return DecompositionView(decomposition)
 
     def pipeline_widget(
         self,
@@ -1271,11 +1616,47 @@ class SPLClient:
             )
 
         if isinstance(pipeline, str):
-            record = self._daemon.get_object(
-                pipeline,
-                version=version,
-                include_yaml=True,
-            )
+            try:
+                record = self._daemon.get_object(
+                    pipeline,
+                    version=version,
+                    include_yaml=True,
+                )
+            except ClientError as exc:
+                if not _local_object_missing(exc):
+                    raise
+                ref = self._resolve_bare_server_ref(pipeline)
+                if ref is None:
+                    raise
+                response = self._remote_decomposition_response(
+                    {
+                        "name": ref.name,
+                        "version": version,
+                        "owner_id": ref.owner_id,
+                        "library": ref.library,
+                    }
+                )
+                decomposition = dict(response["decomposition"])
+                decomposition["resolved_from_server"] = _resolved_from_server_record(ref)
+                if not decomposition.get("nodes"):
+                    raise ValueError(f"remote object is not a pipeline or has no nodes: {pipeline}")
+                record = response.get("object") or {}
+                remote = response.get("remote") or {}
+                object_name = (
+                    title or record.get("display_name") or record.get("name") or remote.get("name") or pipeline
+                )
+                return PipelineGraphWidget(
+                    decomposition,
+                    {
+                        **record,
+                        "remote": remote,
+                        "id": record.get("id") or remote.get("object_id") or pipeline,
+                        "name": record.get("name") or remote.get("name") or pipeline,
+                        "displayName": object_name,
+                    },
+                    height=height,
+                    theme=theme,
+                )
             decomposition = record.get("decomposition") or self.decomposition(
                 pipeline,
                 version=version,
@@ -1334,8 +1715,19 @@ class SPLClient:
             library=library,
             function=function,
         )
+        freshness_line = None
+        if function is None and "resolved_from_server" not in signature and self._has_server_connection():
+            freshness_line = _server_freshness_line(
+                signature,
+                self._daemon.server_objects(compact=True),
+                owner=owner,
+                library=library,
+            )
         display_name = signature.get("display_name") or signature["name"]
         lines = [(f"{display_name} v{signature['version']} ({signature['kind']})")]
+        server_resolution = _server_resolution_label(signature.get("resolved_from_server"))
+        if server_resolution is not None:
+            lines.append(f"Resolved from server: {server_resolution}")
         if signature.get("description"):
             lines.append(signature["description"])
 
@@ -1363,6 +1755,8 @@ class SPLClient:
 
         lines.append(f"Example: {signature['call']['example']}")
         lines.append(f"Read: {signature['call']['read']}")
+        if freshness_line is not None:
+            lines.append(freshness_line)
         return "\n".join(lines)
 
     def envs(self) -> dict[str, Any]:
@@ -1391,20 +1785,32 @@ class SPLClient:
     def runs(self, *, local: bool = False) -> list[dict[str, Any]]:
         """Return known daemon runs, newest first."""
 
-        return RunListView(m_manifest.list_local_runs() if local else self._daemon.list_runs())
+        if local:
+            return RunListView(m_manifest.list_local_runs())
+        daemon_runs = self._daemon.list_runs()
+        return RunListView(daemon_runs, local_retained_count=_local_retained_run_count())
 
-    def run_show(self, run_id: str, *, full_inline: bool = False, local: bool = False) -> dict[str, Any]:
+    def run_show(self, run_id: str, *, full_inline: bool = False, local: bool | None = None) -> dict[str, Any]:
         """Return one retained run manifest.
 
         Inline JSON values are summarized by default; pass ``full_inline=True``
-        to include the full manifest values.
+        to include the full manifest values. With ``local`` unset, local-format
+        retained run ids are read from the local manifest store automatically;
+        explicit ``local=True``/``False`` still selects one namespace.
         """
 
-        payload = (
-            m_manifest.show_local_run(run_id, include_inline_values=full_inline)
-            if local
-            else self._daemon.show_run(run_id, full_inline=full_inline)
-        )
+        namespace = _run_id_namespace(run_id)
+        use_local = local is True or (local is None and namespace == "local")
+        if use_local:
+            payload = m_manifest.show_local_run(run_id, include_inline_values=full_inline)
+            return RunRecordView(payload)
+
+        try:
+            payload = self._daemon.show_run(run_id, full_inline=full_inline)
+        except ClientError as exc:
+            if not _is_404_error(exc):
+                raise
+            raise ClientError(_run_show_not_found_message(run_id, namespace)) from None
         return RunRecordView(payload)
 
     def resume(
@@ -1423,6 +1829,13 @@ class SPLClient:
         progress: ProgressOption = True,
     ) -> RemoteRun | RemoteResult:
         """Resume a retained daemon pipeline run from selected recalculation nodes."""
+
+        if _run_id_namespace(run_id) == "local":
+            raise ValueError(
+                "This is a local retained run id; resume it with "
+                "`Deployment(<pipeline>).resume({!r}, from_=...)`. "
+                "client.resume() drives daemon runs only.".format(run_id)
+            )
 
         state = self._daemon.resume_run(
             run_id,

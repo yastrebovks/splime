@@ -299,20 +299,86 @@ the pipeline, not on the reusable node object:
    pipeline = pipeline.with_node_runtime('heavy_step', 'venv-subprocess')
    Deployment(pipeline).run(runtimes={'heavy_step': 'native'})
 
-``venv-subprocess`` executes a Python function node in a separate SPL-free
-runner process and records the selected runtime plus source in retained run
-manifests. Per-node ``docker`` is reserved for a later 0.4.x follow-up; the
-existing object-level Docker worker backend is unchanged.
+Choose the smallest runtime that gives the isolation you need:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 14 28 34 34
+
+   * - Runtime
+     - Isolation
+     - Requirements and image owner
+     - Limits
+   * - ``native``
+     - Runs in the conductor process.
+     - No extra tools and no image.
+     - Supports the full in-process Python path. ``node_timeout_seconds`` does
+       not apply.
+   * - ``venv-subprocess``
+     - Runs a function node in a separate SPL-free Python process.
+     - Uses the current interpreter or daemon-provided node environment.
+       No Docker image.
+     - Function nodes only; inputs must be JSON-native; honors
+       ``node_timeout_seconds``.
+   * - ``docker``
+     - Runs a function node in a Docker container with only the SPL-free runner
+       work directory mounted.
+     - Needs the Docker CLI and a responsive Docker daemon. Daemon runs use the
+       object environment image; local ``Deployment`` needs an explicit
+       ``runtime_config.docker.image``. Missing explicit images are pulled, if
+       possible, by the host Docker daemon before the node runs.
+     - Function nodes only; inputs must be JSON-native; honors
+       ``node_timeout_seconds`` and kills the container on timeout. No SPL
+       package, no ``PYTHONPATH`` injection, and no nested Docker inside an
+       object-level Docker worker. Node containers default to no network.
+
+For daemon runs, per-node ``docker`` uses the object-level environment spec:
+the daemon builds or reuses the Docker image before starting the worker and the
+manifest records the resolved ``image_tag``. Local client runs do not build
+images in 0.4.x, so they must pass an explicit image:
+
+.. code-block:: python
+
+   import os
+
+   from spl import Deployment, lift
+
+   def seed() -> int:
+       return 21
+
+   def double(value: int) -> int:
+       return value * 2
+
+   if os.environ.get("RUN_SPL_DOCKER_EXAMPLE") == "1":
+       seed_node = lift(seed).alias("seed")
+       pipeline = (
+           lift(double)
+           .bind(value=seed_node)
+           .alias("double")
+           .render("docker_node_example")
+           .with_node_runtime("double", "docker")
+       )
+       result = Deployment(
+           pipeline,
+           runtime_config={"docker": {"image": "python:3.13-slim"}},
+       ).run(output="double")
+       assert result == 42
+
+Docker node containers default to ``--network none`` for isolation. If an
+explicit image needs network access while the node function runs, set
+``runtime_config={"docker": {"image": "...", "network": "enabled"}}``. Pulling a
+missing image is done by the host Docker daemon and does not depend on the
+node container's ``network`` setting.
 
 Set ``runtime_config={"node_timeout_seconds": 10}`` on ``Deployment`` to bound
 non-native per-node subprocess runtimes. ``native`` runs in the conductor
 process and intentionally has no per-node timeout.
 
-In 0.4.0, ``venv-subprocess`` receives inputs through ``input.json``, so input
-values must be JSON-native. If a node needs an arbitrary Python object from an
-adapter edge, run that node with ``native``, insert a converter node as in
-`Converter Nodes For Adapter Tags`_, or wait for artifact-file input transport
-in a later 0.4.x update.
+``venv-subprocess`` and ``docker`` both receive inputs through ``input.json``,
+so input values must be JSON-native. If a node needs an arbitrary Python object
+from an adapter edge, run that node with ``native``, insert a converter node as
+in `Converter Nodes For Adapter Tags`_, or wait for artifact-file input
+transport in a later 0.4.x update.
 
 Optional: connect a server
 --------------------------

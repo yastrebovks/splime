@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 # ``spl.client`` shim would not affect lookups inside ``spl._client``.
 import spl._client as spl_client_module
 from spl._client import SPLClient
+from spl.core import manifest as m_manifest
 from spl.core.entities.node_remote import NodeRemote
 from spl.daemon_client import Client, ClientError
 from spl.server_client import SPLServerClient
@@ -173,11 +175,16 @@ class FakeDaemon:
         self.decomposition_calls: list[dict[str, Any]] = []
         self.list_object_calls: list[dict[str, Any]] = []
         self.server_object_calls: list[dict[str, Any]] = []
+        self.input_calls: list[dict[str, Any]] = []
+        self.output_calls: list[dict[str, Any]] = []
         self.library_calls: list[tuple[Any, ...]] = []
         self.register_object_calls: list[dict[str, Any]] = []
         self.cleanup_calls: list[tuple[Any, ...]] = []
         self.server_connected = False
         self.server_url = "https://splime.io/api"
+        self.missing_local_objects: set[str] = set()
+        self.missing_runs: set[str] = set()
+        self.server_object_records: list[dict[str, Any]] | None = None
 
     def connect_server(
         self,
@@ -257,6 +264,8 @@ class FakeDaemon:
 
     def show_run(self, run_id: str, *, full_inline: bool = False) -> dict[str, Any]:
         self.cleanup_calls.append(("show_run", run_id, full_inline))
+        if run_id in self.missing_runs:
+            raise ClientError("404: run is not found: {}".format(run_id))
         return {"id": run_id, "status": "succeeded", "manifest": {"full_inline": full_inline}}
 
     def list_runs(self) -> list[dict[str, Any]]:
@@ -336,6 +345,8 @@ class FakeDaemon:
 
     def signature(self, name: str, **kwargs: Any) -> dict[str, Any]:
         self.signature_calls.append({"name": name, **kwargs})
+        if name in self.missing_local_objects and kwargs.get("owner_id") is None and kwargs.get("library") is None:
+            raise ClientError("404: object is not registered: {}".format(name))
         display_name = "pretty_score" if name == "server.remote-score" else name
         return {
             "name": name,
@@ -343,13 +354,25 @@ class FakeDaemon:
             "version": 7,
             "kind": "function",
             "description": "",
-            "inputs": [],
-            "outputs": [],
+            "inputs": [{"name": "amount", "type": "float", "required": True, "default": None}],
+            "outputs": [{"name": "default", "selector": None, "read": "result.value"}],
             "call": {
                 "example": f'result = client.call("{display_name}", kwargs={{}})',
                 "read": "result.value",
             },
         }
+
+    def inputs(self, name: str, **kwargs: Any) -> list[dict[str, Any]]:
+        self.input_calls.append({"name": name, **kwargs})
+        if name in self.missing_local_objects and kwargs.get("owner_id") is None and kwargs.get("library") is None:
+            raise ClientError("404: object is not registered: {}".format(name))
+        return self.signature(name, **kwargs)["inputs"]
+
+    def outputs(self, name: str, **kwargs: Any) -> list[dict[str, Any]]:
+        self.output_calls.append({"name": name, **kwargs})
+        if name in self.missing_local_objects and kwargs.get("owner_id") is None and kwargs.get("library") is None:
+            raise ClientError("404: object is not registered: {}".format(name))
+        return self.signature(name, **kwargs)["outputs"]
 
     def get_object(
         self,
@@ -365,6 +388,8 @@ class FakeDaemon:
                 "include_yaml": include_yaml,
             }
         )
+        if name in self.missing_local_objects:
+            raise ClientError("404: object is not registered: {}".format(name))
         return {
             "id": "object-1",
             "name": name,
@@ -423,6 +448,8 @@ class FakeDaemon:
                 "compact": compact,
             }
         )
+        if self.server_object_records is not None:
+            return list(self.server_object_records)
         return [
             {
                 "name": "server_obj",
@@ -652,6 +679,313 @@ def test_spl_client_call_and_signature_accept_owner_library() -> None:
     }
 
 
+def _server_record(name: str, *, owner_id: str, library: str, version: int) -> dict[str, Any]:
+    return {
+        "name": name,
+        "owner_id": owner_id,
+        "library": library,
+        "current_version": {"version": version},
+    }
+
+
+_LOCAL_RUN_ID = "20260710T215643Z-b82829775344"
+_DAEMON_RUN_ID = "b82829775344b82829775344b8282977"
+
+
+def _write_local_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, run_id: str = _LOCAL_RUN_ID) -> None:
+    runs_home = tmp_path / "runs"
+    monkeypatch.setenv("SPL_RUNS_HOME", str(runs_home))
+    m_manifest.atomic_write_json(
+        runs_home / run_id / m_manifest.RUN_MANIFEST_FILENAME,
+        {
+            "schema_version": m_manifest.RUN_MANIFEST_SCHEMA_VERSION,
+            "run_id": run_id,
+            "status": "succeeded",
+            "keep": True,
+            "created_at": "2026-07-10T21:56:43+00:00",
+            "started_at": "2026-07-10T21:56:43+00:00",
+            "finished_at": "2026-07-10T21:56:44+00:00",
+            "nodes": {},
+            "edges": [],
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("run_id", "namespace"),
+    [
+        (_LOCAL_RUN_ID, "local"),
+        (_DAEMON_RUN_ID, "daemon"),
+        ("b82829775344", "unknown"),
+        ("run-1", "unknown"),
+    ],
+)
+def test_run_id_namespace_classifies_syntax(run_id: str, namespace: str) -> None:
+    assert spl_client_module._run_id_namespace(run_id) == namespace
+
+
+def test_spl_client_bare_signature_offline_keeps_local_404() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.missing_local_objects = {"clean_amount"}
+    client._daemon = fake_daemon
+
+    with pytest.raises(ClientError, match="404: object is not registered: clean_amount"):
+        client.signature("clean_amount")
+
+    assert fake_daemon.server_object_calls == []
+
+
+def test_spl_client_bare_signature_auto_resolves_unique_server_catalog_match() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    fake_daemon.missing_local_objects = {"clean_amount"}
+    fake_daemon.server_object_records = [
+        _server_record("clean_amount", owner_id="owner-1", library="default", version=10)
+    ]
+    client._daemon = fake_daemon
+
+    signature = client.signature("clean_amount")
+
+    assert signature["name"] == "clean_amount"
+    assert signature["resolved_from_server"] == {
+        "name": "clean_amount",
+        "library": "default",
+        "owner_id": "owner-1",
+    }
+    assert "resolved from server" in repr(signature)
+    assert "library 'default'" in repr(signature)
+    assert fake_daemon.server_object_calls == [{"owner_id": None, "library": None, "compact": True}]
+    assert fake_daemon.signature_calls == [
+        {
+            "name": "clean_amount",
+            "version": None,
+            "owner_id": None,
+            "library": None,
+            "function": None,
+        },
+        {
+            "name": "clean_amount",
+            "version": None,
+            "owner_id": "owner-1",
+            "library": "default",
+            "function": None,
+        },
+    ]
+
+
+def test_spl_client_bare_signature_reports_ambiguous_server_catalog_matches() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    fake_daemon.missing_local_objects = {"order_pipeline"}
+    fake_daemon.server_object_records = [
+        _server_record("order_pipeline", owner_id="owner-1", library="default", version=10),
+        _server_record("order_pipeline", owner_id="owner-1", library="risk", version=1),
+    ]
+    client._daemon = fake_daemon
+
+    with pytest.raises(ClientError) as exc_info:
+        client.signature("order_pipeline")
+
+    message = str(exc_info.value)
+    assert "'order_pipeline' is not registered locally" in message
+    assert "default (owner owner-1, v10)" in message
+    assert "risk (owner owner-1, v1)" in message
+    assert "client.signature('order_pipeline', library='...')" in message
+    assert fake_daemon.server_object_calls == [{"owner_id": None, "library": None, "compact": True}]
+    assert len(fake_daemon.signature_calls) == 1
+
+
+def test_spl_client_bare_signature_reports_no_accessible_server_match() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    fake_daemon.missing_local_objects = {"clean_amount"}
+    fake_daemon.server_object_records = [_server_record("other", owner_id="owner-1", library="default", version=3)]
+    client._daemon = fake_daemon
+
+    with pytest.raises(ClientError) as exc_info:
+        client.signature("clean_amount")
+
+    message = str(exc_info.value)
+    assert "not registered locally" in message
+    assert "no accessible server object named 'clean_amount'" in message
+    assert "connected as" in message
+    assert "client.objects(scope='server')" in message
+    assert fake_daemon.server_object_calls == [{"owner_id": None, "library": None, "compact": True}]
+
+
+def test_spl_client_bare_decomposition_auto_resolves_unique_server_catalog_match() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    fake_daemon.missing_local_objects = {"order_pipeline"}
+    fake_daemon.server_object_records = [
+        _server_record("order_pipeline", owner_id="owner-1", library="default", version=10)
+    ]
+    client._daemon = fake_daemon
+
+    decomposition = client.decomposition("order_pipeline")
+
+    assert decomposition["resolved_from_server"] == {
+        "name": "order_pipeline",
+        "library": "default",
+        "owner_id": "owner-1",
+    }
+    assert "resolved from server" in repr(decomposition)
+    assert fake_daemon.remote_decomposition_calls[-1] == {
+        "name": "order_pipeline",
+        "version": None,
+        "owner_id": "owner-1",
+        "library": "default",
+    }
+    assert fake_daemon.server_object_calls == [{"owner_id": None, "library": None, "compact": True}]
+
+
+def test_spl_client_bare_decomposition_reports_server_catalog_ambiguity() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    fake_daemon.missing_local_objects = {"order_pipeline"}
+    fake_daemon.server_object_records = [
+        _server_record("order_pipeline", owner_id="owner-1", library="default", version=10),
+        _server_record("order_pipeline", owner_id="owner-1", library="risk", version=1),
+    ]
+    client._daemon = fake_daemon
+
+    with pytest.raises(ClientError) as exc_info:
+        client.decomposition("order_pipeline")
+
+    message = str(exc_info.value)
+    assert "default (owner owner-1, v10)" in message
+    assert "risk (owner owner-1, v1)" in message
+    assert fake_daemon.remote_decomposition_calls == []
+
+
+@pytest.mark.parametrize("method_name", ["describe", "inputs", "outputs"])
+def test_spl_client_bare_metadata_methods_offline_keep_local_404(method_name: str) -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.missing_local_objects = {"clean_amount"}
+    client._daemon = fake_daemon
+
+    with pytest.raises(ClientError, match="404: object is not registered: clean_amount"):
+        getattr(client, method_name)("clean_amount")
+
+    assert fake_daemon.server_object_calls == []
+
+
+@pytest.mark.parametrize("method_name", ["describe", "inputs", "outputs"])
+def test_spl_client_bare_metadata_methods_auto_resolve_unique_server_catalog_match(method_name: str) -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    fake_daemon.missing_local_objects = {"clean_amount"}
+    fake_daemon.server_object_records = [
+        _server_record("clean_amount", owner_id="owner-1", library="default", version=10)
+    ]
+    client._daemon = fake_daemon
+
+    result = getattr(client, method_name)("clean_amount")
+
+    if method_name == "describe":
+        assert "Resolved from server: library 'default', owner owner-1" in result
+    elif method_name == "inputs":
+        assert result == [{"name": "amount", "type": "float", "required": True, "default": None}]
+    else:
+        assert result == [{"name": "default", "selector": None, "read": "result.value"}]
+    assert fake_daemon.server_object_calls == [{"owner_id": None, "library": None, "compact": True}]
+    assert fake_daemon.signature_calls[-1] == {
+        "name": "clean_amount",
+        "version": None,
+        "owner_id": "owner-1",
+        "library": "default",
+        "function": None,
+    }
+
+
+@pytest.mark.parametrize("method_name", ["describe", "inputs", "outputs"])
+def test_spl_client_bare_metadata_methods_report_server_catalog_ambiguity(method_name: str) -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    fake_daemon.missing_local_objects = {"order_pipeline"}
+    fake_daemon.server_object_records = [
+        _server_record("order_pipeline", owner_id="owner-1", library="default", version=10),
+        _server_record("order_pipeline", owner_id="owner-1", library="risk", version=1),
+    ]
+    client._daemon = fake_daemon
+
+    with pytest.raises(ClientError) as exc_info:
+        getattr(client, method_name)("order_pipeline")
+
+    message = str(exc_info.value)
+    assert "default (owner owner-1, v10)" in message
+    assert "risk (owner owner-1, v1)" in message
+    assert "library='...'" in message
+
+
+@pytest.mark.parametrize("method_name", ["describe", "inputs", "outputs"])
+def test_spl_client_bare_metadata_methods_report_server_catalog_miss(method_name: str) -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    fake_daemon.missing_local_objects = {"clean_amount"}
+    fake_daemon.server_object_records = []
+    client._daemon = fake_daemon
+
+    with pytest.raises(ClientError, match="no accessible server object named 'clean_amount'"):
+        getattr(client, method_name)("clean_amount")
+
+    assert fake_daemon.server_object_calls == [{"owner_id": None, "library": None, "compact": True}]
+
+
+def test_spl_client_describe_reports_server_freshness_when_local_is_stale() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    fake_daemon.server_object_records = [
+        _server_record("fraud_score", owner_id="owner-1", library="default", version=10)
+    ]
+    client._daemon = fake_daemon
+
+    description = client.describe("fraud_score")
+
+    assert "local v7; server has v10 (library 'default') - run/call resolves via source='auto'" in description
+    assert fake_daemon.server_object_calls == [{"owner_id": None, "library": None, "compact": True}]
+
+
+def test_spl_client_describe_omits_freshness_when_versions_match() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    fake_daemon.server_object_records = [
+        _server_record("fraud_score", owner_id="owner-1", library="default", version=7)
+    ]
+    client._daemon = fake_daemon
+
+    description = client.describe("fraud_score")
+
+    assert "server has" not in description
+
+
+def test_spl_client_describe_offline_does_not_probe_server_freshness() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = False
+    fake_daemon.server_object_records = [
+        _server_record("fraud_score", owner_id="owner-1", library="default", version=10)
+    ]
+    client._daemon = fake_daemon
+
+    description = client.describe("fraud_score")
+
+    assert "server has" not in description
+    assert fake_daemon.server_object_calls == []
+
+
 def test_spl_client_submit_is_async_alias_for_start() -> None:
     client = SPLClient(daemon_port=8765)
     fake_daemon = FakeDaemon()
@@ -746,6 +1080,118 @@ def test_spl_client_resume_wait_collects_result() -> None:
 
     assert result.output is True
     assert fake_daemon.run_calls[-1]["resume_run_id"] == "parent-run"
+
+
+def test_spl_client_run_show_auto_routes_local_run_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _write_local_run(monkeypatch, tmp_path)
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.missing_runs.add(_LOCAL_RUN_ID)
+    client._daemon = fake_daemon
+
+    shown = client.run_show(_LOCAL_RUN_ID)
+
+    assert shown["id"] == _LOCAL_RUN_ID
+    assert shown["manifest"]["run_id"] == _LOCAL_RUN_ID
+    assert fake_daemon.cleanup_calls == []
+
+
+def test_spl_client_run_show_explicit_daemon_overrides_local_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _write_local_run(monkeypatch, tmp_path)
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.missing_runs.add(_LOCAL_RUN_ID)
+    client._daemon = fake_daemon
+
+    with pytest.raises(ClientError) as excinfo:
+        client.run_show(_LOCAL_RUN_ID, local=False)
+
+    message = str(excinfo.value)
+    assert "run id namespace: local" in message
+    assert "run_show('20260710T215643Z-b82829775344', local=True)" in message
+    assert fake_daemon.cleanup_calls == [("show_run", _LOCAL_RUN_ID, False)]
+
+
+def test_spl_client_run_show_explicit_local_overrides_daemon_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _write_local_run(monkeypatch, tmp_path, run_id=_DAEMON_RUN_ID)
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.missing_runs.add(_DAEMON_RUN_ID)
+    client._daemon = fake_daemon
+
+    shown = client.run_show(_DAEMON_RUN_ID, local=True)
+
+    assert shown["id"] == _DAEMON_RUN_ID
+    assert fake_daemon.cleanup_calls == []
+
+
+@pytest.mark.parametrize(
+    ("run_id", "namespace", "hint"),
+    [
+        (_DAEMON_RUN_ID, "daemon", "check that the daemon"),
+        ("run-1", "unknown", "runs(local=True)"),
+    ],
+)
+def test_spl_client_run_show_daemon_404_mentions_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    run_id: str,
+    namespace: str,
+    hint: str,
+) -> None:
+    monkeypatch.setenv("SPL_RUNS_HOME", str(tmp_path / "runs"))
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.missing_runs.add(run_id)
+    client._daemon = fake_daemon
+
+    with pytest.raises(ClientError) as excinfo:
+        client.run_show(run_id)
+
+    message = str(excinfo.value)
+    assert "run id namespace: {}".format(namespace) in message
+    assert hint in message
+
+
+def test_spl_client_resume_rejects_local_run_id_without_daemon_call() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+
+    with pytest.raises(ValueError) as excinfo:
+        client.resume(_LOCAL_RUN_ID, from_="consumer")
+
+    message = str(excinfo.value)
+    assert "local retained run id" in message
+    assert "Deployment(<pipeline>).resume('20260710T215643Z-b82829775344', from_=...)" in message
+    assert "client.resume() drives daemon runs only" in message
+    assert fake_daemon.run_calls == []
+
+
+def test_spl_client_runs_footer_mentions_local_retained_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+
+    monkeypatch.setenv("SPL_RUNS_HOME", str(tmp_path / "empty-runs"))
+    assert "runs(local=True)" not in repr(client.runs())
+
+    _write_local_run(monkeypatch, tmp_path)
+    rendered = repr(client.runs())
+
+    assert "+ 1 local retained runs - runs(local=True)" in rendered
 
 
 def test_spl_client_objects_auto_prefers_server_when_connected() -> None:
@@ -1120,15 +1566,18 @@ def test_spl_client_local_cleanup_does_not_require_server_connection() -> None:
     assert client.forget("demo_obj", owner="owner-1", library="risk") == {
         "name": "demo_obj",
         "forgotten": True,
+        "warning": "local cache only; server copies (if any) stay visible in objects() while connected",
     }
     assert client.remove_local("scratch_obj") == {
         "name": "scratch_obj",
         "forgotten": True,
+        "warning": "local cache only; server copies (if any) stay visible in objects() while connected",
     }
     assert client.forget_version("demo_obj", 2, library="risk") == {
         "name": "demo_obj",
         "version": 2,
         "forgotten": True,
+        "warning": "local cache only; server copies (if any) stay visible in objects() while connected",
     }
     assert client.prune_stale_mirrors(owner="owner-1") == {
         "count": 0,
@@ -1221,6 +1670,21 @@ def test_spl_client_objects_explicit_local_remains_local_when_connected() -> Non
     assert objects == {"local_obj": {"name": "local_obj", "compact": True}}
     assert fake_daemon.list_object_calls[-1] == {"compact": True}
     assert fake_daemon.server_object_calls == []
+
+
+def test_spl_client_objects_scope_headers() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    client._daemon = fake_daemon
+
+    assert repr(client.objects(scope="local", compact=True)).startswith("local objects (1):")
+    assert repr(client.objects(scope="server", compact=True)).startswith("server objects (1):")
+    catalog_text = repr(client.objects(scope="all", compact=True))
+
+    assert "objects (2 = 1 local + 1 server)" in catalog_text
+    assert "local objects (1):" in catalog_text
+    assert "server objects (1):" in catalog_text
 
 
 def test_spl_client_offline_server_helpers_return_empty_states() -> None:
@@ -1420,6 +1884,35 @@ def test_spl_client_draw_pipeline_returns_notebook_widget_for_object() -> None:
     assert "Notebook graph" in rendered
     assert "calculate" in rendered
     assert 'data-pipeline-control="fullscreen"' in rendered
+    assert "pipeline-graph-shell" in rendered
+
+
+def test_spl_client_draw_pipeline_auto_resolves_bare_server_name() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    fake_daemon.missing_local_objects = {"server_pipeline"}
+    fake_daemon.server_object_records = [
+        _server_record("server_pipeline", owner_id="owner-1", library="default", version=10)
+    ]
+    client._daemon = fake_daemon
+
+    widget = client.draw_pipeline("server_pipeline")
+    rendered = widget._repr_html_()
+
+    assert fake_daemon.object_calls[-1] == {
+        "name": "server_pipeline",
+        "version": None,
+        "include_yaml": True,
+    }
+    assert fake_daemon.remote_decomposition_calls[-1] == {
+        "name": "server_pipeline",
+        "version": None,
+        "owner_id": "owner-1",
+        "library": "default",
+    }
+    assert "Remote Demo Pipeline" in rendered
+    assert "server_pipeline" in rendered
     assert "pipeline-graph-shell" in rendered
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from typing import Any
 
 DEFAULT_RUNTIME_MODE = "venv"
@@ -34,7 +35,9 @@ def normalize_runtime_config(value: dict[str, Any] | None) -> dict[str, Any]:
         raise ValueError("runtime mode must be 'venv' or 'docker'")
 
     if mode == "venv":
-        return {"mode": "venv"}
+        venv_config: dict[str, Any] = {"mode": "venv"}
+        _copy_node_runtime_fields(venv_config, raw)
+        return venv_config
 
     python = str(raw.get("python") or raw.get("python_version") or DEFAULT_DOCKER_PYTHON)
     _validate_python_version(python)
@@ -46,7 +49,7 @@ def normalize_runtime_config(value: dict[str, Any] | None) -> dict[str, Any]:
     apt_packages = _string_list(raw.get("apt_packages") or [])
     limits = _normalize_limits(raw.get("limits") or raw)
 
-    config = {
+    docker_config: dict[str, Any] = {
         "mode": "docker",
         "python": python,
         "base_image": base_image,
@@ -61,8 +64,49 @@ def normalize_runtime_config(value: dict[str, Any] | None) -> dict[str, Any]:
         "init": _bool_value(raw.get("init"), True),
     }
     if raw.get("pull") is not None:
-        config["pull"] = bool(raw["pull"])
+        docker_config["pull"] = bool(raw["pull"])
+    _copy_node_runtime_fields(docker_config, raw)
+    return docker_config
+
+
+def normalize_docker_runtime_options(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return Docker CLI options shared by object and per-node runtimes."""
+
+    raw = dict(value or {})
+    network = str(raw.get("network") or "auto").lower()
+    if network not in SUPPORTED_DOCKER_NETWORK_MODES:
+        raise ValueError("docker runtime network must be 'auto', 'none', or 'enabled'")
+    config: dict[str, Any] = {
+        "network": network,
+        "limits": _normalize_limits(raw.get("limits") or raw),
+        "read_only": _bool_value(raw.get("read_only"), True),
+        "tmpfs": str(raw.get("tmpfs") or f"/tmp:rw,nosuid,size={DEFAULT_DOCKER_TMPFS_SIZE}"),
+        "env": _normalize_env(raw.get("env") or {}),
+        "cap_drop": str(raw.get("cap_drop") or "ALL"),
+        "no_new_privileges": _bool_value(raw.get("no_new_privileges"), True),
+        "init": _bool_value(raw.get("init"), True),
+    }
+    image = raw.get("image")
+    if image is not None:
+        config["image"] = str(image)
     return config
+
+
+def _copy_node_runtime_fields(config: dict[str, Any], raw: dict[str, Any]) -> None:
+    node_runtime = raw.get("node_runtime")
+    if node_runtime is not None:
+        node_runtime_value = str(node_runtime)
+        if not node_runtime_value:
+            raise ValueError("node_runtime must be a non-empty string")
+        config["node_runtime"] = node_runtime_value
+    node_timeout_seconds = raw.get("node_timeout_seconds")
+    if node_timeout_seconds is not None:
+        config["node_timeout_seconds"] = node_timeout_seconds
+    docker = raw.get("docker")
+    if docker is not None:
+        if not isinstance(docker, dict):
+            raise ValueError("runtime config field 'docker' must be a mapping")
+        config["docker"] = dict(docker)
 
 
 def _string_list(value: Any) -> list[str]:

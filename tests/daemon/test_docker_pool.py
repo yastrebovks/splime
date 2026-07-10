@@ -5,7 +5,7 @@ from typing import Any, Iterator
 
 import pytest
 
-from spl.daemon.docker_pool import DockerPool
+from spl.daemon.docker_pool import DockerPool, docker_node_network_args
 from spl.daemon.store import RegistryStore
 
 
@@ -78,6 +78,12 @@ def test_pool_key_includes_effective_network(
     )
 
     assert local_key != remote_key
+
+
+def test_node_docker_network_args_do_not_add_daemon_host_mapping() -> None:
+    assert docker_node_network_args({"network": "none"}) == ["--network", "none"]
+    assert docker_node_network_args({"network": "auto"}) == ["--network", "none"]
+    assert docker_node_network_args({"network": "enabled"}) == []
 
 
 def test_idle_eviction_skips_in_use_containers(store: RegistryStore) -> None:
