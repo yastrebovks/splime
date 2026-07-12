@@ -9,11 +9,13 @@ import shutil
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
 
 import spl.daemon.metadata as metadata_module
+from spl.daemon.repositories.server_connection import SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
 from spl.daemon.remote_client import ServerClientError
 from spl.daemon.server import DaemonRuntime
 from spl.daemon.services.sync import SyncVisibilityService
@@ -159,6 +161,88 @@ def _test_credential(label: str) -> str:
     return hashlib.sha256(f"spl-test-credential:{label}".encode("utf-8")).hexdigest()
 
 
+def _save_connected_owner_credentials(store: RegistryStore, *, owner_id: str = "owner-1") -> dict[str, Any]:
+    return store.save_server_connection(
+        server_url="https://splime.io/api",
+        token="machine-token-123456",
+        user_token="user-token-123456",
+        connection={
+            "id": "remote-connection-1",
+            "owner_id": owner_id,
+            "subject_type": "machine",
+            "subject_id": "machine-1",
+            "machine_id": "machine-1",
+            "display_name": "lab-machine",
+            "status": "connected",
+            "capabilities": {},
+        },
+        heartbeat_interval_seconds=60,
+    )
+
+
+def _drop_remote_connection_lease(store: RegistryStore, connection_id: str) -> None:
+    with store._lock, store._conn:  # noqa: SLF001 - regression seeds post-restart offline state.
+        store._conn.execute(
+            """
+            UPDATE server_connections
+            SET remote_connection_id = NULL,
+                status = 'connect_failed',
+                error = 'offline after restart'
+            WHERE id = ?
+            """,
+            (connection_id,),
+        )
+
+
+def _insert_server_connection_row(
+    store: RegistryStore,
+    *,
+    connection_id: str,
+    machine_id: str,
+    owner_id: str | None,
+    status: str = "connected",
+    updated_at: str = "2999-01-01T00:00:00+00:00",
+) -> None:
+    with store._lock, store._conn:  # noqa: SLF001 - regression seed for multi-identity rows.
+        store._conn.execute(
+            """
+            INSERT INTO server_connections(
+                id, server_url, token_hint, user_token_hint,
+                token_secret_ref, user_token_secret_ref,
+                token_redacted, user_token_redacted,
+                remote_connection_id, owner_id, subject_type, subject_id,
+                machine_id, display_name, capabilities_json, status,
+                heartbeat_interval_seconds, last_heartbeat_at, next_heartbeat_at,
+                lease_expires_at, last_library_snapshot_hash,
+                last_library_snapshot_at, created_at, connected_at,
+                disconnected_at, updated_at, error
+            )
+            VALUES(?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, NULL, ?, NULL)
+            """,
+            (
+                connection_id,
+                "https://splime.io/api",
+                "...foreign",
+                "...foreign",
+                "<redacted>",
+                f"remote-{connection_id}",
+                owner_id,
+                "machine",
+                machine_id,
+                machine_id,
+                machine_id,
+                "{}",
+                status,
+                60.0,
+                updated_at,
+                updated_at,
+                updated_at,
+                updated_at if status == "connected" else None,
+                updated_at,
+            ),
+        )
+
+
 def _assert_identity_invariants(home: Path) -> None:
     with sqlite3.connect(home / "daemon.sqlite3") as conn:
         duplicate_objects = conn.execute(
@@ -198,6 +282,481 @@ def _assert_identity_invariants(home: Path) -> None:
             if re.fullmatch(r"server\.[0-9a-fA-F]{8,}", name)
         ]
         assert synthetic_names == []
+
+
+def test_caller_owner_id_uses_stored_owner_without_remote_connection_id(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        connection = _save_connected_owner_credentials(store, owner_id="owner-1")
+        _drop_remote_connection_lease(store, connection["id"])
+
+        assert store.objects._caller_owner_id() == "owner-1"  # noqa: SLF001
+        assert store.objects._caller_owner_id("explicit-owner") == "explicit-owner"  # noqa: SLF001
+    finally:
+        store.close()
+
+
+def test_caller_owner_id_defaults_without_enrollment_credentials(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        assert store.objects._caller_owner_id() == DEFAULT_OBJECT_OWNER_ID  # noqa: SLF001
+    finally:
+        store.close()
+
+
+def test_needs_reconnect_identity_still_resolves_bare_names(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        store.register_env("default", sys.executable)
+        connection = _save_connected_owner_credentials(store, owner_id="owner-a")
+        store.register_object(
+            "clean_amount",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML,
+            library="default",
+        )
+        store.record_server_connection_error(
+            connection["id"],
+            status=SERVER_CONNECTION_STATUS_NEEDS_RECONNECT,
+            error="lease rejected by server (404): stale lease",
+        )
+
+        assert store.current_server_connection_credentials()["owner_id"] == "owner-a"
+        assert store.objects._caller_owner_id() == "owner-a"  # noqa: SLF001
+        assert store.get_object("clean_amount")["owner_id"] == "owner-a"
+    finally:
+        store.close()
+
+
+def test_bare_lookup_names_cross_owner_local_matches(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        store.register_env("default", sys.executable)
+        _save_connected_owner_credentials(store, owner_id="owner-b")
+        store.register_object(
+            "clean_amount",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML,
+            owner_id="owner-a",
+            library="default",
+        )
+        store.register_object(
+            "clean_amount",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML_V2,
+            owner_id="owner-c",
+            library="risk",
+        )
+
+        with pytest.raises(KeyError) as exc_info:
+            store.get_object("clean_amount")
+
+        message = str(exc_info.value)
+        assert "registered locally under other owners" in message
+        assert "owner 'owner-a' (library 'default')" in message
+        assert "owner 'owner-c' (library 'risk')" in message
+        assert "pass owner=/library=" in message
+        assert "reconnect under that identity" in message
+
+        scoped = store.get_object("clean_amount", owner_id="owner-a", library="default")
+        assert scoped["canonical_name"] == "owner-a/default/clean_amount"
+    finally:
+        store.close()
+
+
+def test_publish_cross_owner_fork_warns_with_existing_owner_version(tmp_path, caplog) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        store.register_env("default", sys.executable)
+        store.register_object(
+            "shared_obj",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML,
+            owner_id="owner-a",
+            library="default",
+        )
+        store.register_object(
+            "shared_obj",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML_V2,
+            owner_id="owner-a",
+            library="default",
+        )
+        store.register_object(
+            "shared_obj",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML.replace("return 1", "return 3"),
+            owner_id="owner-a",
+            library="default",
+        )
+        _save_connected_owner_credentials(store, owner_id="owner-b")
+
+        with caplog.at_level(logging.WARNING, logger="spl.daemon.repositories.object"):
+            fork = store.register_object(
+                "shared_obj",
+                "demo_obj",
+                "default",
+                yaml_text=FUNCTION_YAML_V2,
+                library="default",
+            )
+
+        warning = fork["warning"]
+        assert warning == fork["warnings"][0]["message"]
+        assert fork["warnings"][0]["type"] == "cross_owner_publish_fork"
+        assert "'shared_obj' also exists locally under owner 'owner-a' (their v3)" in warning
+        assert "Publishing as 'owner-b' creates a SEPARATE object" in warning
+        assert "versions do not continue owner-a's chain" in warning
+        assert "bare-name lookups resolve per current identity" in warning
+        assert any(getattr(record, "spl_event", None) == "cross_owner_publish_fork" for record in caplog.records)
+    finally:
+        store.close()
+
+
+def test_publish_cross_owner_fork_warning_is_not_emitted_for_single_owner_republish(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        store.register_env("default", sys.executable)
+        first = store.register_object(
+            "solo_obj",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML,
+            owner_id="owner-a",
+            library="default",
+        )
+        second = store.register_object(
+            "solo_obj",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML_V2,
+            owner_id="owner-a",
+            library="default",
+        )
+
+        assert "warning" not in first
+        assert "warnings" not in first
+        assert "warning" not in second
+        assert "warnings" not in second
+    finally:
+        store.close()
+
+
+def test_local_publish_after_same_name_mirror_warns_about_separate_owner_chain(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        store.register_env("default", sys.executable)
+        mirror = store.register_object(
+            "shared_obj",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML,
+            owner_id="owner-a",
+            library="default",
+            origin="server",
+            remote_owner_id="owner-a",
+            remote_object_id="remote-object-a",
+            remote_version_id="remote-version-a-1",
+        )
+        # I-01 decision: mirror imports themselves are quiet, but a later local
+        # publish under another owner gets the same fork warning as hand-authored
+        # local objects because it starts an independent version chain.
+        published = store.register_object(
+            "shared_obj",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML_V2,
+            owner_id="owner-b",
+            library="default",
+        )
+
+        assert "warning" not in mirror
+        assert "'shared_obj' also exists locally under owner 'owner-a' (their v1)" in published["warning"]
+        assert "Publishing as 'owner-b' creates a SEPARATE object" in published["warning"]
+    finally:
+        store.close()
+
+
+def test_bare_forget_names_cross_owner_match_and_scoped_forget_works(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        store.register_env("default", sys.executable)
+        store.register_object(
+            "clean_amount",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML,
+            owner_id="owner-a",
+            library="default",
+        )
+        _save_connected_owner_credentials(store, owner_id="owner-b")
+
+        with pytest.raises(KeyError) as exc_info:
+            store.forget_object("clean_amount")
+
+        message = str(exc_info.value)
+        assert "registered locally under owner 'owner-a'" in message
+        assert "library 'default'" in message
+        assert "pass owner=/library=" in message
+        assert store.get_object("clean_amount", owner_id="owner-a", library="default")["owner_id"] == "owner-a"
+
+        receipt = store.forget_object("clean_amount", owner_id="owner-a", library="default")
+
+        assert receipt["object"]["canonical_name"] == "owner-a/default/clean_amount"
+        with pytest.raises(KeyError):
+            store.get_object("clean_amount", owner_id="owner-a", library="default")
+    finally:
+        store.close()
+
+
+def test_bare_forget_version_names_cross_owner_match_and_scoped_forget_version_works(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        store.register_env("default", sys.executable)
+        store.register_object(
+            "versioned_amount",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML,
+            owner_id="owner-a",
+            library="default",
+        )
+        store.register_object(
+            "versioned_amount",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML_V2,
+            owner_id="owner-a",
+            library="default",
+        )
+        _save_connected_owner_credentials(store, owner_id="owner-b")
+
+        with pytest.raises(KeyError) as exc_info:
+            store.forget_object_version("versioned_amount", 1)
+
+        message = str(exc_info.value)
+        assert "registered locally under owner 'owner-a'" in message
+        assert "library 'default'" in message
+        assert (
+            store.get_object("versioned_amount", version=1, owner_id="owner-a", library="default")["owner_id"]
+            == "owner-a"
+        )
+
+        receipt = store.forget_object_version("versioned_amount", 1, owner_id="owner-a", library="default")
+
+        assert receipt["object"]["canonical_name"] == "owner-a/default/versioned_amount"
+        assert receipt["object_deleted"] is False
+        assert store.get_object("versioned_amount", owner_id="owner-a", library="default")["version"] == 2
+    finally:
+        store.close()
+
+
+def test_current_connection_prefers_local_machine_identity_over_newer_foreign_row(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        current = _save_connected_owner_credentials(store, owner_id="owner-a")
+        _insert_server_connection_row(
+            store,
+            connection_id="foreign-connection",
+            machine_id="machine-2",
+            owner_id="owner-b",
+            updated_at="2999-01-01T00:00:00+00:00",
+        )
+
+        assert store.current_server_connection()["id"] == current["id"]
+        credentials = store.current_server_connection_credentials()
+        assert credentials["id"] == current["id"]
+        assert credentials["owner_id"] == "owner-a"
+        assert credentials["token"] == "machine-token-123456"
+    finally:
+        store.close()
+
+
+def test_current_connection_ignores_newer_active_missing_owner_row(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        current = _save_connected_owner_credentials(store, owner_id="owner-a")
+        _insert_server_connection_row(
+            store,
+            connection_id="ownerless-connection",
+            machine_id="machine-1",
+            owner_id=None,
+            status="connect_failed",
+            updated_at="2999-01-01T00:00:00+00:00",
+        )
+
+        assert store.current_server_connection()["id"] == current["id"]
+        credentials = store.current_server_connection_credentials()
+        assert credentials["id"] == current["id"]
+        assert credentials["owner_id"] == "owner-a"
+    finally:
+        store.close()
+
+
+def test_caller_owner_id_warns_when_identity_degrades_with_only_ownerless_rows(
+    tmp_path,
+    caplog,
+) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        _insert_server_connection_row(
+            store,
+            connection_id="ownerless-connection",
+            machine_id="machine-1",
+            owner_id=None,
+            status="connect_failed",
+            updated_at="2999-01-01T00:00:00+00:00",
+        )
+
+        assert store.current_server_connection() is None
+        assert store.current_server_connection_credentials() is None
+        with caplog.at_level(logging.WARNING, logger="spl.daemon.repositories.object"):
+            assert store.objects._caller_owner_id() == DEFAULT_OBJECT_OWNER_ID  # noqa: SLF001
+
+        assert "identity degraded to 'local'" in caplog.text
+        assert "1 stored credential rows exist" in caplog.text
+        summary = store.server_connection_summary()
+        assert summary["identity_degraded"] is True
+        assert summary["stored_credential_rows"] == 1
+    finally:
+        store.close()
+
+
+def test_store_backfills_machine_identity_sidecar_from_single_owned_active_row(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        current = _save_connected_owner_credentials(store, owner_id="owner-a")
+        sidecar_path = tmp_path / "server-machine-identity.json"
+        sidecar_path.unlink()
+        assert not sidecar_path.exists()
+    finally:
+        store.close()
+
+    reopened = RegistryStore(tmp_path)
+    try:
+        assert json.loads(sidecar_path.read_text(encoding="utf-8")) == {"machine_id": "machine-1"}
+        assert reopened.current_server_connection()["id"] == current["id"]
+    finally:
+        reopened.close()
+
+
+def test_store_recovers_legacy_stale_lease_identity_across_restarts(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        current = _save_connected_owner_credentials(store, owner_id="owner-a")
+        with store._lock, store._conn:  # noqa: SLF001 - seed a legacy K-01v1 victim row.
+            store._conn.execute(
+                """
+                UPDATE server_connections
+                SET status = 'stale',
+                    error = 'lease rejected by server (404): stale lease'
+                WHERE id = ?
+                """,
+                (current["id"],),
+            )
+    finally:
+        store.close()
+
+    first_reopen = RegistryStore(tmp_path)
+    try:
+        credentials = first_reopen.current_server_connection_credentials()
+        assert credentials["id"] == current["id"]
+        assert credentials["owner_id"] == "owner-a"
+        assert credentials["status"] == SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
+        assert credentials["token"] == "machine-token-123456"
+    finally:
+        first_reopen.close()
+
+    second_reopen = RegistryStore(tmp_path)
+    try:
+        connections = second_reopen.list_server_connections()
+        assert len(connections) == 1
+        assert connections[0]["id"] == current["id"]
+        assert connections[0]["status"] == SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
+    finally:
+        second_reopen.close()
+
+
+def test_prune_server_connections_prunes_missing_owner_rows_even_if_newer(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        current = _save_connected_owner_credentials(store, owner_id="owner-a")
+        with store._lock, store._conn:  # noqa: SLF001 - make the current row stale but protected.
+            store._conn.execute(
+                "UPDATE server_connections SET owner_id = NULL WHERE id = ?",
+                (current["id"],),
+            )
+        _insert_server_connection_row(
+            store,
+            connection_id="old-disconnected",
+            machine_id="machine-old",
+            owner_id="owner-old",
+            status="disconnected",
+            updated_at="2000-01-01T00:00:00+00:00",
+        )
+
+        dry_run = store.prune_server_connections(older_than_days=None, dry_run=True)
+
+        assert dry_run["dry_run"] is True
+        assert [row["id"] for row in dry_run["stale"]] == [current["id"], "old-disconnected"]
+        assert store.get_server_connection("old-disconnected")["id"] == "old-disconnected"
+
+        receipt = store.prune_server_connections(older_than_days=None)
+
+        assert receipt["count"] == 2
+        assert [row["id"] for row in receipt["pruned"]] == [current["id"], "old-disconnected"]
+        assert receipt["kept_current"] == []
+        with pytest.raises(KeyError):
+            store.get_server_connection(current["id"])
+        with pytest.raises(KeyError):
+            store.get_server_connection("old-disconnected")
+    finally:
+        store.close()
+
+
+def test_forget_scoped_object_does_not_delete_pending_sync_events_for_other_owner(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        store.register_env("default", sys.executable)
+        store.register_object(
+            "shared_obj",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML,
+            owner_id="owner-a",
+            library="default",
+        )
+        store.register_object(
+            "shared_obj",
+            "demo_obj",
+            "default",
+            yaml_text=FUNCTION_YAML_V2,
+            owner_id="owner-b",
+            library="default",
+        )
+        foreign_event = store.enqueue_sync_event(
+            "object_conflict",
+            {
+                # I-02 regression seed: a legacy/confused payload can share the
+                # scoped canonical name while still belonging to another owner.
+                "canonical_name": "owner-b/default/shared_obj",
+                "owner_id": "owner-a",
+                "library": "default",
+                "name": "shared_obj",
+            },
+        )
+
+        result = store.forget_object("shared_obj", owner_id="owner-b", library="default")
+
+        assert result["object"]["canonical_name"] == "owner-b/default/shared_obj"
+        assert store.get_sync_event(foreign_event["id"])["status"] == "pending"
+    finally:
+        store.close()
 
 
 def _create_old_identity_db(home: Path) -> tuple[Path, str]:
@@ -634,7 +1193,9 @@ def test_server_mirror_exposes_source_name_aliases(tmp_path) -> None:
         )
         assert resolved["name"] == "demo_obj"
         assert resolved["display_name"] == "demo_obj"
-        with pytest.raises(KeyError, match="object is not registered"):
+        # H-01: a bare miss with a visible cross-owner local mirror now explains
+        # the owner/library to pass instead of returning the old empty 404.
+        with pytest.raises(KeyError, match="registered locally under owner 'admin1'"):
             store.get_object("demo_obj")
     finally:
         store.close()
@@ -891,7 +1452,7 @@ def test_connected_publish_adopts_existing_server_object_identity(tmp_path) -> N
             docker_pool=_NoopDockerPool(),
             server_client_factory=ExistingObjectServerClient,
         )
-        store.save_server_connection(
+        connection = store.save_server_connection(
             server_url="https://splime.io/api",
             token=_test_credential("machine"),
             user_token=_test_credential("user"),
@@ -907,6 +1468,7 @@ def test_connected_publish_adopts_existing_server_object_identity(tmp_path) -> N
             },
             heartbeat_interval_seconds=60,
         )
+        runtime._mark_server_channel_success(store.get_server_connection_credentials(connection["id"]))
 
         first = runtime.register_object(
             "order_pipeline",

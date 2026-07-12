@@ -165,6 +165,237 @@ def test_daemon_client_local_cleanup_paths() -> None:
     ]
 
 
+def test_daemon_client_pull_server_object_sends_ref_payload() -> None:
+    client = RecordingClient()
+
+    client.pull_server_object(
+        "demo_obj",
+        owner_id="owner-1",
+        library="risk",
+        version=3,
+        all_versions=True,
+    )
+
+    assert client.requests[-1] == (
+        "POST",
+        "/server-objects/pull",
+        {
+            "name": "demo_obj",
+            "all_versions": True,
+            "owner_id": "owner-1",
+            "library": "risk",
+            "version": 3,
+        },
+    )
+
+
+def test_daemon_client_pull_all_batches_catalog_once_and_aggregates_receipt() -> None:
+    class PullAllRecordingClient(Client):
+        def __init__(self) -> None:
+            super().__init__("http://daemon.local")
+            self.requests: list[tuple[str, str, dict[str, Any] | None]] = []
+
+        def _json_request(
+            self,
+            method: str,
+            path: str,
+            payload: dict[str, Any] | None = None,
+        ) -> Any:
+            self.requests.append((method, path, payload))
+            if method == "GET" and path == "/server/objects?owner=owner-1&library=risk&view=summary":
+                return [
+                    {
+                        "name": "score_a",
+                        "owner_id": "owner-1",
+                        "library": "risk",
+                        "current_version": {"version": 2},
+                    },
+                    {
+                        "name": "score_b",
+                        "owner_id": "owner-1",
+                        "library": "risk",
+                        "current_version": {"version": 3},
+                    },
+                ]
+            if method == "POST" and path == "/server-objects/pull":
+                assert payload is not None
+                if payload["name"] == "score_a":
+                    return {
+                        "pulled": ["owner-1/risk/score_a@v2"],
+                        "skipped": [],
+                        "failed": [],
+                        "ambiguous_names": [],
+                    }
+                return {
+                    "pulled": [],
+                    "skipped": ["owner-1/risk/score_b@v3"],
+                    "failed": [],
+                    "ambiguous_names": [],
+                }
+            if method == "GET" and path == "/objects?view=summary":
+                return {
+                    "score_a": {"name": "score_a", "canonical_name": "owner-1/risk/score_a"},
+                    "score_b": {"name": "score_b", "canonical_name": "owner-1/risk/score_b"},
+                }
+            raise AssertionError((method, path, payload))
+
+    client = PullAllRecordingClient()
+
+    receipt = client.pull_all_server_objects(
+        owner_id="owner-1",
+        library="risk",
+        all_versions=True,
+        progress=False,
+    )
+
+    assert receipt == {
+        "objects_seen": 2,
+        "pulled": ["owner-1/risk/score_a@v2"],
+        "skipped": ["owner-1/risk/score_b@v3"],
+        "failed": [],
+        "ambiguous_names": [],
+    }
+    assert client.requests == [
+        ("GET", "/server/objects?owner=owner-1&library=risk&view=summary", None),
+        (
+            "POST",
+            "/server-objects/pull",
+            {
+                "name": "score_a",
+                "all_versions": True,
+                "owner_id": "owner-1",
+                "library": "risk",
+            },
+        ),
+        (
+            "POST",
+            "/server-objects/pull",
+            {
+                "name": "score_b",
+                "all_versions": True,
+                "owner_id": "owner-1",
+                "library": "risk",
+            },
+        ),
+        ("GET", "/objects?view=summary", None),
+    ]
+
+
+def test_daemon_client_pull_all_dry_run_projects_ambiguity_without_final_local_read() -> None:
+    class DryRunRecordingClient(Client):
+        def __init__(self) -> None:
+            super().__init__("http://daemon.local")
+            self.requests: list[tuple[str, str, dict[str, Any] | None]] = []
+
+        def _json_request(
+            self,
+            method: str,
+            path: str,
+            payload: dict[str, Any] | None = None,
+        ) -> Any:
+            self.requests.append((method, path, payload))
+            if method == "GET" and path == "/server/objects?library=risk&view=summary":
+                return [
+                    {
+                        "name": "demo_obj",
+                        "owner_id": "owner-1",
+                        "library": "risk",
+                        "current_version": {"version": 4},
+                    }
+                ]
+            if method == "GET" and path == "/objects?view=summary":
+                return {"demo_obj": {"name": "demo_obj", "canonical_name": "owner-1/default/demo_obj"}}
+            if method == "POST" and path == "/server-objects/pull":
+                return {
+                    "pulled": ["owner-1/risk/demo_obj@v4"],
+                    "skipped": [],
+                    "failed": [],
+                    "ambiguous_names": [],
+                }
+            raise AssertionError((method, path, payload))
+
+    client = DryRunRecordingClient()
+
+    receipt = client.pull_all_server_objects(library="risk", dry_run=True, progress=False)
+
+    assert receipt == {
+        "objects_seen": 1,
+        "pulled": ["owner-1/risk/demo_obj@v4"],
+        "skipped": [],
+        "failed": [],
+        "ambiguous_names": ["demo_obj"],
+    }
+    assert client.requests == [
+        ("GET", "/server/objects?library=risk&view=summary", None),
+        ("GET", "/objects?view=summary", None),
+        (
+            "POST",
+            "/server-objects/pull",
+            {
+                "name": "demo_obj",
+                "all_versions": False,
+                "owner_id": "owner-1",
+                "library": "risk",
+                "dry_run": True,
+            },
+        ),
+    ]
+
+
+def test_daemon_client_pull_all_large_catalog_uses_compact_listing_and_per_object_pulls() -> None:
+    class LargeCatalogClient(Client):
+        def __init__(self) -> None:
+            super().__init__("http://daemon.local")
+            self.requests: list[tuple[str, str, dict[str, Any] | None]] = []
+            self.catalog = [
+                {
+                    "name": f"obj_{index}",
+                    "owner_id": "owner-1",
+                    "library": "default",
+                    "current_version": {"version": 1},
+                }
+                for index in range(500)
+            ]
+
+        def _json_request(
+            self,
+            method: str,
+            path: str,
+            payload: dict[str, Any] | None = None,
+        ) -> Any:
+            self.requests.append((method, path, payload))
+            if method == "GET" and path == "/server/objects?view=summary":
+                assert all("yaml" not in record for record in self.catalog)
+                return self.catalog
+            if method == "POST" and path == "/server-objects/pull":
+                assert payload is not None
+                assert "yaml" not in payload
+                return {
+                    "pulled": [f"owner-1/default/{payload['name']}@v1"],
+                    "skipped": [],
+                    "failed": [],
+                    "ambiguous_names": [],
+                }
+            if method == "GET" and path == "/objects?view=summary":
+                return {
+                    record["name"]: {
+                        "name": record["name"],
+                        "canonical_name": f"owner-1/default/{record['name']}",
+                    }
+                    for record in self.catalog
+                }
+            raise AssertionError((method, path, payload))
+
+    client = LargeCatalogClient()
+
+    receipt = client.pull_all_server_objects(progress=False)
+
+    assert receipt["objects_seen"] == 500
+    assert len(receipt["pulled"]) == 500
+    assert len([request for request in client.requests if request[1] == "/server/objects?view=summary"]) == 1
+    assert len([request for request in client.requests if request[1] == "/server-objects/pull"]) == 500
+
+
 class FakeDaemon:
     def __init__(self) -> None:
         self.run_calls: list[dict[str, Any]] = []
@@ -180,6 +411,7 @@ class FakeDaemon:
         self.library_calls: list[tuple[Any, ...]] = []
         self.register_object_calls: list[dict[str, Any]] = []
         self.cleanup_calls: list[tuple[Any, ...]] = []
+        self.pull_calls: list[dict[str, Any]] = []
         self.server_connected = False
         self.server_url = "https://splime.io/api"
         self.missing_local_objects: set[str] = set()
@@ -557,6 +789,25 @@ class FakeDaemon:
         self.cleanup_calls.append(("prune_stale_mirrors", owner_id, library))
         return {"count": 0, "pruned": []}
 
+    def pull_server_object(self, name: str, **kwargs: Any) -> dict[str, Any]:
+        self.pull_calls.append({"name": name, **kwargs})
+        return {
+            "pulled": ["owner-1/default/{}@v7".format(name)],
+            "skipped": [],
+            "failed": [],
+            "ambiguous_names": [],
+        }
+
+    def pull_all_server_objects(self, **kwargs: Any) -> dict[str, Any]:
+        self.pull_calls.append({"name": "__all__", **kwargs})
+        return {
+            "objects_seen": 2,
+            "pulled": ["owner-1/default/clean_amount@v7"],
+            "skipped": ["owner-1/default/existing@v3"],
+            "failed": [],
+            "ambiguous_names": [],
+        }
+
     def register_object(self, name: str, **kwargs: Any) -> dict[str, Any]:
         self.register_object_calls.append({"name": name, **kwargs})
         return {
@@ -601,9 +852,102 @@ class MissingServerConnectionErrorDaemon(MissingServerConnectionDaemon):
         raise ClientError("404: active server connection is not found")
 
 
+def _central_server_unreachable_error(
+    message: str = "central SPL daemon server is not reachable at https://splime.io/api: connection refused",
+) -> ClientError:
+    return ClientError(
+        "502: {}".format(message),
+        status_code=502,
+        payload={
+            "error": message,
+            "code": "central_server_unreachable",
+            "offline": True,
+        },
+    )
+
+
+class ServerUnreachableDaemon(MissingServerConnectionDaemon):
+    def server_connection(self) -> dict[str, Any]:
+        return {
+            "connected": False,
+            "offline": True,
+            "connection": {"id": "conn-1", "status": "connected"},
+            "code": "central_server_unreachable",
+            "error": "central SPL daemon server is not reachable",
+        }
+
+    def server_machines(self) -> dict[str, Any]:
+        raise _central_server_unreachable_error()
+
+    def server_objects(
+        self,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+        compact: bool = False,
+    ) -> list[dict[str, Any]]:
+        self.server_object_calls.append(
+            {
+                "owner_id": owner_id,
+                "library": library,
+                "compact": compact,
+            }
+        )
+        raise _central_server_unreachable_error()
+
+    def server_libraries(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
+        self.library_calls.append(("server_libraries", include_accessible))
+        raise _central_server_unreachable_error()
+
+
+class LegacyServerUnreachableDaemon(FakeDaemon):
+    def __init__(self) -> None:
+        super().__init__()
+        self.server_connected = True
+
+    def server_machines(self) -> dict[str, Any]:
+        raise ClientError("502: central SPL server is not reachable at https://splime.io/api")
+
+    def server_objects(
+        self,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+        compact: bool = False,
+    ) -> list[dict[str, Any]]:
+        self.server_object_calls.append(
+            {
+                "owner_id": owner_id,
+                "library": library,
+                "compact": compact,
+            }
+        )
+        raise ClientError("502: central SPL daemon server is not reachable at https://splime.io/api")
+
+    def server_libraries(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
+        self.library_calls.append(("server_libraries", include_accessible))
+        raise ClientError("502: central SPL daemon server is not reachable at https://splime.io/api")
+
+
 class FailingServerDaemon(MissingServerConnectionDaemon):
     def server_connection(self) -> dict[str, Any]:
         return {"connected": True, "offline": False, "connection": {"id": "conn-1"}}
+
+    def server_objects(
+        self,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+        compact: bool = False,
+    ) -> list[dict[str, Any]]:
+        self.server_object_calls.append(
+            {
+                "owner_id": owner_id,
+                "library": library,
+                "compact": compact,
+            }
+        )
+        raise ClientError("503: upstream unavailable")
 
     def server_libraries(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
         self.library_calls.append(("server_libraries", include_accessible))
@@ -724,16 +1068,72 @@ def test_run_id_namespace_classifies_syntax(run_id: str, namespace: str) -> None
     assert spl_client_module._run_id_namespace(run_id) == namespace
 
 
-def test_spl_client_bare_signature_offline_keeps_local_404() -> None:
+def _assert_g01_offline_bare_name_hint(message: str, name: str) -> None:
+    # G-01 in Release/plan-0.4.3.md intentionally replaces the raw local
+    # "object is not registered" 404 with an actionable offline bare-name hint.
+    assert "404:" in message
+    assert "{!r} is not registered locally".format(name) in message
+    assert "no server connection" in message
+    assert "connect_server" in message
+    assert "pull" in message
+
+
+def _assert_j02_unreachable_bare_name_hint(message: str, name: str) -> None:
+    assert "404:" in message
+    assert "{!r} is not registered locally".format(name) in message
+    assert "server unreachable" in message
+    assert "client.pull" in message
+    assert "when online" in message
+
+
+def test_spl_client_detects_server_unreachable_marker_and_legacy_texts() -> None:
+    assert spl_client_module._is_server_unreachable(_central_server_unreachable_error())
+    assert spl_client_module._is_server_unreachable(
+        ClientError("502: central SPL daemon server is not reachable at https://splime.io/api")
+    )
+    assert spl_client_module._is_server_unreachable(
+        ClientError("502: central SPL server is not reachable at https://splime.io/api")
+    )
+    assert not spl_client_module._is_server_unreachable(ClientError("503: connection state unavailable"))
+
+
+def test_spl_client_bare_signature_offline_reports_g01_hint() -> None:
     client = SPLClient(daemon_port=8765)
     fake_daemon = FakeDaemon()
     fake_daemon.missing_local_objects = {"clean_amount"}
     client._daemon = fake_daemon
 
-    with pytest.raises(ClientError, match="404: object is not registered: clean_amount"):
+    with pytest.raises(ClientError) as exc_info:
         client.signature("clean_amount")
 
+    _assert_g01_offline_bare_name_hint(str(exc_info.value), "clean_amount")
     assert fake_daemon.server_object_calls == []
+
+
+def test_spl_client_bare_signature_unreachable_reports_pull_hint() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = ServerUnreachableDaemon()
+    fake_daemon.missing_local_objects = {"clean_amount"}
+    client._daemon = fake_daemon
+
+    with pytest.raises(ClientError) as exc_info:
+        client.signature("clean_amount")
+
+    _assert_j02_unreachable_bare_name_hint(str(exc_info.value), "clean_amount")
+    assert fake_daemon.server_object_calls == []
+
+
+def test_spl_client_bare_signature_legacy_unreachable_reports_pull_hint() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = LegacyServerUnreachableDaemon()
+    fake_daemon.missing_local_objects = {"clean_amount"}
+    client._daemon = fake_daemon
+
+    with pytest.raises(ClientError) as exc_info:
+        client.signature("clean_amount")
+
+    _assert_j02_unreachable_bare_name_hint(str(exc_info.value), "clean_amount")
+    assert fake_daemon.server_object_calls == [{"owner_id": None, "library": None, "compact": True}]
 
 
 def test_spl_client_bare_signature_auto_resolves_unique_server_catalog_match() -> None:
@@ -817,6 +1217,128 @@ def test_spl_client_bare_signature_reports_no_accessible_server_match() -> None:
     assert fake_daemon.server_object_calls == [{"owner_id": None, "library": None, "compact": True}]
 
 
+def test_spl_client_pull_auto_resolves_bare_server_catalog_match() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    fake_daemon.server_object_records = [
+        _server_record("clean_amount", owner_id="owner-1", library="default", version=10)
+    ]
+    client._daemon = fake_daemon
+
+    receipt = client.pull("clean_amount", all_versions=True)
+
+    assert receipt["pulled"] == ["owner-1/default/clean_amount@v7"]
+    assert receipt["skipped"] == []
+    assert receipt["failed"] == []
+    assert receipt["ambiguous_names"] == []
+    assert fake_daemon.server_object_calls == [{"owner_id": None, "library": None, "compact": True}]
+    assert fake_daemon.pull_calls == [
+        {
+            "name": "clean_amount",
+            "owner_id": "owner-1",
+            "library": "default",
+            "version": None,
+            "all_versions": True,
+        }
+    ]
+
+
+def test_spl_client_pull_scoped_uses_direct_daemon_ref() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    client._daemon = fake_daemon
+
+    client.pull("clean_amount", owner="owner-1", library="risk", version=3)
+
+    assert fake_daemon.server_object_calls == []
+    assert fake_daemon.pull_calls == [
+        {
+            "name": "clean_amount",
+            "owner_id": "owner-1",
+            "library": "risk",
+            "version": 3,
+            "all_versions": False,
+        }
+    ]
+
+
+def test_spl_client_pull_offline_reports_connection_action() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+
+    with pytest.raises(ClientError) as exc_info:
+        client.pull("clean_amount")
+
+    message = str(exc_info.value)
+    assert "pull requires a server connection" in message
+    assert "no server connection" in message
+    assert "connect_server" in message
+    assert "client.pull" in message
+    assert fake_daemon.pull_calls == []
+
+
+def test_spl_client_pull_reports_bare_server_catalog_ambiguity() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    fake_daemon.server_object_records = [
+        _server_record("order_pipeline", owner_id="owner-1", library="default", version=10),
+        _server_record("order_pipeline", owner_id="owner-1", library="risk", version=1),
+    ]
+    client._daemon = fake_daemon
+
+    with pytest.raises(ClientError) as exc_info:
+        client.pull("order_pipeline")
+
+    message = str(exc_info.value)
+    assert "default (owner owner-1, v10)" in message
+    assert "risk (owner owner-1, v1)" in message
+    assert "client.pull('order_pipeline', library='...')" in message
+    assert fake_daemon.pull_calls == []
+
+
+def test_spl_client_pull_all_delegates_to_daemon_batch() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    client._daemon = fake_daemon
+
+    receipt = client.pull_all(owner="owner-1", library="risk", all_versions=True, dry_run=True)
+
+    assert receipt["objects_seen"] == 2
+    assert receipt["pulled"] == ["owner-1/default/clean_amount@v7"]
+    assert receipt["skipped"] == ["owner-1/default/existing@v3"]
+    assert receipt["ambiguous_names"] == []
+    assert fake_daemon.pull_calls == [
+        {
+            "name": "__all__",
+            "owner_id": "owner-1",
+            "library": "risk",
+            "all_versions": True,
+            "dry_run": True,
+        }
+    ]
+
+
+def test_spl_client_pull_all_offline_reports_connection_action() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+
+    with pytest.raises(ClientError) as exc_info:
+        client.pull_all()
+
+    message = str(exc_info.value)
+    assert "pull_all requires a server connection" in message
+    assert "no server connection" in message
+    assert "connect_server" in message
+    assert "client.pull_all" in message
+    assert fake_daemon.pull_calls == []
+
+
 def test_spl_client_bare_decomposition_auto_resolves_unique_server_catalog_match() -> None:
     client = SPLClient(daemon_port=8765)
     fake_daemon = FakeDaemon()
@@ -864,16 +1386,17 @@ def test_spl_client_bare_decomposition_reports_server_catalog_ambiguity() -> Non
     assert fake_daemon.remote_decomposition_calls == []
 
 
-@pytest.mark.parametrize("method_name", ["describe", "inputs", "outputs"])
-def test_spl_client_bare_metadata_methods_offline_keep_local_404(method_name: str) -> None:
+@pytest.mark.parametrize("method_name", ["describe", "inputs", "outputs", "decomposition"])
+def test_spl_client_bare_metadata_methods_offline_report_g01_hint(method_name: str) -> None:
     client = SPLClient(daemon_port=8765)
     fake_daemon = FakeDaemon()
     fake_daemon.missing_local_objects = {"clean_amount"}
     client._daemon = fake_daemon
 
-    with pytest.raises(ClientError, match="404: object is not registered: clean_amount"):
+    with pytest.raises(ClientError) as exc_info:
         getattr(client, method_name)("clean_amount")
 
+    _assert_g01_offline_bare_name_hint(str(exc_info.value), "clean_amount")
     assert fake_daemon.server_object_calls == []
 
 
@@ -984,6 +1507,17 @@ def test_spl_client_describe_offline_does_not_probe_server_freshness() -> None:
 
     assert "server has" not in description
     assert fake_daemon.server_object_calls == []
+
+
+def test_spl_client_describe_omits_freshness_when_server_unreachable() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = LegacyServerUnreachableDaemon()
+    client._daemon = fake_daemon
+
+    description = client.describe("fraud_score")
+
+    assert "server has" not in description
+    assert fake_daemon.server_object_calls == [{"owner_id": None, "library": None, "compact": True}]
 
 
 def test_spl_client_submit_is_async_alias_for_start() -> None:
@@ -1709,6 +2243,57 @@ def test_spl_client_offline_server_helpers_return_empty_states() -> None:
     assert fake_daemon.server_object_calls == []
 
 
+def test_spl_client_unreachable_server_helpers_return_empty_states() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = ServerUnreachableDaemon()
+    client._daemon = fake_daemon
+
+    assert client.current_server_connection() == {
+        "connected": False,
+        "offline": True,
+        "connection": {"id": "conn-1", "status": "connected"},
+        "code": "central_server_unreachable",
+        "error": "central SPL daemon server is not reachable",
+    }
+    assert client.machines() == {"current_machine_id": None, "machines": []}
+    assert client.libraries(include_accessible=False) == []
+    assert client.objects(scope="server", compact=True) == []
+    assert client.objects(scope="auto", compact=True) == {
+        "local_obj": {"name": "local_obj", "compact": True},
+    }
+    assert client.objects(scope="all", compact=True) == {
+        "local": {"local_obj": {"name": "local_obj", "compact": True}},
+        "server": [],
+    }
+
+    assert fake_daemon.library_calls == []
+    assert fake_daemon.server_object_calls == []
+
+
+def test_spl_client_legacy_unreachable_server_helpers_return_empty_states() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = LegacyServerUnreachableDaemon()
+    client._daemon = fake_daemon
+
+    assert client.machines() == {"current_machine_id": None, "machines": []}
+    assert client.libraries(include_accessible=False) == []
+    assert client.objects(scope="server", compact=True) == []
+    assert client.objects(scope="auto", compact=True) == {
+        "local_obj": {"name": "local_obj", "compact": True},
+    }
+    assert client.objects(scope="all", compact=True) == {
+        "local": {"local_obj": {"name": "local_obj", "compact": True}},
+        "server": [],
+    }
+
+    assert fake_daemon.library_calls == [("server_libraries", False)]
+    assert fake_daemon.server_object_calls == [
+        {"owner_id": None, "library": None, "compact": True},
+        {"owner_id": None, "library": None, "compact": True},
+        {"owner_id": None, "library": None, "compact": True},
+    ]
+
+
 def test_spl_client_offline_server_helpers_reraise_other_failures() -> None:
     client = SPLClient(daemon_port=8765)
     client._daemon = FailingServerDaemon()
@@ -1716,9 +2301,18 @@ def test_spl_client_offline_server_helpers_reraise_other_failures() -> None:
     with pytest.raises(ClientError, match="503: upstream unavailable"):
         client.libraries()
 
-    client._daemon = BrokenConnectionStateDaemon()
+    with pytest.raises(ClientError, match="503: upstream unavailable"):
+        client.objects(scope="server", compact=True)
+
+    broken_daemon = BrokenConnectionStateDaemon()
+    broken_daemon.missing_local_objects = {"clean_amount"}
+    client._daemon = broken_daemon
     with pytest.raises(ClientError, match="503: connection state unavailable"):
         client.machines()
+    with pytest.raises(ClientError, match="503: connection state unavailable"):
+        client.objects(scope="server", compact=True)
+    with pytest.raises(ClientError, match="503: connection state unavailable"):
+        client.signature("clean_amount")
 
 
 # ``run_node()``/``run_node_result()`` were removed in 0.2.0 (WP-07b); the

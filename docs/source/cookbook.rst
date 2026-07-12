@@ -139,6 +139,58 @@ Catalog, async runs, cleanup
    client.forget_version('daily_total', 1)   # local cleanup, no server needed
    client.forget('daily_total')
 
+Warm the cache, go offline
+--------------------------
+
+When you know you will lose the server connection, pull the server objects you
+need into the local daemon cache while you are still online. A pulled mirror is
+stored as server-origin metadata plus YAML; after disconnect,
+``signature()``, ``describe()``, ``inputs()``, ``outputs()``, and normal
+``call()`` execution read the local mirror.
+
+For one object, use the explicit owner/library when you have it. A bare name is
+also accepted when the connected server catalog contains a single visible
+match:
+
+.. code-block:: python
+
+   connection = client.current_server_connection()
+   if not connection.get("connected"):
+       print("Connect once with client.connect_server(...) before warming the cache.")
+   else:
+       server_objects = client.objects(scope="server", library="risk")
+       if server_objects:
+           first = server_objects[0]
+           client.pull(
+               first["name"],
+               owner=first.get("owner_id"),
+               library="risk",
+           )
+           client.signature(first["name"], owner=first.get("owner_id"), library="risk")
+
+For a library or the whole visible catalog, plan first. ``pull_all`` can touch a
+large catalog; ``dry_run=True`` returns the same receipt shape without writing
+mirror rows or YAML bodies:
+
+.. code-block:: python
+
+   plan = client.pull_all(library="risk", dry_run=True)
+   print(plan["objects_seen"], len(plan["pulled"]), len(plan["skipped"]))
+
+   if not plan["failed"]:
+       receipt = client.pull_all(library="risk")
+       print(receipt["pulled"], receipt["skipped"], receipt["failed"])
+
+The mirror lifecycle is deliberately boring. When you reconnect with
+``client.connect_server(...)``, the daemon's normal reconcile pass refreshes
+server-origin mirrors that still exist. While connected, ``client.describe()``
+shows when the visible server catalog has a newer version than your local
+mirror. If an object was removed from the server catalog,
+``client.prune_stale_mirrors(owner=..., library=...)`` removes stale
+server-origin rows without touching local-origin objects. To drop one cached
+mirror yourself, use ``client.forget(...)`` or ``client.forget_version(...)``;
+those are local cleanup operations and do not delete anything from the server.
+
 Retained runs and retention
 ---------------------------
 

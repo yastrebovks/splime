@@ -32,6 +32,7 @@ from spl.daemon.docker_pool import (
     OBJECT_DOCKER_WORKER_VALUE,
 )
 from spl.daemon.interpreter_visibility import python_minor_mismatch
+from spl.daemon.repositories.server_connection import SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
 from spl.daemon_client import default_daemon_home
 
 OK = "ok"
@@ -139,6 +140,7 @@ def run_doctor(
     daemon_check, health = check_daemon(client)
     checks.append(daemon_check)
     checks.append(check_server_connection(health))
+    checks.append(check_server_identity(health))
     checks.append(check_environment_builds(health))
     checks.append(check_interpreter_substitutions(health))
     if pipeline is not None:
@@ -319,6 +321,15 @@ def check_server_connection(health: dict[str, Any] | None) -> CheckResult:
             status=OK,
             detail=f"connected to {server_url}",
         )
+    if connection.get("status") == SERVER_CONNECTION_STATUS_NEEDS_RECONNECT:
+        error = str(connection.get("error") or "")
+        code = _lease_rejection_code(error) or "unknown"
+        return CheckResult(
+            name=name,
+            status=WARN,
+            detail=f"lease rejected by server ({code}) - identity kept; run connect_server to restore sync",
+            hint="reconnect with `client.connect_server(...)` or `spl-daemon server-connect`",
+        )
     if server.get("offline"):
         error = connection.get("error") or connection.get("status") or "unknown error"
         return CheckResult(
@@ -332,6 +343,75 @@ def check_server_connection(health: dict[str, Any] | None) -> CheckResult:
         status=OK,
         detail="no server connection configured (local-only mode)",
     )
+
+
+def _lease_rejection_code(error: str) -> str | None:
+    prefix = "lease rejected by server ("
+    if not error.startswith(prefix):
+        return None
+    suffix = error[len(prefix) :]
+    code, _, _ = suffix.partition(")")
+    return code or None
+
+
+def check_server_identity(health: dict[str, Any] | None) -> CheckResult:
+    """Report the locally selected server owner/machine identity."""
+
+    name = "server identity"
+    if health is None:
+        return CheckResult(
+            name=name,
+            status=SKIP,
+            detail="skipped: daemon is not reachable",
+        )
+    server = health.get("server") or {}
+    connection = server.get("connection") or {}
+    summary = server.get("connection_summary") or {}
+    owner_id = connection.get("owner_id") or "not enrolled"
+    machine_id = connection.get("machine_id") or summary.get("current_machine_id") or "unknown machine"
+    stored_count = _as_int(summary.get("stored_count"))
+    stale_count = _as_int(summary.get("stale_count"))
+    held_sync_events = _as_int(summary.get("held_sync_events"))
+    offline_replaced_identity_rows = _as_int(summary.get("offline_replaced_identity_rows"))
+    owners = [str(owner) for owner in summary.get("owners") or [] if owner]
+    if summary.get("identity_degraded"):
+        if offline_replaced_identity_rows:
+            return CheckResult(
+                name=name,
+                status=WARN,
+                detail=(
+                    "identity row replaced while offline — reconnect to restore; "
+                    f"{offline_replaced_identity_rows} stored identity rows lost secrets"
+                ),
+                hint=(
+                    "reconnect with `client.connect_server(...)`, then inspect "
+                    "`connections-list` and prune stale rows with `connections-prune --dry-run`"
+                ),
+            )
+        return CheckResult(
+            name=name,
+            status=WARN,
+            detail=(
+                f"identity degraded to 'local'; {stored_count} stored credential rows exist; "
+                "run spl-daemon doctor / connections-prune"
+            ),
+            hint="inspect `connections-list` and prune stale rows with `connections-prune --dry-run`",
+        )
+    detail = (
+        f"enrolled as {owner_id} on {machine_id}; "
+        f"{stored_count} stored connections ({stale_count} stale); "
+        f"{held_sync_events} sync events held for other identities"
+    )
+    if len(set(owners)) > 1:
+        return CheckResult(
+            name=name,
+            status=WARN,
+            detail=detail,
+            hint="multiple owners stored locally: {}; inspect `connections-list` and prune stale rows with `connections-prune --dry-run`".format(
+                ", ".join(sorted(set(owners)))
+            ),
+        )
+    return CheckResult(name=name, status=OK, detail=detail)
 
 
 def check_environment_builds(health: dict[str, Any] | None) -> CheckResult:

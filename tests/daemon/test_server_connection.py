@@ -8,6 +8,7 @@ from typing import Any, Iterator
 import pytest
 
 from spl.daemon.heartbeat_service import HeartbeatService
+from spl.daemon.repositories.server_connection import SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
 from spl.daemon.remote_client import ServerClientError
 from spl.daemon.server import DaemonRuntime
 from spl.daemon.server_connection import (
@@ -197,11 +198,78 @@ def test_server_connection_manager_persists_pending_connection_when_offline(
         "error": SERVER_OFFLINE_MESSAGE,
         "detail": "server offline",
     }
-    assert connection["status"] == "connect_failed"
+    assert connection["status"] == "enroll_failed"
     assert connection["remote_connection_id"] is None
     assert connection["machine_id"] == expected_machine_id
+    assert store.current_server_connection_credentials() is None
+    pending_credentials = store.get_server_connection_credentials(connection["id"])
     with pytest.raises(ServerOfflineError, match="central SPL daemon server is offline"):
-        manager.require_connected_server_credentials()
+        manager.require_connected_server_credentials(pending_credentials)
+
+
+def test_server_connection_manager_reuses_ownerless_pending_attempt(
+    store: RegistryStore,
+) -> None:
+    manager = ServerConnectionManager(store, ClientFactory(OfflineClient()))
+
+    first = manager.connect_server(
+        server_url="https://splime.io/api",
+        machine_token="machine-token-secret",
+        user_token="user-token-secret",
+        machine_id="machine-1",
+        display_name=None,
+        capabilities={},
+        heartbeat_interval_seconds=60,
+    )
+    second = manager.connect_server(
+        server_url="https://splime.io/api",
+        machine_token="next-machine-token-secret",
+        user_token="next-user-token-secret",
+        machine_id="machine-1",
+        display_name=None,
+        capabilities={},
+        heartbeat_interval_seconds=60,
+    )
+
+    assert second["connection"]["id"] == first["connection"]["id"]
+    assert second["connection"]["status"] == "enroll_failed"
+    assert len(store.list_server_connections()) == 1
+    credentials = store.get_server_connection_credentials(first["connection"]["id"])
+    assert credentials["token"] == "next-machine-token-secret"
+    assert credentials["user_token"] == "next-user-token-secret"
+
+
+def test_server_connection_manager_completes_reused_pending_attempt(
+    store: RegistryStore,
+) -> None:
+    pending = ServerConnectionManager(store, ClientFactory(OfflineClient())).connect_server(
+        server_url="https://splime.io/api",
+        machine_token="machine-token-secret",
+        user_token="user-token-secret",
+        machine_id="machine-1",
+        display_name=None,
+        capabilities={},
+        heartbeat_interval_seconds=60,
+    )["connection"]
+    client = ConnectedClient()
+    manager = ServerConnectionManager(store, ClientFactory(client))
+
+    result = manager.connect_server(
+        server_url="https://splime.io/api",
+        machine_token="machine-token-secret",
+        user_token="user-token-secret",
+        machine_id="machine-1",
+        display_name=None,
+        capabilities={},
+        heartbeat_interval_seconds=60,
+    )
+
+    assert result["connected"] is True
+    assert result["connection"]["id"] == pending["id"]
+    assert result["connection"]["owner_id"] == "admin1"
+    assert result["connection"]["status"] == "connected"
+    assert len(store.list_server_connections()) == 1
+    assert client.connect_calls == 1
 
 
 def test_server_connection_manager_reuses_matching_connection(
@@ -234,6 +302,66 @@ def test_server_connection_manager_reuses_matching_connection(
     assert second["remote_connection"]["id"] == "remote-connection-1"
     assert second["remote_connection"]["machine_id"] == "machine-1"
     assert client.connect_calls == 1
+
+
+def test_save_server_connection_requires_confirmed_remote_identity_before_replace(
+    store: RegistryStore,
+) -> None:
+    first = store.save_server_connection(
+        server_url="https://splime.io/api",
+        token="machine-token-secret",
+        user_token="user-token-secret",
+        connection=_remote_connection(machine_id="machine-1"),
+        heartbeat_interval_seconds=60,
+    )
+    incomplete_remote_connection = dict(_remote_connection(machine_id="machine-2"))
+    incomplete_remote_connection.pop("id")
+
+    with pytest.raises(ValueError, match="remote_connection_id"):
+        store.save_server_connection(
+            server_url="https://splime.io/api",
+            token="next-machine-token-secret",
+            user_token="next-user-token-secret",
+            connection=incomplete_remote_connection,
+            heartbeat_interval_seconds=60,
+        )
+
+    current = store.current_server_connection()
+    credentials = store.get_server_connection_credentials(first["id"])
+    assert current is not None
+    assert current["id"] == first["id"]
+    assert current["status"] == "connected"
+    assert credentials["token"] == "machine-token-secret"
+    assert credentials["user_token"] == "user-token-secret"
+    assert len(store.list_server_connections()) == 1
+
+
+def test_server_connection_summary_reports_replaced_identity_without_secrets(
+    store: RegistryStore,
+) -> None:
+    connection = store.save_server_connection(
+        server_url="https://splime.io/api",
+        token="machine-token-secret",
+        user_token="user-token-secret",
+        connection=_remote_connection(machine_id="machine-1"),
+        heartbeat_interval_seconds=60,
+    )
+
+    with store._lock, store._conn:  # noqa: SLF001 - seed a post-K-01 victim row.
+        store._conn.execute(
+            """
+            UPDATE server_connections
+            SET status = 'replaced',
+                token_secret_ref = NULL,
+                user_token_secret_ref = NULL
+            WHERE id = ?
+            """,
+            (connection["id"],),
+        )
+
+    summary = store.server_connection_summary()
+    assert summary["identity_degraded"] is True
+    assert summary["offline_replaced_identity_rows"] == 1
 
 
 def test_server_connection_manager_refreshes_reused_technical_display_name(
@@ -293,7 +421,7 @@ def test_server_connection_manager_disconnects_pending_connection(
         machine_id="machine-1",
     )
 
-    result = manager.disconnect_server()
+    result = manager.disconnect_server(store.get_server_connection_credentials(pending["id"]))
 
     assert result["connected"] is False
     assert result["offline"] is True
@@ -303,8 +431,10 @@ def test_server_connection_manager_disconnects_pending_connection(
     assert client.disconnect_calls == 0
 
 
-def test_heartbeat_service_records_stale_and_stops(
+@pytest.mark.parametrize("status_code", [401, 404])
+def test_heartbeat_service_records_lease_rejection_keeps_identity_and_secrets(
     store: RegistryStore,
+    status_code: int,
 ) -> None:
     connection = store.save_server_connection(
         server_url="https://splime.io/api",
@@ -315,7 +445,7 @@ def test_heartbeat_service_records_stale_and_stops(
     )
 
     def sync_once(**kwargs: Any) -> dict[str, Any]:
-        raise ServerClientError(401, "stale lease")
+        raise ServerClientError(status_code, "stale lease")
 
     service = HeartbeatService(store, sync_once)
 
@@ -326,8 +456,136 @@ def test_heartbeat_service_records_stale_and_stops(
     )
 
     updated = store.get_server_connection(connection["id"])
-    assert updated["status"] == "stale"
-    assert updated["error"] == "stale lease"
+    assert updated["status"] == SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
+    assert updated["error"] == f"lease rejected by server ({status_code}): stale lease"
+
+    credentials = store.current_server_connection_credentials()
+    assert credentials["id"] == connection["id"]
+    assert credentials["owner_id"] == "admin1"
+    assert credentials["token"] == "machine-token-secret"
+    assert credentials["user_token"] == "user-token-secret"
+
+
+def test_heartbeat_restore_does_not_retry_needs_reconnect_until_explicit_reconnect(
+    store: RegistryStore,
+) -> None:
+    connection = store.save_server_connection(
+        server_url="https://splime.io/api",
+        token="machine-token-secret",
+        user_token="user-token-secret",
+        connection=_remote_connection(machine_id="machine-1"),
+        heartbeat_interval_seconds=60,
+    )
+    store.record_server_connection_error(
+        connection["id"],
+        status=SERVER_CONNECTION_STATUS_NEEDS_RECONNECT,
+        error="lease rejected by server (404): stale lease",
+    )
+    calls = 0
+
+    def sync_once(**kwargs: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {"connected": True}
+
+    HeartbeatService(store, sync_once).restore_server_heartbeat()
+
+    assert calls == 0
+    assert store.current_server_connection_credentials()["id"] == connection["id"]
+
+
+def test_record_server_connection_error_normalizes_legacy_stale_status(
+    store: RegistryStore,
+) -> None:
+    connection = store.save_server_connection(
+        server_url="https://splime.io/api",
+        token="machine-token-secret",
+        user_token="user-token-secret",
+        connection=_remote_connection(machine_id="machine-1"),
+        heartbeat_interval_seconds=60,
+    )
+
+    store.record_server_connection_error(
+        connection["id"],
+        status="stale",
+        error="legacy stale lease",
+    )
+
+    assert store.current_server_connection_credentials()["status"] == SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
+
+
+def test_connect_server_reconnects_reused_needs_reconnect_identity(
+    store: RegistryStore,
+) -> None:
+    connection = store.save_server_connection(
+        server_url="https://splime.io/api",
+        token="machine-token-secret",
+        user_token="user-token-secret",
+        connection=_remote_connection(machine_id="machine-1"),
+        heartbeat_interval_seconds=60,
+    )
+    store.record_server_connection_error(
+        connection["id"],
+        status=SERVER_CONNECTION_STATUS_NEEDS_RECONNECT,
+        error="lease rejected by server (404): stale lease",
+    )
+    client = ConnectedClient()
+    manager = ServerConnectionManager(store, ClientFactory(client))
+
+    result = manager.connect_server(
+        server_url="https://splime.io/api",
+        machine_token="machine-token-secret",
+        user_token="user-token-secret",
+        machine_id="machine-1",
+        display_name=None,
+        capabilities={"python": "3.13"},
+        heartbeat_interval_seconds=60,
+    )
+
+    assert result["connected"] is True
+    assert result["reused"] is True
+    assert result["refreshed"] is True
+    assert client.connect_calls == 1
+    assert store.current_server_connection_credentials()["status"] == "connected"
+
+
+def test_daemon_runtime_reconnect_restores_live_sync_channel(
+    store: RegistryStore,
+) -> None:
+    connection = store.save_server_connection(
+        server_url="https://splime.io/api",
+        token="machine-token-secret",
+        user_token="user-token-secret",
+        connection=_remote_connection(machine_id="machine-1"),
+        heartbeat_interval_seconds=60,
+    )
+    store.record_server_connection_error(
+        connection["id"],
+        status=SERVER_CONNECTION_STATUS_NEEDS_RECONNECT,
+        error="lease rejected by server (404): stale lease",
+    )
+    client = ConnectedClient()
+    runtime = DaemonRuntime(
+        store,
+        heartbeat_service=FakeHeartbeatService(),
+        server_client_factory=ClientFactory(client),
+    )
+
+    result = runtime.connect_server(
+        server_url="https://splime.io/api",
+        machine_token="machine-token-secret",
+        user_token="user-token-secret",
+        machine_id="machine-1",
+        display_name=None,
+        capabilities={"python": "3.13"},
+        heartbeat_interval_seconds=60,
+    )
+
+    credentials = store.current_server_connection_credentials()
+    assert result["connected"] is True
+    assert result["reconcile"]["owner_id"] == "admin1"
+    assert runtime._server_channel_is_live(credentials) is True  # noqa: SLF001
+    runtime.shutdown()
 
 
 def test_heartbeat_service_records_transient_failure(

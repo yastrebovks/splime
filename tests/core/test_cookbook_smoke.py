@@ -1,17 +1,22 @@
 """Cookbook smoke test: the offline DX contract, mechanically enforced (WP-08).
 
-Runs against a live local daemon (``just smoke``); each test skips cleanly when
-the daemon is not running. Every assertion is a DX invariant from the cookbook:
-if this file goes red, the cookbook experience regressed — offline calls that
-raise, huge reprs, or the need for deeper imports.
+Runs against a temporary local daemon so the smoke path cannot mutate the user's
+live daemon home. Every assertion is a DX invariant from the cookbook: if this
+file goes red, the cookbook experience regressed — offline calls that raise,
+huge reprs, or the need for deeper imports.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import socket
+import threading
+import time
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
+from typing import Iterator
 
 import pytest
 
@@ -20,6 +25,9 @@ import pytest
 from spl import Deployment, SPLClient, lift
 from spl.core.adapter_compat import find_pipeline_adapter_compatibility_issues
 from spl.core.entities.adapter import Adapter, make_key
+from spl.daemon.server import create_app
+from spl.daemon.store import RegistryStore
+from spl.daemon_client import Client
 
 pytestmark = pytest.mark.smoke
 
@@ -69,14 +77,72 @@ def cookbook_csv_to_json_rows(value: str) -> dict:
     return {"rows": [dict(zip(columns, line.split(","))) for line in lines]}
 
 
+def _free_local_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _serve_app_in_thread(app, port: int) -> tuple[threading.Event, threading.Thread, list[BaseException]]:
+    stop_event = threading.Event()
+    errors: list[BaseException] = []
+
+    def _run() -> None:
+        from hypercorn.asyncio import serve as hypercorn_serve
+        from hypercorn.config import Config
+
+        async def _shutdown_trigger() -> None:
+            while not stop_event.is_set():
+                await asyncio.sleep(0.05)
+
+        async def _serve() -> None:
+            config = Config()
+            config.bind = [f"127.0.0.1:{port}"]
+            config.use_reloader = False
+            config.accesslog = None
+            config.errorlog = None
+            await hypercorn_serve(app, config, shutdown_trigger=_shutdown_trigger)
+
+        try:
+            asyncio.run(_serve())
+        except BaseException as exc:  # pragma: no cover - re-raised by caller.
+            errors.append(exc)
+
+    thread = threading.Thread(target=_run, name=f"spl-cookbook-smoke-daemon-{port}", daemon=True)
+    thread.start()
+
+    client = Client(f"http://127.0.0.1:{port}", api_token=app.api_token)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if errors:
+            raise RuntimeError("cookbook smoke daemon failed to start") from errors[0]
+        try:
+            client.health()
+            return stop_event, thread, errors
+        except Exception:
+            time.sleep(0.05)
+
+    stop_event.set()
+    thread.join(timeout=2.0)
+    raise TimeoutError("cookbook smoke daemon did not start")
+
+
 @pytest.fixture(scope="module")
-def client() -> SPLClient:
-    candidate = SPLClient()
+def client(tmp_path_factory: pytest.TempPathFactory) -> Iterator[SPLClient]:
+    home = tmp_path_factory.mktemp("cookbook-smoke-daemon")
+    store = RegistryStore(home)
+    app = create_app(store, api_token="cookbook-smoke-token")
+    port = _free_local_port()
+    stop_event, thread, errors = _serve_app_in_thread(app, port)
     try:
-        candidate.health()
-    except Exception:  # noqa: BLE001 - any transport error means "no daemon"
-        pytest.skip("local daemon is not running (start it: spl-daemon serve)")
-    return candidate
+        yield SPLClient(base_url=f"http://127.0.0.1:{port}", api_token=app.api_token)
+    finally:
+        stop_event.set()
+        thread.join(timeout=2.0)
+        app.runtime.shutdown()
+        store.close()
+        if errors:
+            raise RuntimeError("cookbook smoke daemon failed") from errors[0]
 
 
 def test_offline_listings_never_raise(client: SPLClient) -> None:
@@ -134,6 +200,34 @@ def test_catalog_prints_compactly(client: SPLClient) -> None:
     # never a raw transport dump.
     assert len(text) < 200 * (len(table) + 3), "objects() repr must stay tabular"
     assert "yaml" not in text, "objects() repr must not leak object bodies"
+
+
+def test_cache_warming_recipe_is_safe_without_server(client: SPLClient) -> None:
+    """Cookbook cache-warming recipe: offline exits; online plans before batch."""
+
+    connection = client.current_server_connection()
+    if not connection.get("connected"):
+        server_objects = client.objects(scope="server")
+        assert list(server_objects) == []
+        return
+
+    plan = client.pull_all(dry_run=True)
+    assert {"objects_seen", "pulled", "skipped", "failed", "ambiguous_names"} <= set(plan)
+
+    server_objects = client.objects(scope="server")
+    if not server_objects:
+        return
+
+    first = server_objects[0]
+    library = first.get("library")
+    if isinstance(library, dict):
+        library = library.get("slug") or library.get("name") or library.get("display_name")
+    receipt = client.pull(
+        first["name"],
+        owner=first.get("owner_id"),
+        library=library if isinstance(library, str) else None,
+    )
+    assert {"pulled", "skipped", "failed", "ambiguous_names"} <= set(receipt)
 
 
 def test_converter_node_recipe_warns_then_runs() -> None:

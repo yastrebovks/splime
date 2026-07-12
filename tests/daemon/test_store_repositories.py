@@ -152,6 +152,7 @@ def test_repositories_are_directly_usable_behind_facade(tmp_path) -> None:
         signature = store.libraries.save_remote_signature(
             {
                 "server_url": "https://splime.io/api",
+                "owner_id": "owner-1",
                 "object_name": "demo_obj",
                 "library": "research",
             },
@@ -172,13 +173,33 @@ def test_repositories_are_directly_usable_behind_facade(tmp_path) -> None:
             store.get_remote_signature(
                 {
                     "server_url": "https://splime.io/api",
+                    "owner_id": "owner-1",
                     "object_name": "demo_obj",
                     "library": "research",
                 }
             )
             == signature
         )
-        assert store.current_server_connection()["id"] == connection["id"]
+        assert store.get_server_connection(connection["id"]) == connection
+        assert store.current_server_connection() is None
+    finally:
+        store.close()
+
+
+def test_remote_signature_cache_ref_requires_owner_id(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    ownerless_ref = {
+        "server_url": "https://splime.io/api",
+        "object_name": "demo_obj",
+        "library": "research",
+    }
+    try:
+        with pytest.raises(ValueError, match="cache ref must carry owner_id"):
+            store.remote_signature_key_for(ownerless_ref)
+        with pytest.raises(ValueError, match="cache ref must carry owner_id"):
+            store.get_remote_signature(ownerless_ref)
+        with pytest.raises(ValueError, match="cache ref must carry owner_id"):
+            store.libraries.save_remote_signature(ownerless_ref, {"inputs": [], "outputs": []})
     finally:
         store.close()
 

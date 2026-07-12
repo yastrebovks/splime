@@ -23,8 +23,11 @@ from spl.core.entities.node import DEFAULT_PORT
 from spl.core.entities.node_function import NodeFunction
 from spl.core.ir.utils import spl_export_to_file
 from spl.daemon.environment import EnvironmentBuildError
+from spl.daemon.heartbeat_service import HeartbeatService
+from spl.daemon.remote_client import ServerClientError
 from spl.daemon.server import DaemonRuntime, create_app
-from spl.daemon.store import RegistryStore, utc_now
+from spl.daemon.storage_base import json_dumps
+from spl.daemon.store import DEFAULT_OBJECT_OWNER_ID, RegistryStore, utc_now
 from spl.daemon import worker as worker_module
 from spl.daemon.worker import ARTIFACT_REF_KEY, WorkerNodeEnvironmentProvider, run_pipeline
 
@@ -56,6 +59,19 @@ REMOTE_FUNCTION_YAML = """\
   body: |-
     return 1
 """
+
+
+def _remote_function_yaml(name: str, value: int) -> str:
+    return """\
+- !DFunction
+  name: {name}
+  inputs: []
+  outputs:
+  - name: default
+    type: int
+  body: |-
+    return {value}
+""".format(name=name, value=value)
 
 
 def _worker_final_png() -> bytes:
@@ -325,6 +341,543 @@ def _post_json_from_app(app: Any, path: str, payload: dict[str, Any]) -> tuple[i
 def _shutdown_app(app: Any) -> None:
     if app is not None:
         app.runtime.shutdown()
+
+
+def _save_connected_server_connection(store: RegistryStore) -> dict[str, Any]:
+    return store.save_server_connection(
+        server_url="https://splime.io/api",
+        token="machine-token-123456",
+        user_token="user-token-123456",
+        connection={
+            "id": "remote-connection-1",
+            "owner_id": "owner-1",
+            "subject_type": "machine",
+            "subject_id": "machine-1",
+            "machine_id": "machine-1",
+            "display_name": "lab-machine",
+            "status": "connected",
+            "capabilities": {},
+        },
+        heartbeat_interval_seconds=60,
+    )
+
+
+def _save_connected_owner(
+    store: RegistryStore,
+    *,
+    owner_id: str,
+    connection_id: str,
+    heartbeat_interval_seconds: float = 60,
+) -> dict[str, Any]:
+    return store.save_server_connection(
+        server_url="https://splime.io/api",
+        token=f"machine-token-{owner_id}",
+        user_token=f"user-token-{owner_id}",
+        connection={
+            "id": f"remote-{connection_id}",
+            "owner_id": owner_id,
+            "subject_type": "machine",
+            "subject_id": "machine-1",
+            "machine_id": "machine-1",
+            "display_name": "lab-machine",
+            "status": "connected",
+            "capabilities": {},
+        },
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
+    )
+
+
+def _mark_current_server_channel_live(runtime: DaemonRuntime) -> None:
+    runtime.heartbeat_service.shutdown()
+    credentials = runtime.store.current_server_connection_credentials()
+    assert credentials is not None
+    runtime.store.record_server_connection_heartbeat(
+        credentials["id"],
+        remote_connection={
+            "id": credentials["remote_connection_id"],
+            "owner_id": credentials["owner_id"],
+            "subject_type": credentials["subject_type"],
+            "subject_id": credentials["subject_id"],
+            "machine_id": credentials["machine_id"],
+            "display_name": credentials["display_name"],
+            "capabilities": credentials.get("capabilities") or {},
+            "status": "connected",
+            "heartbeat_interval_seconds": credentials["heartbeat_interval_seconds"],
+        },
+    )
+    runtime._mark_server_channel_success(runtime.store.get_server_connection_credentials(credentials["id"]))
+
+
+class _CapturingSyncServerClient:
+    calls: list[dict[str, Any]] = []
+
+    def __init__(
+        self,
+        base_url: str,
+        machine_token: str,
+        *,
+        user_token: str | None = None,
+        request_timeout_seconds: float | None = None,
+    ) -> None:
+        self.base_url = base_url
+        self.machine_token = machine_token
+        self.user_token = user_token
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.calls = []
+
+    def latest_machine_library_snapshot(self, machine_id: str) -> dict[str, Any] | None:
+        _ = machine_id
+        return {}
+
+    def sync(
+        self,
+        *,
+        connection_id: str,
+        machine_id: str,
+        heartbeat_interval_seconds: float,
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        self.calls.append(
+            {
+                "connection_id": connection_id,
+                "machine_id": machine_id,
+                "heartbeat_interval_seconds": heartbeat_interval_seconds,
+                "events": events,
+            }
+        )
+        return {
+            "event_results": [
+                {
+                    "event_id": event["id"],
+                    "status": "ok",
+                }
+                for event in events
+            ],
+            "jobs": [],
+        }
+
+
+class _OwnerSignatureServerClient:
+    calls: list[dict[str, Any]] = []
+
+    def __init__(
+        self,
+        base_url: str,
+        machine_token: str,
+        *,
+        user_token: str | None = None,
+        request_timeout_seconds: float | None = None,
+    ) -> None:
+        self.base_url = base_url
+        self.machine_token = machine_token
+        self.user_token = user_token
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.calls = []
+
+    def object_signature(
+        self,
+        object_name: str,
+        *,
+        version: int | None = None,
+        owner_id: str | None = None,
+        library: str | None = None,
+        function: str | None = None,
+    ) -> dict[str, Any]:
+        if owner_id is None:
+            raise AssertionError("remote signature server calls must be owner-concrete")
+        self.calls.append(
+            {
+                "object_name": object_name,
+                "version": version,
+                "owner_id": owner_id,
+                "library": library,
+                "function": function,
+            }
+        )
+        return {
+            "id": f"remote-object-{owner_id}",
+            "version_id": f"remote-version-{owner_id}-1",
+            "owner_id": owner_id,
+            "kind": "function",
+            "inputs": [{"name": f"{owner_id}_amount", "type": "int"}],
+            "outputs": [{"name": "default", "type": "int"}],
+        }
+
+
+def test_sync_flush_holds_events_for_other_identities_until_matching_owner(tmp_path, caplog) -> None:
+    store = RegistryStore(tmp_path)
+    runtime = None
+    _CapturingSyncServerClient.reset()
+    try:
+        event_a = store.enqueue_sync_event("object_version", {"name": "a_only", "owner_id": "owner-a"})
+        event_b = store.enqueue_sync_event("object_version", {"name": "b_only", "owner_id": "owner-b"})
+        _save_connected_owner(store, owner_id="owner-b", connection_id="connection-b")
+        runtime = DaemonRuntime(
+            store,
+            heartbeat_service=_NoopHeartbeats(),
+            server_client_factory=_CapturingSyncServerClient,
+        )
+        _mark_current_server_channel_live(runtime)
+
+        with caplog.at_level(logging.INFO, logger=daemon_server.LOGGER.name):
+            runtime.sync_once()
+
+        first_events = [
+            event for event in _CapturingSyncServerClient.calls[-1]["events"] if event["kind"] == "object_version"
+        ]
+        assert [event["id"] for event in first_events] == [event_b["id"]]
+        assert store.get_sync_event(event_a["id"])["status"] == "pending"
+        assert store.get_sync_event(event_b["id"])["status"] == "sent"
+        assert "held for another identity" in caplog.text
+
+        summary = store.server_connection_summary()
+        assert summary["held_sync_events"] == 1
+        current_connection = store.current_server_connection()
+        connections = store.list_server_connections()
+        current_row = next(row for row in connections if row["id"] == current_connection["id"])
+        assert current_row["held_sync_events"] == 1
+
+        _save_connected_owner(store, owner_id="owner-a", connection_id="connection-a")
+        _mark_current_server_channel_live(runtime)
+        runtime.sync_once()
+
+        second_events = [
+            event for event in _CapturingSyncServerClient.calls[-1]["events"] if event["kind"] == "object_version"
+        ]
+        assert [event["id"] for event in second_events] == [event_a["id"]]
+        assert store.get_sync_event(event_a["id"])["status"] == "sent"
+    finally:
+        if runtime is not None:
+            runtime.shutdown()
+        store.close()
+
+
+def test_sync_flush_adopts_legacy_pre_enrollment_events_under_current_owner(tmp_path, caplog) -> None:
+    store = RegistryStore(tmp_path)
+    runtime = None
+    _CapturingSyncServerClient.reset()
+    try:
+        ownerless = store.enqueue_sync_event("object_version", {"name": "legacy_ownerless"})
+        placeholder = store.enqueue_sync_event(
+            "object_version",
+            {"name": "local_placeholder", "owner_id": DEFAULT_OBJECT_OWNER_ID},
+        )
+        _save_connected_owner(store, owner_id="owner-a", connection_id="connection-a")
+        runtime = DaemonRuntime(
+            store,
+            heartbeat_service=_NoopHeartbeats(),
+            server_client_factory=_CapturingSyncServerClient,
+        )
+        _mark_current_server_channel_live(runtime)
+
+        with caplog.at_level(logging.INFO, logger=daemon_server.LOGGER.name):
+            runtime.sync_once()
+
+        sent = [event for event in _CapturingSyncServerClient.calls[-1]["events"] if event["kind"] == "object_version"]
+        assert [event["id"] for event in sent] == [ownerless["id"], placeholder["id"]]
+        assert [event["payload"]["owner_id"] for event in sent] == ["owner-a", "owner-a"]
+        assert store.get_sync_event(ownerless["id"])["status"] == "sent"
+        assert store.get_sync_event(placeholder["id"])["status"] == "sent"
+        assert "adopted 2 pre-enrollment events as owner-a" in caplog.text
+    finally:
+        if runtime is not None:
+            runtime.shutdown()
+        store.close()
+
+
+def test_sync_opens_circuit_and_next_non_probe_sync_fails_fast(tmp_path) -> None:
+    class FailingSyncServerClient:
+        calls = 0
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def latest_machine_library_snapshot(self, machine_id: str) -> dict[str, Any]:
+            return {}
+
+        def sync(self, **kwargs: Any) -> dict[str, Any]:
+            type(self).calls += 1
+            raise ServerClientError(502, "closed port")
+
+    store = RegistryStore(tmp_path)
+    runtime = None
+    try:
+        _save_connected_owner(store, owner_id="owner-a", connection_id="connection-a")
+        runtime = DaemonRuntime(
+            store,
+            heartbeat_service=_NoopHeartbeats(),
+            server_client_factory=FailingSyncServerClient,
+        )
+        _mark_current_server_channel_live(runtime)
+
+        with pytest.raises(ServerClientError):
+            runtime.sync_once()
+        retry = runtime.sync_once()
+
+        assert FailingSyncServerClient.calls == 1
+        assert retry["connected"] is False
+        assert retry["offline"] is True
+        assert retry["code"] == "central_server_unreachable"
+    finally:
+        if runtime is not None:
+            runtime.shutdown()
+        store.close()
+
+
+def test_offline_heartbeat_preserves_identity_row_and_secrets_across_restarts(tmp_path) -> None:
+    class UnreachableHeartbeatServerClient:
+        sync_calls = 0
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def latest_machine_library_snapshot(self, machine_id: str) -> dict[str, Any]:
+            return {}
+
+        def sync(self, **kwargs: Any) -> dict[str, Any]:
+            type(self).sync_calls += 1
+            raise ServerClientError(502, "closed port")
+
+    store = RegistryStore(tmp_path)
+    runtime = None
+    try:
+        original = _save_connected_owner(
+            store,
+            owner_id="ky-monetech.mx",
+            connection_id="monetech",
+            heartbeat_interval_seconds=0.01,
+        )
+        original_credentials = store.get_server_connection_credentials(original["id"])
+
+        for _ in range(3):
+            store.close()
+            store = RegistryStore(tmp_path)
+            runtime = DaemonRuntime(
+                store,
+                heartbeat_service=_NoopHeartbeats(),
+                server_client_factory=UnreachableHeartbeatServerClient,
+            )
+            credentials = store.current_server_connection_credentials()
+            assert credentials is not None
+            stop_event = threading.Event()
+            tick_count = 0
+
+            def heartbeat_sync_once(**kwargs: Any) -> dict[str, Any]:
+                nonlocal tick_count
+                tick_count += 1
+                if tick_count >= 2:
+                    stop_event.set()
+                return runtime.sync_once(**kwargs)
+
+            HeartbeatService(store, heartbeat_sync_once)._server_heartbeat_loop(
+                credentials["id"],
+                credentials["token"],
+                stop_event,
+            )
+            runtime.shutdown()
+            runtime = None
+
+            current = store.current_server_connection()
+            credentials = store.current_server_connection_credentials()
+            machine_identity = json.loads((tmp_path / "server-machine-identity.json").read_text(encoding="utf-8"))
+
+            assert tick_count == 2
+            assert current is not None
+            assert current["id"] == original["id"]
+            assert current["owner_id"] == "ky-monetech.mx"
+            assert current["status"] == "heartbeat_failed"
+            assert credentials is not None
+            assert credentials["id"] == original["id"]
+            assert credentials["owner_id"] == "ky-monetech.mx"
+            assert credentials["token"] == original_credentials["token"]
+            assert credentials["user_token"] == original_credentials["user_token"]
+            assert len(store.list_server_connections()) == 1
+            assert machine_identity == {"machine_id": "machine-1"}
+    finally:
+        if runtime is not None:
+            runtime.shutdown()
+        store.close()
+
+
+def test_run_update_sync_kick_does_not_block_local_run_path(tmp_path) -> None:
+    class BlockingRunUpdateServerClient:
+        started = threading.Event()
+        release = threading.Event()
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def latest_machine_library_snapshot(self, machine_id: str) -> dict[str, Any]:
+            return {}
+
+        def sync(self, **kwargs: Any) -> dict[str, Any]:
+            type(self).started.set()
+            type(self).release.wait(timeout=5)
+            raise ServerClientError(502, "closed port")
+
+    store = RegistryStore(tmp_path)
+    runtime = None
+    try:
+        connection = _save_connected_owner(store, owner_id="owner-a", connection_id="connection-a")
+        runtime = DaemonRuntime(
+            store,
+            heartbeat_service=_NoopHeartbeats(),
+            server_client_factory=BlockingRunUpdateServerClient,
+        )
+        _mark_current_server_channel_live(runtime)
+
+        started = time.monotonic()
+        runtime._send_server_run_update(connection["id"], run_id="run-1", status="succeeded")
+        elapsed = time.monotonic() - started
+
+        pending = store.list_pending_sync_events()
+        assert elapsed < 2.0
+        assert BlockingRunUpdateServerClient.started.wait(timeout=2)
+        assert len(pending) == 1
+        assert pending[0]["kind"] == "run_update"
+        assert pending[0]["payload"]["owner_id"] == "owner-a"
+    finally:
+        BlockingRunUpdateServerClient.release.set()
+        if runtime is not None:
+            runtime.shutdown()
+        store.close()
+
+
+def test_remote_signature_cache_misses_after_identity_switch_between_same_bare_name(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    runtime = None
+    _OwnerSignatureServerClient.reset()
+    try:
+        _save_connected_owner(store, owner_id="owner-a", connection_id="connection-a")
+        runtime = DaemonRuntime(
+            store,
+            heartbeat_service=_NoopHeartbeats(),
+            server_client_factory=_OwnerSignatureServerClient,
+        )
+        _mark_current_server_channel_live(runtime)
+
+        owner_a_signature = runtime.resolve_remote_signature({"url": "https://splime.io/api", "name": "clean_amount"})
+
+        assert owner_a_signature["inputs"] == [{"name": "owner-a_amount", "type": "int"}]
+        assert [call["owner_id"] for call in _OwnerSignatureServerClient.calls] == ["owner-a"]
+
+        _save_connected_owner(store, owner_id="owner-b", connection_id="connection-b")
+        _mark_current_server_channel_live(runtime)
+
+        owner_b_signature = runtime.resolve_remote_signature({"url": "https://splime.io/api", "name": "clean_amount"})
+
+        assert owner_b_signature["inputs"] == [{"name": "owner-b_amount", "type": "int"}]
+        assert [call["owner_id"] for call in _OwnerSignatureServerClient.calls] == ["owner-a", "owner-b"]
+        cached_by_owner = {row["owner_id"]: row for row in store.list_remote_signatures()}
+        assert cached_by_owner["owner-a"]["signature"]["inputs"] == [{"name": "owner-a_amount", "type": "int"}]
+        assert cached_by_owner["owner-b"]["signature"]["inputs"] == [{"name": "owner-b_amount", "type": "int"}]
+
+        _save_connected_owner(store, owner_id="owner-a", connection_id="connection-a-latest")
+        _mark_current_server_channel_live(runtime)
+        call_count = len(_OwnerSignatureServerClient.calls)
+
+        owner_a_cached = runtime.resolve_remote_signature({"url": "https://splime.io/api", "name": "clean_amount"})
+
+        assert owner_a_cached["inputs"] == [{"name": "owner-a_amount", "type": "int"}]
+        assert len(_OwnerSignatureServerClient.calls) == call_count
+    finally:
+        if runtime is not None:
+            runtime.shutdown()
+        store.close()
+
+
+def test_remote_signature_cache_ignores_legacy_ownerless_rows(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    runtime = None
+    _OwnerSignatureServerClient.reset()
+    try:
+        legacy_ref = {
+            "server_url": "https://splime.io/api",
+            "owner_id": None,
+            "library": None,
+            "object_name": "clean_amount",
+            "function": None,
+            "version": None,
+            "version_id": None,
+        }
+        legacy_key = hashlib.sha256(json_dumps(legacy_ref).encode("utf-8")).hexdigest()
+        now = utc_now()
+        with store._lock, store._conn:  # noqa: SLF001 - seed a pre-I-03 ownerless cache row.
+            store._conn.execute(
+                """
+                INSERT INTO remote_signatures(
+                    id, server_url, owner_id, library, object_name, version, version_id,
+                    signature_json, status, error, fetched_at, created_at, updated_at
+                )
+                VALUES(?, ?, NULL, NULL, ?, NULL, NULL, ?, 'resolved', NULL, ?, ?, ?)
+                """,
+                (
+                    legacy_key,
+                    legacy_ref["server_url"],
+                    legacy_ref["object_name"],
+                    json_dumps({"inputs": [{"name": "legacy_amount", "type": "int"}], "outputs": []}),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        _save_connected_owner(store, owner_id="owner-b", connection_id="connection-b")
+        runtime = DaemonRuntime(
+            store,
+            heartbeat_service=_NoopHeartbeats(),
+            server_client_factory=_OwnerSignatureServerClient,
+        )
+        _mark_current_server_channel_live(runtime)
+
+        signature = runtime.resolve_remote_signature({"url": "https://splime.io/api", "name": "clean_amount"})
+
+        assert signature["inputs"] == [{"name": "owner-b_amount", "type": "int"}]
+        assert [call["owner_id"] for call in _OwnerSignatureServerClient.calls] == ["owner-b"]
+        rows = store.list_remote_signatures()
+        assert any(row["owner_id"] is None for row in rows)
+        assert store.get_remote_signature(
+            {
+                "server_url": "https://splime.io/api",
+                "owner_id": "owner-b",
+                "object_name": "clean_amount",
+            }
+        )["signature"]["inputs"] == [{"name": "owner-b_amount", "type": "int"}]
+    finally:
+        if runtime is not None:
+            runtime.shutdown()
+        store.close()
+
+
+def test_local_run_update_payload_includes_object_owner_id(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    runtime = None
+    try:
+        store.register_env("default", sys.executable)
+        record = store.register_object(
+            "owned_runner",
+            "demo_obj",
+            "default",
+            yaml_text=REMOTE_FUNCTION_YAML,
+            owner_id="owner-a",
+            library="default",
+        )
+        run = store.create_run(
+            "owned_runner",
+            object_version_id=record["version_id"],
+        )
+        runtime = DaemonRuntime(store, heartbeat_service=_NoopHeartbeats())
+
+        payload = runtime._local_run_sync_payload(run)  # noqa: SLF001 - I-02 payload identity regression.
+
+        assert payload["owner_id"] == "owner-a"
+    finally:
+        if runtime is not None:
+            runtime.shutdown()
+        store.close()
 
 
 class _FakeDockerEnvironmentManager:
@@ -2077,6 +2630,7 @@ def test_remote_import_mirrors_server_versions_with_source_identity(
             heartbeat_interval_seconds=60,
         )
         runtime = DaemonRuntime(store)
+        _mark_current_server_channel_live(runtime)
 
         imported = runtime.import_server_object("demo_obj")
 
@@ -2215,6 +2769,7 @@ def test_remote_import_auto_registers_missing_server_env(
             heartbeat_interval_seconds=60,
         )
         runtime = DaemonRuntime(store, heartbeat_service=_NoopHeartbeats())
+        _mark_current_server_channel_live(runtime)
 
         imported = runtime.import_server_object("demo_obj")
 
@@ -2222,6 +2777,402 @@ def test_remote_import_auto_registers_missing_server_env(
         assert imported["current_version"]["env"] == "spl_core"
         assert store.get_env("spl_core")["python"] == default_env["python"]
     finally:
+        store.close()
+
+
+def _remote_version(
+    name: str,
+    *,
+    version: int,
+    value: int,
+    owner_id: str = "owner-1",
+    library: str = "default",
+    object_id: str = "remote-object-1",
+    version_id: str | None = None,
+    content_hash: str | None = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "id": object_id,
+        "owner_id": owner_id,
+        "library": library,
+        "name": name,
+        "version": version,
+        "version_id": version_id or f"{object_id}-version-{version}",
+        "entrypoint": name,
+        "env": "default",
+        "description": f"{name} v{version}",
+        "version_label": f"v{version}",
+        "yaml": _remote_function_yaml(name, value),
+    }
+    if content_hash is not None:
+        record["content_hash"] = content_hash
+    return record
+
+
+class _PullServerClient:
+    def __init__(
+        self,
+        versions: list[dict[str, Any]],
+        *,
+        catalog: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.versions = versions
+        self.catalog = catalog
+        self.list_objects_calls: list[dict[str, Any]] = []
+        self.get_object_calls: list[dict[str, Any]] = []
+        self.list_object_versions_calls: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _public_record(record: dict[str, Any], *, include_yaml: bool) -> dict[str, Any]:
+        payload = dict(record)
+        if not include_yaml:
+            payload.pop("yaml", None)
+        return payload
+
+    @staticmethod
+    def _matches(
+        record: dict[str, Any],
+        name_or_id: str,
+        *,
+        owner_id: str | None,
+        library: str | None,
+    ) -> bool:
+        if name_or_id not in {record.get("name"), record.get("id")}:
+            return False
+        if owner_id is not None and record.get("owner_id") != owner_id:
+            return False
+        if library is not None and record.get("library") != library:
+            return False
+        return True
+
+    def _matching_versions(
+        self,
+        name_or_id: str,
+        *,
+        owner_id: str | None,
+        library: str | None,
+    ) -> list[dict[str, Any]]:
+        return [
+            record for record in self.versions if self._matches(record, name_or_id, owner_id=owner_id, library=library)
+        ]
+
+    def _latest_catalog_records(self) -> list[dict[str, Any]]:
+        latest: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for record in self.versions:
+            key = (
+                str(record.get("owner_id") or ""),
+                str(record.get("library") or ""),
+                str(record.get("name") or ""),
+            )
+            if key not in latest or int(record.get("version") or 0) > int(latest[key].get("version") or 0):
+                latest[key] = record
+        return list(latest.values())
+
+    def list_objects(
+        self,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+        compact: bool = False,
+    ) -> list[dict[str, Any]]:
+        self.list_objects_calls.append({"owner_id": owner_id, "library": library, "compact": compact})
+        records = self.catalog if self.catalog is not None else self._latest_catalog_records()
+        return [
+            self._public_record(record, include_yaml=False)
+            for record in records
+            if (owner_id is None or record.get("owner_id") == owner_id)
+            and (library is None or record.get("library") == library)
+        ]
+
+    def get_object(
+        self,
+        name_or_id: str,
+        *,
+        version: int | None = None,
+        include_yaml: bool = False,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        self.get_object_calls.append(
+            {
+                "name_or_id": name_or_id,
+                "version": version,
+                "include_yaml": include_yaml,
+                "owner_id": owner_id,
+                "library": library,
+            }
+        )
+        matches = self._matching_versions(name_or_id, owner_id=owner_id, library=library)
+        if version is not None:
+            matches = [record for record in matches if int(record.get("version") or 0) == int(version)]
+        if not matches:
+            raise KeyError(f"server object is not registered: {name_or_id}")
+        record = max(matches, key=lambda item: int(item.get("version") or 0))
+        return self._public_record(record, include_yaml=include_yaml)
+
+    def list_object_versions(
+        self,
+        name_or_id: str,
+        *,
+        include_yaml: bool = False,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> list[dict[str, Any]]:
+        self.list_object_versions_calls.append(
+            {
+                "name_or_id": name_or_id,
+                "include_yaml": include_yaml,
+                "owner_id": owner_id,
+                "library": library,
+            }
+        )
+        return [
+            self._public_record(record, include_yaml=include_yaml)
+            for record in sorted(
+                self._matching_versions(name_or_id, owner_id=owner_id, library=library),
+                key=lambda item: int(item.get("version") or 0),
+                reverse=True,
+            )
+        ]
+
+
+def test_pull_server_object_by_bare_name_imports_latest_skips_repeat_and_runs_locally(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    runtime: DaemonRuntime | None = None
+    try:
+        store.register_env("default", sys.executable)
+        _save_connected_server_connection(store)
+        server = _PullServerClient(
+            [
+                _remote_version(
+                    "remote_calc",
+                    version=2,
+                    value=7,
+                    object_id="remote-object-calc",
+                    version_id="remote-version-calc-2",
+                )
+            ]
+        )
+        runtime = DaemonRuntime(
+            store,
+            heartbeat_service=_NoopHeartbeats(),
+            server_client_factory=lambda *args, **kwargs: server,
+        )
+        _mark_current_server_channel_live(runtime)
+
+        receipt = runtime.pull_server_object("remote_calc")
+        repeat = runtime.pull_server_object("remote_calc")
+        record = store.get_object("remote_calc", owner_id="owner-1", library="default")
+        build = _mark_object_environment_ready(runtime, record)
+        started = runtime.start_run(
+            "remote_calc",
+            source="local",
+            report_local_run=False,
+            timeout_seconds=30,
+        )
+        final = _wait_for_run(store, started["id"])
+
+        assert receipt == {
+            "pulled": ["owner-1/default/remote_calc@v2"],
+            "skipped": [],
+            "failed": [],
+            "ambiguous_names": [],
+        }
+        assert repeat["pulled"] == []
+        assert repeat["skipped"] == ["owner-1/default/remote_calc@v2"]
+        assert repeat["failed"] == []
+        assert repeat["ambiguous_names"] == []
+        assert server.list_objects_calls == [
+            {"owner_id": None, "library": None, "compact": True},
+            {"owner_id": None, "library": None, "compact": True},
+        ]
+        assert record["origin"] == "server"
+        assert record["source_owner_id"] == "owner-1"
+        assert record["source_object_id"] == "remote-object-calc"
+        assert record["remote_identity"]["source_version_id"] == "remote-version-calc-2"
+        assert final["status"] == "succeeded"
+        assert final["env_build_hash"] == build["spec_hash"]
+        assert final["result"]["result"] == 7
+    finally:
+        if runtime is not None:
+            runtime.shutdown()
+        store.close()
+
+
+def test_pull_server_object_scoped_all_versions_reports_new_local_ambiguity(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    runtime: DaemonRuntime | None = None
+    try:
+        store.register_env("default", sys.executable)
+        server = _PullServerClient(
+            [
+                _remote_version(
+                    "demo_obj",
+                    version=1,
+                    value=1,
+                    library="risk",
+                    object_id="remote-object-risk",
+                    version_id="remote-version-risk-1",
+                ),
+                _remote_version(
+                    "demo_obj",
+                    version=2,
+                    value=2,
+                    library="risk",
+                    object_id="remote-object-risk",
+                    version_id="remote-version-risk-2",
+                ),
+            ]
+        )
+        runtime = DaemonRuntime(
+            store,
+            heartbeat_service=_NoopHeartbeats(),
+            server_client_factory=lambda *args, **kwargs: server,
+        )
+        runtime.register_object(
+            "demo_obj",
+            "demo_obj",
+            "default",
+            yaml_text=REMOTE_FUNCTION_YAML,
+            owner_id="owner-1",
+            library="default",
+        )
+        _save_connected_server_connection(store)
+        _mark_current_server_channel_live(runtime)
+
+        receipt = runtime.pull_server_object(
+            "demo_obj",
+            owner_id="owner-1",
+            library="risk",
+            all_versions=True,
+        )
+        versions = store.list_object_versions("demo_obj", owner_id="owner-1", library="risk")
+
+        assert receipt == {
+            "pulled": ["owner-1/risk/demo_obj@v1", "owner-1/risk/demo_obj@v2"],
+            "skipped": [],
+            "failed": [],
+            "ambiguous_names": ["demo_obj"],
+        }
+        assert server.list_objects_calls == []
+        assert server.list_object_versions_calls == [
+            {
+                "name_or_id": "demo_obj",
+                "include_yaml": False,
+                "owner_id": "owner-1",
+                "library": "risk",
+            }
+        ]
+        assert [item["version"] for item in versions] == [2, 1]
+        assert {item["origin"] for item in versions} == {"server"}
+    finally:
+        if runtime is not None:
+            runtime.shutdown()
+        store.close()
+
+
+def test_pull_server_object_ambiguous_bare_name_lists_server_candidates(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    runtime: DaemonRuntime | None = None
+    try:
+        _save_connected_server_connection(store)
+        server = _PullServerClient(
+            [],
+            catalog=[
+                _remote_version("order_pipeline", version=10, value=10, library="default"),
+                _remote_version("order_pipeline", version=1, value=1, library="risk"),
+            ],
+        )
+        runtime = DaemonRuntime(
+            store,
+            heartbeat_service=_NoopHeartbeats(),
+            server_client_factory=lambda *args, **kwargs: server,
+        )
+        _mark_current_server_channel_live(runtime)
+
+        with pytest.raises(ValueError) as exc_info:
+            runtime.pull_server_object("order_pipeline")
+
+        message = str(exc_info.value)
+        assert "'order_pipeline' is not registered locally" in message
+        assert "default (owner owner-1, v10)" in message
+        assert "risk (owner owner-1, v1)" in message
+        assert "client.pull('order_pipeline', library='...')" in message
+        assert server.get_object_calls == []
+    finally:
+        if runtime is not None:
+            runtime.shutdown()
+        store.close()
+
+
+def test_pull_server_object_requires_server_connection(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    runtime: DaemonRuntime | None = None
+    try:
+        runtime = DaemonRuntime(store, heartbeat_service=_NoopHeartbeats())
+
+        with pytest.raises(KeyError) as exc_info:
+            runtime.pull_server_object("demo_obj")
+
+        message = str(exc_info.value)
+        assert "pull requires a server connection" in message
+        assert "no server connection" in message
+        assert "connect_server" in message
+        assert "client.pull" in message
+    finally:
+        if runtime is not None:
+            runtime.shutdown()
+        store.close()
+
+
+def test_pull_server_object_does_not_overwrite_local_origin_on_matching_content(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    runtime: DaemonRuntime | None = None
+    try:
+        store.register_env("default", sys.executable)
+        server_holder: dict[str, _PullServerClient] = {}
+        runtime = DaemonRuntime(
+            store,
+            heartbeat_service=_NoopHeartbeats(),
+            server_client_factory=lambda *args, **kwargs: server_holder["server"],
+        )
+        local = runtime.register_object(
+            "demo_obj",
+            "demo_obj",
+            "default",
+            yaml_text=REMOTE_FUNCTION_YAML,
+            owner_id="owner-1",
+            library="default",
+        )
+        _save_connected_server_connection(store)
+        _mark_current_server_channel_live(runtime)
+        server_holder["server"] = _PullServerClient(
+            [
+                _remote_version(
+                    "demo_obj",
+                    version=3,
+                    value=1,
+                    object_id="remote-object-local-content",
+                    version_id="remote-version-local-content-3",
+                    content_hash=local["content_hash"],
+                )
+            ]
+        )
+
+        receipt = runtime.pull_server_object("demo_obj", owner_id="owner-1", library="default")
+        current = store.get_object("demo_obj", owner_id="owner-1", library="default")
+
+        assert receipt == {
+            "pulled": [],
+            "skipped": ["owner-1/default/demo_obj@v3"],
+            "failed": [],
+            "ambiguous_names": [],
+        }
+        assert current["origin"] == "local"
+        assert current["remote_identity"]["source_version_id"] == "remote-version-local-content-3"
+    finally:
+        if runtime is not None:
+            runtime.shutdown()
         store.close()
 
 

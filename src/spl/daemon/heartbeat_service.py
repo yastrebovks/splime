@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from typing import Any, Callable
 
+from spl.daemon.repositories.server_connection import SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
 from spl.daemon.remote_client import ServerClientError
 from spl.daemon.store import RegistryStore
 
@@ -27,7 +28,7 @@ class HeartbeatService:
         """Resume heartbeat loop for a persisted active connection, if present."""
 
         credentials = self.store.current_server_connection_credentials()
-        if credentials is not None:
+        if credentials is not None and credentials.get("status") != SERVER_CONNECTION_STATUS_NEEDS_RECONNECT:
             self.start_server_heartbeat(credentials, token=credentials["token"])
 
     def start_server_heartbeat(
@@ -90,26 +91,60 @@ class HeartbeatService:
 
         first_tick = True
         while not stop_event.is_set():
-            credentials = self.store.get_server_connection_credentials(connection_id)
+            try:
+                credentials = self.store.get_server_connection_credentials(connection_id)
+            except RuntimeError as exc:
+                if self._store_closed(exc):
+                    return
+                raise
             interval = float(credentials["heartbeat_interval_seconds"])
             if not first_tick and stop_event.wait(interval):
                 return
             first_tick = False
 
             try:
-                self.sync_once(connection_id=connection_id)
+                self.sync_once(connection_id=connection_id, probe_server_channel=True)
             except ServerClientError as exc:
-                status = "stale" if exc.status_code in {401, 403, 404, 409} else "heartbeat_failed"
-                self.store.record_server_connection_error(
+                lease_rejected = exc.status_code in {401, 403, 404, 409}
+                status = SERVER_CONNECTION_STATUS_NEEDS_RECONNECT if lease_rejected else "heartbeat_failed"
+                error = (
+                    f"lease rejected by server ({exc.status_code}): {exc.message}" if lease_rejected else exc.message
+                )
+                if not self._record_heartbeat_error(
                     connection_id,
                     status=status,
-                    error=exc.message,
-                )
-                if status == "stale":
+                    error=error,
+                ):
+                    return
+                if lease_rejected:
                     return
             except Exception as exc:
-                self.store.record_server_connection_error(
+                if not self._record_heartbeat_error(
                     connection_id,
                     status="heartbeat_failed",
                     error=repr(exc),
-                )
+                ):
+                    return
+
+    def _record_heartbeat_error(
+        self,
+        connection_id: str,
+        *,
+        status: str,
+        error: str,
+    ) -> bool:
+        try:
+            self.store.record_server_connection_error(
+                connection_id,
+                status=status,
+                error=error,
+            )
+        except RuntimeError as exc:
+            if self._store_closed(exc):
+                return False
+            raise
+        return True
+
+    @staticmethod
+    def _store_closed(exc: RuntimeError) -> bool:
+        return str(exc) == "store is closed"

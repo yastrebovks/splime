@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from spl.daemon.storage_base import (
+    DEFAULT_OBJECT_OWNER_ID,
     RepositoryBase,
     json_dumps,
     json_loads,
@@ -47,18 +48,61 @@ class SyncEventRepository(RepositoryBase):
             raise KeyError(f"sync event is not found: {event_id}")
         return self._sync_event_row(row)
 
-    def list_pending_sync_events(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list_pending_sync_events(self, limit: int | None = 100) -> list[dict[str, Any]]:
+        limit_clause = "" if limit is None else "LIMIT ?"
+        args: tuple[Any, ...] = () if limit is None else (limit,)
         with self._lock:
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT * FROM sync_events
                 WHERE status IN ('pending', 'failed')
                 ORDER BY created_at
-                LIMIT ?
+                {limit_clause}
                 """,
-                (limit,),
+                args,
             ).fetchall()
         return [self._sync_event_row(row) for row in rows]
+
+    def pending_sync_event_identity_summary(
+        self,
+        current_owner_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return owner-routing counts for retryable sync events.
+
+        Events from the pre-enrollment namespace are adoptable by the next
+        flush.  Events owned by a different real owner stay pending until the
+        daemon reconnects under that identity.
+        """
+
+        current_owner_id = str(current_owner_id) if current_owner_id else None
+        by_owner: dict[str, int] = {}
+        pre_enrollment = 0
+        held = 0
+        held_owners: set[str] = set()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT payload_json
+                FROM sync_events
+                WHERE status IN ('pending', 'failed')
+                """
+            ).fetchall()
+        for row in rows:
+            payload = json_loads(row["payload_json"], {})
+            owner_id = self._payload_owner_id(payload)
+            if owner_id is None or owner_id == DEFAULT_OBJECT_OWNER_ID:
+                pre_enrollment += 1
+                continue
+            by_owner[owner_id] = by_owner.get(owner_id, 0) + 1
+            if current_owner_id is not None and owner_id != current_owner_id:
+                held += 1
+                held_owners.add(owner_id)
+        return {
+            "by_owner": by_owner,
+            "pre_enrollment": pre_enrollment,
+            "held_for_other_identities": held,
+            "held_owner_ids": sorted(held_owners),
+        }
 
     def mark_sync_event_sent(self, event_id: str) -> dict[str, Any]:
         event_id = validate_name(event_id)
@@ -115,3 +159,12 @@ class SyncEventRepository(RepositoryBase):
                 "last_error": row["error"],
             },
         }
+
+    def _payload_owner_id(self, payload: dict[str, Any]) -> str | None:
+        owner_id = payload.get("owner_id")
+        if owner_id is None and isinstance(payload.get("run"), dict):
+            owner_id = payload["run"].get("owner_id")
+        if owner_id is None:
+            return None
+        owner_text = str(owner_id)
+        return owner_text or None

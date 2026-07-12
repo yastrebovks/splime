@@ -5,7 +5,6 @@ from __future__ import annotations
 from http import HTTPStatus
 from typing import Any
 
-from spl.daemon.remote_client import ServerClientError
 from spl.daemon.routes._helpers import RouteContext, RouteRegistrar
 from spl.daemon.signature import build_signature, summarize_object
 from spl.daemon.store import validate_name
@@ -31,10 +30,32 @@ def register_object_routes(
             "yes",
         }
         return json_response(
-            server.list_objects(
+            await context.run_blocking(
+                server.list_objects,
                 owner_id=context.first_query_value("owner", "owner_id"),
                 library=context.first_query_value("library"),
                 compact=view == "summary" or compact,
+            )
+        )
+
+    @app.post("/server-objects/pull")
+    @route_errors
+    async def pull_server_object() -> Any:
+        body = await context.read_json_body()
+        name = body.get("name") or body.get("object_name")
+        if name is None or str(name) == "":
+            raise ValueError("name is required")
+        raw_version = body.get("version")
+        version = None if raw_version is None or raw_version == "" else int(raw_version)
+        return json_response(
+            await context.run_blocking(
+                runtime.pull_server_object,
+                validate_name(str(name)),
+                version=version,
+                owner_id=body.get("owner_id") or body.get("owner"),
+                library=body.get("library"),
+                all_versions=str(body.get("all_versions", "")).strip().lower() in {"1", "true", "yes", "on"},
+                dry_run=str(body.get("dry_run", "")).strip().lower() in {"1", "true", "yes", "on"},
             )
         )
 
@@ -83,7 +104,7 @@ def register_object_routes(
             "yes",
         }
         return json_response(
-            context.object_from_local_or_server(
+            await context.object_from_local_or_server_async(
                 validate_name(name_or_id),
                 include_yaml=include_yaml,
             )
@@ -116,7 +137,7 @@ def register_object_routes(
     @route_errors
     async def object_signature(name_or_id: str) -> Any:
         object_name, function = context.object_function_ref(name_or_id)
-        record = context.object_from_local_or_server(
+        record = await context.object_from_local_or_server_async(
             object_name,
             include_yaml=False,
         )
@@ -125,7 +146,7 @@ def register_object_routes(
     @app.get("/objects/<name_or_id>/decomposition")
     @route_errors
     async def object_decomposition(name_or_id: str) -> Any:
-        record = context.object_from_local_or_server(
+        record = await context.object_from_local_or_server_async(
             validate_name(name_or_id),
             include_yaml=False,
         )
@@ -135,7 +156,7 @@ def register_object_routes(
     @route_errors
     async def object_inputs(name_or_id: str) -> Any:
         object_name, function = context.object_function_ref(name_or_id)
-        record = context.object_from_local_or_server(
+        record = await context.object_from_local_or_server_async(
             object_name,
             include_yaml=False,
         )
@@ -145,7 +166,7 @@ def register_object_routes(
     @route_errors
     async def object_outputs(name_or_id: str) -> Any:
         object_name, function = context.object_function_ref(name_or_id)
-        record = context.object_from_local_or_server(
+        record = await context.object_from_local_or_server_async(
             object_name,
             include_yaml=False,
         )
@@ -156,7 +177,8 @@ def register_object_routes(
     async def list_object_versions(name_or_id: str) -> Any:
         owner_id = context.first_query_value("owner", "owner_id")
         library = context.first_query_value("library")
-        refresh = runtime.refresh_server_object_if_available(
+        refresh = await context.run_blocking(
+            runtime.refresh_server_object_if_available,
             validate_name(name_or_id),
             owner_id=owner_id,
             library=library,
@@ -214,9 +236,7 @@ def register_object_routes(
                 create_library=create_library,
                 library_display_name=(body.get("library_display_name") or body.get("library_name")),
             )
-            try:
-                record["sync"] = runtime.sync_once()
-            except ServerClientError as exc:
-                record["sync_error"] = exc.message
+            record["sync"] = runtime._local_sync_status()
+            runtime._kick_server_sync()
         record["environment_build"] = runtime.prepare_object_environment(record)
         return json_response(record, HTTPStatus.CREATED)

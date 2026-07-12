@@ -22,6 +22,7 @@ class LibraryRepository(RepositoryBase):
         """Return a stable cache key for one remote object reference."""
 
         normalized = self._normalize_remote_signature_ref(ref)
+        self._require_remote_signature_owner(normalized)
         return hashlib.sha256(json_dumps(normalized).encode("utf-8")).hexdigest()
 
     def get_remote_signature(self, ref: dict[str, Any]) -> dict[str, Any] | None:
@@ -158,3 +159,8 @@ class LibraryRepository(RepositoryBase):
             "version": normalized_version,
             "version_id": normalized_version_id,
         }
+
+    @staticmethod
+    def _require_remote_signature_owner(ref: dict[str, Any]) -> None:
+        if not ref.get("owner_id"):
+            raise ValueError("cache ref must carry owner_id")

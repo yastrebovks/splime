@@ -21,6 +21,7 @@ Endpoints:
     POST /remote-signatures/resolve
     POST /remote-decompositions/resolve
     POST /remote-nodes/run
+    POST /server-objects/pull
     GET  /server/connection
     GET  /server/libraries
     POST /server/libraries
@@ -107,6 +108,8 @@ from spl.daemon.runtime_dependencies import (
 )
 from spl.daemon.server_connection import (
     SERVER_OFFLINE_MESSAGE,
+    SERVER_PROXY_TIMEOUT_SECONDS,
+    SERVER_UNREACHABLE_CODE,
     ServerConnectionManager,
     ServerOfflineError,
 )
@@ -151,6 +154,8 @@ DEFAULT_INLINE_REMOTE_ARTIFACT_TOTAL_MAX_BYTES = int(
         str(20 * 1024 * 1024),
     )
 )
+SERVER_CHANNEL_MIN_LIVENESS_WINDOW_SECONDS = 5.0
+SERVER_CHANNEL_LIVENESS_MULTIPLIER = 2.0
 LOGGER = logging.getLogger(__name__)
 
 
@@ -220,8 +225,16 @@ def _default_server_client_factory(
     machine_token: str,
     *,
     user_token: str | None = None,
+    request_timeout_seconds: float | None = None,
 ) -> ServerClientProtocol:
-    return ServerClient(base_url, machine_token, user_token=user_token)
+    client_kwargs: dict[str, Any] = {"user_token": user_token}
+    if request_timeout_seconds is not None:
+        client_kwargs["request_timeout_seconds"] = request_timeout_seconds
+    return ServerClient(
+        base_url,
+        machine_token,
+        **client_kwargs,
+    )
 
 
 def _default_server_connection_manager_factory(
@@ -304,6 +317,9 @@ class DaemonRuntime:
         self.runtime_backends = runtime_backends or runtime_backend_registry_factory(backend_services)
         self.sync_visibility = sync_visibility or sync_visibility_factory(store)
         self._server_sync_lock = threading.Lock()
+        self._server_channel_lock = threading.Lock()
+        self._server_channel_success_at: dict[str, float] = {}
+        self._server_channel_failed: set[str] = set()
         self._run_threads_lock = threading.Lock()
         self._run_threads: list[threading.Thread] = []
         self._shutdown_lock = threading.Lock()
@@ -322,18 +338,121 @@ class DaemonRuntime:
         token: str,
         *,
         user_token: str | None,
+        request_timeout_seconds: float | None = None,
     ) -> ServerClientProtocol:
         return self.server_connections.server_client(
             server_url,
             token,
             user_token=user_token,
+            request_timeout_seconds=request_timeout_seconds,
         )
 
     def _server_client_for_credentials(
         self,
         credentials: dict[str, Any],
+        *,
+        request_timeout_seconds: float | None = None,
     ) -> ServerClientProtocol:
-        return self.server_connections.server_client_for_credentials(credentials)
+        return self.server_connections.server_client_for_credentials(
+            credentials,
+            request_timeout_seconds=request_timeout_seconds,
+        )
+
+    @staticmethod
+    def _server_channel_key(credentials: dict[str, Any]) -> str:
+        return str(credentials.get("id") or credentials.get("remote_connection_id") or "")
+
+    @staticmethod
+    def _server_channel_window_seconds(credentials: dict[str, Any]) -> float:
+        try:
+            interval = float(credentials.get("heartbeat_interval_seconds") or 0)
+        except (TypeError, ValueError):
+            interval = 0.0
+        return max(
+            SERVER_CHANNEL_MIN_LIVENESS_WINDOW_SECONDS,
+            interval * SERVER_CHANNEL_LIVENESS_MULTIPLIER,
+        )
+
+    def _mark_server_channel_success(self, credentials: dict[str, Any]) -> None:
+        key = self._server_channel_key(credentials)
+        if not key:
+            return
+        with self._server_channel_lock:
+            self._server_channel_success_at[key] = time.monotonic()
+            self._server_channel_failed.discard(key)
+
+    def _mark_server_channel_failure(self, credentials: dict[str, Any] | None) -> None:
+        if credentials is None:
+            return
+        key = self._server_channel_key(credentials)
+        if not key:
+            return
+        with self._server_channel_lock:
+            self._server_channel_success_at.pop(key, None)
+            self._server_channel_failed.add(key)
+
+    def _mark_current_server_channel_failure(self) -> None:
+        self._mark_server_channel_failure(self.store.current_server_connection_credentials())
+
+    def _server_channel_is_live(self, credentials: dict[str, Any] | None) -> bool:
+        """Return true only for a recently proven central-server channel.
+
+        Stored identity rows remain valid offline, but a persisted
+        ``status='connected'`` row is not proof that the TCP channel is live
+        after a daemon restart or network loss.  The circuit closes only after
+        a successful connect/sync heartbeat in this process and opens on the
+        first connectivity failure.
+        """
+
+        if credentials is None:
+            return False
+        if not credentials.get("remote_connection_id") or credentials.get("status") != "connected":
+            return False
+        key = self._server_channel_key(credentials)
+        if not key:
+            return False
+        with self._server_channel_lock:
+            if key in self._server_channel_failed:
+                return False
+            success_at = self._server_channel_success_at.get(key)
+        if success_at is None:
+            return False
+        return time.monotonic() - success_at <= self._server_channel_window_seconds(credentials)
+
+    def _require_live_server_channel_credentials(
+        self,
+        credentials: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        credentials = self._require_connected_server_credentials(credentials)
+        if not self._server_channel_is_live(credentials):
+            raise ServerOfflineError(
+                SERVER_OFFLINE_MESSAGE,
+                code=SERVER_UNREACHABLE_CODE,
+            )
+        return credentials
+
+    def _local_sync_status(self) -> dict[str, Any]:
+        credentials = self.store.current_server_connection_credentials()
+        live = self._server_channel_is_live(credentials)
+        status = {
+            "connected": live,
+            "offline": credentials is not None and not live,
+            "event_results": [],
+            "jobs": [],
+            "sync": self.sync_visibility.summary(),
+        }
+        if credentials is not None and not live:
+            status["error"] = SERVER_OFFLINE_MESSAGE
+            status["code"] = SERVER_UNREACHABLE_CODE
+        return status
+
+    @staticmethod
+    def _pull_requires_server_connection_message() -> str:
+        return (
+            "pull requires a server connection; the daemon has no server connection. "
+            "Reconnect with client.connect_server(...) to search the server catalog, "
+            "then retry client.pull(...)."
+        )
 
     def connect_server(
         self,
@@ -360,9 +479,18 @@ class DaemonRuntime:
         if not result.get("reused") and result.get("connection") is not None:
             self.start_server_heartbeat(result["connection"], token=machine_token)
         connection = result.get("connection") or {}
+        network_verified = bool(result.get("refreshed") or not result.get("reused"))
         if connection.get("owner_id") and connection.get("remote_connection_id"):
             credentials = self.store.get_server_connection_credentials(connection["id"])
-            result["reconcile"] = self.reconcile_connected_objects(credentials)
+            if network_verified:
+                self._mark_server_channel_success(credentials)
+            if self._server_channel_is_live(credentials):
+                result["reconcile"] = self.reconcile_connected_objects(credentials)
+            else:
+                result["reconcile"] = {
+                    "skipped": True,
+                    "reason": "server_channel_not_live",
+                }
         return result
 
     def _matching_server_connection(
@@ -511,7 +639,12 @@ class DaemonRuntime:
         """Link local objects to the connected owner's server namespace."""
 
         credentials = credentials or self.store.current_server_connection_credentials()
-        if credentials is None or not credentials.get("remote_connection_id") or not credentials.get("owner_id"):
+        if (
+            credentials is None
+            or not credentials.get("remote_connection_id")
+            or not credentials.get("owner_id")
+            or credentials.get("status") != "connected"
+        ):
             return {"skipped": True, "reason": "not_connected"}
 
         owner_id = validate_name(str(credentials["owner_id"]))
@@ -897,6 +1030,17 @@ class DaemonRuntime:
             or credentials.get("status") != "connected"
         ):
             return
+        if not self._server_channel_is_live(credentials):
+            LOGGER.info(
+                "skipping server identity adoption for %s: server channel is not live",
+                name,
+                extra={
+                    "spl_event": "server_identity_adoption_skipped_offline",
+                    "object": name,
+                    "connection_id": credentials.get("id"),
+                },
+            )
+            return
 
         owner_id = validate_name(str(kwargs.get("owner_id") or credentials["owner_id"]))
         library = validate_name(str(kwargs.get("library") or DEFAULT_OBJECT_LIBRARY))
@@ -913,7 +1057,10 @@ class DaemonRuntime:
         except KeyError:
             pass
 
-        server = self._server_client_for_credentials(credentials)
+        server = self._server_client_for_credentials(
+            credentials,
+            request_timeout_seconds=SERVER_PROXY_TIMEOUT_SECONDS,
+        )
         try:
             remote_current = server.get_object(
                 object_name,
@@ -923,6 +1070,19 @@ class DaemonRuntime:
             )
         except ServerClientError as exc:
             if exc.status_code == 404:
+                return
+            if self._is_server_connectivity_error(exc):
+                self._mark_server_channel_failure(credentials)
+                LOGGER.info(
+                    "skipping server identity adoption for %s: server channel failed",
+                    name,
+                    extra={
+                        "spl_event": "server_identity_adoption_skipped_offline",
+                        "object": name,
+                        "connection_id": credentials.get("id"),
+                        "error": exc.message,
+                    },
+                )
                 return
             raise
 
@@ -947,17 +1107,23 @@ class DaemonRuntime:
         """
 
         normalized = self._normalize_remote_ref(ref)
-        cached = self.store.get_remote_signature(normalized)
+        cache_ref = self._remote_signature_cache_ref(normalized)
+        cached = self.store.get_remote_signature(cache_ref) if cache_ref.get("owner_id") else None
         if cached is not None and cached["status"] == "resolved" and not force:
             return cast(dict[str, Any], cached["signature"])
 
+        credentials: dict[str, Any] | None = None
         try:
             credentials = self._credentials_for_remote_ref(normalized)
-            server = self._server_client_for_credentials(credentials)
+            cache_ref = self._remote_signature_cache_ref(normalized, credentials=credentials)
+            server = self._server_client_for_credentials(
+                credentials,
+                request_timeout_seconds=SERVER_PROXY_TIMEOUT_SECONDS,
+            )
             signature = server.object_signature(
                 normalized["object_name"],
                 version=self._remote_ref_version(normalized),
-                owner_id=normalized.get("owner_id"),
+                owner_id=cache_ref.get("owner_id"),
                 library=normalized.get("library"),
                 function=normalized.get("function"),
             )
@@ -967,13 +1133,16 @@ class DaemonRuntime:
                 "function": normalized.get("function"),
                 "requested_version": normalized.get("version"),
                 "version_id": signature.get("version_id"),
-                "owner_id": signature.get("owner_id"),
+                "owner_id": signature.get("owner_id") or cache_ref.get("owner_id"),
                 "library": normalized.get("library") or (signature.get("library") or {}).get("slug"),
             }
-            self.store.save_remote_signature(normalized, signature)
+            self.store.save_remote_signature(cache_ref, signature)
             return signature
         except Exception as exc:
-            self.store.mark_remote_signature_unavailable(normalized, repr(exc))
+            if isinstance(exc, ServerClientError) and self._is_server_connectivity_error(exc):
+                self._mark_server_channel_failure(credentials)
+            if cache_ref.get("owner_id"):
+                self.store.mark_remote_signature_unavailable(cache_ref, repr(exc))
             if cached is not None and cached.get("signature"):
                 signature = dict(cached["signature"])
                 signature["cache_status"] = "stale"
@@ -981,19 +1150,36 @@ class DaemonRuntime:
                 return signature
             raise
 
+    def remote_signature_cache_record(self, ref: dict[str, Any]) -> dict[str, Any] | None:
+        """Return the owner-concrete remote signature cache row for diagnostics."""
+
+        normalized = self._normalize_remote_ref(ref)
+        cache_ref = self._remote_signature_cache_ref(normalized)
+        if not cache_ref.get("owner_id"):
+            return None
+        return self.store.get_remote_signature(cache_ref)
+
     def resolve_remote_decomposition(self, ref: dict[str, Any]) -> dict[str, Any]:
         """Resolve a remote object graph through the connected central server."""
 
         normalized = self._normalize_remote_ref(ref)
         credentials = self._credentials_for_remote_ref(normalized)
-        server = self._server_client_for_credentials(credentials)
-        record = server.get_object(
-            normalized["object_name"],
-            version=self._remote_ref_version(normalized),
-            include_yaml=False,
-            owner_id=normalized.get("owner_id"),
-            library=normalized.get("library"),
+        server = self._server_client_for_credentials(
+            credentials,
+            request_timeout_seconds=SERVER_PROXY_TIMEOUT_SECONDS,
         )
+        try:
+            record = server.get_object(
+                normalized["object_name"],
+                version=self._remote_ref_version(normalized),
+                include_yaml=False,
+                owner_id=normalized.get("owner_id"),
+                library=normalized.get("library"),
+            )
+        except ServerClientError as exc:
+            if self._is_server_connectivity_error(exc):
+                self._mark_server_channel_failure(credentials)
+            raise
         return {
             "decomposition": record.get("decomposition") or {},
             "object": record,
@@ -1035,6 +1221,26 @@ class DaemonRuntime:
             "version_id": ref.get("version_id"),
             "target_machine": ref.get("target_machine") or ref.get("target_machine_id"),
         }
+
+    def _remote_signature_cache_ref(
+        self,
+        ref: dict[str, Any],
+        *,
+        credentials: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return the owner-concrete ref used for remote signature cache IO."""
+
+        if ref.get("owner_id"):
+            return ref
+        credentials = credentials if credentials is not None else self.store.current_server_connection_credentials()
+        if credentials is None:
+            return ref
+        if credentials.get("server_url", "").rstrip("/") != ref["server_url"].rstrip("/"):
+            return ref
+        owner_id = credentials.get("owner_id")
+        if not owner_id:
+            return ref
+        return {**ref, "owner_id": str(owner_id)}
 
     def _split_remote_url(self, raw_url: str) -> tuple[str, str | None, str | None]:
         """Extract optional owner/library from NodeRemote.url.
@@ -1080,6 +1286,11 @@ class DaemonRuntime:
                 "or run"
             )
         credentials = self._require_connected_server_credentials(credentials)
+        if not self._server_channel_is_live(credentials):
+            raise ServerOfflineError(
+                SERVER_OFFLINE_MESSAGE,
+                code=SERVER_UNREACHABLE_CODE,
+            )
         if credentials["server_url"].rstrip("/") != ref["server_url"].rstrip("/"):
             raise KeyError(
                 f"remote node points to a different server than the active daemon connection: {ref['server_url']}"
@@ -1122,7 +1333,7 @@ class DaemonRuntime:
         """Create a server-side run through the next sync handshake."""
 
         object_name, function = split_object_function_ref(object_name, function)
-        credentials = self._require_connected_server_credentials()
+        credentials = self._require_live_server_channel_credentials()
         resolved_offline_policy = offline_policy or (
             "fail_fast" if target_machine and target_machine != credentials["machine_id"] else "queue"
         )
@@ -1177,7 +1388,10 @@ class DaemonRuntime:
     ) -> None:
         """Fail before queueing when the caller expects an immediate remote result."""
 
-        server = self._server_client_for_credentials(credentials)
+        server = self._server_client_for_credentials(
+            credentials,
+            request_timeout_seconds=SERVER_PROXY_TIMEOUT_SECONDS,
+        )
         machines = server.list_machines()
         machine = next((item for item in machines if item.get("id") == target_machine), None)
         if machine is None:
@@ -1191,6 +1405,252 @@ class DaemonRuntime:
             "client.submit(..., offline_policy='queue') to register the task "
             "and poll it later."
         )
+
+    @staticmethod
+    def _server_record_string(value: Any, *keys: str) -> str | None:
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, dict):
+            for key in keys:
+                item = value.get(key)
+                if item is not None and str(item):
+                    return str(item)
+        return None
+
+    @classmethod
+    def _server_record_names(cls, record: dict[str, Any]) -> set[str]:
+        names = {record.get("display_name"), record.get("name"), record.get("object_name")}
+        return {str(name) for name in names if isinstance(name, str) and name}
+
+    @classmethod
+    def _server_record_owner(cls, record: dict[str, Any]) -> str | None:
+        return cls._server_record_string(record.get("owner_id")) or cls._server_record_string(
+            record.get("owner"),
+            "id",
+            "owner_id",
+            "name",
+        )
+
+    @classmethod
+    def _server_record_library(cls, record: dict[str, Any]) -> str | None:
+        return cls._server_record_string(record.get("library"), "slug", "name", "display_name")
+
+    @classmethod
+    def _server_record_version(cls, record: dict[str, Any]) -> str | None:
+        current = record.get("current_version")
+        if isinstance(current, dict):
+            for key in ("version", "number", "label", "name"):
+                value = current.get(key)
+                if value is not None and str(value):
+                    return str(value)
+        for key in ("version", "version_label"):
+            value = record.get(key)
+            if value is not None and str(value):
+                return str(value)
+        return None
+
+    @classmethod
+    def _server_candidate_label(cls, record: dict[str, Any]) -> str:
+        library = cls._server_record_library(record) or "<unknown library>"
+        owner = cls._server_record_owner(record)
+        version = cls._server_record_version(record)
+        details = []
+        if owner is not None:
+            details.append("owner {}".format(owner))
+        if version is not None:
+            details.append("v{}".format(version))
+        return "{} ({})".format(library, ", ".join(details)) if details else library
+
+    def _resolve_pull_server_ref(
+        self,
+        server: ServerClientProtocol,
+        name: str,
+        *,
+        owner_id: str | None,
+        library: str | None,
+    ) -> tuple[str, str | None, str | None]:
+        if owner_id is not None or library is not None:
+            return name, owner_id, library
+        candidates = [
+            record
+            for record in server.list_objects(compact=True)
+            if isinstance(record, dict) and name in self._server_record_names(record)
+        ]
+        if len(candidates) == 1:
+            record = candidates[0]
+            return (
+                self._server_record_string(record.get("name")) or name,
+                self._server_record_owner(record),
+                self._server_record_library(record),
+            )
+        if candidates:
+            choices = ", ".join(self._server_candidate_label(record) for record in candidates)
+            raise ValueError(
+                "{!r} is not registered locally; found on the server in: {}. "
+                "Pass library=... and owner=... to disambiguate, for example "
+                "client.pull({!r}, library='...').".format(name, choices, name)
+            )
+        raise KeyError(
+            "{!r} is not registered locally; no accessible server object named {!r}. "
+            "Run client.objects(scope='server') to inspect the accessible catalog, or pass "
+            "owner=... and library=... if you know the server scope.".format(name, name)
+        )
+
+    def _remote_version_ref(
+        self,
+        remote_version: dict[str, Any],
+        *,
+        fallback_owner_id: str | None,
+        fallback_library: str | None,
+        fallback_name: str,
+    ) -> str:
+        owner_id = self._server_version_owner_id(remote_version, fallback_owner_id)
+        library = self._server_version_library(remote_version, fallback_library)
+        name = validate_name(str(remote_version.get("name") or fallback_name))
+        version = int(remote_version.get("version") or 0)
+        return f"{owner_id}/{library}/{name}@v{version}"
+
+    def _remote_version_is_cached_by_content(
+        self,
+        remote_version: dict[str, Any],
+        *,
+        owner_id: str,
+        library: str,
+        name: str,
+    ) -> bool:
+        remote_hash = remote_version.get("content_hash")
+        if not remote_hash:
+            return False
+        try:
+            local_versions = self.store.list_object_versions(
+                name,
+                owner_id=owner_id,
+                library=library,
+            )
+        except KeyError:
+            return False
+        return any(item.get("content_hash") == remote_hash for item in local_versions)
+
+    def _ambiguous_local_bare_names(self, names: set[str]) -> set[str]:
+        buckets: dict[str, set[str]] = {name: set() for name in names}
+        for identity in self.store.list_object_identities():
+            name = str(identity.get("name") or "")
+            if name in buckets:
+                buckets[name].add(str(identity["canonical_name"]))
+        return {name for name, canonicals in buckets.items() if len(canonicals) > 1}
+
+    def pull_server_object(
+        self,
+        object_name: str,
+        *,
+        version: int | None = None,
+        owner_id: str | None = None,
+        library: str | None = None,
+        all_versions: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Mirror one accessible server object into the local registry."""
+
+        credentials = self.store.current_server_connection_credentials()
+        try:
+            credentials = self._require_live_server_channel_credentials(credentials)
+        except (KeyError, ServerOfflineError) as exc:
+            raise KeyError(self._pull_requires_server_connection_message()) from exc
+
+        server = self._server_client_for_credentials(
+            credentials,
+            request_timeout_seconds=SERVER_PROXY_TIMEOUT_SECONDS,
+        )
+        resolved_name, resolved_owner_id, resolved_library = self._resolve_pull_server_ref(
+            server,
+            validate_name(str(object_name)),
+            owner_id=owner_id,
+            library=library,
+        )
+        before_ambiguous = self._ambiguous_local_bare_names({resolved_name})
+        remote_current = server.get_object(
+            resolved_name,
+            version=version,
+            include_yaml=False,
+            owner_id=resolved_owner_id,
+            library=resolved_library,
+        )
+        remote_object_id = remote_current.get("id")
+        if all_versions:
+            remote_versions = server.list_object_versions(
+                resolved_name,
+                include_yaml=False,
+                owner_id=resolved_owner_id,
+                library=resolved_library,
+            )
+            if not remote_versions:
+                remote_versions = [remote_current]
+        else:
+            remote_versions = [remote_current]
+
+        if not dry_run:
+            self._ensure_server_object_envs(remote_versions)
+        pulled: list[str] = []
+        skipped: list[str] = []
+        failed: list[str] = []
+        imported_names = {resolved_name}
+        for remote_version in sorted(remote_versions, key=lambda item: int(item.get("version") or 0)):
+            remote_name = validate_name(str(remote_version.get("name") or resolved_name))
+            imported_names.add(remote_name)
+            remote_owner_id = self._server_version_owner_id(remote_version, resolved_owner_id)
+            remote_library = self._server_version_library(remote_version, resolved_library)
+            version_ref = self._remote_version_ref(
+                remote_version,
+                fallback_owner_id=resolved_owner_id,
+                fallback_library=resolved_library,
+                fallback_name=resolved_name,
+            )
+            already_imported = False
+            remote_version_id = remote_version.get("version_id")
+            if remote_version_id is not None:
+                already_imported = (
+                    self.store.get_object_by_remote_version(
+                        str(remote_version_id),
+                        include_yaml=False,
+                    )
+                    is not None
+                )
+            if not already_imported:
+                already_imported = self._remote_version_is_cached_by_content(
+                    remote_version,
+                    owner_id=remote_owner_id,
+                    library=remote_library,
+                    name=remote_name,
+                )
+            if dry_run:
+                if already_imported:
+                    skipped.append(version_ref)
+                else:
+                    pulled.append(version_ref)
+                continue
+            try:
+                self._import_reconcile_remote_version(
+                    remote_version,
+                    owner_id=remote_owner_id,
+                    library=remote_library,
+                    remote_object_id=remote_object_id,
+                    server=server,
+                )
+            except Exception:
+                failed.append(version_ref)
+                continue
+            if already_imported:
+                skipped.append(version_ref)
+            else:
+                pulled.append(version_ref)
+
+        after_ambiguous = self._ambiguous_local_bare_names(imported_names)
+        return {
+            "pulled": pulled,
+            "skipped": skipped,
+            "failed": failed,
+            "ambiguous_names": sorted(after_ambiguous - before_ambiguous),
+        }
 
     def import_server_object(
         self,
@@ -1211,9 +1671,12 @@ class DaemonRuntime:
         credentials = self.store.current_server_connection_credentials()
         if credentials is None:
             raise KeyError(f"object is not registered locally and active server connection is not found: {object_name}")
-        credentials = self._require_connected_server_credentials(credentials)
+        credentials = self._require_live_server_channel_credentials(credentials)
 
-        server = self._server_client_for_credentials(credentials)
+        server = self._server_client_for_credentials(
+            credentials,
+            request_timeout_seconds=SERVER_PROXY_TIMEOUT_SECONDS,
+        )
 
         server_scope: dict[str, Any] = {}
         if owner_id is not None:
@@ -1274,25 +1737,13 @@ class DaemonRuntime:
                 imported.append(existing_version)
                 continue
 
-            yaml_text = remote_version.get("yaml")
-            if not yaml_text:
-                raise RuntimeError(f"server did not return YAML for object version {remote_version.get('version_id')}")
             imported.append(
-                self.register_object(
-                    remote_version["name"],
-                    remote_version["entrypoint"],
-                    remote_version.get("env") or "default",
-                    yaml_text=yaml_text,
-                    owner_id=self._server_version_owner_id(remote_version),
-                    library=self._server_version_library(remote_version),
-                    description=remote_version.get("description") or "",
-                    version_label=remote_version.get("version_label"),
-                    origin="server",
-                    remote_owner_id=remote_version.get("owner_id"),
-                    remote_object_id=remote_version.get("id"),
-                    remote_version_id=remote_version.get("version_id"),
-                    source_object_name=remote_version["name"],
-                    runtime_config=remote_version.get("runtime_config"),
+                self._import_reconcile_remote_version(
+                    remote_version,
+                    owner_id=self._server_version_owner_id(remote_version, owner_id),
+                    library=self._server_version_library(remote_version, library),
+                    remote_object_id=remote_version.get("id") or remote_object_id,
+                    server=server,
                 )
             )
 
@@ -1316,12 +1767,12 @@ class DaemonRuntime:
             "refreshed": True,
         }
 
-    def _server_version_owner_id(self, version: dict[str, Any]) -> str:
-        owner_id = version.get("owner_id") or version.get("owner")
+    def _server_version_owner_id(self, version: dict[str, Any], fallback: str | None = None) -> str:
+        owner_id = version.get("owner_id") or version.get("owner") or fallback
         return validate_name(str(owner_id or DEFAULT_OBJECT_OWNER_ID))
 
-    def _server_version_library(self, version: dict[str, Any]) -> str:
-        library = version.get("library_slug") or version.get("library")
+    def _server_version_library(self, version: dict[str, Any], fallback: str | None = None) -> str:
+        library = version.get("library_slug") or version.get("library") or fallback
         if isinstance(library, dict):
             library = library.get("slug") or library.get("name")
         return validate_name(str(library or DEFAULT_OBJECT_LIBRARY))
@@ -1359,6 +1810,10 @@ class DaemonRuntime:
         object, still surface to the caller.
         """
 
+        credentials = self.store.current_server_connection_credentials()
+        if not self._server_channel_is_live(credentials):
+            return None
+
         try:
             return self.import_server_object(
                 object_name,
@@ -1391,6 +1846,7 @@ class DaemonRuntime:
         *,
         connection_id: str | None = None,
         extra_events: list[dict[str, Any]] | None = None,
+        probe_server_channel: bool = False,
     ) -> dict[str, Any]:
         """Exchange pending local events and jobs with the central server."""
 
@@ -1407,12 +1863,24 @@ class DaemonRuntime:
                 "sync": self.sync_visibility.summary(),
             }
 
+        if not probe_server_channel and not self._server_channel_is_live(credentials):
+            return {
+                "connected": False,
+                "offline": True,
+                "event_results": [],
+                "jobs": [],
+                "error": SERVER_OFFLINE_MESSAGE,
+                "code": SERVER_UNREACHABLE_CODE,
+                "sync": self.sync_visibility.summary(),
+            }
+
         if not credentials.get("remote_connection_id"):
             try:
                 credentials = self._restore_pending_server_connection(credentials)
             except ServerClientError as exc:
                 if not self._is_server_connectivity_error(exc):
                     raise
+                self._mark_server_channel_failure(credentials)
                 self.store.record_server_connection_error(
                     credentials["id"],
                     status="connect_failed",
@@ -1427,9 +1895,46 @@ class DaemonRuntime:
                     "detail": exc.message,
                     "sync": self.sync_visibility.summary(),
                 }
+            self._mark_server_channel_success(credentials)
 
         snapshot_hash, manifest_items = self.build_machine_library_snapshot_manifest()
-        pending = self.store.list_pending_sync_events()
+        pending = self.store.list_pending_sync_events(limit=None)
+        credentials_owner_id = str(credentials.get("owner_id") or DEFAULT_OBJECT_OWNER_ID)
+        sendable_pending, held_pending, adopted_count = self._sync_events_for_owner(
+            pending,
+            owner_id=credentials_owner_id,
+        )
+        if adopted_count:
+            LOGGER.info(
+                "adopted %s pre-enrollment events as %s",
+                adopted_count,
+                credentials_owner_id,
+                extra={
+                    "spl_event": "sync_events_adopted",
+                    "sync_event_count": adopted_count,
+                    "owner_id": credentials_owner_id,
+                },
+            )
+        if held_pending:
+            held_owner_ids = sorted(
+                {
+                    owner_id
+                    for event in held_pending
+                    if (owner_id := self._sync_event_owner_id(event.get("payload") or {})) is not None
+                }
+            )
+            LOGGER.info(
+                "held for another identity: %s sync events while connected as %s; event owners: %s",
+                len(held_pending),
+                credentials_owner_id,
+                ", ".join(held_owner_ids) or "unknown",
+                extra={
+                    "spl_event": "sync_events_held_for_another_identity",
+                    "sync_event_count": len(held_pending),
+                    "owner_id": credentials_owner_id,
+                    "held_owner_ids": held_owner_ids,
+                },
+            )
         sync_before = self.sync_visibility.summary(pending)
         snapshot_event = None
 
@@ -1454,25 +1959,36 @@ class DaemonRuntime:
             events = []
             if snapshot_event is not None:
                 events.append(snapshot_event)
-            events.extend([{"id": item["id"], "kind": item["kind"], "payload": item["payload"]} for item in pending])
+            events.extend(
+                [{"id": item["id"], "kind": item["kind"], "payload": item["payload"]} for item in sendable_pending]
+            )
             events.extend(extra_events or [])
 
-            response = server.sync(
-                connection_id=credentials["remote_connection_id"],
-                machine_id=credentials["machine_id"],
-                heartbeat_interval_seconds=float(credentials["heartbeat_interval_seconds"]),
-                events=events,
-            )
+            try:
+                response = server.sync(
+                    connection_id=credentials["remote_connection_id"],
+                    machine_id=credentials["machine_id"],
+                    heartbeat_interval_seconds=float(credentials["heartbeat_interval_seconds"]),
+                    events=events,
+                )
+            except ServerClientError as exc:
+                if self._is_server_connectivity_error(exc):
+                    self._mark_server_channel_failure(credentials)
+                raise
+            except Exception:
+                self._mark_server_channel_failure(credentials)
+                raise
 
         connection = response.get("connection")
         if connection:
-            self.store.record_server_connection_heartbeat(
+            credentials = self.store.record_server_connection_heartbeat(
                 credentials["id"],
                 remote_connection=connection,
             )
+        self._mark_server_channel_success(credentials)
 
         snapshot_event_id = snapshot_event["id"] if snapshot_event is not None else None
-        pending_ids = {item["id"] for item in pending}
+        pending_ids = {item["id"] for item in sendable_pending}
         for result in response.get("event_results", []):
             event_id = result.get("event_id")
             if event_id == snapshot_event_id:
@@ -1499,6 +2015,50 @@ class DaemonRuntime:
             "after": self.sync_visibility.summary(),
         }
         return response
+
+    def _sync_events_for_owner(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        owner_id: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+        sendable: list[dict[str, Any]] = []
+        held: list[dict[str, Any]] = []
+        adopted = 0
+        for event in events:
+            event_owner_id = self._sync_event_owner_id(event.get("payload") or {})
+            if event_owner_id is None or event_owner_id == DEFAULT_OBJECT_OWNER_ID:
+                adopted += 1
+                sendable.append(self._sync_event_with_owner(event, owner_id))
+                continue
+            if event_owner_id == owner_id:
+                sendable.append(event)
+                continue
+            held.append(event)
+        return sendable, held, adopted
+
+    def _sync_event_with_owner(
+        self,
+        event: dict[str, Any],
+        owner_id: str,
+    ) -> dict[str, Any]:
+        payload = dict(event.get("payload") or {})
+        if isinstance(payload.get("run"), dict):
+            run_payload = dict(payload["run"])
+            run_payload["owner_id"] = owner_id
+            payload["run"] = run_payload
+        else:
+            payload["owner_id"] = owner_id
+        return {**event, "payload": payload}
+
+    def _sync_event_owner_id(self, payload: dict[str, Any]) -> str | None:
+        owner_id = payload.get("owner_id")
+        if owner_id is None and isinstance(payload.get("run"), dict):
+            owner_id = payload["run"].get("owner_id")
+        if owner_id is None:
+            return None
+        owner_text = str(owner_id)
+        return owner_text or None
 
     def _server_latest_library_snapshot_hash(
         self,
@@ -1621,21 +2181,25 @@ class DaemonRuntime:
         payload: dict[str, Any] | None = None,
         artifacts: list[dict[str, Any]] | None = None,
     ) -> None:
+        credentials = self.store.get_server_connection_credentials(connection_id)
+        event_payload = {
+            "run_id": run_id,
+            "status": status,
+            "result": result,
+            "error": error,
+            "message": message,
+            "payload": payload or {},
+            "artifacts": artifacts or [],
+        }
+        if credentials.get("owner_id"):
+            event_payload["owner_id"] = credentials["owner_id"]
         event: dict[str, Any] = {
             "id": uuid4().hex,
             "kind": "run_update",
-            "payload": {
-                "run_id": run_id,
-                "status": status,
-                "result": result,
-                "error": error,
-                "message": message,
-                "payload": payload or {},
-                "artifacts": artifacts or [],
-            },
+            "payload": event_payload,
         }
         self.store.enqueue_sync_event(event["kind"], event["payload"])
-        self.sync_once(connection_id=connection_id)
+        self._kick_server_sync(connection_id)
 
     def _wait_local_run(
         self,
@@ -1658,8 +2222,11 @@ class DaemonRuntime:
         *,
         timeout_seconds: float | None,
     ) -> dict[str, Any]:
-        credentials = self._require_connected_server_credentials()
-        server = self._server_client_for_credentials(credentials)
+        credentials = self._require_live_server_channel_credentials()
+        server = self._server_client_for_credentials(
+            credentials,
+            request_timeout_seconds=SERVER_PROXY_TIMEOUT_SECONDS,
+        )
         started = time.monotonic()
         while True:
             state = server.get_remote_run(run_id)
@@ -1910,6 +2477,8 @@ class DaemonRuntime:
         version: int | None = None,
         object_version_id: str | None = None,
         function: str | None = None,
+        object_owner_id: str | None = None,
+        library: str | None = None,
         source: str = "auto",
         report_local_run: bool = True,
         runtimes: dict[str, str] | None = None,
@@ -1926,6 +2495,8 @@ class DaemonRuntime:
             refresh = self.refresh_server_object_if_available(
                 object_name,
                 version=version,
+                owner_id=object_owner_id,
+                library=library,
             )
             if refresh and refresh.get("current_version"):
                 resolved_version_id = refresh["current_version"]["version_id"]
@@ -1940,6 +2511,8 @@ class DaemonRuntime:
                 version=version,
                 object_version_id=resolved_version_id,
                 function=function,
+                owner_id=object_owner_id,
+                library=library,
                 runtimes=runtimes,
                 keep=keep,
             )
@@ -1950,7 +2523,12 @@ class DaemonRuntime:
             # No local fallback exists, so this second import attempt is strict:
             # if the server is unavailable, report that instead of hiding it
             # behind a local "object is not registered" error.
-            imported = self.import_server_object(object_name, version=version)
+            imported = self.import_server_object(
+                object_name,
+                version=version,
+                owner_id=object_owner_id,
+                library=library,
+            )
             resolved_version_id = imported["current_version"]["version_id"]
             state = self.store.create_run(
                 object_name,
@@ -1961,6 +2539,8 @@ class DaemonRuntime:
                 version=version,
                 object_version_id=resolved_version_id,
                 function=function,
+                owner_id=object_owner_id,
+                library=library,
                 runtimes=runtimes,
                 keep=keep,
             )
@@ -2543,9 +3123,15 @@ class DaemonRuntime:
         )
         self._kick_server_sync()
 
-    def _kick_server_sync(self) -> None:
-        credentials = self.store.current_server_connection_credentials()
+    def _kick_server_sync(self, connection_id: str | None = None) -> None:
+        credentials = (
+            self.store.get_server_connection_credentials(connection_id)
+            if connection_id is not None
+            else self.store.current_server_connection_credentials()
+        )
         if credentials is None:
+            return
+        if not self._server_channel_is_live(credentials):
             return
         thread = threading.Thread(
             target=self._sync_once_safely,
@@ -2559,11 +3145,16 @@ class DaemonRuntime:
         try:
             self.sync_once(connection_id=connection_id)
         except Exception as exc:
-            self.store.record_server_connection_error(
-                connection_id,
-                status="heartbeat_failed",
-                error=repr(exc),
-            )
+            try:
+                self._mark_server_channel_failure(self.store.get_server_connection_credentials(connection_id))
+                self.store.record_server_connection_error(
+                    connection_id,
+                    status="heartbeat_failed",
+                    error=repr(exc),
+                )
+            except RuntimeError as store_exc:
+                if str(store_exc) != "store is closed":
+                    raise
 
     def _local_run_sync_payload(self, state: dict[str, Any]) -> dict[str, Any]:
         object_label = self._local_run_object_label(state)
@@ -2575,6 +3166,7 @@ class DaemonRuntime:
             "object_id": state.get("object_id"),
             "object_version_id": state.get("object_version_id"),
             "object_version": state.get("object_version"),
+            "owner_id": object_label.get("owner_id"),
             "remote_object_id": object_label.get("remote_object_id"),
             "remote_version_id": object_label.get("remote_version_id"),
             "entrypoint": state.get("entrypoint"),
@@ -2602,6 +3194,7 @@ class DaemonRuntime:
         label = {
             "display_name": local_name,
             "local_name": local_name,
+            "owner_id": None,
             "remote_object_id": None,
             "remote_version_id": None,
         }
@@ -2618,6 +3211,7 @@ class DaemonRuntime:
         label["display_name"] = display_name
         label["remote_object_id"] = record.get("remote_object_id") or record.get("object_remote_object_id")
         label["remote_version_id"] = record.get("remote_version_id")
+        label["owner_id"] = record.get("owner_id")
         return label
 
     def _local_run_text_artifacts(self, state: dict[str, Any]) -> list[dict[str, Any]]:

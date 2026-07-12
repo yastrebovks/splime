@@ -27,12 +27,11 @@ def register_remote_routes(
         body = await context.read_json_body()
         ref = body.get("ref") or body
         force = bool(body.get("force", False))
-        signature = runtime.resolve_remote_signature(ref, force=force)
-        normalized = runtime._normalize_remote_ref(ref)
+        signature = await context.run_blocking(runtime.resolve_remote_signature, ref, force=force)
         return json_response(
             {
                 "signature": signature,
-                "cache": runtime.store.get_remote_signature(normalized),
+                "cache": runtime.remote_signature_cache_record(ref),
             }
         )
 
@@ -41,14 +40,15 @@ def register_remote_routes(
     async def resolve_remote_decomposition() -> Any:
         body = await context.read_json_body()
         ref = body.get("ref") or body
-        return json_response(runtime.resolve_remote_decomposition(ref))
+        return json_response(await context.run_blocking(runtime.resolve_remote_decomposition, ref))
 
     @app.post("/remote-nodes/run")
     @route_errors
     async def run_remote_node() -> Any:
         body = await context.read_json_body()
         return json_response(
-            runtime.run_remote_node(
+            await context.run_blocking(
+                runtime.run_remote_node,
                 body["node"],
                 kwargs=body.get("kwargs") or {},
                 timeout_seconds=body.get("timeout_seconds"),

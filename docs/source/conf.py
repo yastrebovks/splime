@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.abspath("../../src"))
 project = "splime"
 copyright = "2026, Yastrebov Kirill"
 author = "Yastrebov Kirill"
-release = "0.4.2"
+release = "0.4.3"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -41,7 +41,7 @@ apidoc_modules = [
         "destination": "api",
         # 0.2.0: the implementation lives in private modules (spl._client,
         # spl.core._common); spl.client / spl.core.common are deprecated
-        # warning shims scheduled for removal in 0.4.2.  Document the real
+        # warning shims scheduled for removal in 0.4.3.  Document the real
         # modules and skip the shims so builds stay warning-free.
         "include_private": True,
         "exclude_patterns": [

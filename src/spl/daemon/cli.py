@@ -206,6 +206,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="list stored central-server connection attempts",
     )
     subparsers.add_parser(
+        "connections-list",
+        help="list stored central-server connection attempts",
+    )
+    connections_prune = subparsers.add_parser(
+        "connections-prune",
+        help="prune stale stored central-server connection attempts",
+    )
+    connections_prune.add_argument(
+        "--older-than-days",
+        type=int,
+        default=30,
+        help="also prune stale non-current rows older than this many days",
+    )
+    connections_prune.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show stale rows without deleting them",
+    )
+    subparsers.add_parser(
         "server-machines",
         help="list machines visible to the connected user",
     )
@@ -369,6 +388,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     object_versions.add_argument("name_or_id")
 
+    pull = subparsers.add_parser("pull", help="mirror server objects into the local daemon cache")
+    pull.add_argument("name", nargs="?")
+    pull.add_argument("--all", dest="all_objects", action="store_true")
+    pull.add_argument("--owner", default=None)
+    pull.add_argument("--library", default=None)
+    pull.add_argument("--version", type=int, default=None)
+    pull.add_argument("--all-versions", action="store_true")
+    pull.add_argument("--dry-run", action="store_true")
+
     run = subparsers.add_parser("run", help="start an object run")
     run.add_argument("object")
     run.add_argument("--args", default="[]", help="JSON list of positional args")
@@ -467,7 +495,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Execute the CLI command."""
 
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
     if args.command == "serve":
         try:
@@ -523,8 +552,15 @@ def main(argv: list[str] | None = None) -> int:
             print_json(client.disconnect_server())
         elif args.command == "server-connection":
             print_json(client.server_connection())
-        elif args.command == "server-connections":
+        elif args.command in {"server-connections", "connections-list"}:
             print_json(client.server_connections())
+        elif args.command == "connections-prune":
+            print_json(
+                client.prune_server_connections(
+                    older_than_days=args.older_than_days,
+                    dry_run=args.dry_run,
+                )
+            )
         elif args.command == "server-machines":
             print_json(client.server_machines())
         elif args.command == "env-add":
@@ -601,6 +637,34 @@ def main(argv: list[str] | None = None) -> int:
             print_json(client.outputs(args.name_or_id, version=args.version))
         elif args.command == "object-versions":
             print_json(client.object_versions(args.name_or_id))
+        elif args.command == "pull":
+            if args.all_objects:
+                if args.name is not None:
+                    parser.error("pull --all does not accept a name")
+                if args.version is not None:
+                    parser.error("pull --all does not accept --version")
+                print_json(
+                    client.pull_all_server_objects(
+                        owner_id=args.owner,
+                        library=args.library,
+                        all_versions=args.all_versions,
+                        dry_run=args.dry_run,
+                    )
+                )
+            else:
+                if args.name is None:
+                    parser.error("pull requires a name unless --all is set")
+                if args.dry_run:
+                    parser.error("pull --dry-run requires --all")
+                print_json(
+                    client.pull_server_object(
+                        args.name,
+                        owner_id=args.owner,
+                        library=args.library,
+                        version=args.version,
+                        all_versions=args.all_versions,
+                    )
+                )
         elif args.command == "run":
             positional_args = parse_json_arg(args.args, list)
             keyword_args = parse_json_arg(args.kwargs, dict)

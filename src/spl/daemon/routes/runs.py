@@ -10,6 +10,7 @@ from typing import Any
 from spl.core import manifest as m_manifest
 from spl.daemon.routes._helpers import RouteContext, RouteRegistrar
 from spl.daemon.run_progress import environment_progress, run_observability_progress
+from spl.daemon.server_connection import SERVER_PROXY_TIMEOUT_SECONDS
 from spl.daemon.store import validate_name
 
 
@@ -57,7 +58,8 @@ def register_run_routes(
             raise ValueError("runtimes must be a mapping")
         if body.get("target_machine") or body.get("remote"):
             return json_response(
-                runtime.start_remote_run(
+                await context.run_blocking(
+                    runtime.start_remote_run,
                     body["object"],
                     target_machine=body.get("target_machine"),
                     object_owner_id=body.get("object_owner_id"),
@@ -86,6 +88,8 @@ def register_run_routes(
                 version=body.get("version"),
                 object_version_id=body.get("version_id"),
                 function=body.get("function"),
+                object_owner_id=body.get("object_owner_id"),
+                library=body.get("library"),
                 source=body.get("source", "auto"),
                 runtimes=runtimes,
                 keep=body.get("keep", "on_failure"),
@@ -96,8 +100,16 @@ def register_run_routes(
     @app.get("/remote-runs/<run_id>")
     @route_errors
     async def get_remote_run(run_id: str) -> Any:
-        credentials = runtime._require_connected_server_credentials()
-        return json_response(runtime._server_client_for_credentials(credentials).get_remote_run(validate_name(run_id)))
+        credentials = runtime._require_live_server_channel_credentials()
+        return json_response(
+            await context.run_blocking(
+                runtime._server_client_for_credentials(
+                    credentials,
+                    request_timeout_seconds=SERVER_PROXY_TIMEOUT_SECONDS,
+                ).get_remote_run,
+                validate_name(run_id),
+            )
+        )
 
     @app.get("/runs/<run_id>")
     @route_errors

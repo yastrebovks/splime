@@ -7,6 +7,7 @@ import stat
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -38,6 +39,19 @@ REMOTE_FUNCTION_YAML = """\
   body: |-
     return 1
 """
+
+
+def _remote_function_yaml(name: str, value: int) -> str:
+    return """\
+- !DFunction
+  name: {name}
+  inputs: []
+  outputs:
+  - name: default
+    type: int
+  body: |-
+    return {value}
+""".format(name=name, value=value)
 
 
 PIPELINE_WITH_INTERNAL_FUNCTION_YAML = """\
@@ -339,9 +353,13 @@ def _shutdown_app(app) -> None:
         app.runtime.shutdown()
 
 
-def _save_connected_server_connection(store: RegistryStore) -> dict:
+def _save_connected_server_connection(
+    store: RegistryStore,
+    *,
+    server_url: str = "https://splime.io/api",
+) -> dict:
     return store.save_server_connection(
-        server_url="https://splime.io/api",
+        server_url=server_url,
         token="machine-token-123456",
         user_token="user-token-123456",
         connection={
@@ -358,6 +376,41 @@ def _save_connected_server_connection(store: RegistryStore) -> dict:
     )
 
 
+def _mark_current_server_channel_live(runtime) -> None:
+    runtime.heartbeat_service.shutdown()
+    credentials = runtime.store.current_server_connection_credentials()
+    assert credentials is not None
+    runtime.store.record_server_connection_heartbeat(
+        credentials["id"],
+        remote_connection={
+            "id": credentials["remote_connection_id"],
+            "owner_id": credentials["owner_id"],
+            "subject_type": credentials["subject_type"],
+            "subject_id": credentials["subject_id"],
+            "machine_id": credentials["machine_id"],
+            "display_name": credentials["display_name"],
+            "capabilities": credentials.get("capabilities") or {},
+            "status": "connected",
+            "heartbeat_interval_seconds": credentials["heartbeat_interval_seconds"],
+        },
+    )
+    runtime._mark_server_channel_success(runtime.store.get_server_connection_credentials(credentials["id"]))
+
+
+def _drop_remote_connection_lease(store: RegistryStore, connection_id: str) -> None:
+    with store._lock, store._conn:  # noqa: SLF001 - regression seeds post-restart offline state.
+        store._conn.execute(
+            """
+            UPDATE server_connections
+            SET remote_connection_id = NULL,
+                status = 'connect_failed',
+                error = 'offline after restart'
+            WHERE id = ?
+            """,
+            (connection_id,),
+        )
+
+
 def _reserved_port_with_free_next() -> tuple[socket.socket, int]:
     for port in range(20000, 45000):
         try:
@@ -370,6 +423,14 @@ def _reserved_port_with_free_next() -> tuple[socket.socket, int]:
         except OSError:
             reserved.close()
     raise RuntimeError("could not find a reserved port with a free next port")
+
+
+def _closed_local_server_url() -> str:
+    reserved = socket.socket()
+    reserved.bind(("127.0.0.1", 0))
+    port = reserved.getsockname()[1]
+    reserved.close()
+    return f"http://127.0.0.1:{port}"
 
 
 def _serve_app_in_thread(app, port: int) -> tuple[threading.Event, threading.Thread, list[BaseException]]:
@@ -537,6 +598,142 @@ def test_run_management_cli_commands(monkeypatch, capsys) -> None:
         ("show_run", "run-1", True),
         ("init", None),
         ("prune_runs", "run-1", ["failed"], None, True),
+    ]
+
+
+def test_connection_hygiene_cli_commands(monkeypatch, capsys) -> None:
+    import spl.daemon.cli as cli_module
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, url=None) -> None:
+            calls.append(("init", url))
+
+        def server_connections(self):
+            calls.append(("server_connections",))
+            return [{"id": "connection-1"}]
+
+        def prune_server_connections(self, *, older_than_days=30, dry_run=False):
+            calls.append(("prune_server_connections", older_than_days, dry_run))
+            return {"count": 0, "dry_run": dry_run}
+
+    monkeypatch.setattr(cli_module, "Client", FakeClient)
+
+    assert cli_module.main(["connections-list"]) == 0
+    assert cli_module.main(["connections-prune", "--older-than-days", "7", "--dry-run"]) == 0
+
+    captured = capsys.readouterr()
+    assert '"connection-1"' in captured.out
+    assert '"dry_run": true' in captured.out
+    assert calls == [
+        ("init", None),
+        ("server_connections",),
+        ("init", None),
+        ("prune_server_connections", 7, True),
+    ]
+
+
+def test_pull_cli_command_uses_daemon_pull_endpoint(monkeypatch, capsys) -> None:
+    import spl.daemon.cli as cli_module
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, url=None) -> None:
+            calls.append(("init", url))
+
+        def pull_server_object(
+            self,
+            name,
+            *,
+            owner_id=None,
+            library=None,
+            version=None,
+            all_versions=False,
+        ):
+            calls.append(("pull_server_object", name, owner_id, library, version, all_versions))
+            return {
+                "pulled": ["owner-1/risk/demo_obj@v3"],
+                "skipped": [],
+                "failed": [],
+                "ambiguous_names": [],
+            }
+
+    monkeypatch.setattr(cli_module, "Client", FakeClient)
+
+    assert (
+        cli_module.main(
+            [
+                "pull",
+                "demo_obj",
+                "--owner",
+                "owner-1",
+                "--library",
+                "risk",
+                "--version",
+                "3",
+                "--all-versions",
+            ]
+        )
+        == 0
+    )
+
+    assert '"pulled": [' in capsys.readouterr().out
+    assert calls == [
+        ("init", None),
+        ("pull_server_object", "demo_obj", "owner-1", "risk", 3, True),
+    ]
+
+
+def test_pull_all_cli_command_uses_daemon_pull_all_batch(monkeypatch, capsys) -> None:
+    import spl.daemon.cli as cli_module
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, url=None) -> None:
+            calls.append(("init", url))
+
+        def pull_all_server_objects(
+            self,
+            *,
+            owner_id=None,
+            library=None,
+            all_versions=False,
+            dry_run=False,
+        ):
+            calls.append(("pull_all_server_objects", owner_id, library, all_versions, dry_run))
+            return {
+                "objects_seen": 2,
+                "pulled": ["owner-1/risk/demo_obj@v3"],
+                "skipped": [],
+                "failed": [],
+                "ambiguous_names": [],
+            }
+
+    monkeypatch.setattr(cli_module, "Client", FakeClient)
+
+    assert (
+        cli_module.main(
+            [
+                "pull",
+                "--all",
+                "--owner",
+                "owner-1",
+                "--library",
+                "risk",
+                "--all-versions",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+
+    assert '"objects_seen": 2' in capsys.readouterr().out
+    assert calls == [
+        ("init", None),
+        ("pull_all_server_objects", "owner-1", "risk", True, True),
     ]
 
 
@@ -754,6 +951,33 @@ def test_health_and_diagnostics_include_sync_retry_visibility(tmp_path) -> None:
         store.close()
 
 
+def test_health_and_connections_include_sync_events_held_for_other_identities(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        current = _save_connected_server_connection(store)
+        store.enqueue_sync_event(
+            "object_version",
+            {"name": "foreign_obj", "owner_id": "owner-2"},
+        )
+
+        app = create_app(store)
+        health_status, health = _json_from_app(app, "/health")
+        connections_status, connections = _json_from_app(app, "/server/connections")
+
+        assert health_status == 200
+        assert health["server"]["connection_summary"]["held_sync_events"] == 1
+        assert health["server"]["connection_summary"]["held_sync_event_owner_ids"] == ["owner-2"]
+
+        assert connections_status == 200
+        current_row = next(row for row in connections if row["id"] == current["id"])
+        assert current_row["held_sync_events"] == 1
+        assert current_row["pending_sync_events"] == 0
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
 def test_health_reports_server_origin_interpreter_substitutions(tmp_path) -> None:
     store = RegistryStore(tmp_path)
     app = None
@@ -928,6 +1152,7 @@ def test_signature_imports_server_object_by_display_name(tmp_path, monkeypatch) 
         )
 
         app = create_app(store)
+        _mark_current_server_channel_live(app.runtime)
         status, body = _json_from_app(app, "/objects/demo_obj/signature")
 
         assert status == 200
@@ -976,6 +1201,7 @@ def test_server_objects_are_listed_through_daemon_proxy(tmp_path, monkeypatch) -
         )
 
         app = create_app(store)
+        _mark_current_server_channel_live(app.runtime)
         status, body = _json_from_app(
             app,
             "/server/objects?library=default&view=summary",
@@ -995,9 +1221,542 @@ def test_server_objects_are_listed_through_daemon_proxy(tmp_path, monkeypatch) -
         store.close()
 
 
+def test_pull_server_object_route_returns_pinned_receipt(tmp_path, monkeypatch) -> None:
+    class PullServerClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def list_objects(self, *, owner_id=None, library=None, compact=False):
+            assert owner_id is None
+            assert library is None
+            assert compact is True
+            return [
+                {
+                    "name": "demo_obj",
+                    "library": "default",
+                    "owner_id": "owner-1",
+                    "current_version": {"version": 1},
+                }
+            ]
+
+        def get_object(self, name_or_id, *, version=None, include_yaml=False, owner_id=None, library=None):
+            assert name_or_id == "demo_obj"
+            assert owner_id == "owner-1"
+            assert library == "default"
+            if include_yaml:
+                assert version == 1
+            return {
+                "id": "remote-object-1",
+                "owner_id": "owner-1",
+                "library": "default",
+                "name": "demo_obj",
+                "version": version or 1,
+                "version_id": "remote-version-1",
+                "entrypoint": "demo_obj",
+                "env": "default",
+                "description": "remote demo",
+                "version_label": "v1",
+                **({"yaml": REMOTE_FUNCTION_YAML} if include_yaml else {}),
+            }
+
+    store = RegistryStore(tmp_path)
+    monkeypatch.setattr(daemon_server, "ServerClient", PullServerClient)
+    app = None
+    try:
+        store.register_env("default", sys.executable)
+        _save_connected_server_connection(store)
+        app = create_app(store)
+        _mark_current_server_channel_live(app.runtime)
+
+        status, body = _post_json_from_app(
+            app,
+            "/server-objects/pull",
+            {"name": "demo_obj"},
+        )
+
+        assert status == 200
+        assert body == {
+            "pulled": ["owner-1/default/demo_obj@v1"],
+            "skipped": [],
+            "failed": [],
+            "ambiguous_names": [],
+        }
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_pull_server_object_route_dry_run_does_not_write_local_db(tmp_path, monkeypatch) -> None:
+    class DryRunServerClient:
+        def __init__(self, *args, **kwargs) -> None:
+            self.get_object_calls: list[dict[str, Any]] = []
+
+        def list_objects(self, *, owner_id=None, library=None, compact=False):
+            return [
+                {
+                    "name": "demo_obj",
+                    "library": "default",
+                    "owner_id": "owner-1",
+                    "current_version": {"version": 1},
+                }
+            ]
+
+        def get_object(self, name_or_id, *, version=None, include_yaml=False, owner_id=None, library=None):
+            self.get_object_calls.append(
+                {
+                    "name_or_id": name_or_id,
+                    "version": version,
+                    "include_yaml": include_yaml,
+                    "owner_id": owner_id,
+                    "library": library,
+                }
+            )
+            assert include_yaml is False
+            return {
+                "id": "remote-object-1",
+                "owner_id": "owner-1",
+                "library": "default",
+                "name": "demo_obj",
+                "version": 1,
+                "version_id": "remote-version-1",
+                "entrypoint": "demo_obj",
+                "env": "default",
+            }
+
+    store = RegistryStore(tmp_path)
+    monkeypatch.setattr(daemon_server, "ServerClient", DryRunServerClient)
+    app = None
+    try:
+        _save_connected_server_connection(store)
+        app = create_app(store)
+        _mark_current_server_channel_live(app.runtime)
+        before = store.list_object_identities()
+
+        status, body = _post_json_from_app(
+            app,
+            "/server-objects/pull",
+            {"name": "demo_obj", "dry_run": True},
+        )
+
+        assert status == 200
+        assert body == {
+            "pulled": ["owner-1/default/demo_obj@v1"],
+            "skipped": [],
+            "failed": [],
+            "ambiguous_names": [],
+        }
+        assert store.list_object_identities() == before == []
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def _remote_catalog_record(
+    name: str,
+    *,
+    version: int,
+    value: int,
+    owner_id: str = "owner-1",
+    library: str = "default",
+    object_id: str | None = None,
+    version_id: str | None = None,
+) -> dict[str, Any]:
+    resolved_object_id = object_id or f"remote-object-{name}"
+    return {
+        "id": resolved_object_id,
+        "owner_id": owner_id,
+        "library": library,
+        "name": name,
+        "version": version,
+        "version_id": version_id or f"{resolved_object_id}-version-{version}",
+        "entrypoint": name,
+        "env": "default",
+        "description": f"{name} v{version}",
+        "version_label": f"v{version}",
+        "yaml": _remote_function_yaml(name, value),
+        "current_version": {"version": version},
+    }
+
+
+class _BatchServerClient:
+    versions: list[dict[str, Any]] = []
+    fail_on_get_names: set[str] = set()
+    list_objects_calls: list[dict[str, Any]] = []
+    get_object_calls: list[dict[str, Any]] = []
+    list_object_versions_calls: list[dict[str, Any]] = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    @classmethod
+    def reset(cls, versions: list[dict[str, Any]], *, fail_on_get_names: set[str] | None = None) -> None:
+        cls.versions = versions
+        cls.fail_on_get_names = fail_on_get_names or set()
+        cls.list_objects_calls = []
+        cls.get_object_calls = []
+        cls.list_object_versions_calls = []
+
+    @staticmethod
+    def _public_record(record: dict[str, Any], *, include_yaml: bool) -> dict[str, Any]:
+        payload = dict(record)
+        if not include_yaml:
+            payload.pop("yaml", None)
+        return payload
+
+    @classmethod
+    def _matches(
+        cls,
+        record: dict[str, Any],
+        name_or_id: str,
+        *,
+        owner_id: str | None,
+        library: str | None,
+    ) -> bool:
+        if name_or_id not in {record.get("name"), record.get("id")}:
+            return False
+        if owner_id is not None and record.get("owner_id") != owner_id:
+            return False
+        if library is not None and record.get("library") != library:
+            return False
+        return True
+
+    @classmethod
+    def _matching_versions(
+        cls,
+        name_or_id: str,
+        *,
+        owner_id: str | None,
+        library: str | None,
+    ) -> list[dict[str, Any]]:
+        return [
+            record for record in cls.versions if cls._matches(record, name_or_id, owner_id=owner_id, library=library)
+        ]
+
+    @classmethod
+    def _latest_catalog_records(cls) -> list[dict[str, Any]]:
+        latest: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for record in cls.versions:
+            key = (
+                str(record.get("owner_id") or ""),
+                str(record.get("library") or ""),
+                str(record.get("name") or ""),
+            )
+            if key not in latest or int(record.get("version") or 0) > int(latest[key].get("version") or 0):
+                latest[key] = record
+        return list(latest.values())
+
+    def list_objects(self, *, owner_id=None, library=None, compact=False):
+        type(self).list_objects_calls.append({"owner_id": owner_id, "library": library, "compact": compact})
+        return [
+            self._public_record(record, include_yaml=False)
+            for record in type(self)._latest_catalog_records()
+            if (owner_id is None or record.get("owner_id") == owner_id)
+            and (library is None or record.get("library") == library)
+        ]
+
+    def get_object(self, name_or_id, *, version=None, include_yaml=False, owner_id=None, library=None):
+        type(self).get_object_calls.append(
+            {
+                "name_or_id": name_or_id,
+                "version": version,
+                "include_yaml": include_yaml,
+                "owner_id": owner_id,
+                "library": library,
+            }
+        )
+        if name_or_id in type(self).fail_on_get_names:
+            raise KeyError(f"server object is not registered: {name_or_id}")
+        matches = type(self)._matching_versions(name_or_id, owner_id=owner_id, library=library)
+        if version is not None:
+            matches = [record for record in matches if int(record.get("version") or 0) == int(version)]
+        if not matches:
+            raise KeyError(f"server object is not registered: {name_or_id}")
+        return self._public_record(
+            max(matches, key=lambda item: int(item.get("version") or 0)), include_yaml=include_yaml
+        )
+
+    def list_object_versions(self, name_or_id, *, include_yaml=False, owner_id=None, library=None):
+        type(self).list_object_versions_calls.append(
+            {
+                "name_or_id": name_or_id,
+                "include_yaml": include_yaml,
+                "owner_id": owner_id,
+                "library": library,
+            }
+        )
+        return [
+            self._public_record(record, include_yaml=include_yaml)
+            for record in sorted(
+                type(self)._matching_versions(name_or_id, owner_id=owner_id, library=library),
+                key=lambda item: int(item.get("version") or 0),
+                reverse=True,
+            )
+        ]
+
+
+def test_pull_all_client_mirrors_filtered_library_and_repeat_skips(tmp_path, monkeypatch) -> None:
+    _BatchServerClient.reset(
+        [
+            _remote_catalog_record("risk_a", version=1, value=1, library="risk"),
+            _remote_catalog_record("risk_b", version=2, value=2, library="risk"),
+            _remote_catalog_record("ops_a", version=1, value=3, library="ops"),
+        ]
+    )
+    monkeypatch.setattr(daemon_server, "ServerClient", _BatchServerClient)
+    store = RegistryStore(tmp_path)
+    app = None
+    stop_server: threading.Event | None = None
+    server_thread: threading.Thread | None = None
+    reserved, port = _reserved_port_with_free_next()
+    reserved.close()
+    try:
+        store.register_env("default", sys.executable)
+        _save_connected_server_connection(store)
+        app = create_app(store)
+        _mark_current_server_channel_live(app.runtime)
+        stop_server, server_thread, server_errors = _serve_app_in_thread(app, port)
+        client = Client(f"http://127.0.0.1:{port}", api_token=app.api_token)
+
+        receipt = client.pull_all_server_objects(library="risk", progress=False)
+        repeat = client.pull_all_server_objects(library="risk", progress=False)
+
+        assert receipt["objects_seen"] == 2
+        assert sorted(receipt["pulled"]) == ["owner-1/risk/risk_a@v1", "owner-1/risk/risk_b@v2"]
+        assert receipt["skipped"] == []
+        assert receipt["failed"] == []
+        assert repeat["pulled"] == []
+        assert sorted(repeat["skipped"]) == ["owner-1/risk/risk_a@v1", "owner-1/risk/risk_b@v2"]
+        assert store.get_object("risk_a", owner_id="owner-1", library="risk")["origin"] == "server"
+        assert store.get_object("risk_b", owner_id="owner-1", library="risk")["origin"] == "server"
+        with pytest.raises(KeyError):
+            store.get_object("ops_a", owner_id="owner-1", library="ops")
+        assert _BatchServerClient.list_objects_calls == [
+            {"owner_id": None, "library": "risk", "compact": True},
+            {"owner_id": None, "library": "risk", "compact": True},
+        ]
+        assert not server_errors
+    finally:
+        if stop_server is not None:
+            stop_server.set()
+        if server_thread is not None:
+            server_thread.join(timeout=5.0)
+        _shutdown_app(app)
+        store.close()
+
+
+def test_pull_all_client_dry_run_keeps_local_catalog_unchanged(tmp_path, monkeypatch) -> None:
+    _BatchServerClient.reset([_remote_catalog_record("dry_demo", version=5, value=5, library="risk")])
+    monkeypatch.setattr(daemon_server, "ServerClient", _BatchServerClient)
+    store = RegistryStore(tmp_path)
+    app = None
+    stop_server: threading.Event | None = None
+    server_thread: threading.Thread | None = None
+    reserved, port = _reserved_port_with_free_next()
+    reserved.close()
+    try:
+        _save_connected_server_connection(store)
+        app = create_app(store)
+        _mark_current_server_channel_live(app.runtime)
+        stop_server, server_thread, server_errors = _serve_app_in_thread(app, port)
+        client = Client(f"http://127.0.0.1:{port}", api_token=app.api_token)
+        before = store.list_object_identities()
+
+        receipt = client.pull_all_server_objects(library="risk", dry_run=True, progress=False)
+
+        assert receipt == {
+            "objects_seen": 1,
+            "pulled": ["owner-1/risk/dry_demo@v5"],
+            "skipped": [],
+            "failed": [],
+            "ambiguous_names": [],
+        }
+        assert store.list_object_identities() == before == []
+        assert all(not call["include_yaml"] for call in _BatchServerClient.get_object_calls)
+        assert not server_errors
+    finally:
+        if stop_server is not None:
+            stop_server.set()
+        if server_thread is not None:
+            server_thread.join(timeout=5.0)
+        _shutdown_app(app)
+        store.close()
+
+
+def test_pull_all_client_keeps_partial_imports_when_one_object_fails(tmp_path, monkeypatch) -> None:
+    _BatchServerClient.reset(
+        [
+            _remote_catalog_record("ok_a", version=1, value=1, library="risk"),
+            _remote_catalog_record("broken", version=1, value=2, library="risk"),
+            _remote_catalog_record("ok_b", version=1, value=3, library="risk"),
+        ],
+        fail_on_get_names={"broken"},
+    )
+    monkeypatch.setattr(daemon_server, "ServerClient", _BatchServerClient)
+    store = RegistryStore(tmp_path)
+    app = None
+    stop_server: threading.Event | None = None
+    server_thread: threading.Thread | None = None
+    reserved, port = _reserved_port_with_free_next()
+    reserved.close()
+    try:
+        store.register_env("default", sys.executable)
+        _save_connected_server_connection(store)
+        app = create_app(store)
+        _mark_current_server_channel_live(app.runtime)
+        stop_server, server_thread, server_errors = _serve_app_in_thread(app, port)
+        client = Client(f"http://127.0.0.1:{port}", api_token=app.api_token)
+
+        receipt = client.pull_all_server_objects(library="risk", progress=False)
+
+        assert receipt["objects_seen"] == 3
+        assert sorted(receipt["pulled"]) == ["owner-1/risk/ok_a@v1", "owner-1/risk/ok_b@v1"]
+        assert receipt["skipped"] == []
+        assert len(receipt["failed"]) == 1
+        assert receipt["failed"][0]["ref"] == "owner-1/risk/broken@v1"
+        assert "server object is not registered: broken" in receipt["failed"][0]["reason"]
+        assert store.get_object("ok_a", owner_id="owner-1", library="risk")["origin"] == "server"
+        assert store.get_object("ok_b", owner_id="owner-1", library="risk")["origin"] == "server"
+        with pytest.raises(KeyError):
+            store.get_object("broken", owner_id="owner-1", library="risk")
+        assert not server_errors
+    finally:
+        if stop_server is not None:
+            stop_server.set()
+        if server_thread is not None:
+            server_thread.join(timeout=5.0)
+        _shutdown_app(app)
+        store.close()
+
+
+def test_pulled_mirror_survives_offline_restart_for_bare_lookup_and_call(tmp_path, monkeypatch) -> None:
+    _BatchServerClient.reset([_remote_catalog_record("clean_amount", version=1, value=42)])
+    monkeypatch.setattr(daemon_server, "ServerClient", _BatchServerClient)
+    store = RegistryStore(tmp_path)
+    app = None
+    stop_server: threading.Event | None = None
+    server_thread: threading.Thread | None = None
+    reserved, port = _reserved_port_with_free_next()
+    reserved.close()
+    try:
+        store.register_env("default", sys.executable)
+        connection = _save_connected_server_connection(store)
+        app = create_app(store, auto_build_envs=False)
+        _mark_current_server_channel_live(app.runtime)
+
+        receipt = app.runtime.pull_server_object("clean_amount")
+        assert receipt["pulled"] == ["owner-1/default/clean_amount@v1"]
+        assert store.get_object("clean_amount", owner_id="owner-1", library="default")["origin"] == "server"
+        assert store.list_pending_sync_events() == []
+
+        _drop_remote_connection_lease(store, connection["id"])
+        spam = store.save_pending_server_connection(
+            server_url="https://splime.io/api",
+            token="spam-machine-token",
+            user_token="spam-user-token",
+            machine_id="machine-spam",
+        )
+        with store._lock, store._conn:  # noqa: SLF001 - legacy H-02 ownerless ACTIVE spam.
+            store._conn.execute(
+                """
+                UPDATE server_connections
+                SET status = 'connect_failed',
+                    updated_at = '2999-01-01T00:00:00+00:00',
+                    error = 'legacy ownerless connect spam'
+                WHERE id = ?
+                """,
+                (spam["id"],),
+            )
+        _shutdown_app(app)
+        app = None
+        store.close()
+
+        store = RegistryStore(tmp_path)
+        credentials = store.current_server_connection_credentials()
+        assert credentials is not None
+        assert credentials["id"] == connection["id"]
+        assert credentials["owner_id"] == "owner-1"
+        assert credentials["remote_connection_id"] is None
+        assert credentials["status"] == "connect_failed"
+
+        app = create_app(store, auto_build_envs=False)
+        stop_server, server_thread, server_errors = _serve_app_in_thread(app, port)
+        client = SPLClient(base_url=f"http://127.0.0.1:{port}", api_token=app.api_token)
+
+        listed = client.objects(scope="local")
+        signature = client.signature("clean_amount")
+        scoped_signature = client.signature("clean_amount", owner="owner-1", library="default")
+        description = client.describe("clean_amount")
+        result = client.call("clean_amount", progress=False)
+
+        assert listed["clean_amount"]["owner_id"] == "owner-1"
+        assert store.get_object("clean_amount")["canonical_name"] == "owner-1/default/clean_amount"
+        assert signature["name"] == "clean_amount"
+        assert scoped_signature["name"] == "clean_amount"
+        assert "clean_amount" in description
+        assert result.mode == "local"
+        assert result.output == 42
+        assert not server_errors
+    finally:
+        if stop_server is not None:
+            stop_server.set()
+        if server_thread is not None:
+            server_thread.join(timeout=5.0)
+        _shutdown_app(app)
+        store.close()
+
+
+def test_local_scoped_run_resolves_cross_owner_object_offline(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        store.register_env("default", sys.executable)
+        store.register_object(
+            "clean_amount",
+            "demo_obj",
+            "default",
+            yaml_text=REMOTE_FUNCTION_YAML,
+            owner_id="owner-a",
+            library="default",
+        )
+        app = create_app(store, auto_build_envs=False)
+
+        status, missing = _json_from_app(app, "/objects/clean_amount/signature")
+        assert status == 404
+        assert "owner 'owner-a'" in missing["error"]
+        assert "library 'default'" in missing["error"]
+
+        status, scoped_signature = _json_from_app(
+            app,
+            "/objects/clean_amount/signature?owner_id=owner-a&library=default",
+        )
+        assert status == 200
+        assert scoped_signature["name"] == "clean_amount"
+
+        status, started = _post_json_from_app(
+            app,
+            "/runs",
+            {
+                "object": "clean_amount",
+                "object_owner_id": "owner-a",
+                "library": "default",
+                "source": "local",
+                "remote": False,
+                "keep": True,
+            },
+        )
+        assert status == 202
+        final = _wait_store_run(store, started["id"])
+
+        assert final["status"] == "succeeded"
+        assert final["result"]["result"] == 1
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
 def test_server_machines_use_machine_token_aliases(tmp_path, monkeypatch) -> None:
     class MachineServerClient:
-        def __init__(self, base_url, machine_token, *, user_token=None) -> None:
+        def __init__(self, base_url, machine_token, *, user_token=None, request_timeout_seconds=None) -> None:
             assert base_url == "https://splime.io/api"
             assert machine_token == "machine-token-123456"
             assert user_token == "user-token-123456"
@@ -1043,6 +1802,7 @@ def test_server_machines_use_machine_token_aliases(tmp_path, monkeypatch) -> Non
     try:
         _save_connected_server_connection(store)
         app = create_app(store)
+        _mark_current_server_channel_live(app.runtime)
 
         status, body = _json_from_app(app, "/server/machines")
 
@@ -1064,7 +1824,7 @@ def test_server_libraries_are_managed_through_daemon_proxy(
     class LibraryServerClient:
         calls = []
 
-        def __init__(self, base_url, machine_token, *, user_token=None) -> None:
+        def __init__(self, base_url, machine_token, *, user_token=None, request_timeout_seconds=None) -> None:
             assert base_url == "https://splime.io/api"
             assert machine_token == "machine-token-123456"
             assert user_token == "user-token-123456"
@@ -1113,8 +1873,9 @@ def test_server_libraries_are_managed_through_daemon_proxy(
     monkeypatch.setattr(daemon_server, "ServerClient", LibraryServerClient)
     app = None
     try:
-        app = create_app(store)
         _save_connected_server_connection(store)
+        app = create_app(store)
+        _mark_current_server_channel_live(app.runtime)
 
         status, body = _json_from_app(app, "/server/libraries?include_accessible=0")
         assert status == 200
@@ -1221,6 +1982,126 @@ def test_server_library_routes_report_missing_connection(tmp_path) -> None:
         assert status == 404
         assert "active server connection is not found" in body["error"]
     finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_local_mutation_routes_do_not_wait_for_unreachable_server(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        _save_connected_server_connection(store, server_url=_closed_local_server_url())
+        app = create_app(store, auto_build_envs=False)
+
+        started = time.monotonic()
+        env_status, env_body = _post_json_from_app(
+            app,
+            "/envs",
+            {"name": "default", "python": sys.executable},
+        )
+        env_elapsed = time.monotonic() - started
+
+        started = time.monotonic()
+        publish_status, publish_body = _post_json_from_app(
+            app,
+            "/objects",
+            {
+                "name": "demo_obj",
+                "entrypoint": "demo_obj",
+                "env": "default",
+                "yaml": REMOTE_FUNCTION_YAML,
+            },
+        )
+        publish_elapsed = time.monotonic() - started
+        stored_origin = store.get_object("demo_obj", owner_id="owner-1", library="default")["origin"]
+
+        started = time.monotonic()
+        forget_status, forget_body = _delete_json_from_app(app, "/objects/demo_obj")
+        forget_elapsed = time.monotonic() - started
+
+        assert env_status == 201
+        assert env_body["name"] == "default"
+        assert publish_status == 201
+        assert publish_body["owner_id"] == "owner-1"
+        assert publish_body["sync"]["connected"] is False
+        assert publish_body["sync"]["offline"] is True
+        assert publish_body["sync"]["code"] == "central_server_unreachable"
+        assert publish_body["sync_event"]["status"] == "pending"
+        assert stored_origin == "local"
+        assert forget_status == 200
+        assert forget_body["object_deleted"] is True
+        assert env_elapsed < 2.0
+        assert publish_elapsed < 2.0
+        assert forget_elapsed < 2.0
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_server_proxy_fails_fast_when_stored_connection_is_not_live(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        _save_connected_server_connection(store, server_url=_closed_local_server_url())
+        app = create_app(store, auto_build_envs=False)
+
+        started = time.monotonic()
+        status, body = _json_from_app(app, "/server/objects")
+        elapsed = time.monotonic() - started
+
+        assert status == 503
+        assert "central SPL daemon server is offline or unreachable" in body["error"]
+        assert body["offline"] is True
+        assert body["code"] == "central_server_unreachable"
+        assert elapsed < 2.0
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_blocking_heartbeat_does_not_block_local_object_registration(tmp_path, monkeypatch) -> None:
+    class BlockingSyncServerClient:
+        started = threading.Event()
+        release = threading.Event()
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def latest_machine_library_snapshot(self, machine_id):
+            return {}
+
+        def sync(self, **kwargs):
+            type(self).started.set()
+            type(self).release.wait(timeout=5)
+            raise RuntimeError("heartbeat is still offline")
+
+    monkeypatch.setattr(daemon_server, "ServerClient", BlockingSyncServerClient)
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        store.register_env("default", sys.executable)
+        _save_connected_server_connection(store)
+        app = create_app(store, auto_build_envs=False)
+        assert BlockingSyncServerClient.started.wait(timeout=2)
+
+        started = time.monotonic()
+        status, body = _post_json_from_app(
+            app,
+            "/objects",
+            {
+                "name": "demo_obj",
+                "entrypoint": "demo_obj",
+                "env": "default",
+                "yaml": REMOTE_FUNCTION_YAML,
+            },
+        )
+        elapsed = time.monotonic() - started
+
+        assert status == 201
+        assert body["owner_id"] == "owner-1"
+        assert elapsed < 2.0
+    finally:
+        BlockingSyncServerClient.release.set()
         _shutdown_app(app)
         store.close()
 
@@ -1728,6 +2609,7 @@ def test_remote_decomposition_resolves_through_daemon_proxy(tmp_path, monkeypatc
         )
 
         app = create_app(store)
+        _mark_current_server_channel_live(app.runtime)
         status, body = _post_json_from_app(
             app,
             "/remote-decompositions/resolve",

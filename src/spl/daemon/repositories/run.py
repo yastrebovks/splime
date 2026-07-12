@@ -47,6 +47,8 @@ class RunRepository(RepositoryBase):
         version: int | None = None,
         object_version_id: str | None = None,
         function: str | None = None,
+        owner_id: str | None = None,
+        library: str | None = None,
         runtimes: dict[str, str] | None = None,
         keep: KeepPolicy = "on_failure",
         parent_run_id: str | None = None,
@@ -65,6 +67,8 @@ class RunRepository(RepositoryBase):
                 object_name,
                 version=version,
                 include_yaml=False,
+                owner_id=owner_id,
+                library=library,
             )
         entrypoint = self._run_entrypoint_for(object_record, function)
         runtime_config = normalize_runtime_config(object_record.get("runtime_config"))

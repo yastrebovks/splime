@@ -5,6 +5,7 @@ from __future__ import annotations
 from http import HTTPStatus
 from typing import Any
 
+from spl.daemon.repositories.server_connection import OFFLINE_SERVER_CONNECTION_STATUSES
 from spl.daemon.remote_client import DEFAULT_SERVER_URL, ServerClientError
 from spl.daemon.routes._helpers import RouteContext, RouteRegistrar
 
@@ -29,7 +30,7 @@ def register_server_connection_routes(
                     and connection["status"] == "connected"
                     and bool(connection.get("remote_connection_id"))
                 ),
-                "offline": (connection is not None and connection["status"] in {"connect_failed", "heartbeat_failed"}),
+                "offline": (connection is not None and connection["status"] in OFFLINE_SERVER_CONNECTION_STATUSES),
                 "connection": connection,
             }
         )
@@ -39,21 +40,22 @@ def register_server_connection_routes(
     async def list_server_connections() -> Any:
         return json_response(runtime.store.list_server_connections())
 
+    @app.post("/server/connections/prune")
+    @route_errors
+    async def prune_server_connections() -> Any:
+        older_than_days = context.optional_int_query("older_than_days")
+        return json_response(
+            runtime.store.prune_server_connections(
+                older_than_days=30 if older_than_days is None else older_than_days,
+                dry_run=context.query_bool("dry_run", default=False),
+            )
+        )
+
     @app.get("/server/machines")
     @route_errors
     async def list_server_machines() -> Any:
         credentials, server = context.connected_server_client()
-        machines = server.list_machines()
-        _apply_machine_token_display_names(machines, credentials, server)
-        current_machine_id = credentials["machine_id"]
-        for machine in machines:
-            machine["is_current"] = machine["id"] == current_machine_id
-        return json_response(
-            {
-                "current_machine_id": current_machine_id,
-                "machines": machines,
-            }
-        )
+        return json_response(await context.run_blocking(_server_machines_payload, credentials, server))
 
     @app.post("/server/connect")
     @route_errors
@@ -66,7 +68,8 @@ def register_server_connection_routes(
 
         server_url = body.get("server_url") or DEFAULT_SERVER_URL
         return json_response(
-            runtime.connect_server(
+            await context.run_blocking(
+                runtime.connect_server,
                 server_url=server_url,
                 machine_token=machine_token,
                 user_token=user_token,
@@ -81,7 +84,19 @@ def register_server_connection_routes(
     @app.post("/server/disconnect")
     @route_errors
     async def disconnect_server() -> Any:
-        return json_response(runtime.disconnect_server())
+        return json_response(await context.run_blocking(runtime.disconnect_server))
+
+
+def _server_machines_payload(credentials: dict[str, Any], server: Any) -> dict[str, Any]:
+    machines = server.list_machines()
+    _apply_machine_token_display_names(machines, credentials, server)
+    current_machine_id = credentials["machine_id"]
+    for machine in machines:
+        machine["is_current"] = machine["id"] == current_machine_id
+    return {
+        "current_machine_id": current_machine_id,
+        "machines": machines,
+    }
 
 
 def _apply_machine_token_display_names(

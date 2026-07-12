@@ -5,6 +5,76 @@ All notable changes to the `splime` package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-07-11
+
+### Added
+
+- `SPLClient.pull(...)`, `POST /server-objects/pull`, and `spl-daemon pull`
+  now mirror one accessible server object into the local daemon cache with
+  `pulled`, `skipped`, `failed`, and `ambiguous_names` receipt keys; repeat
+  pulls are idempotent by content hash.
+- `SPLClient.pull_all(...)` and `spl-daemon pull --all` now mirror the visible
+  server catalog with owner/library filters, dry-run planning, progress output,
+  and failure-tolerant aggregate receipts without writing anything during
+  `dry_run=True`.
+- `spl-daemon doctor` now reports the selected enrolled owner/machine identity
+  and stored/stale server-connection counts, while `spl-daemon connections-list`
+  and `spl-daemon connections-prune` expose and clean stale connection rows.
+
+### Changed
+
+- Bare-name lookup misses in `SPLClient.signature()`, `describe()`, `inputs()`,
+  `outputs()`, and `decomposition()` now explain when the daemon has no server
+  connection and point to `client.connect_server(...)` or `client.pull(...)`.
+- Bare-name local lookup misses now name same-name objects stored under other
+  owners and ask callers to pass `owner=`/`library=` or reconnect under that
+  identity; local object tables show an `owner` column only when multiple owners
+  are present locally.
+- Publishing a same-name local object under another owner now adds a receipt
+  warning and daemon log line explaining that this creates a separate object
+  whose versions do not continue the other owner's chain.
+- No server-side changes are required for the pull wave; the SDK and local
+  daemon use the existing server catalog/object surfaces.
+
+### Fixed
+
+- Multi-identity safety: heartbeat sync now sends only events owned by the
+  currently enrolled owner, holds events for other identities pending for a
+  later reconnect under that owner, and adopts legacy pre-enrollment events
+  under the first connected owner with an explicit daemon log line.
+- Pulled server-origin mirrors stay addressable after a daemon restart without
+  a server connection; bare-name lookup now uses the last enrolled owner
+  identity even when the live remote connection lease is absent.
+- Current server credentials are selected deterministically for the daemon
+  home's machine id before falling back to newest `updated_at`, so a fresher
+  active row from another machine cannot silently change the caller identity.
+- Ownerless failed-enrollment rows no longer participate in daemon identity
+  selection: failed enrollments stay `enroll_failed`, repeated attempts reuse
+  one pending row, old homes backfill the machine sidecar from a single owned
+  active connection, and doctor/logs warn when identity degrades to `local`.
+- Offline integrity: stored `status='connected'` credentials no longer make
+  publish, local sync kicks, or server proxy routes wait on the central server
+  after restart or network loss; live-channel decisions now require a recent
+  successful heartbeat/connect, local mutations return immediately, and
+  `/server/*` proxy failures include `central_server_unreachable`.
+- Offline heartbeat failures no longer replace enrolled identity rows or delete
+  their secrets; already damaged replaced identity rows are reported by doctor
+  with a reconnect remediation.
+- Server lease rejection safety: heartbeat 401/403/404/409 responses now keep
+  the stored owner identity as `needs_reconnect`, leave secrets intact, keep
+  bare-name local lookup under the enrolled owner, and ask users to reconnect to
+  restore sync.
+- Test safety: pytest now forces an isolated daemon home and file-backed
+  secrets, fails fast on attempts to open `~/.spl-daemon`, and runs cookbook
+  smoke against a temporary local daemon instead of a live user daemon.
+- Client offline presentation now treats `central_server_unreachable` the same
+  as a missing server connection for `machines()`, `libraries()`, server object
+  listings, and describe freshness, while bare-name fallback reports a
+  `client.pull(...)` remediation instead of surfacing the raw proxy failure.
+- Remote signature cache lookups are owner-concrete: bare remote-node refs are
+  enriched with the current stored owner before cache access, so changing daemon
+  identity cannot return another owner's cached signature.
+
 ## [0.4.2] - 2026-07-10
 
 Republish of 0.4.1 with a daemon lifecycle fix. The `v0.4.1` tag exists in git

@@ -203,6 +203,59 @@ def test_object_views_render_compact_tables() -> None:
     assert hasattr(catalog, "_repr_html_")
 
 
+def test_object_table_shows_owner_only_for_multi_owner_local_catalog() -> None:
+    one_owner_text = repr(
+        ObjectTable(
+            {
+                "daily_total": {
+                    "name": "daily_total",
+                    "owner_id": "owner-a",
+                    "kind": "function",
+                    "version": 1,
+                    "library": "default",
+                    "inputs": [],
+                },
+                "risk_score": {
+                    "name": "risk_score",
+                    "owner_id": "owner-a",
+                    "kind": "function",
+                    "version": 1,
+                    "library": "risk",
+                    "inputs": [],
+                },
+            }
+        )
+    )
+    assert "owner" not in one_owner_text.splitlines()[1].split()
+
+    multi_owner_text = repr(
+        ObjectTable(
+            {
+                "owner-a/default/clean_amount": {
+                    "name": "clean_amount",
+                    "owner_id": "owner-a",
+                    "kind": "function",
+                    "version": 1,
+                    "library": "default",
+                    "inputs": [],
+                },
+                "owner-b/default/clean_amount": {
+                    "name": "clean_amount",
+                    "owner_id": "owner-b",
+                    "kind": "function",
+                    "version": 1,
+                    "library": "default",
+                    "inputs": [],
+                },
+            }
+        )
+    )
+    header = multi_owner_text.splitlines()[1].split()
+    assert "owner" in header
+    assert "owner-a" in multi_owner_text
+    assert "owner-b" in multi_owner_text
+
+
 def test_empty_views_render_placeholders() -> None:
     assert repr(ObjectList([])) == "server objects: (empty)"
     assert "(empty)" in repr(ObjectCatalog({"local": {}, "server": []}))

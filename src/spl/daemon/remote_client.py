@@ -11,7 +11,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request
 
-from spl._http import DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS, urlopen_verified, verified_https_context
+from spl._http import (
+    DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS,
+    DEFAULT_HTTP_TIMEOUT_SECONDS,
+    urlopen_verified,
+    verified_https_context,
+)
 
 DEFAULT_SERVER_URL = "https://splime.io/api"
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60.0
@@ -48,10 +53,12 @@ class ServerClient:
         machine_token: str,
         *,
         user_token: str | None = None,
+        request_timeout_seconds: float | None = DEFAULT_HTTP_TIMEOUT_SECONDS,
     ):
         self.base_url = base_url.rstrip("/")
         self.machine_token = machine_token
         self.user_token = user_token
+        self.request_timeout_seconds = request_timeout_seconds
 
     def _headers(self, *, auth: str = "machine") -> dict[str, str]:
         token = self.machine_token
@@ -93,7 +100,7 @@ class ServerClient:
             method=method,
         )
         try:
-            with urlopen_verified(request) as response:
+            with urlopen_verified(request, timeout=self.request_timeout_seconds) as response:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")

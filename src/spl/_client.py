@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Literal, cast, overload
 
 from spl._views import (
+    ActionReceiptView,
     ConnectionStatusView,
     DecompositionView,
     EnvTableView,
@@ -62,6 +63,11 @@ RunSource = Literal["auto", "local"]
 RunIdNamespace = Literal["local", "daemon", "unknown"]
 ProgressOption = bool | RunStateCallback
 _NO_SERVER_CONNECTION_MESSAGE = "active server connection is not found"
+_SERVER_UNREACHABLE_CODE = "central_server_unreachable"
+_SERVER_UNREACHABLE_MESSAGES = (
+    "central SPL daemon server is not reachable",
+    "central SPL server is not reachable",
+)
 _LIBRARY_DELETE_UNSUPPORTED_MESSAGE = (
     "Deleting central-server libraries is not supported by the SPL server API. "
     "Use the Console archive action to hide a library, or remove individual "
@@ -82,6 +88,24 @@ def _preview(value: Any, *, limit: int = 80) -> str:
 def _is_missing_server_connection(exc: Exception) -> bool:
     message = str(exc)
     return isinstance(exc, ClientError) and _NO_SERVER_CONNECTION_MESSAGE in message
+
+
+def _is_server_unreachable(exc: Exception) -> bool:
+    """Return whether the daemon says the central server cannot be reached."""
+
+    if not isinstance(exc, ClientError):
+        return False
+    if getattr(exc, "code", None) == _SERVER_UNREACHABLE_CODE:
+        return True
+    payload = getattr(exc, "payload", None)
+    if isinstance(payload, Mapping) and payload.get("code") == _SERVER_UNREACHABLE_CODE:
+        return True
+    message = str(exc)
+    return _SERVER_UNREACHABLE_CODE in message or any(text in message for text in _SERVER_UNREACHABLE_MESSAGES)
+
+
+def _is_server_unavailable(exc: Exception) -> bool:
+    return _is_missing_server_connection(exc) or _is_server_unreachable(exc)
 
 
 def _is_404_error(exc: Exception) -> bool:
@@ -124,6 +148,39 @@ def _local_retained_run_count() -> int:
 
 def _with_local_cache_warning(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {**dict(payload), "warning": _LOCAL_CACHE_ONLY_WARNING}
+
+
+def _server_connection_mapping(state: Mapping[str, Any]) -> Mapping[str, Any]:
+    connection = state.get("connection") or state.get("remote_connection") or {}
+    return connection if isinstance(connection, Mapping) else {}
+
+
+def _state_is_server_unreachable(state: Mapping[str, Any]) -> bool:
+    if state.get("code") == _SERVER_UNREACHABLE_CODE:
+        return True
+    return bool(state.get("offline")) and bool(_server_connection_mapping(state))
+
+
+def _state_has_server_connection(state: Mapping[str, Any]) -> bool:
+    if _state_is_server_unreachable(state):
+        return False
+    connected = state.get("connected")
+    if connected is not None:
+        return bool(connected)
+    return _server_connection_mapping(state).get("status") == "connected"
+
+
+def _normalize_server_connection_state(state: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = dict(state)
+    normalized.setdefault("connected", bool(normalized.get("server_url")))
+    if _state_is_server_unreachable(normalized):
+        normalized["connected"] = False
+        normalized["offline"] = True
+    elif not normalized.get("connected"):
+        normalized.setdefault("offline", bool(_server_connection_mapping(normalized)))
+    else:
+        normalized.setdefault("offline", False)
+    return normalized
 
 
 def _progress_callback(progress: ProgressOption) -> RunStateCallback | None:
@@ -205,6 +262,7 @@ class _BareServerRef:
 
 
 _CATALOG_HEADERS = ("name", "kind", "version", "library", "inputs")
+_CATALOG_HEADERS_WITH_OWNER = ("name", "kind", "version", "owner", "library", "inputs")
 
 
 def _catalog_rows(
@@ -237,6 +295,7 @@ def _catalog_rows(
                 "name": str(record.get("display_name") or record.get("name") or ""),
                 "kind": str(record.get("kind") or ""),
                 "version": str(version_value or ""),
+                "owner": str(record.get("owner_id") or ""),
                 "library": str(library_name or ""),
                 "inputs": str(len(record.get("inputs") or [])),
             }
@@ -244,20 +303,26 @@ def _catalog_rows(
     return rows
 
 
+def _catalog_headers(rows: list[dict[str, str]]) -> tuple[str, ...]:
+    owners = {row.get("owner") or "" for row in rows}
+    owners.discard("")
+    return _CATALOG_HEADERS_WITH_OWNER if len(owners) > 1 else _CATALOG_HEADERS
+
+
 def _rows_to_text(rows: list[dict[str, str]], title: str) -> str:
     if not rows:
         return f"{title}: (empty)"
-    widths = {header: max(len(header), *(len(row[header]) for row in rows)) for header in _CATALOG_HEADERS}
-    head = "  ".join(header.ljust(widths[header]) for header in _CATALOG_HEADERS)
-    body = "\n".join("  ".join(row[header].ljust(widths[header]) for header in _CATALOG_HEADERS) for row in rows)
+    headers = _catalog_headers(rows)
+    widths = {header: max(len(header), *(len(row[header]) for row in rows)) for header in headers}
+    head = "  ".join(header.ljust(widths[header]) for header in headers)
+    body = "\n".join("  ".join(row[header].ljust(widths[header]) for header in headers) for row in rows)
     return f"{title} ({len(rows)}):\n{head}\n{body}"
 
 
 def _rows_to_html(rows: list[dict[str, str]], title: str) -> str:
-    head = "".join(f"<th style='text-align:left'>{escape(header)}</th>" for header in _CATALOG_HEADERS)
-    body = "".join(
-        "<tr>" + "".join(f"<td>{escape(row[header])}</td>" for header in _CATALOG_HEADERS) + "</tr>" for row in rows
-    )
+    headers = _catalog_headers(rows)
+    head = "".join(f"<th style='text-align:left'>{escape(header)}</th>" for header in headers)
+    body = "".join("<tr>" + "".join(f"<td>{escape(row[header])}</td>" for header in headers) + "</tr>" for row in rows)
     return (
         f"<div><b>{escape(title)}</b> ({len(rows)})"
         f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
@@ -579,7 +644,7 @@ class RemoteRun:
         poll_interval: float = 0.25,
         timeout_seconds: float | None = None,
         progress: ProgressOption = True,
-    ) -> dict[str, Any]:
+    ) -> RunRecordView:
         """Wait until the run succeeds or fails, then return final state.
 
         ``progress`` controls feedback during slow phases (first-run
@@ -965,9 +1030,10 @@ class SPLClient:
         except Exception as exc:
             if _is_missing_server_connection(exc):
                 return ConnectionStatusView({"connected": False, "offline": False, "connection": None})
+            if _is_server_unreachable(exc):
+                return ConnectionStatusView({"connected": False, "offline": True, "connection": None})
             raise
-        state.setdefault("connected", bool(state.get("server_url")))
-        return ConnectionStatusView(state)
+        return ConnectionStatusView(_normalize_server_connection_state(state))
 
     def machines(self) -> dict[str, Any]:
         """Return the user's machines, or an empty listing when not connected.
@@ -983,13 +1049,13 @@ class SPLClient:
             try:
                 self._daemon.server_connection()
             except Exception as exc:
-                if not _is_missing_server_connection(exc):
+                if not _is_server_unavailable(exc):
                     raise
                 return MachineListView({"current_machine_id": None, "machines": []})
         try:
             machines = self._daemon.server_machines()
         except Exception as exc:
-            if not _is_missing_server_connection(exc):
+            if not _is_server_unavailable(exc):
                 raise
             return MachineListView({"current_machine_id": None, "machines": []})
         return MachineListView(machines)
@@ -999,7 +1065,13 @@ class SPLClient:
 
         if not self._has_server_connection():
             return LibraryListView([])
-        return LibraryListView(self._daemon.server_libraries(include_accessible=include_accessible))
+        try:
+            libraries = self._daemon.server_libraries(include_accessible=include_accessible)
+        except Exception as exc:
+            if not _is_server_unavailable(exc):
+                raise
+            libraries = []
+        return LibraryListView(libraries)
 
     # The flat library aliases (create_library, get_library, update_library,
     # delete_library, grant_library, revoke_library_grant, add_reference,
@@ -1196,6 +1268,7 @@ class SPLClient:
         accessible server catalog when connected and local-only when offline.
         """
 
+        requested_scope = scope
         if scope == "auto":
             scope = "server" if owner is not None or library is not None or self._has_server_connection() else "local"
         if scope == "local":
@@ -1205,25 +1278,34 @@ class SPLClient:
         if scope == "server":
             if owner is None and library is None and not self._has_server_connection():
                 return ObjectList([], title=object_scope_title("server"))
-            return _wrap_objects(
-                self._daemon.server_objects(
-                    owner_id=owner,
-                    library=library,
-                    compact=compact,
-                ),
-                title=object_scope_title("server"),
-            )
-        if scope == "all":
-            local_objects = self._daemon.list_objects(compact=compact)
-            server_objects = (
-                []
-                if owner is None and library is None and not self._has_server_connection()
-                else self._daemon.server_objects(
+            try:
+                server_objects = self._daemon.server_objects(
                     owner_id=owner,
                     library=library,
                     compact=compact,
                 )
-            )
+            except Exception as exc:
+                if not _is_server_unavailable(exc):
+                    raise
+                if requested_scope == "auto" and owner is None and library is None:
+                    return _wrap_objects(self._daemon.list_objects(compact=compact), title=object_scope_title("local"))
+                server_objects = []
+            return _wrap_objects(server_objects, title=object_scope_title("server"))
+        if scope == "all":
+            local_objects = self._daemon.list_objects(compact=compact)
+            if owner is None and library is None and not self._has_server_connection():
+                server_objects = []
+            else:
+                try:
+                    server_objects = self._daemon.server_objects(
+                        owner_id=owner,
+                        library=library,
+                        compact=compact,
+                    )
+                except Exception as exc:
+                    if not _is_server_unavailable(exc):
+                        raise
+                    server_objects = []
             return ObjectCatalog(
                 {
                     "local": local_objects,
@@ -1292,19 +1374,82 @@ class SPLClient:
             "stale mirrors pruned",
         )
 
+    def pull(
+        self,
+        name: str,
+        *,
+        owner: str | None = None,
+        library: str | None = None,
+        version: int | None = None,
+        all_versions: bool = False,
+    ) -> ActionReceiptView:
+        """Mirror one accessible server object into the local daemon cache.
+
+        A pulled server-origin mirror can be inspected and called while the
+        daemon is offline. The method requires an active server connection for
+        the download itself; repeat pulls are idempotent and report unchanged
+        versions under ``skipped``.
+        """
+
+        if not self._has_server_connection():
+            raise ClientError(self._pull_requires_server_connection_message())
+        resolved_name = name
+        owner_id = owner
+        resolved_library = library
+        if owner is None and library is None:
+            ref = self._resolve_bare_server_ref(name, example_method="pull")
+            resolved_name = ref.name
+            owner_id = ref.owner_id
+            resolved_library = ref.library
+        return wrap_action(
+            self._daemon.pull_server_object(
+                resolved_name,
+                owner_id=owner_id,
+                library=resolved_library,
+                version=version,
+                all_versions=all_versions,
+            ),
+            "object pulled",
+        )
+
+    def pull_all(
+        self,
+        *,
+        owner: str | None = None,
+        library: str | None = None,
+        all_versions: bool = False,
+        dry_run: bool = False,
+    ) -> ActionReceiptView:
+        """Mirror the visible server catalog into the local daemon cache.
+
+        The visible catalog can be large. Start with ``dry_run=True`` and
+        narrow the batch with ``owner=`` or ``library=`` before downloading a
+        whole catalog. ``dry_run`` returns the same receipt shape without
+        writing local mirror rows or YAML files.
+        """
+
+        if not self._has_server_connection():
+            raise ClientError(self._pull_all_requires_server_connection_message())
+        return wrap_action(
+            self._daemon.pull_all_server_objects(
+                owner_id=owner,
+                library=library,
+                all_versions=all_versions,
+                dry_run=dry_run,
+            ),
+            "server catalog pull plan" if dry_run else "server catalog pulled",
+        )
+
     def _has_server_connection(self) -> bool:
         if self.server_connection is not None:
-            return bool(self.server_connection.get("connected"))
+            return _state_has_server_connection(self.server_connection)
         try:
             state = self._daemon.server_connection()
         except Exception as exc:
-            if _is_missing_server_connection(exc):
+            if _is_server_unavailable(exc):
                 return False
             raise
-        if bool(state.get("connected")):
-            return True
-        connection = state.get("connection") or state.get("remote_connection") or {}
-        return connection.get("status") == "connected"
+        return _state_has_server_connection(state)
 
     def _server_connection_label(self) -> str:
         state = self.server_connection
@@ -1323,7 +1468,39 @@ class SPLClient:
                     return str(value)
         return "the active server connection"
 
-    def _resolve_bare_server_ref(self, name: str) -> _BareServerRef | None:
+    @staticmethod
+    def _offline_bare_server_ref_message(name: str) -> str:
+        return (
+            "404: {!r} is not registered locally and the daemon has no server connection; "
+            "reconnect with client.connect_server(...) to search the server catalog, or "
+            "client.pull(...) the object next time you are online."
+        ).format(name)
+
+    @staticmethod
+    def _unreachable_bare_server_ref_message(name: str) -> str:
+        return (
+            "404: {!r} is not registered locally; server unreachable; "
+            "mirror it with client.pull(...) when online, or reconnect with "
+            "client.connect_server(...) to search the server catalog."
+        ).format(name)
+
+    @staticmethod
+    def _pull_requires_server_connection_message() -> str:
+        return (
+            "404: pull requires a server connection; the daemon has no server connection. "
+            "Reconnect with client.connect_server(...) to search the server catalog, "
+            "then retry client.pull(...)."
+        )
+
+    @staticmethod
+    def _pull_all_requires_server_connection_message() -> str:
+        return (
+            "404: pull_all requires a server connection; the daemon has no server connection. "
+            "Reconnect with client.connect_server(...) to search the server catalog, "
+            "then retry client.pull_all(...)."
+        )
+
+    def _resolve_bare_server_ref(self, name: str, *, example_method: str = "signature") -> _BareServerRef:
         """Resolve a bare object name through the visible server catalog after a local 404.
 
         This is intentionally catalog-driven: no default library is assumed.
@@ -1331,12 +1508,30 @@ class SPLClient:
         ``owner=``/``library=`` explicitly.
         """
 
-        if not self._has_server_connection():
-            return None
+        try:
+            connection_state = (
+                self.server_connection if self.server_connection is not None else self._daemon.server_connection()
+            )
+        except Exception as exc:
+            if _is_server_unreachable(exc):
+                raise ClientError(self._unreachable_bare_server_ref_message(name)) from exc
+            if _is_missing_server_connection(exc):
+                raise ClientError(self._offline_bare_server_ref_message(name)) from exc
+            raise
+        if not _state_has_server_connection(connection_state):
+            if _state_is_server_unreachable(connection_state):
+                raise ClientError(self._unreachable_bare_server_ref_message(name))
+            raise ClientError(self._offline_bare_server_ref_message(name))
+        try:
+            server_records = self._daemon.server_objects(compact=True)
+        except Exception as exc:
+            if _is_server_unreachable(exc):
+                raise ClientError(self._unreachable_bare_server_ref_message(name)) from exc
+            if _is_missing_server_connection(exc):
+                raise ClientError(self._offline_bare_server_ref_message(name)) from exc
+            raise
         candidates = [
-            record
-            for record in self._daemon.server_objects(compact=True)
-            if isinstance(record, Mapping) and name in _server_record_names(record)
+            record for record in server_records if isinstance(record, Mapping) and name in _server_record_names(record)
         ]
         if len(candidates) == 1:
             record = candidates[0]
@@ -1351,7 +1546,7 @@ class SPLClient:
             raise ClientError(
                 "{!r} is not registered locally; found on the server in: {}. "
                 "Pass library=... and owner=... to disambiguate, for example "
-                "client.signature({!r}, library='...').".format(name, choices, name)
+                "client.{}({!r}, library='...').".format(name, choices, example_method, name)
             )
         raise ClientError(
             "{!r} is not registered locally; no accessible server object named {!r} (connected as {}). "
@@ -1384,8 +1579,6 @@ class SPLClient:
             if owner is not None or library is not None or not _local_object_missing(exc):
                 raise
             ref = self._resolve_bare_server_ref(name)
-            if ref is None:
-                raise
             signature = dict(
                 self._daemon.signature(
                     ref.name,
@@ -1537,8 +1730,6 @@ class SPLClient:
             if not _local_object_missing(exc):
                 raise
             ref = self._resolve_bare_server_ref(str(name))
-            if ref is None:
-                raise
             response = self._remote_decomposition_response(
                 {
                     "name": ref.name,
@@ -1626,8 +1817,6 @@ class SPLClient:
                 if not _local_object_missing(exc):
                     raise
                 ref = self._resolve_bare_server_ref(pipeline)
-                if ref is None:
-                    raise
                 response = self._remote_decomposition_response(
                     {
                         "name": ref.name,
@@ -1717,12 +1906,18 @@ class SPLClient:
         )
         freshness_line = None
         if function is None and "resolved_from_server" not in signature and self._has_server_connection():
-            freshness_line = _server_freshness_line(
-                signature,
-                self._daemon.server_objects(compact=True),
-                owner=owner,
-                library=library,
-            )
+            try:
+                server_records = self._daemon.server_objects(compact=True)
+            except Exception as exc:
+                if not _is_server_unavailable(exc):
+                    raise
+            else:
+                freshness_line = _server_freshness_line(
+                    signature,
+                    server_records,
+                    owner=owner,
+                    library=library,
+                )
         display_name = signature.get("display_name") or signature["name"]
         lines = [(f"{display_name} v{signature['version']} ({signature['kind']})")]
         server_resolution = _server_resolution_label(signature.get("resolved_from_server"))

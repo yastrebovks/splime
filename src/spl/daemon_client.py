@@ -112,6 +112,118 @@ def _as_object_listing(value: Any) -> dict[str, Any] | list[dict[str, Any]]:
     return cast(dict[str, Any] | list[dict[str, Any]], value)
 
 
+def _record_string(value: Any, *keys: str) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, Mapping):
+        for key in keys:
+            item = value.get(key)
+            if item is not None and str(item):
+                return str(item)
+    return None
+
+
+def _server_record_name(record: Mapping[str, Any]) -> str | None:
+    return (
+        _record_string(record.get("name"))
+        or _record_string(record.get("display_name"))
+        or _record_string(record.get("object_name"))
+    )
+
+
+def _server_record_owner(record: Mapping[str, Any]) -> str | None:
+    return _record_string(record.get("owner_id")) or _record_string(record.get("owner"), "id", "owner_id", "name")
+
+
+def _server_record_library(record: Mapping[str, Any]) -> str | None:
+    return _record_string(record.get("library"), "slug", "name", "display_name")
+
+
+def _server_record_version(record: Mapping[str, Any]) -> str | None:
+    current = record.get("current_version")
+    if isinstance(current, Mapping):
+        for key in ("version", "number", "label", "name"):
+            value = current.get(key)
+            if value is not None and str(value):
+                return str(value)
+    for key in ("version", "version_label"):
+        value = record.get(key)
+        if value is not None and str(value):
+            return str(value)
+    return None
+
+
+def _server_record_canonical(
+    record: Mapping[str, Any],
+    *,
+    fallback_owner_id: str | None = None,
+    fallback_library: str | None = None,
+) -> str | None:
+    name = _server_record_name(record)
+    if name is None:
+        return None
+    owner_id = _server_record_owner(record) or fallback_owner_id or "unknown"
+    library = _server_record_library(record) or fallback_library or "default"
+    return f"{owner_id}/{library}/{name}"
+
+
+def _server_record_ref(
+    record: Mapping[str, Any],
+    *,
+    fallback_owner_id: str | None = None,
+    fallback_library: str | None = None,
+) -> str:
+    canonical = _server_record_canonical(
+        record,
+        fallback_owner_id=fallback_owner_id,
+        fallback_library=fallback_library,
+    )
+    if canonical is None:
+        return str(record.get("id") or "<unknown server object>")
+    version = _server_record_version(record)
+    return "{}@v{}".format(canonical, version) if version is not None else canonical
+
+
+def _object_records(value: Any) -> list[Mapping[str, Any]]:
+    if isinstance(value, Mapping):
+        return [item for item in value.values() if isinstance(item, Mapping)]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, Mapping)]
+    return []
+
+
+def _identity_buckets(value: Any) -> dict[str, set[str]]:
+    buckets: dict[str, set[str]] = {}
+    for record in _object_records(value):
+        name = _record_string(record.get("name"))
+        if name is None:
+            continue
+        canonical = _record_string(record.get("canonical_name")) or _server_record_canonical(record)
+        if canonical is None:
+            continue
+        buckets.setdefault(name, set()).add(canonical)
+    return buckets
+
+
+def _add_projected_identity(
+    buckets: dict[str, set[str]],
+    record: Mapping[str, Any],
+    *,
+    fallback_owner_id: str | None = None,
+    fallback_library: str | None = None,
+) -> str | None:
+    name = _server_record_name(record)
+    canonical = _server_record_canonical(
+        record,
+        fallback_owner_id=fallback_owner_id,
+        fallback_library=fallback_library,
+    )
+    if name is None or canonical is None:
+        return None
+    buckets.setdefault(name, set()).add(canonical)
+    return name
+
+
 def generate_daemon_api_token() -> str:
     """Generate the local daemon HTTP API bearer token."""
 
@@ -221,6 +333,37 @@ def resolve_base_url(
 
 class ClientError(RuntimeError):
     """Raised when the daemon returns an error response."""
+
+    status_code: int | None
+    payload: dict[str, Any] | None
+    code: str | None
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.payload = payload
+        code = payload.get("code") if payload is not None else None
+        self.code = str(code) if code is not None else None
+
+
+def _client_error_from_http_error(exc: HTTPError, raw: str) -> ClientError:
+    payload: dict[str, Any] | None = None
+    message = raw
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    else:
+        if isinstance(decoded, dict):
+            payload = decoded
+            message = str(decoded.get("error", raw))
+    return ClientError(f"{exc.code}: {message}", status_code=exc.code, payload=payload)
 
 
 RunStateCallback = Callable[[dict[str, Any]], None]
@@ -440,6 +583,41 @@ class RunProgressPrinter:
         print(message, file=stream, flush=True)
 
 
+class PullProgressPrinter:
+    """Print throttled pull-all progress lines to stderr."""
+
+    def __init__(
+        self,
+        *,
+        stream: TextIO | None = None,
+        interval_seconds: float = 1.0,
+        clock: Callable[[], float] = time.monotonic,
+        label: str = "[spl]",
+    ):
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be positive")
+        self._stream = stream
+        self._interval = float(interval_seconds)
+        self._clock = clock
+        self._label = label
+        self._last_printed_at: float | None = None
+
+    def __call__(self, current: int, total: int, ref: str) -> None:
+        try:
+            self._observe(current, total, ref)
+        except Exception:  # noqa: BLE001 - progress output must never raise.
+            return
+
+    def _observe(self, current: int, total: int, ref: str) -> None:
+        now = self._clock()
+        if current != 1 and current != total and self._last_printed_at is not None:
+            if now - self._last_printed_at < self._interval:
+                return
+        self._last_printed_at = now
+        stream = self._stream if self._stream is not None else sys.stderr
+        print(f"{self._label} pull_all {current}/{total}: {ref}", file=stream, flush=True)
+
+
 class Client:
     """Advanced/internal wrapper around the local daemon HTTP API."""
 
@@ -517,11 +695,7 @@ class Client:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")
-            try:
-                message = json.loads(raw).get("error", raw)
-            except json.JSONDecodeError:
-                message = raw
-            raise ClientError(f"{exc.code}: {message}") from exc
+            raise _client_error_from_http_error(exc, raw) from exc
         except URLError as exc:
             raise self._local_daemon_unreachable(exc) from exc
 
@@ -542,11 +716,7 @@ class Client:
                 return cast(bytes, response.read())
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")
-            try:
-                message = json.loads(raw).get("error", raw)
-            except json.JSONDecodeError:
-                message = raw
-            raise ClientError(f"{exc.code}: {message}") from exc
+            raise _client_error_from_http_error(exc, raw) from exc
         except URLError as exc:
             raise self._local_daemon_unreachable(exc) from exc
 
@@ -596,6 +766,22 @@ class Client:
 
         return _as_json_dict_list(self._json_request("GET", "/server/connections"))
 
+    def prune_server_connections(
+        self,
+        *,
+        older_than_days: int = 30,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Prune stale stored central-server connection attempts."""
+
+        query = urlencode(
+            {
+                "older_than_days": str(older_than_days),
+                "dry_run": "1" if dry_run else "0",
+            }
+        )
+        return _as_json_dict(self._json_request("POST", f"/server/connections/prune?{query}"))
+
     def server_machines(self) -> dict[str, Any]:
         """Return machines visible to the connected user."""
 
@@ -619,6 +805,110 @@ class Client:
             query.append("view=summary")
         suffix = f"?{'&'.join(query)}" if query else ""
         return _as_json_dict_list(self._json_request("GET", f"/server/objects{suffix}"))
+
+    def pull_server_object(
+        self,
+        name: str,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+        version: int | None = None,
+        all_versions: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Mirror one accessible server object into the local registry.
+
+        Repeat calls are idempotent by content hash. ``dry_run`` reports what
+        would be pulled or skipped without writing mirror rows or YAML bodies.
+        """
+
+        payload: dict[str, Any] = {
+            "name": name,
+            "all_versions": all_versions,
+        }
+        if owner_id is not None:
+            payload["owner_id"] = owner_id
+        if library is not None:
+            payload["library"] = library
+        if version is not None:
+            payload["version"] = version
+        if dry_run:
+            payload["dry_run"] = True
+        return _as_json_dict(self._json_request("POST", "/server-objects/pull", payload))
+
+    def pull_all_server_objects(
+        self,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+        all_versions: bool = False,
+        dry_run: bool = False,
+        progress: bool | Callable[[int, int, str], None] = True,
+    ) -> dict[str, Any]:
+        """Mirror the visible server catalog into the local registry.
+
+        Full-catalog pulls can be large. Prefer ``dry_run=True`` first and use
+        owner/library filters when possible; failures for individual objects are
+        collected in the receipt and do not roll back earlier imports.
+        """
+
+        catalog = self.server_objects(owner_id=owner_id, library=library, compact=True)
+        progress_callback: Callable[[int, int, str], None] | None
+        if callable(progress):
+            progress_callback = progress
+        elif progress:
+            progress_callback = PullProgressPrinter()
+        else:
+            progress_callback = None
+
+        pulled: list[str] = []
+        skipped: list[str] = []
+        failed: list[dict[str, str]] = []
+        seen_names: set[str] = set()
+        projected_buckets = _identity_buckets(self.list_objects(compact=True)) if dry_run else {}
+
+        total = len(catalog)
+        for index, record in enumerate(catalog, start=1):
+            ref = _server_record_ref(record, fallback_owner_id=owner_id, fallback_library=library)
+            try:
+                name = _server_record_name(record)
+                if name is None:
+                    raise ValueError("server catalog record has no object name")
+                record_owner_id = _server_record_owner(record) or owner_id
+                record_library = _server_record_library(record) or library
+                result = self.pull_server_object(
+                    name,
+                    owner_id=record_owner_id,
+                    library=record_library,
+                    all_versions=all_versions,
+                    dry_run=dry_run,
+                )
+                pulled.extend(str(item) for item in result.get("pulled") or [])
+                skipped.extend(str(item) for item in result.get("skipped") or [])
+                for failed_ref in result.get("failed") or []:
+                    failed.append({"ref": str(failed_ref), "reason": "object pull failed"})
+                seen_names.add(name)
+                if dry_run and not result.get("failed"):
+                    _add_projected_identity(
+                        projected_buckets,
+                        record,
+                        fallback_owner_id=record_owner_id,
+                        fallback_library=record_library,
+                    )
+            except Exception as exc:  # noqa: BLE001 - one object must not fail the batch.
+                failed.append({"ref": ref, "reason": str(exc)})
+            finally:
+                if progress_callback is not None:
+                    progress_callback(index, total, ref)
+
+        buckets = projected_buckets if dry_run else _identity_buckets(self.list_objects(compact=True))
+        return {
+            "objects_seen": total,
+            "pulled": pulled,
+            "skipped": skipped,
+            "failed": failed,
+            "ambiguous_names": sorted(name for name in seen_names if len(buckets.get(name, set())) > 1),
+        }
 
     def server_libraries(
         self,

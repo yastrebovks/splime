@@ -8,7 +8,7 @@ import pytest
 
 import spl.daemon.server as daemon_server
 from spl.daemon.remote_client import ServerClientError
-from spl.daemon.server import DaemonRuntime, ServerOfflineError
+from spl.daemon.server import DaemonRuntime
 from spl.daemon.store import REDACTED_SECRET_VALUE, RegistryStore, utc_now
 
 
@@ -61,24 +61,19 @@ def test_connect_server_persists_pending_connection_when_server_is_offline(
 
         assert result["connected"] is False
         assert result["offline"] is True
-        assert connection["status"] == "connect_failed"
+        assert connection["status"] == "enroll_failed"
         assert connection["remote_connection_id"] is None
         expected_machine_id = f"machine-{hashlib.sha256(machine_token.encode('utf-8')).hexdigest()[:12]}"
         assert connection["machine_id"] == expected_machine_id
         assert connection["machine_id"] != "machine-x"
-        assert store.current_server_connection_credentials() is not None
+        assert store.current_server_connection_credentials() is None
 
         sync = runtime.sync_once(connection_id=connection["id"])
 
         assert sync["connected"] is False
         assert sync["offline"] is True
-        try:
+        with pytest.raises(KeyError, match="active server connection is not found"):
             runtime._require_connected_server_credentials()
-        except ServerOfflineError:
-            pass
-        else:
-            raise AssertionError("server-backed operations must fail while offline")
-        runtime.disconnect_server()
     finally:
         store.close()
 
@@ -175,16 +170,18 @@ def test_server_connection_tokens_are_stored_outside_sqlite(tmp_path) -> None:
         assert row["token_secret_ref"].startswith("file:")
         assert row["user_token_secret_ref"].startswith("file:")
 
-        credentials = store.current_server_connection_credentials()
+        assert store.current_server_connection_credentials() is None
+        credentials = store.get_server_connection_credentials(first["id"])
         assert credentials["token"] == "machine-token-secret"
         assert credentials["user_token"] == "user-token-secret"
 
-        store.save_pending_server_connection(
+        second = store.save_pending_server_connection(
             server_url="https://splime.io/api",
             token="next-machine-token-secret",
             user_token="next-user-token-secret",
-            machine_id="machine-2",
+            machine_id="machine-1",
         )
+        assert second["id"] == first["id"]
         secret_values = json.loads((tmp_path / "daemon-secrets.json").read_text(encoding="utf-8")).values()
         assert "machine-token-secret" not in secret_values
         assert "user-token-secret" not in secret_values
@@ -198,11 +195,11 @@ def test_server_connection_tokens_are_stored_outside_sqlite(tmp_path) -> None:
             """,
             (first["id"],),
         ).fetchone()
-        assert old_row["status"] == "replaced"
-        assert old_row["token_secret_ref"] is None
-        assert old_row["user_token_secret_ref"] is None
+        assert old_row["status"] == "enroll_failed"
+        assert old_row["token_secret_ref"].startswith("file:")
+        assert old_row["user_token_secret_ref"].startswith("file:")
 
-        current = store.current_server_connection_credentials()
+        current = store.get_server_connection_credentials(first["id"])
         store.mark_server_connection_disconnected(current["id"])
         secret_values = json.loads((tmp_path / "daemon-secrets.json").read_text(encoding="utf-8")).values()
         assert "next-machine-token-secret" not in secret_values
@@ -281,7 +278,8 @@ def test_legacy_server_connection_tokens_are_migrated_from_sqlite(tmp_path) -> N
         assert row["token_secret_ref"].startswith("file:")
         assert row["user_token_secret_ref"].startswith("file:")
 
-        credentials = store.current_server_connection_credentials()
+        assert store.current_server_connection_credentials() is None
+        credentials = store.get_server_connection_credentials("legacy1")
         assert credentials["token"] == "legacy-machine-secret"
         assert credentials["user_token"] == "legacy-user-secret"
     finally:

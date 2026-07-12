@@ -122,6 +122,7 @@ class ObjectRepository(RepositoryBase):
         )
         content_hash = hashlib.sha256(canonicalize(canonical_definition)).hexdigest()
         object_kind = validate_name(str(metadata["kind"]))
+        publish_fork_warning: dict[str, Any] | None = None
 
         with self._lock, self._conn:
             if remote_version_id is not None:
@@ -186,6 +187,12 @@ class ObjectRepository(RepositoryBase):
             self._validate_object_decomposition_metadata(metadata)
 
             if object_row is None:
+                publish_fork_warning = self._cross_owner_publish_fork_warning_locked(
+                    owner_id=owner_id,
+                    library=library,
+                    name=name,
+                    origin=origin,
+                )
                 self._conn.execute(
                     """
                     INSERT INTO objects(
@@ -378,7 +385,8 @@ class ObjectRepository(RepositoryBase):
         yaml_cache_path.parent.mkdir(parents=True, exist_ok=True)
         yaml_cache_path.write_text(yaml_text, encoding="utf-8")
 
-        return self.get_object_version(version_id, include_yaml=False)
+        record = self.get_object_version(version_id, include_yaml=False)
+        return self._with_publish_fork_warning(record, publish_fork_warning)
 
     @staticmethod
     def _warn_remote_version_id_collision(
@@ -407,6 +415,99 @@ class ObjectRepository(RepositoryBase):
                 "remote_version_id_collision": payload,
             },
         )
+
+    def _cross_owner_publish_fork_warning_locked(
+        self,
+        *,
+        owner_id: str,
+        library: str,
+        name: str,
+        origin: str,
+    ) -> dict[str, Any] | None:
+        if origin != "local":
+            return None
+        rows = self._conn.execute(
+            """
+            SELECT o.owner_id,
+                   o.library,
+                   COALESCE(ov.version, 0) AS version
+            FROM objects o
+            LEFT JOIN object_versions ov ON ov.id = o.current_version_id
+            WHERE o.owner_id != ?
+              AND o.library = ?
+              AND o.name = ?
+            ORDER BY o.owner_id, o.library, o.id
+            """,
+            (owner_id, library, name),
+        ).fetchall()
+        if not rows:
+            return None
+        candidates = [
+            {
+                "owner_id": str(row["owner_id"]),
+                "library": str(row["library"]),
+                "version": int(row["version"]),
+            }
+            for row in rows
+        ]
+        message = self._format_cross_owner_publish_fork_warning(
+            name=name,
+            owner_id=owner_id,
+            candidates=candidates,
+        )
+        return {
+            "type": "cross_owner_publish_fork",
+            "message": message,
+            "name": name,
+            "library": library,
+            "owner_id": owner_id,
+            "other_owners": candidates,
+        }
+
+    @staticmethod
+    def _format_cross_owner_publish_fork_warning(
+        *,
+        name: str,
+        owner_id: str,
+        candidates: list[dict[str, Any]],
+    ) -> str:
+        if len(candidates) == 1:
+            [candidate] = candidates
+            other_owner_id = str(candidate["owner_id"])
+            return (
+                f"{name!r} also exists locally under owner {other_owner_id!r} "
+                f"(their v{candidate['version']}). Publishing as {owner_id!r} "
+                "creates a SEPARATE object; versions do not continue "
+                f"{other_owner_id}'s chain; bare-name lookups resolve per current identity"
+            )
+        candidate_text = ", ".join(
+            f"owner {candidate['owner_id']!r} (their v{candidate['version']})" for candidate in candidates
+        )
+        return (
+            f"{name!r} also exists locally under other owners: {candidate_text}. "
+            f"Publishing as {owner_id!r} creates a SEPARATE object; versions do not continue "
+            "those owners' chains; bare-name lookups resolve per current identity"
+        )
+
+    @staticmethod
+    def _with_publish_fork_warning(
+        record: dict[str, Any],
+        warning: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if warning is None:
+            return record
+        result = dict(record)
+        result["warning"] = warning["message"]
+        result["warnings"] = [warning]
+        LOGGER.warning(
+            "%s",
+            warning["message"],
+            extra={
+                "spl_event": "cross_owner_publish_fork",
+                "cross_owner_publish_fork": warning,
+            },
+        )
+        return result
 
     def list_objects(self) -> dict[str, Any]:
         """Return current object versions keyed by registry name."""
@@ -1102,6 +1203,8 @@ class ObjectRepository(RepositoryBase):
                 library=library,
             )
             same_name_libraries: list[str] = []
+            cross_owner_hint: str | None = None
+            bare_lookup = owner_id is None and library is None
             if not rows and library is None:
                 same_name_libraries = sorted(
                     {
@@ -1112,6 +1215,8 @@ class ObjectRepository(RepositoryBase):
                         )
                     }
                 )
+            if not rows and bare_lookup:
+                cross_owner_hint = self._cross_owner_name_hint_locked(name_or_id)
         if not rows:
             suffix = f" version {version}" if version is not None else ""
             if len(same_name_libraries) > 1:
@@ -1121,6 +1226,8 @@ class ObjectRepository(RepositoryBase):
                     f"(you have {name_or_id!r} in several libraries: {libraries}; "
                     "pass library=... to choose one)"
                 )
+            if cross_owner_hint is not None:
+                raise KeyError(cross_owner_hint)
             raise KeyError(f"object is not registered: {name_or_id}{suffix}")
         if len(rows) > 1:
             names = ", ".join(sorted(self._canonical_row_name(item) for item in rows))
@@ -1235,6 +1342,13 @@ class ObjectRepository(RepositoryBase):
                 library=library,
             )
             if not rows:
+                cross_owner_hint = self._forget_cross_owner_name_hint_locked(
+                    name_or_id,
+                    owner_id=owner_id,
+                    library=library,
+                )
+                if cross_owner_hint is not None:
+                    raise KeyError(cross_owner_hint)
                 raise KeyError(f"object is not registered: {name_or_id}")
             if len(rows) > 1:
                 names = ", ".join(sorted(self._canonical_object_identity_name(row) for row in rows))
@@ -1260,6 +1374,13 @@ class ObjectRepository(RepositoryBase):
                 library=library,
             )
             if not rows:
+                cross_owner_hint = self._forget_cross_owner_name_hint_locked(
+                    name_or_id,
+                    owner_id=owner_id,
+                    library=library,
+                )
+                if cross_owner_hint is not None:
+                    raise KeyError(cross_owner_hint)
                 raise KeyError(f"object is not registered: {name_or_id}")
             if len(rows) > 1:
                 names = ", ".join(sorted(self._canonical_object_identity_name(row) for row in rows))
@@ -1632,6 +1753,7 @@ class ObjectRepository(RepositoryBase):
     ) -> int:
         object_id = object_info["id"] if object_info is not None else None
         canonical_name = object_info["canonical_name"] if object_info is not None else None
+        owner_id = object_info["owner_id"] if object_info is not None else None
         event_rows = self._conn.execute(
             """
             SELECT id, kind, payload_json
@@ -1647,6 +1769,7 @@ class ObjectRepository(RepositoryBase):
                 payload,
                 object_id=object_id,
                 canonical_name=canonical_name,
+                owner_id=owner_id,
                 version_ids=version_ids,
             ):
                 delete_ids.append(event["id"])
@@ -1661,8 +1784,11 @@ class ObjectRepository(RepositoryBase):
         *,
         object_id: str | None,
         canonical_name: str | None,
+        owner_id: str | None,
         version_ids: set[str],
     ) -> bool:
+        if owner_id is not None and not self._sync_event_payload_matches_owner(payload, owner_id):
+            return False
         if kind == "object_version":
             return (object_id is not None and payload.get("source_object_id") == object_id) or payload.get(
                 "source_version_id"
@@ -1677,6 +1803,16 @@ class ObjectRepository(RepositoryBase):
                 "object_version_id"
             ) in version_ids
         return False
+
+    def _sync_event_payload_matches_owner(
+        self,
+        payload: dict[str, Any],
+        owner_id: str,
+    ) -> bool:
+        payload_owner_id = payload.get("owner_id")
+        if payload_owner_id is None and isinstance(payload.get("run"), dict):
+            payload_owner_id = payload["run"].get("owner_id")
+        return payload_owner_id is None or str(payload_owner_id) == owner_id
 
     def _object_identity_info(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
@@ -1694,6 +1830,68 @@ class ObjectRepository(RepositoryBase):
 
     def _canonical_object_identity_name(self, row: sqlite3.Row) -> str:
         return f"{row['owner_id']}/{row['library']}/{row['name']}"
+
+    def _cross_owner_name_hint_locked(self, name: str) -> str | None:
+        caller_owner_id = self._caller_owner_id()
+        rows = self._object_identity_rows_for_clause_locked(
+            "owner_id != ? AND name = ?",
+            (caller_owner_id, name),
+        )
+        if not rows:
+            return None
+        libraries_by_owner: dict[str, list[str]] = {}
+        for row in rows:
+            libraries_by_owner.setdefault(str(row["owner_id"]), []).append(str(row["library"]))
+        if len(libraries_by_owner) == 1:
+            [(owner_id, libraries)] = libraries_by_owner.items()
+            unique_libraries = sorted(set(libraries))
+            if len(unique_libraries) == 1:
+                return (
+                    f"{name!r} is registered locally under owner {owner_id!r} "
+                    f"(library {unique_libraries[0]!r}); pass owner=/library=, "
+                    "or reconnect under that identity"
+                )
+            library_list = ", ".join(repr(item) for item in unique_libraries)
+            return (
+                f"{name!r} is registered locally under owner {owner_id!r} "
+                f"(libraries {library_list}); pass owner=/library=, "
+                "or reconnect under that identity"
+            )
+        owner_parts = []
+        for owner_id, libraries in sorted(libraries_by_owner.items()):
+            library_list = ", ".join(repr(item) for item in sorted(set(libraries)))
+            label = "library" if len(set(libraries)) == 1 else "libraries"
+            owner_parts.append(f"owner {owner_id!r} ({label} {library_list})")
+        return (
+            f"{name!r} is registered locally under other owners: "
+            f"{', '.join(owner_parts)}; pass owner=/library=, "
+            "or reconnect under that identity"
+        )
+
+    def _forget_cross_owner_name_hint_locked(
+        self,
+        name: str,
+        *,
+        owner_id: str | None,
+        library: str | None,
+    ) -> str | None:
+        if owner_id is not None:
+            return None
+        if library is None:
+            return self._cross_owner_name_hint_locked(name)
+        caller_owner_id = self._caller_owner_id()
+        rows = self._object_identity_rows_for_clause_locked(
+            "owner_id != ? AND library = ? AND name = ?",
+            (caller_owner_id, self._object_library(library), name),
+        )
+        if not rows:
+            return None
+        owners = ", ".join(f"owner {row['owner_id']!r}" for row in rows)
+        return (
+            f"{name!r} is registered locally under {owners} "
+            f"(library {self._object_library(library)!r}); pass owner=/library=, "
+            "or reconnect under that identity"
+        )
 
     def _object_rows_for_clause_locked(
         self,
@@ -1717,12 +1915,45 @@ class ObjectRepository(RepositoryBase):
         )
 
     def _caller_owner_id(self, owner_id: str | None = None) -> str:
+        """Return the stable identity owner for local object resolution.
+
+        Identity is not connectivity: a daemon can know the enrolled owner from
+        stored server credentials even when there is no live remote connection
+        lease. Server-backed operations still gate on ``remote_connection_id``;
+        local mirror lookup must not.
+        """
+
         if owner_id is not None:
             return validate_name(str(owner_id))
         credentials = self.current_server_connection_credentials()
-        if credentials is not None and credentials.get("remote_connection_id") and credentials.get("owner_id"):
+        if credentials is not None and credentials.get("owner_id"):
             return validate_name(str(credentials["owner_id"]))
+        self._warn_identity_degraded_to_local_if_needed()
         return DEFAULT_OBJECT_OWNER_ID
+
+    def _warn_identity_degraded_to_local_if_needed(self) -> None:
+        row = self._conn.execute(
+            """
+            SELECT COUNT(*) AS stored_count,
+                   SUM(CASE WHEN owner_id IS NOT NULL THEN 1 ELSE 0 END) AS owner_rows
+            FROM server_connections
+            """
+        ).fetchone()
+        if row is None or int(row["stored_count"] or 0) == 0:
+            return
+        stored_count = int(row["stored_count"])
+        owner_rows = int(row["owner_rows"] or 0)
+        LOGGER.warning(
+            "identity degraded to 'local'; %s stored credential rows exist - run spl-daemon doctor / connections-prune",
+            stored_count,
+            extra={
+                "spl_event": "server_identity_degraded_to_local",
+                "server_identity_degraded_to_local": {
+                    "stored_count": stored_count,
+                    "owner_rows": owner_rows,
+                },
+            },
+        )
 
     def _object_library(self, library: str | None = None) -> str:
         return validate_name(str(library or DEFAULT_OBJECT_LIBRARY))

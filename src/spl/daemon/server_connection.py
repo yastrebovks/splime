@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+from spl.daemon.repositories.server_connection import SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
 from spl.daemon.remote_client import ServerClientError
 from spl.daemon.runtime_dependencies import (
     ServerClientFactoryProtocol,
@@ -16,6 +17,10 @@ from spl.daemon.store import RegistryStore, validate_name
 class ServerOfflineError(RuntimeError):
     """Raised when a server-backed operation is requested while offline."""
 
+    def __init__(self, message: str, *, code: str = "central_server_offline"):
+        self.code = code
+        super().__init__(message)
+
 
 SERVER_OFFLINE_MESSAGE = (
     "central SPL daemon server is offline or unreachable. Local registry, "
@@ -23,6 +28,8 @@ SERVER_OFFLINE_MESSAGE = (
     "operations require connectivity and should be retried after the daemon "
     "reconnects."
 )
+SERVER_UNREACHABLE_CODE = "central_server_unreachable"
+SERVER_PROXY_TIMEOUT_SECONDS = 1.0
 
 
 class ServerConnectionManager:
@@ -42,17 +49,33 @@ class ServerConnectionManager:
         token: str,
         *,
         user_token: str | None,
+        request_timeout_seconds: float | None = None,
     ) -> ServerClientProtocol:
-        return self.server_client_factory(server_url, token, user_token=user_token)
+        if request_timeout_seconds is None:
+            return self.server_client_factory(server_url, token, user_token=user_token)
+        try:
+            return self.server_client_factory(
+                server_url,
+                token,
+                user_token=user_token,
+                request_timeout_seconds=request_timeout_seconds,
+            )
+        except TypeError as exc:
+            if "request_timeout_seconds" not in str(exc):
+                raise
+            return self.server_client_factory(server_url, token, user_token=user_token)
 
     def server_client_for_credentials(
         self,
         credentials: dict[str, Any],
+        *,
+        request_timeout_seconds: float | None = None,
     ) -> ServerClientProtocol:
         return self.server_client(
             credentials["server_url"],
             credentials["token"],
             user_token=credentials["user_token"],
+            request_timeout_seconds=request_timeout_seconds,
         )
 
     def connect_server(
@@ -76,25 +99,44 @@ class ServerConnectionManager:
         )
         if existing is not None and existing.get("remote_connection_id"):
             local_connection = self.store.get_server_connection(existing["id"])
-            if (
+            display_name_refresh = bool(
                 display_name
                 and display_name != local_connection.get("display_name")
                 and self._is_technical_machine_label(
                     local_connection.get("display_name"),
                     local_connection["machine_id"],
                 )
-            ):
+            )
+            if local_connection.get("status") != "connected" or display_name_refresh:
                 server = self.server_client(
                     server_url,
                     machine_token,
                     user_token=user_token,
                 )
-                remote_connection = server.connect_machine(
-                    machine_id=machine_id or local_connection["machine_id"],
-                    display_name=display_name,
-                    capabilities=capabilities,
-                    heartbeat_interval_seconds=heartbeat_interval_seconds,
-                )
+                try:
+                    remote_connection = server.connect_machine(
+                        machine_id=machine_id or local_connection["machine_id"],
+                        display_name=display_name,
+                        capabilities=capabilities,
+                        heartbeat_interval_seconds=heartbeat_interval_seconds,
+                    )
+                except ServerClientError as exc:
+                    if not self._is_server_connectivity_error(exc):
+                        raise
+                    local_connection = self.store.record_server_connection_error(
+                        existing["id"],
+                        status="connect_failed",
+                        error=exc.message,
+                    )
+                    return {
+                        "connected": False,
+                        "offline": True,
+                        "reused": True,
+                        "connection": local_connection,
+                        "remote_connection": None,
+                        "error": SERVER_OFFLINE_MESSAGE,
+                        "detail": exc.message,
+                    }
                 local_connection = self.store.complete_server_connection(
                     existing["id"],
                     remote_connection=remote_connection,
@@ -109,7 +151,8 @@ class ServerConnectionManager:
                 }
             return {
                 "connected": local_connection["status"] == "connected",
-                "offline": local_connection["status"] == "heartbeat_failed",
+                "offline": local_connection["status"]
+                in {"heartbeat_failed", "connect_failed", SERVER_CONNECTION_STATUS_NEEDS_RECONNECT},
                 "reused": True,
                 "connection": local_connection,
                 "remote_connection": self.remote_connection_snapshot(local_connection),
@@ -161,13 +204,24 @@ class ServerConnectionManager:
                 heartbeat_interval_seconds=heartbeat_interval_seconds,
             )
         else:
-            local_connection = self.store.save_server_connection(
+            pending = self.store.find_pending_server_connection(
                 server_url=server_url,
-                token=machine_token,
-                user_token=user_token,
-                connection=remote_connection,
-                heartbeat_interval_seconds=heartbeat_interval_seconds,
+                machine_id=remote_connection["machine_id"],
             )
+            if pending is not None:
+                local_connection = self.store.complete_server_connection(
+                    pending["id"],
+                    remote_connection=remote_connection,
+                    heartbeat_interval_seconds=heartbeat_interval_seconds,
+                )
+            else:
+                local_connection = self.store.save_server_connection(
+                    server_url=server_url,
+                    token=machine_token,
+                    user_token=user_token,
+                    connection=remote_connection,
+                    heartbeat_interval_seconds=heartbeat_interval_seconds,
+                )
         return {
             "connected": True,
             "connection": local_connection,
@@ -292,6 +346,10 @@ class ServerConnectionManager:
             raise KeyError("active server connection is not found")
         if not credentials.get("remote_connection_id"):
             raise ServerOfflineError(SERVER_OFFLINE_MESSAGE)
+        if credentials.get("status") == SERVER_CONNECTION_STATUS_NEEDS_RECONNECT:
+            raise ServerOfflineError(
+                "central SPL daemon server lease was rejected; reconnect with client.connect_server(...) to restore sync.",
+            )
         return credentials
 
     def remote_connection_snapshot(self, connection: dict[str, Any]) -> dict[str, Any]:

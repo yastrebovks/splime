@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import asyncio
 from dataclasses import dataclass
 from functools import wraps
 from http import HTTPStatus
@@ -11,7 +12,7 @@ from typing import Any, Awaitable, Callable, Protocol, TypeVar, cast
 
 from spl.daemon.remote_client import ServerClientError
 from spl.daemon.runtime_dependencies import ServerClientProtocol
-from spl.daemon.server_connection import ServerOfflineError
+from spl.daemon.server_connection import SERVER_PROXY_TIMEOUT_SECONDS, SERVER_UNREACHABLE_CODE, ServerOfflineError
 from spl.daemon.store import split_object_function_ref
 
 RouteHandler = TypeVar("RouteHandler", bound=Callable[..., Awaitable[Any]])
@@ -52,6 +53,9 @@ class RouteContext:
             content_type="application/json; charset=utf-8",
         )
 
+    async def run_blocking(self, func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        return await asyncio.to_thread(func, *args, **kwargs)
+
     def route_errors(
         self,
         handler: RouteHandler,
@@ -65,24 +69,30 @@ class RouteContext:
             except ValueError as exc:
                 return self.json_response({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except ServerOfflineError as exc:
+                body = {"error": str(exc), "offline": True}
+                code = getattr(exc, "code", None)
+                if code:
+                    body["code"] = code
                 return self.json_response(
-                    {"error": str(exc), "offline": True},
+                    body,
                     HTTPStatus.SERVICE_UNAVAILABLE,
                 )
             except ServerClientError as exc:
+                body = {
+                    "error": exc.message,
+                    "upstream_status": exc.status_code,
+                }
+                if self.runtime._is_server_connectivity_error(exc):
+                    self.runtime._mark_current_server_channel_failure()
+                    body["offline"] = True
+                    body["code"] = SERVER_UNREACHABLE_CODE
                 try:
                     status = HTTPStatus(exc.status_code)
                 except ValueError:
                     status = HTTPStatus.BAD_GATEWAY
                 if int(status) >= 500:
                     status = HTTPStatus.BAD_GATEWAY
-                return self.json_response(
-                    {
-                        "error": exc.message,
-                        "upstream_status": exc.status_code,
-                    },
-                    status,
-                )
+                return self.json_response(body, status)
             except RuntimeError as exc:
                 return self.json_response({"error": str(exc)}, HTTPStatus.CONFLICT)
             except Exception as exc:
@@ -127,8 +137,11 @@ class RouteContext:
         return value.lower() in {"1", "true", "yes", "on"}
 
     def connected_server_client(self) -> tuple[dict[str, Any], ServerClientProtocol]:
-        credentials = self.runtime._require_connected_server_credentials()
-        return credentials, self.runtime._server_client_for_credentials(credentials)
+        credentials = self.runtime._require_live_server_channel_credentials()
+        return credentials, self.runtime._server_client_for_credentials(
+            credentials,
+            request_timeout_seconds=SERVER_PROXY_TIMEOUT_SECONDS,
+        )
 
     def object_function_ref(self, name_or_id: str) -> tuple[str, str | None]:
         return split_object_function_ref(
@@ -136,7 +149,7 @@ class RouteContext:
             self.first_query_value("function", "entrypoint"),
         )
 
-    def object_from_local_or_server(
+    async def object_from_local_or_server_async(
         self,
         name_or_id: str,
         *,
@@ -145,7 +158,8 @@ class RouteContext:
         version = self.optional_int_query("version")
         owner_id = self.first_query_value("owner", "owner_id")
         library = self.first_query_value("library")
-        refresh = self.runtime.refresh_server_object_if_available(
+        refresh = await self.run_blocking(
+            self.runtime.refresh_server_object_if_available,
             name_or_id,
             version=version,
             owner_id=owner_id,
@@ -164,8 +178,8 @@ class RouteContext:
             self.runtime.store.get_object(
                 name_or_id,
                 version=version,
-                include_yaml=include_yaml,
                 owner_id=owner_id,
                 library=library,
+                include_yaml=include_yaml,
             ),
         )

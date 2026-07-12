@@ -92,6 +92,8 @@ class RegistryStore:
             backfill_object_kinds_locked=self.objects._backfill_object_kinds_locked,
             backfill_object_decomposition_locked=(self.objects._backfill_object_decomposition_locked),
         )
+        self.server_connections.backfill_local_machine_identity()
+        self.server_connections.recover_lease_rejected_identity_rows()
 
     def close(self) -> None:
         """Close the SQLite connection held by this store."""
@@ -253,6 +255,17 @@ class RegistryStore:
     def get_server_connection_credentials(self, connection_id: str) -> dict[str, Any]:
         return self.server_connections.get_server_connection_credentials(connection_id)
 
+    def find_pending_server_connection(
+        self,
+        *,
+        server_url: str,
+        machine_id: str,
+    ) -> dict[str, Any] | None:
+        return self.server_connections.find_pending_server_connection(
+            server_url=server_url,
+            machine_id=machine_id,
+        )
+
     def current_server_connection(self) -> dict[str, Any] | None:
         return self.server_connections.current_server_connection()
 
@@ -260,7 +273,45 @@ class RegistryStore:
         return self.server_connections.current_server_connection_credentials()
 
     def list_server_connections(self) -> list[dict[str, Any]]:
-        return self.server_connections.list_server_connections()
+        connections = self.server_connections.list_server_connections()
+        current = self.server_connections.current_server_connection()
+        current_id = current.get("id") if current else None
+        current_owner_id = current.get("owner_id") if current else None
+        sync_summary = self.sync_events.pending_sync_event_identity_summary(
+            str(current_owner_id) if current_owner_id else None
+        )
+        by_owner = sync_summary["by_owner"]
+        for connection in connections:
+            owner_id = connection.get("owner_id")
+            connection["pending_sync_events"] = by_owner.get(str(owner_id), 0) if owner_id else 0
+            connection["pre_enrollment_sync_events"] = sync_summary["pre_enrollment"]
+            connection["held_sync_events"] = (
+                sync_summary["held_for_other_identities"] if connection.get("id") == current_id else 0
+            )
+        return connections
+
+    def server_connection_summary(self, *, older_than_days: int | None = 30) -> dict[str, Any]:
+        summary = self.server_connections.server_connection_summary(older_than_days=older_than_days)
+        current = self.server_connections.current_server_connection()
+        current_owner_id = current.get("owner_id") if current else None
+        sync_summary = self.sync_events.pending_sync_event_identity_summary(
+            str(current_owner_id) if current_owner_id else None
+        )
+        summary["held_sync_events"] = sync_summary["held_for_other_identities"]
+        summary["held_sync_event_owner_ids"] = sync_summary["held_owner_ids"]
+        summary["pre_enrollment_sync_events"] = sync_summary["pre_enrollment"]
+        return summary
+
+    def prune_server_connections(
+        self,
+        *,
+        older_than_days: int | None = 30,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        return self.server_connections.prune_server_connections(
+            older_than_days=older_than_days,
+            dry_run=dry_run,
+        )
 
     def record_server_connection_heartbeat(
         self,
@@ -314,8 +365,14 @@ class RegistryStore:
     def get_sync_event(self, event_id: str) -> dict[str, Any]:
         return self.sync_events.get_sync_event(event_id)
 
-    def list_pending_sync_events(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list_pending_sync_events(self, limit: int | None = 100) -> list[dict[str, Any]]:
         return self.sync_events.list_pending_sync_events(limit)
+
+    def pending_sync_event_identity_summary(
+        self,
+        current_owner_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self.sync_events.pending_sync_event_identity_summary(current_owner_id)
 
     def mark_sync_event_sent(self, event_id: str) -> dict[str, Any]:
         return self.sync_events.mark_sync_event_sent(event_id)
@@ -551,6 +608,8 @@ class RegistryStore:
         version: int | None = None,
         object_version_id: str | None = None,
         function: str | None = None,
+        owner_id: str | None = None,
+        library: str | None = None,
         runtimes: dict[str, str] | None = None,
         keep: KeepPolicy = "on_failure",
         parent_run_id: str | None = None,
@@ -565,6 +624,8 @@ class RegistryStore:
             version=version,
             object_version_id=object_version_id,
             function=function,
+            owner_id=owner_id,
+            library=library,
             runtimes=runtimes,
             keep=keep,
             parent_run_id=parent_run_id,

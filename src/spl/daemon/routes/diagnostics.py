@@ -8,6 +8,7 @@ from spl.daemon.interpreter_visibility import (
     interpreter_substitution_from_resolution,
     python_minor_mismatch,
 )
+from spl.daemon.repositories.server_connection import OFFLINE_SERVER_CONNECTION_STATUSES
 from spl.daemon.routes._helpers import RouteErrorDecorator, RouteRegistrar
 from spl.daemon.services.sync import SyncVisibilityService
 from spl.daemon.store import utc_now
@@ -41,6 +42,7 @@ def register_diagnostics_routes(
             build_statuses[status] = build_statuses.get(status, 0) + 1
 
         connection = runtime.store.current_server_connection()
+        connection_summary = runtime.store.server_connection_summary()
         sync_summary = sync_visibility.summary()
         return json_response(
             {
@@ -63,10 +65,9 @@ def register_diagnostics_routes(
                         and connection["status"] == "connected"
                         and bool(connection.get("remote_connection_id"))
                     ),
-                    "offline": (
-                        connection is not None and connection["status"] in {"connect_failed", "heartbeat_failed"}
-                    ),
+                    "offline": (connection is not None and connection["status"] in OFFLINE_SERVER_CONNECTION_STATUSES),
                     "connection": connection,
+                    "connection_summary": connection_summary,
                 },
                 "sync": sync_summary,
                 "interpreter_substitutions": interpreter_substitutions,

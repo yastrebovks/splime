@@ -38,6 +38,7 @@ from spl.daemon.doctor import (
     check_pipeline_adapter_tags,
     check_python,
     check_server_connection,
+    check_server_identity,
     check_uv_builder,
     check_venv_tooling,
     run_doctor,
@@ -351,6 +352,107 @@ class TestIndividualChecks:
         )
         assert offline.status == FAIL
         assert "401: bad token" in offline.detail
+
+        needs_reconnect = check_server_connection(
+            _healthy_payload(
+                server={
+                    "connected": False,
+                    "offline": True,
+                    "connection": {
+                        "server_url": "https://splime.io/api",
+                        "status": "needs_reconnect",
+                        "error": "lease rejected by server (404): stale lease",
+                    },
+                }
+            )
+        )
+        assert needs_reconnect.status == WARN
+        assert "lease rejected by server (404) - identity kept" in needs_reconnect.detail
+        assert "connect_server" in needs_reconnect.detail
+        assert "client.connect_server" in (needs_reconnect.hint or "")
+
+    def test_server_identity_reports_owner_machine_and_multi_owner_warning(self) -> None:
+        assert check_server_identity(None).status == SKIP
+
+        single = check_server_identity(
+            _healthy_payload(
+                server={
+                    "connected": True,
+                    "offline": False,
+                    "connection": {"owner_id": "owner-a", "machine_id": "machine-1"},
+                    "connection_summary": {
+                        "stored_count": 1,
+                        "stale_count": 0,
+                        "held_sync_events": 0,
+                        "owners": ["owner-a"],
+                    },
+                }
+            )
+        )
+        assert single.status == OK
+        assert "enrolled as owner-a on machine-1" in single.detail
+        assert "1 stored connections (0 stale)" in single.detail
+        assert "0 sync events held for other identities" in single.detail
+
+        degraded = check_server_identity(
+            _healthy_payload(
+                server={
+                    "connected": False,
+                    "offline": True,
+                    "connection": {},
+                    "connection_summary": {
+                        "identity_degraded": True,
+                        "stored_count": 13,
+                        "stale_count": 13,
+                        "owners": [],
+                    },
+                }
+            )
+        )
+        assert degraded.status == WARN
+        assert "identity degraded to 'local'" in degraded.detail
+        assert "13 stored credential rows exist" in degraded.detail
+        assert "connections-prune" in (degraded.hint or "")
+
+        replaced_offline = check_server_identity(
+            _healthy_payload(
+                server={
+                    "connected": False,
+                    "offline": True,
+                    "connection": {},
+                    "connection_summary": {
+                        "identity_degraded": True,
+                        "stored_count": 1,
+                        "stale_count": 1,
+                        "offline_replaced_identity_rows": 1,
+                        "owners": ["ky-monetech.mx"],
+                    },
+                }
+            )
+        )
+        assert replaced_offline.status == WARN
+        assert "identity row replaced while offline" in replaced_offline.detail
+        assert "reconnect to restore" in replaced_offline.detail
+        assert "connect_server" in (replaced_offline.hint or "")
+
+        multi = check_server_identity(
+            _healthy_payload(
+                server={
+                    "connected": True,
+                    "offline": False,
+                    "connection": {"owner_id": "owner-b", "machine_id": "machine-1"},
+                    "connection_summary": {
+                        "stored_count": 3,
+                        "stale_count": 1,
+                        "held_sync_events": 2,
+                        "owners": ["owner-a", "owner-b"],
+                    },
+                }
+            )
+        )
+        assert multi.status == WARN
+        assert "2 sync events held for other identities" in multi.detail
+        assert "owner-a, owner-b" in (multi.hint or "")
 
     def test_environment_builds_states(self) -> None:
         assert check_environment_builds(None).status == SKIP
@@ -670,7 +772,7 @@ class TestRunDoctor:
     ) -> None:
         report = run_doctor(FakeClient({"counts": None, "server": None}), home=tmp_path)
         assert isinstance(report, DoctorReport)
-        assert len(report.checks) == 11
+        assert len(report.checks) == 12
 
 
 class TestCli:

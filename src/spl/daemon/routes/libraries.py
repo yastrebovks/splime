@@ -25,7 +25,8 @@ def register_library_routes(
     async def list_server_libraries() -> Any:
         _, server = context.connected_server_client()
         return json_response(
-            server.list_libraries(
+            await context.run_blocking(
+                server.list_libraries,
                 include_accessible=context.query_bool(
                     "include_accessible",
                     default=True,
@@ -38,7 +39,7 @@ def register_library_routes(
     async def create_server_library() -> Any:
         _, server = context.connected_server_client()
         return json_response(
-            server.create_library(await context.read_json_body()),
+            await context.run_blocking(server.create_library, await context.read_json_body()),
             HTTPStatus.CREATED,
         )
 
@@ -46,14 +47,15 @@ def register_library_routes(
     @route_errors
     async def get_server_library(library_ref: str) -> Any:
         _, server = context.connected_server_client()
-        return json_response(server.get_library(validate_name(library_ref)))
+        return json_response(await context.run_blocking(server.get_library, validate_name(library_ref)))
 
     @app.put("/server/libraries/<library_ref>")
     @route_errors
     async def update_server_library(library_ref: str) -> Any:
         _, server = context.connected_server_client()
         return json_response(
-            server.update_library(
+            await context.run_blocking(
+                server.update_library,
                 validate_name(library_ref),
                 await context.read_json_body(),
             )
@@ -72,14 +74,15 @@ def register_library_routes(
     @route_errors
     async def list_server_library_grants(library_ref: str) -> Any:
         _, server = context.connected_server_client()
-        return json_response(server.list_library_grants(validate_name(library_ref)))
+        return json_response(await context.run_blocking(server.list_library_grants, validate_name(library_ref)))
 
     @app.post("/server/libraries/<library_ref>/grants")
     @route_errors
     async def grant_server_library(library_ref: str) -> Any:
         _, server = context.connected_server_client()
         return json_response(
-            server.grant_library(
+            await context.run_blocking(
+                server.grant_library,
                 validate_name(library_ref),
                 await context.read_json_body(),
             ),
@@ -91,7 +94,8 @@ def register_library_routes(
     async def revoke_server_library_grant(library_ref: str, grantee: str) -> Any:
         _, server = context.connected_server_client()
         return json_response(
-            server.revoke_library_grant(
+            await context.run_blocking(
+                server.revoke_library_grant,
                 validate_name(library_ref),
                 validate_name(grantee),
             )
@@ -102,7 +106,8 @@ def register_library_routes(
     async def add_server_library_reference(library_ref: str) -> Any:
         _, server = context.connected_server_client()
         return json_response(
-            server.add_library_reference(
+            await context.run_blocking(
+                server.add_library_reference,
                 validate_name(library_ref),
                 await context.read_json_body(),
             ),
@@ -114,7 +119,8 @@ def register_library_routes(
     async def copy_server_library_object(library_ref: str) -> Any:
         _, server = context.connected_server_client()
         return json_response(
-            server.copy_object_into_library(
+            await context.run_blocking(
+                server.copy_object_into_library,
                 validate_name(library_ref),
                 await context.read_json_body(),
             ),
@@ -126,7 +132,8 @@ def register_library_routes(
     async def remove_server_library_entry(library_ref: str, name: str) -> Any:
         _, server = context.connected_server_client()
         return json_response(
-            server.remove_library_entry(
+            await context.run_blocking(
+                server.remove_library_entry,
                 validate_name(library_ref),
                 validate_name(name),
             )

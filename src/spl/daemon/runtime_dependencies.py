@@ -372,6 +372,7 @@ class ServerClientFactoryProtocol(Protocol):
         machine_token: str,
         *,
         user_token: str | None = None,
+        request_timeout_seconds: float | None = None,
     ) -> ServerClientProtocol:
         """Return a central server client."""
         ...
@@ -386,6 +387,7 @@ class ServerConnectionsProtocol(Protocol):
         token: str,
         *,
         user_token: str | None,
+        request_timeout_seconds: float | None = None,
     ) -> ServerClientProtocol:
         """Return a central server client for explicit credentials."""
         ...
@@ -393,6 +395,8 @@ class ServerConnectionsProtocol(Protocol):
     def server_client_for_credentials(
         self,
         credentials: dict[str, Any],
+        *,
+        request_timeout_seconds: float | None = None,
     ) -> ServerClientProtocol:
         """Return a central server client for stored credentials."""
         ...
