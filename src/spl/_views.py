@@ -134,6 +134,18 @@ def _name(record: Mapping[str, Any]) -> str:
     )
 
 
+def _owner_label(record: Mapping[str, Any]) -> str:
+    """Return the human owner label carried by ``record`` without resolving it."""
+
+    handle = record.get("owner_handle")
+    if isinstance(handle, str) and handle:
+        return f"@{handle}"
+    owner_id = record.get("owner_id")
+    if owner_id is None or owner_id == "":
+        return _EMPTY
+    return str(owner_id)
+
+
 def _version(record: Mapping[str, Any]) -> str:
     current = record.get("current_version")
     if isinstance(current, Mapping):
@@ -147,6 +159,22 @@ def _library_name(value: Any) -> str:
     if isinstance(value, Mapping):
         value = value.get("display_name") or value.get("slug") or value.get("name")
     return _EMPTY if value is None else str(value)
+
+
+def _object_library_label(record: Mapping[str, Any]) -> str:
+    library = record.get("library")
+    label = _library_name(library)
+    if not isinstance(library, Mapping):
+        return label
+    if "owner_handle" not in record and "owner_handle" not in library:
+        return label
+    object_owner = record.get("owner_id")
+    library_owner = library.get("owner_id")
+    if not object_owner or not library_owner or object_owner == library_owner:
+        return label
+    slug = library.get("slug") or library.get("name") or label
+    owner = _owner_label(library)
+    return f"{owner}/{slug}" if owner != _EMPTY else str(slug)
 
 
 def _status(value: Any) -> str:
@@ -187,13 +215,33 @@ def _server_resolution_label(value: Any) -> str | None:
     if not isinstance(value, Mapping):
         return None
     parts = []
-    library = value.get("library")
-    owner = value.get("owner_id")
+    library = value.get("library") or value.get("resolved_library")
+    owner = _owner_label(
+        {
+            "owner_handle": value.get("owner_handle") or value.get("resolved_owner_handle"),
+            "owner_id": value.get("owner_id") or value.get("resolved_owner_id"),
+        }
+    )
     if isinstance(library, str) and library:
         parts.append("library {!r}".format(library))
-    if isinstance(owner, str) and owner:
+    if owner != _EMPTY:
         parts.append("owner {}".format(owner))
     return ", ".join(parts) if parts else "server catalog"
+
+
+def _resolved_scope_label(value: Any) -> str | None:
+    if not isinstance(value, Mapping) or value.get("auto_resolved") is not True:
+        return None
+    owner = _owner_label(
+        {
+            "owner_handle": value.get("resolved_owner_handle"),
+            "owner_id": value.get("resolved_owner_id"),
+        }
+    )
+    library = value.get("resolved_library")
+    if owner == _EMPTY or not isinstance(library, str) or not library:
+        return _EMPTY
+    return f"{owner}/{library}"
 
 
 class CompactDict(dict[str, Any]):
@@ -236,11 +284,14 @@ class CompactList(list[Any]):
     def _table_rows(self) -> list[dict[str, Any]]:
         return [{"item": item} for item in self]
 
+    def _table_headers(self) -> tuple[str, ...]:
+        return self.headers
+
     def __repr__(self) -> str:
-        return table_to_text(self._title, self.headers, self._table_rows())
+        return table_to_text(self._title, self._table_headers(), self._table_rows())
 
     def _repr_html_(self) -> str:
-        return table_to_html(self._title, self.headers, self._table_rows())
+        return table_to_html(self._title, self._table_headers(), self._table_rows())
 
 
 class HealthView(CompactDict):
@@ -324,14 +375,20 @@ class MachineListView(CompactDict):
 
 class LibraryListView(CompactList):
     title = "libraries"
-    headers = ("slug", "display", "owner", "access", "visibility", "default_machine")
+    headers = ("slug", "display", "owner", "owned", "access", "visibility", "default_machine")
+
+    def _table_headers(self) -> tuple[str, ...]:
+        if any(isinstance(item, Mapping) and "owned" in item for item in self):
+            return self.headers
+        return tuple(header for header in self.headers if header != "owned")
 
     def _table_rows(self) -> list[dict[str, Any]]:
         return [
             {
                 "slug": item.get("slug") or item.get("name") or item.get("id"),
                 "display": item.get("display_name") or item.get("name"),
-                "owner": item.get("owner_id"),
+                "owner": _owner_label(item),
+                "owned": item.get("owned") if "owned" in item else _EMPTY,
                 "access": ",".join(item.get("access") or item.get("scopes") or []),
                 "visibility": item.get("visibility"),
                 "default_machine": item.get("default_machine_id"),
@@ -395,6 +452,8 @@ class ActionReceiptView(CompactDict):
             "kind",
             "version",
             "library",
+            "owner",
+            "resolved",
             "env",
             "python",
             "removed",
@@ -403,7 +462,22 @@ class ActionReceiptView(CompactDict):
             "count",
             "id",
         )
-        rows = [(key, self.get(key)) for key in keys if key in self]
+        resolution = self.get("resolution")
+        if not isinstance(resolution, Mapping):
+            resolution = self.get("resolved_from")
+        if not isinstance(resolution, Mapping) and self.get("auto_resolved") is True:
+            resolution = self
+        resolved = _resolved_scope_label(resolution)
+        rows: list[tuple[str, Any]] = []
+        for key in keys:
+            if key == "owner":
+                if "owner_handle" in self:
+                    rows.append((key, _owner_label(self)))
+            elif key == "resolved":
+                if resolved is not None:
+                    rows.append((key, resolved))
+            elif key in self:
+                rows.append((key, self.get(key)))
         if rows:
             return rows
         return super()._summary_rows()
@@ -413,22 +487,30 @@ class ObjectRecordView(CompactDict):
     title = "object"
 
     def _summary_rows(self) -> list[tuple[str, Any]]:
-        return [
+        rows = [
             ("name", _name(self)),
             ("kind", self.get("kind") or self.get("object_kind") or self.get("type")),
             ("version", _version(self)),
-            ("library", _library_name(self.get("library"))),
-            ("env", self.get("env")),
-            ("entrypoint", self.get("entrypoint")),
-            ("inputs", len(self.get("inputs") or [])),
-            ("outputs", len(self.get("outputs") or [])),
-            ("yaml", self.get("yaml_path") or ("included" if self.get("yaml") else None)),
         ]
+        if "owner_handle" in self:
+            rows.append(("owner", _owner_label(self)))
+        rows.extend(
+            [
+                ("library", _object_library_label(self)),
+                ("env", self.get("env")),
+                ("entrypoint", self.get("entrypoint")),
+                ("inputs", len(self.get("inputs") or [])),
+                ("outputs", len(self.get("outputs") or [])),
+                ("yaml", self.get("yaml_path") or ("included" if self.get("yaml") else None)),
+            ]
+        )
+        return rows
 
 
 class ObjectListView(CompactList):
     title = "objects"
-    headers = ("name", "kind", "version", "library", "inputs")
+    headers = ("name", "kind", "version", "owner", "library", "inputs")
+    _legacy_headers = ("name", "kind", "version", "library", "inputs")
 
     def __init__(self, payload: list[Any] | None = None, *, title: str | None = None):
         super().__init__(
@@ -440,12 +522,18 @@ class ObjectListView(CompactList):
             title=title,
         )
 
+    def _table_headers(self) -> tuple[str, ...]:
+        if any(isinstance(item, Mapping) and "owner_handle" in item for item in self):
+            return self.headers
+        return self._legacy_headers
+
     def _table_rows(self) -> list[dict[str, Any]]:
         return [
             {
                 "name": _name(item),
                 "kind": item.get("kind") or item.get("object_kind") or item.get("type"),
                 "version": _version(item),
+                "owner": _owner_label(item),
                 "library": _library_name(item.get("library")),
                 "inputs": len(item.get("inputs") or []),
             }
@@ -470,7 +558,10 @@ class SignatureView(CompactDict):
             ("example", call.get("example")),
             ("read", call.get("read")),
         ]
-        resolved = _server_resolution_label(self.get("resolved_from_server"))
+        resolved_value = self.get("resolved_from_server")
+        if not isinstance(resolved_value, Mapping):
+            resolved_value = self.get("resolved_from")
+        resolved = _server_resolution_label(resolved_value)
         if resolved is not None:
             rows.append(("resolved from server", resolved))
         return rows
@@ -599,7 +690,7 @@ class RunRecordView(CompactDict):
         if isinstance(result, Mapping):
             artifacts = result.get("artifacts")
             artifact_count = len(artifacts) if isinstance(artifacts, Mapping | list) else 0
-        return [
+        rows = [
             ("id", self.get("id")),
             ("status", self.get("status")),
             ("keep", self.get("keep")),
@@ -615,6 +706,13 @@ class RunRecordView(CompactDict):
             ("artifacts", artifact_count),
             ("error", self.get("error")),
         ]
+        resolution = self.get("resolution")
+        if not isinstance(resolution, Mapping):
+            resolution = self.get("resolved_from")
+        resolved = _resolved_scope_label(resolution)
+        if resolved is not None:
+            rows.append(("resolved", resolved))
+        return rows
 
     def _runtime_rows(self) -> list[dict[str, Any]]:
         return [

@@ -40,12 +40,14 @@ def register_run_routes(
         statuses = body.get("statuses")
         if statuses is not None and not isinstance(statuses, list):
             raise ValueError("statuses must be a list")
+        if statuses == []:
+            raise ValueError("statuses must not be empty; provide statuses or omit the field")
         return json_response(
             runtime.store.prune_runs(
                 run_id=body.get("run_id"),
                 statuses=statuses,
                 older_than_seconds=body.get("older_than_seconds"),
-                dry_run=bool(body.get("dry_run", False)),
+                dry_run=context.strict_body_bool(body, "dry_run"),
             )
         )
 
@@ -56,7 +58,8 @@ def register_run_routes(
         runtimes = body.get("runtimes")
         if runtimes is not None and not isinstance(runtimes, dict):
             raise ValueError("runtimes must be a mapping")
-        if body.get("target_machine") or body.get("remote"):
+        remote = context.strict_body_bool(body, "remote")
+        if body.get("target_machine") or remote:
             return json_response(
                 await context.run_blocking(
                     runtime.start_remote_run,
@@ -100,7 +103,7 @@ def register_run_routes(
     @app.get("/remote-runs/<run_id>")
     @route_errors
     async def get_remote_run(run_id: str) -> Any:
-        credentials = runtime._require_live_server_channel_credentials()
+        credentials = await context.run_blocking(runtime._require_live_server_channel_credentials)
         return json_response(
             await context.run_blocking(
                 runtime._server_client_for_credentials(
@@ -166,7 +169,7 @@ def register_run_routes(
         return json_response(
             runtime.store.delete_run(
                 validate_name(run_id),
-                dry_run=context.query_bool("dry_run", default=False),
+                dry_run=context.strict_query_bool("dry_run"),
             )
         )
 

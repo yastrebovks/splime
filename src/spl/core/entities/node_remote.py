@@ -7,6 +7,7 @@ from uuid import UUID
 import yaml
 
 from spl._deprecate import warn_deprecated
+from spl._owner_ref import canonical_owner_from_response, normalize_owner_ref
 from spl.core.entities.node import InputPort, Node, OutputPort
 from spl.core.ir.common import DBase
 from spl.core.ir.parse import _branch, ir_parse
@@ -63,9 +64,10 @@ class NodeRemote(Node):
         target_machine = None if target_machine is None else str(target_machine)
 
         if inputs is None or outputs is None:
-            resolved_inputs, resolved_outputs = _resolve_remote_ports(
+            resolved_inputs, resolved_outputs, resolved_owner_id = _resolve_remote_ports(
                 url=url, name=name, version=version, owner_id=owner_id, library=library, target_machine=target_machine
             )
+            owner_id = resolved_owner_id
             if inputs is None:
                 inputs = resolved_inputs
             if outputs is None:
@@ -95,8 +97,12 @@ class NodeRemote(Node):
         """The single documented way to reference a remote object.
 
         Pass either ``name`` (optionally with ``function``) or
-        ``pipeline`` + ``function``.  ``owner``/``library`` select another
-        user's namespace, mirroring ``SPLClient.call``.  Since 0.2.0 the
+        ``pipeline`` + ``function``.  ``owner`` accepts a canonical user id or
+        ``@handle`` and ``library`` selects that user's namespace. When ports
+        are resolved through the daemon, the returned canonical owner id
+        replaces a handle before serialization. Explicit ``inputs`` and
+        ``outputs`` avoid the network round trip and therefore retain the raw
+        owner reference until run time. Since 0.2.0 the
         convenience ``__init__`` forms (``pipeline=``/``function=`` keywords,
         object name in the positional ``url`` slot) emit
         ``DeprecationWarning``; ``locate`` is the canonical spelling and the
@@ -148,7 +154,7 @@ def _normalize_owner(owner: Any, owner_id: Any) -> str | None:
     if owner is not None and owner_id is not None and str(owner) != str(owner_id):
         raise ValueError(f"owner and owner_id were both provided with different values: {owner!r} and {owner_id!r}")
     value = owner_id if owner_id is not None else owner
-    return None if value is None else str(value)
+    return normalize_owner_ref(None if value is None else str(value))
 
 
 def _remote_ref(
@@ -178,7 +184,7 @@ def _resolve_remote_ports(
     owner_id: str | None = None,
     library: str | None = None,
     target_machine: str | None = None,
-) -> tuple[list[InputPort], list[OutputPort]]:
+) -> tuple[list[InputPort], list[OutputPort], str | None]:
     """Resolve a remote node signature through the local daemon."""
 
     try:
@@ -200,9 +206,23 @@ def _resolve_remote_ports(
     signature = payload.get("signature") if isinstance(payload, dict) else payload
     if not isinstance(signature, dict):
         raise RuntimeError(f"NodeRemote signature resolver returned an invalid response for {name}:{version}")
+    remote = signature.get("remote")
+    remote_ref = signature.get("remote_ref")
+    response_owner = remote.get("owner_id") if isinstance(remote, dict) else None
+    if response_owner is None and isinstance(remote_ref, dict):
+        response_owner = remote_ref.get("owner_id")
+    if response_owner is None:
+        response_owner = signature.get("owner_id")
+    try:
+        resolved_owner_id = canonical_owner_from_response(owner_id, response_owner)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"NodeRemote signature resolver returned an invalid owner for {name}:{version}: {exc}"
+        ) from exc
     return (
         [_signature_input_to_port(item) for item in signature.get("inputs") or []],
         _signature_outputs_to_ports(signature.get("outputs") or []),
+        resolved_owner_id,
     )
 
 

@@ -78,15 +78,35 @@ yaml.add_constructor(
 
 
 def get_dependency_names_from_bytecode(f: FunctionType | CodeType | str) -> Generator[str]:
-    for x in dis.Bytecode(f):
-        match x.opname:
-            case "LOAD_GLOBAL":
-                yield cast(str, x.argval)
-            case "LOAD_NAME":
-                yield cast(str, x.argval)
-            case "LOAD_CONST":
-                if isinstance(x.argval, CodeType):
-                    yield from get_dependency_names_from_bytecode(x.argval)
+    """Yield external names while respecting bindings in nested code objects."""
+
+    def scan(
+        value: FunctionType | CodeType | str,
+        enclosing_bindings: frozenset[str],
+    ) -> Generator[str]:
+        if isinstance(value, FunctionType):
+            code: CodeType | None = value.__code__
+        elif isinstance(value, CodeType):
+            code = value
+        else:
+            code = None
+
+        local_bindings = frozenset((*code.co_varnames, *code.co_cellvars)) if code is not None else frozenset()
+        child_bindings = local_bindings | frozenset(code.co_freevars) if code is not None else frozenset()
+        for instruction in dis.Bytecode(value):
+            match instruction.opname:
+                case "LOAD_GLOBAL" | "LOAD_NAME" | "LOAD_DEREF" | "LOAD_CLASSDEREF":
+                    name = cast(str, instruction.argval)
+                    if name not in enclosing_bindings | local_bindings:
+                        yield name
+                case "LOAD_CONST":
+                    if isinstance(instruction.argval, CodeType):
+                        yield from scan(
+                            instruction.argval,
+                            enclosing_bindings | child_bindings,
+                        )
+
+    yield from scan(f, frozenset())
 
 
 def get_dependencies_from_bytecode(frame_offset: int, f: FunctionType | CodeType | str) -> Generator[Any]:
@@ -118,13 +138,60 @@ def serialize_function_output(func: FunctionType, tree: ast.FunctionDef) -> list
     return [OutputPort(name=name, typ_=ast.unparse(tree.returns) if (tree.returns is not None) else None)]
 
 
+def _validate_live_function(func: FunctionType, tree: ast.FunctionDef) -> None:
+    """Reject callable features that ``!DFunction`` cannot represent."""
+    args = tree.args
+    unsupported: list[str] = []
+    if args.posonlyargs:
+        unsupported.append("positional-only parameters")
+    if args.kwonlyargs or args.kw_defaults:
+        unsupported.append("keyword-only parameters")
+    if args.vararg is not None:
+        unsupported.append("*args")
+    if args.kwarg is not None:
+        unsupported.append("**kwargs")
+
+    signature = "{}{}".format(func.__name__, inspect.signature(func))
+    if unsupported:
+        raise ValueError(
+            "cannot serialize function {!r}: unsupported parameter kinds: {}. "
+            "splime 0.4.x publishes functions with plain positional-or-keyword parameters only; "
+            "refactor `{}` into explicit parameters.".format(
+                func.__qualname__,
+                ", ".join(unsupported),
+                signature,
+            )
+        )
+
+    # Only the function's own freevars are captures from an outer scope.
+    # Nested code objects use freevars for ordinary comprehensions, genexprs,
+    # lambdas, and inner defs that read this function's parameters or locals.
+    captured = sorted(func.__code__.co_freevars)
+    if captured:
+        raise ValueError(
+            "cannot serialize function {!r}: captured closure variables: {}. "
+            "splime 0.4.x cannot publish closure cells; move the function to module level "
+            "or pass captured values as explicit parameters.".format(func.__qualname__, ", ".join(captured))
+        )
+
+
 def serialize_function(func: FunctionType, tree: ast.FunctionDef | None = None) -> DFunction:
+    """Serialize a supported live function into the legacy ``!DFunction`` shape.
+
+    This is the fail-closed boundary used by live publication and ``lift``.
+    splime 0.4.x only represents positional-or-keyword parameters and cannot
+    represent closure cells, so unsupported live callables are rejected here.
+    Already-serialized YAML is loaded directly as :class:`DFunction` and does
+    not pass through this guard; its schema and registration behavior remain
+    unchanged.
+    """
     if tree is None:
         # dedent: getsource keeps the original indentation, so a function
         # defined inside an ``if``/``with``/function body would not parse.
         [node] = ast.parse(textwrap.dedent(inspect.getsource(func))).body
         tree = cast(ast.FunctionDef, node)
 
+    _validate_live_function(func, tree)
     args = tree.args
 
     return DFunction(

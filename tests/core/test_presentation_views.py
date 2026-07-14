@@ -584,3 +584,298 @@ def test_pipeline_graph_widget_repr_is_compact() -> None:
     assert "decomposition=" not in rendered
     assert "bodybody" not in rendered
     assert len(rendered) < 300
+
+
+def test_owner_aware_object_and_library_views_use_handle_then_id() -> None:
+    object_payload = [
+        {
+            "name": "risk_score",
+            "kind": "function",
+            "version": 7,
+            "owner_id": "owner-a",
+            "owner_handle": "alice",
+            "library": {"owner_id": "owner-a", "slug": "default"},
+            "inputs": [],
+        },
+        {
+            "name": "risk_report",
+            "kind": "pipeline",
+            "version": 3,
+            "owner_id": "owner-b",
+            "owner_handle": None,
+            "library": {"owner_id": "owner-b", "slug": "default"},
+            "inputs": [],
+        },
+        {
+            "name": "legacy_local",
+            "kind": "function",
+            "version": 1,
+            "library": "local",
+            "inputs": [],
+        },
+    ]
+    object_view = ObjectListView(object_payload)
+    object_text = repr(object_view)
+
+    assert object_text.splitlines()[1].split() == ["name", "kind", "version", "owner", "library", "inputs"]
+    assert "@alice" in object_text
+    assert "owner-b" in object_text
+    assert "legacy_local" in object_text and "—" in object_text
+    assert object_view.raw == object_payload
+
+    record_with_handle = ObjectRecordView(object_payload[0])
+    record_with_id = ObjectRecordView(object_payload[1])
+    copied_record = ObjectRecordView(
+        {
+            **object_payload[0],
+            "library": {
+                "owner_id": "owner-b",
+                "owner_handle": "bob",
+                "slug": "shared",
+                "display_name": "Shared library",
+            },
+        }
+    )
+    assert "\nowner     : @alice\n" in repr(record_with_handle)
+    assert "\nowner     : owner-b\n" in repr(record_with_id)
+    assert "\nlibrary   : @bob/shared\n" in repr(copied_record)
+
+    library_payload = [
+        {
+            "slug": "default",
+            "display_name": "Alice default",
+            "owner_id": "owner-a",
+            "owner_handle": "alice",
+            "owned": True,
+            "access": ["execute"],
+        },
+        {
+            "slug": "shared",
+            "display_name": "Legacy shared",
+            "owner_id": "owner-b",
+            "access": ["metadata:read"],
+        },
+    ]
+    library_view = LibraryListView(library_payload)
+    library_text = repr(library_view)
+    assert library_text.splitlines()[1].split() == [
+        "slug",
+        "display",
+        "owner",
+        "owned",
+        "access",
+        "visibility",
+        "default_machine",
+    ]
+    assert "@alice" in library_text
+    assert "owner-b" in library_text
+    assert "True" in library_text
+    assert library_view.raw == library_payload
+
+
+def test_action_receipt_renders_owner_and_auto_resolved_scope() -> None:
+    payload = {
+        "status": "queued",
+        "library": "default",
+        "owner_id": "caller-id",
+        "owner_handle": "caller",
+        "resolution": {
+            "auto_resolved": True,
+            "requested_library": "default",
+            "resolved_owner_id": "owner-a",
+            "resolved_owner_handle": "alice",
+            "resolved_library": "default",
+            "resolved_library_id": "library-a",
+        },
+        "id": "run-1",
+    }
+
+    view = ActionReceiptView(payload)
+    rendered = repr(view)
+
+    assert "library : default\nowner   : @caller\nresolved: @alice/default" in rendered
+    assert view.raw == payload
+
+
+def test_signature_resolution_prefers_handle_for_old_and_d1_annotations() -> None:
+    old_retry_payload = {
+        **_SIGNATURE_PAYLOAD,
+        "resolved_from_server": {
+            "library": "default",
+            "owner_id": "owner-a",
+            "owner_handle": "alice",
+        },
+    }
+    d1_payload = {
+        **_SIGNATURE_PAYLOAD,
+        "resolved_from": {
+            "auto_resolved": True,
+            "requested_library": "default",
+            "resolved_owner_id": "owner-b",
+            "resolved_owner_handle": "bob",
+            "resolved_library": "default",
+            "resolved_library_id": "library-b",
+        },
+    }
+    id_fallback_payload = {
+        **_SIGNATURE_PAYLOAD,
+        "resolved_from_server": {"library": "shared", "owner_id": "owner-c"},
+    }
+
+    assert "resolved from server: library 'default', owner @alice" in repr(SignatureView(old_retry_payload))
+    assert "resolved from server: library 'default', owner @bob" in repr(SignatureView(d1_payload))
+    assert "resolved from server: library 'shared', owner owner-c" in repr(SignatureView(id_fallback_payload))
+
+
+def test_client_describe_uses_handle_aware_resolution_label() -> None:
+    class DescribeDaemon:
+        def signature(self, *args, **kwargs) -> dict[str, object]:
+            return {
+                **_SIGNATURE_PAYLOAD,
+                "resolved_from": {
+                    "auto_resolved": True,
+                    "requested_library": "default",
+                    "resolved_owner_id": "owner-a",
+                    "resolved_owner_handle": "alice",
+                    "resolved_library": "default",
+                    "resolved_library_id": "library-a",
+                },
+            }
+
+    client = SPLClient.__new__(SPLClient)
+    client._daemon = DescribeDaemon()
+    client.server_connection = {"connected": True}
+
+    rendered = client.describe("order_pipeline")
+
+    assert "Resolved from server: library 'default', owner @alice" in rendered
+
+
+def test_legacy_payload_repr_snapshots_and_raw_are_unchanged() -> None:
+    old_object = {
+        "name": "order_pipeline",
+        "kind": "pipeline",
+        "version": 7,
+        "owner_id": "owner-a",
+        "library": {"owner_id": "owner-b", "display_name": "Default library"},
+        "inputs": [{"name": "amount"}],
+        "outputs": [{"name": "result"}],
+        "yaml": "body",
+    }
+    old_library = [
+        {
+            "slug": "default",
+            "display_name": "Default library",
+            "owner_id": "owner-a",
+            "access": ["execute", "metadata:read"],
+        }
+    ]
+    old_receipt = {"name": "risk", "status": "created", "owner_id": "owner-a"}
+    old_signature = {
+        "name": "demo",
+        "kind": "function",
+        "version": 1,
+        "inputs": [],
+        "outputs": [],
+        "internal_functions": [],
+        "call": {},
+    }
+
+    object_record = ObjectRecordView(old_object)
+    object_list = ObjectListView([old_object])
+    library_list = LibraryListView(old_library)
+    receipt = ActionReceiptView(old_receipt)
+    signature = SignatureView(old_signature)
+
+    assert repr(object_record) == (
+        "object:\n"
+        "name      : order_pipeline\n"
+        "kind      : pipeline\n"
+        "version   : 7\n"
+        "library   : Default library\n"
+        "env       : —\n"
+        "entrypoint: —\n"
+        "inputs    : 1\n"
+        "outputs   : 1\n"
+        "yaml      : included"
+    )
+    assert repr(object_list) == (
+        "objects (1):\n"
+        "name            kind      version  library          inputs\n"
+        "order_pipeline  pipeline  7        Default library  1     "
+    )
+    assert repr(library_list) == (
+        "libraries (1):\n"
+        "slug     display          owner    access                 visibility  default_machine\n"
+        "default  Default library  owner-a  execute,metadata:read  —           —              "
+    )
+    assert repr(receipt) == "receipt:\nstatus: created\nname  : risk"
+    assert repr(signature) == (
+        "signature:\n"
+        "name     : demo\n"
+        "kind     : function\n"
+        "version  : 1\n"
+        "inputs   : 0\n"
+        "outputs  : 0\n"
+        "functions: 0\n"
+        "example  : —\n"
+        "read     : —"
+    )
+    assert object_record.raw == old_object
+    assert object_list.raw == [old_object]
+    assert library_list.raw == old_library
+    assert receipt.raw == old_receipt
+    assert signature.raw == old_signature
+
+
+class _OwnerCatalogPresentationDaemon:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+        self.payload = [
+            {
+                "name": "risk_score",
+                "kind": "function",
+                "version": 7,
+                "owner_id": "owner-a",
+                "owner_handle": "alice",
+                "library": {"owner_id": "owner-a", "slug": "default"},
+                "inputs": [],
+            }
+        ]
+
+    def server_libraries(self, *, include_accessible: bool = True) -> list[dict[str, object]]:
+        self.calls.append(("libraries", include_accessible))
+        return [
+            {
+                "slug": "default",
+                "owner_id": "owner-a",
+                "owner_handle": "alice",
+                "owned": True,
+            }
+        ]
+
+    def server_objects(
+        self,
+        *,
+        owner_id: str | None,
+        library: str | None,
+        compact: bool,
+    ) -> list[dict[str, object]]:
+        self.calls.append(("objects", owner_id, library, compact))
+        return self.payload
+
+
+def test_client_server_library_listing_shows_owner_without_repr_network_calls() -> None:
+    daemon = _OwnerCatalogPresentationDaemon()
+    client = SPLClient.__new__(SPLClient)
+    client._daemon = daemon
+    client.server_connection = {"connected": True}
+
+    objects = client.objects(scope="server", library="default")
+    calls_before_repr = list(daemon.calls)
+    rendered = repr(objects)
+
+    assert "owner" in rendered.splitlines()[1].split()
+    assert "@alice" in rendered
+    assert objects.raw == daemon.payload
+    assert daemon.calls == calls_before_repr

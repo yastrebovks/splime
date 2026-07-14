@@ -136,6 +136,12 @@ class _NoopHeartbeats:
     def start_server_heartbeat(self, connection, *, token: str) -> None:
         pass
 
+    def ensure_server_heartbeat(self, connection=None) -> None:
+        pass
+
+    def status(self, connection_id: str | None = None) -> dict[str, object]:
+        return {"connection_id": connection_id, "thread_alive": False, "last_tick_at": None}
+
     def stop_server_heartbeat(self, connection_id: str) -> None:
         pass
 

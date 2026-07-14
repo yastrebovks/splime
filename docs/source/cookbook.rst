@@ -432,11 +432,85 @@ from an adapter edge, run that node with ``native``, insert a converter node as
 in `Converter Nodes For Adapter Tags`_, or wait for artifact-file input
 transport in a later 0.4.x update.
 
-Optional: connect a server
---------------------------
+Work with a library someone shared with you
+-------------------------------------------
 
-Connecting adds private worker machines, teams and shared libraries. The same
-``call()`` becomes a remote run with ``target_machine=``; library management
-lives under ``client.library.*``; a published object can join a new pipeline
-via ``NodeRemote.locate(...)``. See the reference notebooks for the full
-connected scenario.
+This connected recipe is the exception to the offline-first sections above.
+Alice and Bob each own a library whose slug is ``default``. Alice has granted
+Bob read and execute access to hers, which contains ``shared_fn``. Connect the
+local daemon before running the steps.
+
+If the grant does not exist yet, open Console **Access**, choose **Request
+access**, enter ``@alice`` as the owner, ``library`` as the resource type,
+``default`` as the resource, and select **Library execute**. This is an
+existing access-request path; the owner must approve the request before the
+calls below can execute.
+
+First confirm which account the daemon represents and inspect the email-free
+directory:
+
+.. code-block:: python
+
+   me = client.whoami()
+   assert me["handle"] == "bob"
+
+   alice = client.users(handle="@alice")[0]
+   assert alice["handle"] == "alice"
+
+The visible library list includes both same-slug rows. ``owned`` separates
+Bob's library from the one Alice shared:
+
+.. code-block:: python
+
+   libraries = client.library.list()
+   shared = client.library.get("default", owner="@alice")
+   assert shared["owned"] is False
+
+Read the shared catalog and signature with an explicit owner:
+
+.. code-block:: python
+
+   objects = client.objects(
+       scope="server",
+       owner="@alice",
+       library="default",
+   )
+   assert any(row["name"] == "shared_fn" for row in objects)
+
+   signature = client.signature(
+       "shared_fn",
+       owner="@alice",
+       library="default",
+   )
+   assert signature["name"] == "shared_fn"
+
+An explicit call is deterministic even when more same-slug libraries become
+accessible:
+
+.. code-block:: python
+
+   explicit = client.call(
+       "shared_fn",
+       owner="@alice",
+       library="default",
+       progress=False,
+   )
+   explicit.output
+
+With ``owner`` omitted, D1 can select Alice only when her accessible library is
+the unique foreign ``default`` containing the function. The run receipt records
+what happened:
+
+.. code-block:: python
+
+   automatic = client.call(
+       "shared_fn",
+       library="default",
+       progress=False,
+   )
+   automatic.run.raw["resolution"]["resolved_owner_handle"]   # "alice"
+   print(automatic.run)   # includes: resolved  : @alice/default
+
+Pass ``owner=`` whenever you already know the intended scope. D1 is a
+read-and-run convenience, never a write target selector. For the complete
+resolution ladder and offline boundary, see :doc:`owners-libraries-handles`.

@@ -141,6 +141,12 @@ class FakeHeartbeatService:
     ) -> None:
         self.started.append((connection["id"], token))
 
+    def ensure_server_heartbeat(self, connection: dict[str, Any] | None = None) -> None:
+        pass
+
+    def status(self, connection_id: str | None = None) -> dict[str, Any]:
+        return {"connection_id": connection_id, "thread_alive": False, "last_tick_at": None}
+
     def stop_server_heartbeat(self, connection_id: str) -> None:
         self.stopped.append(connection_id)
 
@@ -443,8 +449,10 @@ def test_heartbeat_service_records_lease_rejection_keeps_identity_and_secrets(
         connection=_remote_connection(machine_id="machine-1"),
         heartbeat_interval_seconds=60,
     )
+    stop_event = threading.Event()
 
     def sync_once(**kwargs: Any) -> dict[str, Any]:
+        stop_event.set()
         raise ServerClientError(status_code, "stale lease")
 
     service = HeartbeatService(store, sync_once)
@@ -452,7 +460,7 @@ def test_heartbeat_service_records_lease_rejection_keeps_identity_and_secrets(
     service._server_heartbeat_loop(
         connection["id"],
         "machine-token-secret",
-        threading.Event(),
+        stop_event,
     )
 
     updated = store.get_server_connection(connection["id"])
@@ -466,7 +474,7 @@ def test_heartbeat_service_records_lease_rejection_keeps_identity_and_secrets(
     assert credentials["user_token"] == "user-token-secret"
 
 
-def test_heartbeat_restore_does_not_retry_needs_reconnect_until_explicit_reconnect(
+def test_heartbeat_restore_retries_needs_reconnect_without_explicit_reconnect(
     store: RegistryStore,
 ) -> None:
     connection = store.save_server_connection(
@@ -481,17 +489,18 @@ def test_heartbeat_restore_does_not_retry_needs_reconnect_until_explicit_reconne
         status=SERVER_CONNECTION_STATUS_NEEDS_RECONNECT,
         error="lease rejected by server (404): stale lease",
     )
-    calls = 0
+    called = threading.Event()
 
     def sync_once(**kwargs: Any) -> dict[str, Any]:
-        nonlocal calls
-        calls += 1
+        called.set()
         return {"connected": True}
 
-    HeartbeatService(store, sync_once).restore_server_heartbeat()
+    service = HeartbeatService(store, sync_once)
+    service.restore_server_heartbeat()
 
-    assert calls == 0
+    assert called.wait(timeout=1)
     assert store.current_server_connection_credentials()["id"] == connection["id"]
+    service.shutdown()
 
 
 def test_record_server_connection_error_normalizes_legacy_stale_status(

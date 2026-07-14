@@ -19,6 +19,12 @@ import sys
 from pathlib import Path
 
 from spl.daemon.server import DaemonRuntime
+from spl.daemon.run_lifecycle import (
+    CANONICAL_RUN_STATUSES,
+    LOCAL_RUN_STATUSES,
+    REMOTE_RUN_STATUSES,
+    RUN_TRANSITIONS,
+)
 from spl.daemon.signature import build_signature
 from spl.daemon.store import RegistryStore
 
@@ -73,6 +79,104 @@ REQUIRED_SHARED_KEYS = {
     "internal_functions",
 }
 
+# Shared with the server contract — do not edit one side only. All fields are
+# additive: a 0.4.3 producer may omit every one of them.
+EXPECTED_044_ADDITIVE_CONTRACT = {
+    "owner_fields": ("owner_handle", "owned"),
+    "resolution_envelopes": ("resolution", "resolved_from"),
+    "resolution_fields": (
+        "auto_resolved",
+        "requested_library",
+        "resolved_owner_id",
+        "resolved_owner_handle",
+        "resolved_library",
+        "resolved_library_id",
+    ),
+    "whoami_fields": (
+        "id",
+        "owner_id",
+        "handle",
+        "display_name",
+        "server_url",
+        "machine_id",
+        "connection_status",
+        "live",
+    ),
+}
+
+EXPECTED_RUN_TRANSITIONS = {
+    "local": {
+        "queued": ("failed", "starting"),
+        "starting": ("failed", "preparing_environment", "running"),
+        "preparing_environment": ("failed", "running"),
+        "running": ("failed", "succeeded"),
+        "succeeded": (),
+        "failed": (),
+    },
+    "remote": {
+        "queued": ("assigned", "cancelled"),
+        "assigned": ("cancelled", "failed", "fetching_object", "preparing", "running", "stale", "succeeded"),
+        "fetching_object": ("cancelled", "failed", "preparing", "running", "stale"),
+        "preparing": ("cancelled", "failed", "running", "stale"),
+        "running": ("cancelled", "failed", "stale", "succeeded"),
+        "succeeded": (),
+        "failed": (),
+        "cancelled": (),
+        "stale": (),
+    },
+    "lease_expired": {
+        "assigned": ("failed", "queued"),
+        "fetching_object": ("failed", "queued"),
+        "preparing": ("failed", "queued"),
+        "running": ("failed", "queued"),
+    },
+}
+
+
+def test_run_lifecycle_transition_contract() -> None:
+    actual = {
+        mode: {source: tuple(sorted(targets)) for source, targets in transitions.items()}
+        for mode, transitions in RUN_TRANSITIONS.items()
+    }
+
+    assert actual == EXPECTED_RUN_TRANSITIONS
+    assert LOCAL_RUN_STATUSES == {
+        "queued",
+        "starting",
+        "preparing_environment",
+        "running",
+        "succeeded",
+        "failed",
+    }
+    assert REMOTE_RUN_STATUSES == {
+        "queued",
+        "assigned",
+        "fetching_object",
+        "preparing",
+        "running",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "stale",
+    }
+    assert CANONICAL_RUN_STATUSES == LOCAL_RUN_STATUSES | REMOTE_RUN_STATUSES
+
+
+def test_044_additive_contract_is_named_and_legacy_payloads_may_omit_it() -> None:
+    legacy_library = {"id": "library-1", "owner_id": "owner-1", "slug": "solo"}
+    legacy_run = {"id": "run-1", "status": "queued"}
+
+    assert EXPECTED_044_ADDITIVE_CONTRACT["owner_fields"] == (
+        "owner_handle",
+        "owned",
+    )
+    assert EXPECTED_044_ADDITIVE_CONTRACT["resolution_envelopes"] == (
+        "resolution",
+        "resolved_from",
+    )
+    assert all(field not in legacy_library for field in EXPECTED_044_ADDITIVE_CONTRACT["owner_fields"])
+    assert all(field not in legacy_run for field in EXPECTED_044_ADDITIVE_CONTRACT["resolution_envelopes"])
+
 
 class _NoopHeartbeats:
     def restore_server_heartbeat(self) -> None:
@@ -80,6 +184,12 @@ class _NoopHeartbeats:
 
     def start_server_heartbeat(self, connection: object, *, token: str) -> None:
         pass
+
+    def ensure_server_heartbeat(self, connection: object | None = None) -> None:
+        pass
+
+    def status(self, connection_id: str | None = None) -> dict[str, object]:
+        return {"connection_id": connection_id, "thread_alive": False, "last_tick_at": None}
 
     def stop_server_heartbeat(self, connection_id: str) -> None:
         pass
@@ -128,3 +238,81 @@ def test_daemon_signature_matches_shared_contract(tmp_path: Path) -> None:
         "env_python": AUTHOR_ENV_PYTHON,
         "env_python_version": AUTHOR_ENV_PYTHON_VERSION,
     }
+
+
+def test_remote_run_receipt_preserves_resolution_annotations(tmp_path: Path) -> None:
+    store = RegistryStore(tmp_path)
+    runtime = None
+    try:
+        store.save_server_connection(
+            server_url="https://splime.io/api",
+            token="machine-token-123456",
+            user_token="user-token-123456",
+            connection={
+                "id": "remote-connection-1",
+                "owner_id": "user-self",
+                "subject_type": "machine",
+                "subject_id": "machine-1",
+                "machine_id": "machine-1",
+                "display_name": "lab-machine",
+                "status": "connected",
+                "capabilities": {},
+            },
+            heartbeat_interval_seconds=60,
+        )
+        runtime = DaemonRuntime(
+            store,
+            auto_build_envs=False,
+            heartbeat_service=_NoopHeartbeats(),
+        )
+        credentials = store.current_server_connection_credentials()
+        assert credentials is not None
+        runtime._mark_server_channel_success(credentials)
+        captured_requests = []
+        resolution = {
+            "auto_resolved": True,
+            "requested_library": "default",
+            "resolved_owner_id": "user-a",
+            "resolved_owner_handle": "alice",
+            "resolved_library": "default",
+            "resolved_library_id": "library-a",
+        }
+        expected = {
+            "id": "run-1",
+            "resolution": resolution,
+            "resolved_from": dict(resolution),
+        }
+
+        class CapturingServer:
+            def create_remote_run(self, payload, *, idempotency_key):
+                captured_requests.append((payload, idempotency_key))
+                return expected
+
+        runtime._server_client_for_credentials = lambda *args, **kwargs: CapturingServer()
+        runtime._kick_server_sync = lambda *args, **kwargs: None
+        receipt = runtime.start_remote_run(
+            "demo_obj",
+            target_machine="machine-1",
+            object_owner_id="@alice",
+            library="default",
+            correlation_id="logical-run-1",
+        )
+        retry_receipt = runtime.start_remote_run(
+            "demo_obj",
+            target_machine="machine-1",
+            object_owner_id="@alice",
+            library="default",
+            correlation_id="logical-run-1",
+        )
+
+        assert receipt == expected
+        assert retry_receipt == expected
+        assert set(receipt["resolution"]) == set(EXPECTED_044_ADDITIVE_CONTRACT["resolution_fields"])
+        assert set(receipt["resolved_from"]) == set(EXPECTED_044_ADDITIVE_CONTRACT["resolution_fields"])
+        assert captured_requests[0][0]["object_owner_id"] == "@alice"
+        assert captured_requests[0][0]["correlation_id"] == "logical-run-1"
+        assert captured_requests[1][1] == captured_requests[0][1]
+    finally:
+        if runtime is not None:
+            runtime.shutdown()
+        store.close()

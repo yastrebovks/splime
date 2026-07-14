@@ -131,6 +131,15 @@ spl.daemon.remote\_client module
    :show-inheritance:
    :undoc-members:
 
+spl.daemon.run\_lifecycle module
+--------------------------------
+
+.. automodule:: spl.daemon.run_lifecycle
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.daemon.run\_progress module
 -------------------------------
 

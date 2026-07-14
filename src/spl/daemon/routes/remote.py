@@ -26,7 +26,7 @@ def register_remote_routes(
     async def resolve_remote_signature() -> Any:
         body = await context.read_json_body()
         ref = body.get("ref") or body
-        force = bool(body.get("force", False))
+        force = context.strict_body_bool(body, "force")
         signature = await context.run_blocking(runtime.resolve_remote_signature, ref, force=force)
         return json_response(
             {

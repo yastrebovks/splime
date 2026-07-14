@@ -122,3 +122,56 @@ def test_streaming_file_request_uses_bundled_ca_context(tmp_path, monkeypatch) -
     assert calls["request"] == ("PUT", "/api/artifacts/run-1/payload.bin")
     assert calls["chunks"] == [b"payload"]
     assert calls["closed"] is True
+
+
+def test_owner_and_handle_reads_use_exact_additive_central_paths(monkeypatch) -> None:
+    client = ServerClient(
+        "https://splime.io/api",
+        "machine-token",
+        user_token="user-token",
+    )
+    calls = []
+
+    def fake_json_request(method, path, payload=None, *, auth="machine"):
+        calls.append((method, path, payload, auth))
+        return []
+
+    monkeypatch.setattr(client, "_json_request", fake_json_request)
+
+    client.list_users()
+    client.list_users(handle="@alice")
+    client.list_libraries(include_accessible=True)
+    client.list_owner_libraries("@alice")
+    client.get_library("default")
+    client.get_library("default", owner="@alice")
+    client.list_library_grants("default")
+    client.list_library_grants("default", owner="@alice")
+    client.list_objects(library="default")
+    client.list_objects(owner_id="@alice", library="default")
+    client.get_object("score", owner_id="@alice", library="default")
+    client.object_signature("score", owner_id="@alice", library="default")
+
+    assert calls == [
+        ("GET", "/users", None, "user"),
+        ("GET", "/users?handle=%40alice", None, "user"),
+        ("GET", "/libraries?include_accessible=1", None, "user"),
+        ("GET", "/owners/%40alice/libraries", None, "user"),
+        ("GET", "/libraries/default", None, "user"),
+        ("GET", "/owners/%40alice/libraries/default", None, "user"),
+        ("GET", "/libraries/default/grants", None, "user"),
+        ("GET", "/libraries/default/grants?owner=%40alice", None, "user"),
+        ("GET", "/objects?library=default", None, "machine"),
+        ("GET", "/objects?owner=%40alice&library=default", None, "machine"),
+        (
+            "GET",
+            "/owners/%40alice/libraries/default/objects/score",
+            None,
+            "machine",
+        ),
+        (
+            "GET",
+            "/owners/%40alice/libraries/default/objects/score/signature",
+            None,
+            "machine",
+        ),
+    ]

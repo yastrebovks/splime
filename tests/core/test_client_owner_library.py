@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,29 @@ class RecordingClient(Client):
         return {"id": "remote-run-1", "status": "queued"}
 
 
+def test_daemon_client_scoped_signature_404_is_not_retried_under_an_owner() -> None:
+    class ScopedMissingClient(RecordingClient):
+        def _json_request(
+            self,
+            method: str,
+            path: str,
+            payload: dict[str, Any] | None = None,
+        ) -> Any:
+            self.requests.append((method, path, payload))
+            raise ClientError(
+                "404: server D1 found no accessible object: foreign_score",
+                status_code=404,
+            )
+
+    client = ScopedMissingClient()
+
+    with pytest.raises(ClientError) as exc_info:
+        client.signature("foreign_score", library="shared")
+
+    assert str(exc_info.value) == ("404: server D1 found no accessible object: foreign_score")
+    assert client.requests == [("GET", "/objects/foreign_score/signature?library=shared", None)]
+
+
 def test_daemon_client_run_sends_owner_library_and_remote_flag() -> None:
     client = RecordingClient()
 
@@ -54,6 +78,41 @@ def test_daemon_client_run_sends_owner_library_and_remote_flag() -> None:
         "library": "risk",
         "offline_policy": "queue",
         "remote": True,
+    }
+
+
+def test_daemon_and_sdk_sync_operator_surfaces_preserve_arguments() -> None:
+    daemon_client = RecordingClient()
+
+    daemon_client.sync_status()
+    assert daemon_client.requests[-1] == ("GET", "/server/sync/status", None)
+    daemon_client.prune_sync_events(
+        status="failed",
+        older_than_days=7,
+        include_protected=True,
+        limit=25,
+    )
+    assert daemon_client.requests[-1] == (
+        "POST",
+        "/server/sync/prune?status=failed&older_than_days=7&include_protected=1&limit=25",
+        None,
+    )
+
+    class OperatorDaemon:
+        def sync_status(self) -> dict[str, Any]:
+            return {"by_status": {"pending": 3}, "heartbeat": {"thread_alive": True}}
+
+        def prune_sync_events(self, **kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+    client = SPLClient(daemon_port=8765)
+    client._daemon = OperatorDaemon()
+    assert client.sync_status()["by_status"] == {"pending": 3}
+    assert client.prune_sync_events(status="pending", older_than_days=2) == {
+        "status": "pending",
+        "older_than_days": 2,
+        "include_protected": False,
+        "limit": 1_000,
     }
 
 
@@ -162,6 +221,34 @@ def test_daemon_client_local_cleanup_paths() -> None:
         ("GET", "/runs/run%201?view=show&full_inline=1", None),
         ("POST", "/runs/prune", {"dry_run": True, "statuses": ["failed"], "older_than_seconds": 10}),
         ("DELETE", "/runs/run%201", None),
+    ]
+
+
+def test_daemon_client_dry_run_booleans_use_canonical_wire_values() -> None:
+    client = RecordingClient()
+
+    client.prune_runs(dry_run=True)
+    client.prune_runs(dry_run=False)
+    client.delete_run("run 1", dry_run=True)
+    client.delete_run("run 1", dry_run=False)
+    client.prune_server_connections(older_than_days=7, dry_run=True)
+    client.prune_server_connections(older_than_days=7, dry_run=False)
+
+    assert client.requests[-6:] == [
+        ("POST", "/runs/prune", {"dry_run": True}),
+        ("POST", "/runs/prune", {"dry_run": False}),
+        ("DELETE", "/runs/run%201?dry_run=1", None),
+        ("DELETE", "/runs/run%201", None),
+        (
+            "POST",
+            "/server/connections/prune?older_than_days=7&dry_run=1",
+            None,
+        ),
+        (
+            "POST",
+            "/server/connections/prune?older_than_days=7&dry_run=0",
+            None,
+        ),
     ]
 
 
@@ -408,7 +495,9 @@ class FakeDaemon:
         self.server_object_calls: list[dict[str, Any]] = []
         self.input_calls: list[dict[str, Any]] = []
         self.output_calls: list[dict[str, Any]] = []
+        self.version_calls: list[dict[str, Any]] = []
         self.library_calls: list[tuple[Any, ...]] = []
+        self.user_calls: list[str | None] = []
         self.register_object_calls: list[dict[str, Any]] = []
         self.cleanup_calls: list[tuple[Any, ...]] = []
         self.pull_calls: list[dict[str, Any]] = []
@@ -417,6 +506,25 @@ class FakeDaemon:
         self.missing_local_objects: set[str] = set()
         self.missing_runs: set[str] = set()
         self.server_object_records: list[dict[str, Any]] | None = None
+        self.server_library_records: list[dict[str, Any]] | None = None
+        self.server_user_records: list[dict[str, Any]] = [
+            {
+                "id": "owner-1",
+                "handle": "alice",
+                "display_name": "Alice",
+                "status": "active",
+            }
+        ]
+        self.whoami_record: dict[str, Any] = {
+            "id": "owner-1",
+            "owner_id": "owner-1",
+            "handle": "alice",
+            "display_name": "Alice",
+            "server_url": self.server_url,
+            "machine_id": "machine-1",
+            "connection_status": "connected",
+            "live": True,
+        }
 
     def connect_server(
         self,
@@ -691,17 +799,45 @@ class FakeDaemon:
             }
         ]
 
-    def server_libraries(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
-        self.library_calls.append(("server_libraries", include_accessible))
+    def server_users(self, *, handle: str | None = None) -> list[dict[str, Any]]:
+        self.user_calls.append(handle)
+        if handle is None:
+            return list(self.server_user_records)
+        normalized = handle.removeprefix("@").casefold()
+        return [row for row in self.server_user_records if str(row.get("handle") or "").casefold() == normalized]
+
+    def server_whoami(self) -> dict[str, Any]:
+        return dict(self.whoami_record)
+
+    def server_libraries(
+        self,
+        *,
+        owner: str | None = None,
+        include_accessible: bool = True,
+    ) -> list[dict[str, Any]]:
+        if owner is None:
+            self.library_calls.append(("server_libraries", include_accessible))
+        else:
+            self.library_calls.append(("server_libraries", owner, include_accessible))
+        if self.server_library_records is not None:
+            return list(self.server_library_records)
         return [{"slug": "risk", "accessible": include_accessible}]
 
     def create_server_library(self, payload: dict[str, Any]) -> dict[str, Any]:
         self.library_calls.append(("create_server_library", payload))
         return {"slug": payload["slug"], "created": True}
 
-    def get_server_library(self, library_ref: str) -> dict[str, Any]:
-        self.library_calls.append(("get_server_library", library_ref))
-        return {"slug": library_ref}
+    def get_server_library(
+        self,
+        library_ref: str,
+        *,
+        owner: str | None = None,
+    ) -> dict[str, Any]:
+        if owner is None:
+            self.library_calls.append(("get_server_library", library_ref))
+        else:
+            self.library_calls.append(("get_server_library", library_ref, owner))
+        return {"slug": library_ref, **({"owner_id": owner} if owner is not None else {})}
 
     def update_server_library(
         self,
@@ -715,8 +851,16 @@ class FakeDaemon:
         self.library_calls.append(("delete_server_library", library_ref))
         return {"slug": library_ref, "deleted": True}
 
-    def server_library_grants(self, library_ref: str) -> list[dict[str, Any]]:
-        self.library_calls.append(("server_library_grants", library_ref))
+    def server_library_grants(
+        self,
+        library_ref: str,
+        *,
+        owner: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if owner is None:
+            self.library_calls.append(("server_library_grants", library_ref))
+        else:
+            self.library_calls.append(("server_library_grants", library_ref, owner))
         return [{"library": library_ref, "grantee_id": "admin2"}]
 
     def grant_server_library(
@@ -768,6 +912,16 @@ class FakeDaemon:
     ) -> dict[str, Any]:
         self.cleanup_calls.append(("forget", name, owner_id, library))
         return {"name": name, "forgotten": True}
+
+    def object_versions(
+        self,
+        name: str,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> list[dict[str, Any]]:
+        self.version_calls.append({"name": name, "owner_id": owner_id, "library": library})
+        return [{"version": 1, "owner_id": owner_id, "library": library}]
 
     def forget_version(
         self,
@@ -1021,6 +1175,62 @@ def test_spl_client_call_and_signature_accept_owner_library() -> None:
         "library": "risk",
         "function": None,
     }
+
+
+def test_spl_client_owner_slots_and_versions_forward_handles_without_lookup() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+
+    client.signature("fraud_score", owner="@Alice", library="risk")
+    versions = client.versions("fraud_score", owner="@Alice", library="risk")
+
+    assert fake_daemon.signature_calls[-1]["owner_id"] == "@Alice"
+    assert versions == [{"version": 1, "owner_id": "@Alice", "library": "risk"}]
+    assert fake_daemon.version_calls == [{"name": "fraud_score", "owner_id": "@Alice", "library": "risk"}]
+
+
+def test_spl_client_owner_normalizer_rejects_embedded_marker_before_daemon_call() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+
+    with pytest.raises(ValueError, match="one leading @handle"):
+        client.signature("fraud_score", owner="alice@example")
+
+    assert fake_daemon.signature_calls == []
+
+
+def test_sdk_owner_slot_docstrings_document_handle_inputs() -> None:
+    client = SPLClient(daemon_port=8765)
+    owner_surfaces = [
+        client.objects,
+        client.forget,
+        client.remove_local,
+        client.forget_version,
+        client.prune_stale_mirrors,
+        client.pull,
+        client.pull_all,
+        client.signature,
+        client.inputs,
+        client.outputs,
+        client.versions,
+        client.decomposition,
+        client.describe,
+        client.submit,
+        client.call,
+        client.library.list,
+        client.library.get,
+        client.library.grants,
+        client.library.grant,
+        client.library.revoke,
+        client.library.add_reference,
+        client.library.copy_object,
+        NodeRemote.locate,
+    ]
+
+    for surface in owner_surfaces:
+        assert "@handle" in (inspect.getdoc(surface) or ""), surface
 
 
 def _server_record(name: str, *, owner_id: str, library: str, version: int) -> dict[str, Any]:
@@ -1792,6 +2002,154 @@ def test_spl_client_objects_server_scope_returns_stable_list() -> None:
     assert fake_daemon.list_object_calls == []
 
 
+def test_spl_client_objects_rejects_ambiguous_same_slug_with_sorted_owner_candidates() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    fake_daemon.server_library_records = [
+        {"slug": "risk", "owner_id": "owner-b", "owner_handle": "bob", "owned": False},
+        {"slug": "risk", "owner_id": "owner-a", "owner_handle": "alice", "owned": False},
+    ]
+    client._daemon = fake_daemon
+
+    with pytest.raises(ClientError) as exc_info:
+        client.objects(scope="server", library="risk", compact=True)
+
+    assert str(exc_info.value) == (
+        "library 'risk' is ambiguous across accessible owners: @alice/risk, @bob/risk. "
+        "Pass owner=... to choose one (for example, owner='@alice')."
+    )
+    assert fake_daemon.library_calls == [("server_libraries", True)]
+    assert fake_daemon.server_object_calls == []
+
+
+@pytest.mark.parametrize("scope", ["server", "auto", "all"])
+def test_spl_client_objects_qualifies_the_sole_foreign_library_owner(scope: str) -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    fake_daemon.server_library_records = [
+        {"slug": "risk", "owner_id": "owner-a", "owner_handle": "alice", "owned": False}
+    ]
+    client._daemon = fake_daemon
+
+    client.objects(scope=scope, library="risk", compact=True)
+
+    assert fake_daemon.library_calls == [("server_libraries", True)]
+    assert fake_daemon.server_object_calls == [{"owner_id": "owner-a", "library": "risk", "compact": True}]
+
+
+def test_spl_client_objects_keeps_the_owned_single_library_legacy_call() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    fake_daemon.server_library_records = [
+        {"slug": "risk", "owner_id": "owner-self", "owner_handle": "self", "owned": True}
+    ]
+    client._daemon = fake_daemon
+
+    client.objects(scope="server", library="risk", compact=True)
+
+    assert fake_daemon.library_calls == [("server_libraries", True)]
+    assert fake_daemon.server_object_calls == [{"owner_id": None, "library": "risk", "compact": True}]
+
+
+def test_spl_client_whoami_online_and_offline_cached_shapes() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+
+    assert client.whoami() == fake_daemon.whoami_record
+
+    fake_daemon.whoami_record = {
+        **fake_daemon.whoami_record,
+        "handle": None,
+        "display_name": "owner-1",
+        "connection_status": "offline",
+        "live": False,
+    }
+    assert client.whoami() == fake_daemon.whoami_record
+
+
+def test_spl_client_whoami_without_identity_surfaces_connect_remediation() -> None:
+    class NoIdentityDaemon(FakeDaemon):
+        def server_whoami(self) -> dict[str, Any]:
+            raise ClientError(
+                "404: active server connection is not found; connect first with client.connect_server(...)"
+            )
+
+    client = SPLClient(daemon_port=8765)
+    client._daemon = NoIdentityDaemon()
+
+    with pytest.raises(ClientError) as exc_info:
+        client.whoami()
+
+    assert str(exc_info.value) == (
+        "404: active server connection is not found; connect first with client.connect_server(...)"
+    )
+
+
+def test_spl_client_users_lists_email_free_rows_and_forwards_handle_filter() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+
+    users = client.users()
+    filtered = client.users("@Alice")
+
+    assert users == fake_daemon.server_user_records
+    assert filtered == fake_daemon.server_user_records
+    assert all("email" not in row for row in users)
+    assert fake_daemon.user_calls == [None, "@Alice"]
+
+
+def test_spl_client_library_owner_reads_forward_handles_without_resolution() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    fake_daemon.server_connected = True
+    client._daemon = fake_daemon
+
+    client.library.list(owner="@Alice", include_accessible=False)
+    library = client.library.get("risk", owner="@Alice")
+    grants = client.library.grants("risk", owner="@Alice")
+
+    assert library == {"slug": "risk", "owner_id": "@Alice"}
+    assert grants == [{"library": "risk", "grantee_id": "admin2"}]
+    assert fake_daemon.library_calls == [
+        ("server_libraries", "@Alice", False),
+        ("get_server_library", "risk", "@Alice"),
+        ("server_library_grants", "risk", "@Alice"),
+    ]
+
+
+def test_spl_client_library_write_surfaces_foreign_owner_error_unchanged() -> None:
+    denial = ClientError(
+        "403: only the library owner can modify it",
+        status_code=403,
+        payload={"error": "only the library owner can modify it"},
+    )
+
+    class ForeignWriteDeniedDaemon(FakeDaemon):
+        def update_server_library(
+            self,
+            library_ref: str,
+            payload: dict[str, Any],
+        ) -> dict[str, Any]:
+            self.library_calls.append(("update_server_library", library_ref, payload))
+            raise denial
+
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = ForeignWriteDeniedDaemon()
+    fake_daemon.server_connected = True
+    client._daemon = fake_daemon
+
+    with pytest.raises(ClientError) as exc_info:
+        client.library.update("@alice/risk", description="blocked")
+
+    assert exc_info.value is denial
+    assert fake_daemon.library_calls == [("update_server_library", "@alice/risk", {"description": "blocked"})]
+
+
 def test_spl_client_library_management_methods_use_daemon() -> None:
     client = SPLClient(daemon_port=8765)
     fake_daemon = FakeDaemon()
@@ -2243,7 +2601,7 @@ def test_spl_client_offline_server_helpers_return_empty_states() -> None:
     assert fake_daemon.server_object_calls == []
 
 
-def test_spl_client_unreachable_server_helpers_return_empty_states() -> None:
+def test_spl_client_dead_channel_server_helpers_raise_instead_of_lying_empty() -> None:
     client = SPLClient(daemon_port=8765)
     fake_daemon = ServerUnreachableDaemon()
     client._daemon = fake_daemon
@@ -2255,9 +2613,12 @@ def test_spl_client_unreachable_server_helpers_return_empty_states() -> None:
         "code": "central_server_unreachable",
         "error": "central SPL daemon server is not reachable",
     }
-    assert client.machines() == {"current_machine_id": None, "machines": []}
-    assert client.libraries(include_accessible=False) == []
-    assert client.objects(scope="server", compact=True) == []
+    with pytest.raises(ClientError, match="not reachable"):
+        client.machines()
+    with pytest.raises(ClientError, match="not reachable"):
+        client.libraries(include_accessible=False)
+    with pytest.raises(ClientError, match="not reachable"):
+        client.objects(scope="server", compact=True)
     assert client.objects(scope="auto", compact=True) == {
         "local_obj": {"name": "local_obj", "compact": True},
     }
@@ -2266,18 +2627,21 @@ def test_spl_client_unreachable_server_helpers_return_empty_states() -> None:
         "server": [],
     }
 
-    assert fake_daemon.library_calls == []
-    assert fake_daemon.server_object_calls == []
+    assert fake_daemon.library_calls == [("server_libraries", False)]
+    assert fake_daemon.server_object_calls == [{"owner_id": None, "library": None, "compact": True}]
 
 
-def test_spl_client_legacy_unreachable_server_helpers_return_empty_states() -> None:
+def test_spl_client_legacy_dead_channel_server_helpers_raise_instead_of_lying_empty() -> None:
     client = SPLClient(daemon_port=8765)
     fake_daemon = LegacyServerUnreachableDaemon()
     client._daemon = fake_daemon
 
-    assert client.machines() == {"current_machine_id": None, "machines": []}
-    assert client.libraries(include_accessible=False) == []
-    assert client.objects(scope="server", compact=True) == []
+    with pytest.raises(ClientError, match="not reachable"):
+        client.machines()
+    with pytest.raises(ClientError, match="not reachable"):
+        client.libraries(include_accessible=False)
+    with pytest.raises(ClientError, match="not reachable"):
+        client.objects(scope="server", compact=True)
     assert client.objects(scope="auto", compact=True) == {
         "local_obj": {"name": "local_obj", "compact": True},
     }
@@ -2460,6 +2824,139 @@ def test_spl_client_call_with_remote_selectors_returns_server_mode() -> None:
     assert result.server_side is True
     assert result.value == {"score": 0.91}
     assert fake_daemon.run_calls[-1]["remote"] is True
+
+
+def test_spl_client_preserves_auto_resolve_field_names_through_run_collection() -> None:
+    resolution = {
+        "auto_resolved": True,
+        "requested_library": "risk",
+        "resolved_owner_id": "owner-a",
+        "resolved_owner_handle": "alice",
+        "resolved_library": "risk",
+        "resolved_library_id": "library-a",
+    }
+    resolved_from = dict(resolution)
+
+    class ResolutionDaemon(FakeDaemon):
+        def run(self, object_name: str, **kwargs: Any) -> dict[str, Any]:
+            self.run_calls.append({"object_name": object_name, **kwargs})
+            return {
+                "id": "remote-run-resolution",
+                "status": "queued",
+                "resolution": resolution,
+                "resolved_from": resolved_from,
+            }
+
+        def wait_remote_run(
+            self,
+            run_id: str,
+            *,
+            poll_interval: float,
+            timeout_seconds: float | None,
+            on_state: Any | None = None,
+        ) -> dict[str, Any]:
+            del poll_interval, timeout_seconds
+            state = {
+                "id": run_id,
+                "status": "succeeded",
+                "result": {"result": {"score": 0.91}, "artifacts": {}},
+            }
+            if on_state is not None:
+                on_state(state)
+            return state
+
+        def signature(self, name: str, **kwargs: Any) -> dict[str, Any]:
+            signature = super().signature(name, **kwargs)
+            signature["resolved_from"] = resolved_from
+            return signature
+
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = ResolutionDaemon()
+    fake_daemon.server_connected = True
+    client._daemon = fake_daemon
+
+    submitted = client.submit("fraud_score", library="risk")
+    result = client.call("fraud_score", library="risk", progress=False)
+    signature = client.signature("fraud_score", library="risk")
+
+    assert submitted.state["resolution"] == resolution
+    assert submitted.state["resolved_from"] == resolved_from
+    assert result.run["resolution"] == resolution
+    assert result.run["resolved_from"] == resolved_from
+    assert signature["resolved_from"] == resolved_from
+    assert set(result.run["resolution"]) == {
+        "auto_resolved",
+        "requested_library",
+        "resolved_owner_id",
+        "resolved_owner_handle",
+        "resolved_library",
+        "resolved_library_id",
+    }
+
+
+def test_spl_client_local_scoped_call_surfaces_cross_owner_hint_verbatim() -> None:
+    hint = (
+        "404: 'score' is registered locally under other owners: owner 'user-a' "
+        "(library 'default'), owner 'user-b' (library 'default'); canonical candidates: "
+        "user-a/default/score, user-b/default/score; pass owner=/library=, or reconnect under that identity"
+    )
+
+    class LocalHintDaemon(FakeDaemon):
+        def run(self, object_name: str, **kwargs: Any) -> dict[str, Any]:
+            self.run_calls.append({"object_name": object_name, **kwargs})
+            raise ClientError(hint)
+
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = LocalHintDaemon()
+    client._daemon = fake_daemon
+
+    with pytest.raises(ClientError) as exc_info:
+        client.call("score", library="default", progress=False)
+
+    assert str(exc_info.value) == hint
+    assert fake_daemon.run_calls[-1]["remote"] is None
+
+
+def test_node_remote_canonicalizes_handle_only_after_signature_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import spl.daemon_client as daemon_client
+
+    calls: list[dict[str, Any]] = []
+
+    class CanonicalSignatureDaemon:
+        def resolve_remote_signature(self, ref: dict[str, Any]) -> dict[str, Any]:
+            calls.append(ref)
+            return {
+                "signature": {
+                    "inputs": [{"name": "amount", "type": "float"}],
+                    "outputs": [{"name": "default", "type": "float"}],
+                    "remote": {"owner_id": "owner-a", "library": "risk"},
+                }
+            }
+
+    monkeypatch.setattr(daemon_client, "Client", CanonicalSignatureDaemon)
+
+    resolved = NodeRemote.locate(name="score", owner="@Alice", library="risk")
+    explicit = NodeRemote(
+        name="score",
+        owner="@Alice",
+        library="risk",
+        inputs=[],
+        outputs=[],
+    )
+
+    assert calls == [
+        {
+            "url": "",
+            "name": "score",
+            "version": "latest",
+            "owner_id": "@Alice",
+            "library": "risk",
+        }
+    ]
+    assert resolved.owner_id == "owner-a"
+    assert explicit.owner_id == "@Alice"
 
 
 def test_spl_client_draw_pipeline_returns_notebook_widget_for_object() -> None:

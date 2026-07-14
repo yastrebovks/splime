@@ -23,6 +23,10 @@ Endpoints:
     POST /remote-nodes/run
     POST /server-objects/pull
     GET  /server/connection
+    GET  /server/users
+    GET  /server/whoami
+    GET  /server/sync/status
+    POST /server/sync/prune
     GET  /server/libraries
     POST /server/libraries
     GET  /server/libraries/<ref>
@@ -60,7 +64,7 @@ import time
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, cast
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import unquote, urlparse, urlunparse
 from uuid import uuid4
 
 from spl.core import resume as m_resume
@@ -74,6 +78,7 @@ from spl.daemon.environment import EnvironmentManager as VenvEnvironmentManager
 from spl.daemon.environment_base import EnvironmentManagerProtocol
 from spl.daemon.heartbeat_service import HeartbeatService
 from spl.daemon.interpreter_visibility import environment_record_interpreter_substitution
+from spl.daemon.repositories.server_connection import SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
 from spl.daemon.remote_client import (
     ServerClient,
     ServerClientError,
@@ -110,6 +115,7 @@ from spl.daemon.server_connection import (
     SERVER_OFFLINE_MESSAGE,
     SERVER_PROXY_TIMEOUT_SECONDS,
     SERVER_UNREACHABLE_CODE,
+    HandleRequiresServerConnectionError,
     ServerConnectionManager,
     ServerOfflineError,
 )
@@ -156,6 +162,26 @@ DEFAULT_INLINE_REMOTE_ARTIFACT_TOTAL_MAX_BYTES = int(
 )
 SERVER_CHANNEL_MIN_LIVENESS_WINDOW_SECONDS = 5.0
 SERVER_CHANNEL_LIVENESS_MULTIPLIER = 2.0
+SERVER_CHANNEL_FAILURE_THRESHOLD = 2
+SERVER_CHANNEL_PROBE_TIMEOUT_SECONDS = 5.0
+# A probe GET may use the one allowed retry plus its 0.5-second delay. Keeping
+# each transport attempt at two seconds bounds the whole single-flight below
+# the five-second probe budget.
+SERVER_CHANNEL_PROBE_ATTEMPT_TIMEOUT_SECONDS = 2.0
+SERVER_CHANNEL_LEASE_REJECTION_STATUSES = frozenset({401, 403, 404, 409})
+SERVER_CHANNEL_LEASE_METHODS = frozenset(
+    {
+        "connect_machine",
+        "current_connection",
+        "heartbeat_connection",
+        "sync",
+    }
+)
+SYNC_EVENT_BATCH_LIMIT = 50
+SYNC_EVENT_SCAN_PAGE_LIMIT = 200
+SYNC_EVENT_MAX_BYTES = 256 * 1024
+SYNC_BATCH_MAX_BYTES = 512 * 1024
+SYNC_REQUEST_TIMEOUT_SECONDS = 15.0
 LOGGER = logging.getLogger(__name__)
 
 
@@ -251,6 +277,45 @@ def _default_heartbeat_service_factory(
     return HeartbeatService(store, sync_once)
 
 
+class _ChannelObservedServerClient:
+    """Observe logical server calls without changing their payload contract."""
+
+    def __init__(
+        self,
+        delegate: ServerClientProtocol,
+        *,
+        success: Callable[[], None],
+        failure: Callable[[ServerClientError, bool], None],
+    ) -> None:
+        self._delegate = delegate
+        self._success = success
+        self._failure = failure
+
+    def __getattr__(self, name: str) -> Any:
+        target = getattr(self._delegate, name)
+        if not callable(target):
+            return target
+
+        def observed(*args: Any, **kwargs: Any) -> Any:
+            try:
+                result = target(*args, **kwargs)
+            except ServerClientError as exc:
+                lease_rejected = (
+                    name in SERVER_CHANNEL_LEASE_METHODS and exc.status_code in SERVER_CHANNEL_LEASE_REJECTION_STATUSES
+                )
+                if lease_rejected or exc.status_code in {502, 503, 504}:
+                    self._failure(exc, lease_rejected)
+                else:
+                    # A non-connectivity HTTP response still proves that the
+                    # authenticated server channel answered this request.
+                    self._success()
+                raise
+            self._success()
+            return result
+
+        return observed
+
+
 class DaemonRuntime:
     """Coordinates registry operations and worker subprocesses."""
 
@@ -319,7 +384,11 @@ class DaemonRuntime:
         self._server_sync_lock = threading.Lock()
         self._server_channel_lock = threading.Lock()
         self._server_channel_success_at: dict[str, float] = {}
+        self._server_channel_failure_count: dict[str, int] = {}
         self._server_channel_failed: set[str] = set()
+        self._server_channel_half_open: set[str] = set()
+        self._server_channel_probe_events: dict[str, threading.Event] = {}
+        self._server_channel_last_probe_result: dict[str, dict[str, Any]] = {}
         self._run_threads_lock = threading.Lock()
         self._run_threads: list[threading.Thread] = []
         self._shutdown_lock = threading.Lock()
@@ -353,9 +422,21 @@ class DaemonRuntime:
         *,
         request_timeout_seconds: float | None = None,
     ) -> ServerClientProtocol:
-        return self.server_connections.server_client_for_credentials(
+        delegate = self.server_connections.server_client_for_credentials(
             credentials,
             request_timeout_seconds=request_timeout_seconds,
+        )
+        return cast(
+            ServerClientProtocol,
+            _ChannelObservedServerClient(
+                delegate,
+                success=lambda: self._mark_server_channel_success(credentials),
+                failure=lambda error, immediate: self._mark_server_channel_failure(
+                    credentials,
+                    error=error,
+                    immediate=immediate,
+                ),
+            ),
         )
 
     @staticmethod
@@ -364,10 +445,7 @@ class DaemonRuntime:
 
     @staticmethod
     def _server_channel_window_seconds(credentials: dict[str, Any]) -> float:
-        try:
-            interval = float(credentials.get("heartbeat_interval_seconds") or 0)
-        except (TypeError, ValueError):
-            interval = 0.0
+        interval = DaemonRuntime._safe_heartbeat_interval(credentials)
         return max(
             SERVER_CHANNEL_MIN_LIVENESS_WINDOW_SECONDS,
             interval * SERVER_CHANNEL_LIVENESS_MULTIPLIER,
@@ -379,33 +457,170 @@ class DaemonRuntime:
             return
         with self._server_channel_lock:
             self._server_channel_success_at[key] = time.monotonic()
+            self._server_channel_failure_count.pop(key, None)
             self._server_channel_failed.discard(key)
 
-    def _mark_server_channel_failure(self, credentials: dict[str, Any] | None) -> None:
+    def _mark_server_channel_failure(
+        self,
+        credentials: dict[str, Any] | None,
+        *,
+        error: BaseException | None = None,
+        immediate: bool = False,
+    ) -> None:
         if credentials is None:
             return
+        # The pre-F04 no-error seam is an explicit hard-open signal used by
+        # recovery code/tests. Observed transient calls always pass the real
+        # exception and therefore use the two-consecutive-failure threshold.
+        hard_open = immediate or error is None
+        if error is not None and getattr(error, "_spl_server_channel_failure_recorded", False):
+            return
+        if error is not None:
+            try:
+                setattr(error, "_spl_server_channel_failure_recorded", True)
+            except (AttributeError, TypeError):
+                pass
         key = self._server_channel_key(credentials)
         if not key:
             return
         with self._server_channel_lock:
-            self._server_channel_success_at.pop(key, None)
-            self._server_channel_failed.add(key)
+            failure_count = self._server_channel_failure_count.get(key, 0) + 1
+            self._server_channel_failure_count[key] = failure_count
+            if hard_open or failure_count >= SERVER_CHANNEL_FAILURE_THRESHOLD:
+                self._server_channel_success_at.pop(key, None)
+                self._server_channel_failed.add(key)
 
-    def _mark_current_server_channel_failure(self) -> None:
-        self._mark_server_channel_failure(self.store.current_server_connection_credentials())
+    def _mark_current_server_channel_failure(
+        self,
+        *,
+        error: BaseException | None = None,
+        immediate: bool = False,
+    ) -> None:
+        self._mark_server_channel_failure(
+            self.store.current_server_connection_credentials(),
+            error=error,
+            immediate=immediate,
+        )
 
-    def _server_channel_is_live(self, credentials: dict[str, Any] | None) -> bool:
+    def _server_channel_breaker_status(
+        self,
+        credentials: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        key = self._server_channel_key(credentials or {})
+        with self._server_channel_lock:
+            if key and key in self._server_channel_half_open:
+                state = "half_open"
+            elif key and key in self._server_channel_failed:
+                state = "open"
+            else:
+                state = "closed"
+            last_probe = self._server_channel_last_probe_result.get(key)
+            status = {
+                "state": state,
+                "consecutive_failures": self._server_channel_failure_count.get(key, 0),
+                "last_probe_result": dict(last_probe) if last_probe is not None else None,
+            }
+            if last_probe is not None:
+                status["last_probe_at"] = last_probe.get("at")
+                status["last_probe_ok"] = bool(last_probe["ok"])
+            return status
+
+    def _probe_server_channel(
+        self,
+        credentials: dict[str, Any],
+    ) -> tuple[bool, str | None]:
+        """Run or join one bounded authenticated liveness probe per channel."""
+
+        key = self._server_channel_key(credentials)
+        if not key:
+            return False, "stored server connection has no local channel id"
+
+        with self._server_channel_lock:
+            probe_event = self._server_channel_probe_events.get(key)
+            leader = probe_event is None
+            if probe_event is None:
+                probe_event = threading.Event()
+                self._server_channel_probe_events[key] = probe_event
+                self._server_channel_half_open.add(key)
+
+        if not leader:
+            completed = probe_event.wait(SERVER_CHANNEL_PROBE_TIMEOUT_SECONDS)
+            with self._server_channel_lock:
+                result = self._server_channel_last_probe_result.get(key)
+            if not completed or result is None:
+                return False, "server channel probe did not complete within its bounded wait"
+            return bool(result["ok"]), cast(str | None, result.get("detail"))
+
+        ok = False
+        detail: str | None = None
+        try:
+            server = self._server_client_for_credentials(
+                credentials,
+                request_timeout_seconds=SERVER_CHANNEL_PROBE_ATTEMPT_TIMEOUT_SECONDS,
+            )
+            remote_connection = server.current_connection()
+            expected_remote_id = str(credentials.get("remote_connection_id") or "")
+            actual_remote_id = str(remote_connection.get("id") or "")
+            if not actual_remote_id or actual_remote_id != expected_remote_id:
+                raise ServerClientError(
+                    409,
+                    "authenticated server channel returned a different connection identity",
+                )
+            self._mark_server_channel_success(credentials)
+            ok = True
+        except ServerClientError as exc:
+            detail = exc.message
+            identity_rejected = exc.status_code in SERVER_CHANNEL_LEASE_REJECTION_STATUSES
+            self._mark_server_channel_failure(
+                credentials,
+                error=exc,
+                immediate=identity_rejected,
+            )
+            if identity_rejected:
+                try:
+                    self.store.record_server_connection_error(
+                        credentials["id"],
+                        status=SERVER_CONNECTION_STATUS_NEEDS_RECONNECT,
+                        error=detail,
+                    )
+                except Exception:
+                    LOGGER.exception("could not mark rejected server channel for re-handshake")
+        except Exception as exc:
+            detail = str(exc) or repr(exc)
+            self._mark_server_channel_failure(credentials, error=exc)
+        finally:
+            probe_result = {
+                "ok": ok,
+                "at": utc_now(),
+                "detail": detail,
+            }
+            with self._server_channel_lock:
+                self._server_channel_last_probe_result[key] = probe_result
+                self._server_channel_half_open.discard(key)
+                active_event = self._server_channel_probe_events.pop(key, None)
+                if active_event is not None:
+                    active_event.set()
+        return ok, detail
+
+    def _server_channel_is_live(
+        self,
+        credentials: dict[str, Any] | None,
+        *,
+        supervise_heartbeat: bool = True,
+    ) -> bool:
         """Return true only for a recently proven central-server channel.
 
         Stored identity rows remain valid offline, but a persisted
         ``status='connected'`` row is not proof that the TCP channel is live
-        after a daemon restart or network loss.  The circuit closes only after
-        a successful connect/sync heartbeat in this process and opens on the
-        first connectivity failure.
+        after a daemon restart or network loss.  The circuit closes after an
+        authenticated success and opens after consecutive transient failures
+        (or immediately when the server rejects the stored lease identity).
         """
 
         if credentials is None:
             return False
+        if supervise_heartbeat:
+            self.heartbeat_service.ensure_server_heartbeat(credentials)
         if not credentials.get("remote_connection_id") or credentials.get("status") != "connected":
             return False
         key = self._server_channel_key(credentials)
@@ -425,15 +640,165 @@ class DaemonRuntime:
     ) -> dict[str, Any]:
         credentials = self._require_connected_server_credentials(credentials)
         if not self._server_channel_is_live(credentials):
+            recovered, detail = self._probe_server_channel(credentials)
+            if recovered:
+                return credentials
             raise ServerOfflineError(
                 SERVER_OFFLINE_MESSAGE,
                 code=SERVER_UNREACHABLE_CODE,
+                detail=detail,
             )
         return credentials
 
+    def resolve_user_ref(self, owner_ref: str) -> str:
+        """Resolve one owner reference immediately before local storage access."""
+
+        owner_ref = str(owner_ref)
+        if not owner_ref.startswith("@"):
+            return validate_name(owner_ref)
+
+        credentials = self.store.current_server_connection_credentials()
+        try:
+            credentials = self._require_live_server_channel_credentials(credentials)
+        except (KeyError, ServerOfflineError):
+            raise HandleRequiresServerConnectionError(owner_ref)
+        server = self._server_client_for_credentials(
+            credentials,
+            request_timeout_seconds=SERVER_PROXY_TIMEOUT_SECONDS,
+        )
+        try:
+            users = server.list_users(handle=owner_ref)
+        except ServerClientError as exc:
+            if self._is_server_connectivity_error(exc):
+                self._mark_server_channel_failure(credentials, error=exc)
+                raise HandleRequiresServerConnectionError(owner_ref) from exc
+            raise
+        if len(users) != 1 or not users[0].get("id"):
+            raise KeyError(f"user handle is not found: {owner_ref}")
+        return validate_name(str(users[0]["id"]))
+
+    def server_whoami(self) -> dict[str, Any]:
+        """Return live directory identity or the stored canonical fallback."""
+
+        connection_state = self.server_connection_state(probe=True)
+        connection = self.store.current_server_connection()
+        if connection is None or not connection.get("owner_id"):
+            raise KeyError("active server connection is not found; connect first with client.connect_server(...)")
+        owner_id = validate_name(str(connection["owner_id"]))
+        result = {
+            "id": owner_id,
+            "owner_id": owner_id,
+            "handle": None,
+            "display_name": owner_id,
+            "server_url": connection["server_url"],
+            "machine_id": connection["machine_id"],
+            "connection_status": connection["status"],
+            "live": bool(connection_state["connected"]),
+        }
+        credentials = self.store.current_server_connection_credentials()
+        if not result["live"]:
+            return result
+        server = self._server_client_for_credentials(
+            cast(dict[str, Any], credentials),
+            request_timeout_seconds=SERVER_PROXY_TIMEOUT_SECONDS,
+        )
+        try:
+            users = server.list_users()
+        except ServerClientError as exc:
+            if exc.status_code == 404:
+                return result
+            if self._is_server_connectivity_error(exc):
+                self._mark_server_channel_failure(credentials, error=exc)
+                return result
+            raise
+        self._mark_server_channel_success(cast(dict[str, Any], credentials))
+        user = next((item for item in users if item.get("id") == owner_id), None)
+        if user is not None:
+            result["handle"] = user.get("handle")
+            result["display_name"] = user.get("display_name") or owner_id
+        return result
+
+    def server_connection_state(self, *, probe: bool = False) -> dict[str, Any]:
+        """Report identity and channel liveness, optionally probing an open breaker.
+
+        The runtime seam defaults to a cold read so heartbeat, health, and
+        diagnostics machinery cannot accidentally perform network I/O. The
+        user-facing ``GET /server/connection`` route explicitly enables the
+        probe by default and exposes ``?probe=0`` for this cold variant.
+        """
+
+        connection = self.store.current_server_connection()
+        credentials = self.store.current_server_connection_credentials()
+        identity_present = bool(
+            connection is not None and connection.get("owner_id") and connection.get("remote_connection_id")
+        )
+        live = identity_present and self._server_channel_is_live(
+            credentials,
+            supervise_heartbeat=False,
+        )
+        probe_detail: str | None = None
+        if (
+            probe
+            and identity_present
+            and not live
+            and credentials is not None
+            and credentials.get("status") == "connected"
+            and credentials.get("remote_connection_id")
+        ):
+            live, probe_detail = self._probe_server_channel(credentials)
+        state: dict[str, Any] = {
+            "connected": live,
+            "live": live,
+            "identity_present": identity_present,
+            "offline": identity_present and not live,
+            "connection": connection,
+            "breaker": self._server_channel_breaker_status(credentials),
+        }
+        if identity_present and not live:
+            state.update(
+                {
+                    "code": SERVER_UNREACHABLE_CODE,
+                    "error": SERVER_OFFLINE_MESSAGE,
+                }
+            )
+            if probe_detail is not None:
+                state["detail"] = probe_detail
+        return state
+
+    def sync_status(self) -> dict[str, Any]:
+        """Return bounded queue and heartbeat diagnostics for operators."""
+
+        connection_state = self.server_connection_state(probe=False)
+        connection = connection_state.get("connection") or {}
+        queue = self.store.sync_event_status_summary()
+        return {
+            **connection_state,
+            "by_status": queue["by_status"],
+            "oldest_event": queue["oldest_event"],
+            "last_error": queue["last_error"],
+            "heartbeat": self.heartbeat_service.status(connection.get("id")),
+        }
+
+    def prune_sync_events(
+        self,
+        *,
+        status: str,
+        older_than_days: int,
+        include_protected: bool = False,
+        limit: int = 1_000,
+    ) -> dict[str, Any]:
+        """Prune a bounded queue slice, protecting non-telemetry events."""
+
+        return self.store.prune_sync_events(
+            status=status,
+            older_than_days=older_than_days,
+            include_protected=include_protected,
+            limit=limit,
+        )
+
     def _local_sync_status(self) -> dict[str, Any]:
         credentials = self.store.current_server_connection_credentials()
-        live = self._server_channel_is_live(credentials)
+        live = self._server_channel_is_live(credentials, supervise_heartbeat=False)
         status = {
             "connected": live,
             "offline": credentials is not None and not live,
@@ -484,13 +849,15 @@ class DaemonRuntime:
             credentials = self.store.get_server_connection_credentials(connection["id"])
             if network_verified:
                 self._mark_server_channel_success(credentials)
-            if self._server_channel_is_live(credentials):
-                result["reconcile"] = self.reconcile_connected_objects(credentials)
-            else:
+            try:
+                credentials = self._require_live_server_channel_credentials(credentials)
+            except (KeyError, ServerOfflineError):
                 result["reconcile"] = {
                     "skipped": True,
                     "reason": "server_channel_not_live",
                 }
+            else:
+                result["reconcile"] = self.reconcile_connected_objects(credentials)
         return result
 
     def _matching_server_connection(
@@ -981,7 +1348,7 @@ class DaemonRuntime:
             )
             items.append({**item, "yaml": version["yaml"]})
         return {
-            "id": uuid4().hex,
+            "id": f"machine_library_snapshot_{snapshot_hash}",
             "kind": "machine_library_snapshot",
             "payload": {
                 "format_version": 1,
@@ -1001,6 +1368,8 @@ class DaemonRuntime:
         """Register an object and resolve remote-node signatures if needed."""
 
         kwargs = dict(kwargs)
+        if kwargs.get("owner_id") is not None:
+            kwargs["owner_id"] = self.resolve_user_ref(str(kwargs["owner_id"]))
         self._adopt_server_object_identity_for_publish(name, kwargs)
         return self.store.register_object(
             name,
@@ -1030,7 +1399,7 @@ class DaemonRuntime:
             or credentials.get("status") != "connected"
         ):
             return
-        if not self._server_channel_is_live(credentials):
+        if not self._server_channel_is_live(credentials, supervise_heartbeat=False):
             LOGGER.info(
                 "skipping server identity adoption for %s: server channel is not live",
                 name,
@@ -1072,7 +1441,7 @@ class DaemonRuntime:
             if exc.status_code == 404:
                 return
             if self._is_server_connectivity_error(exc):
-                self._mark_server_channel_failure(credentials)
+                self._mark_server_channel_failure(credentials, error=exc)
                 LOGGER.info(
                     "skipping server identity adoption for %s: server channel failed",
                     name,
@@ -1123,24 +1492,31 @@ class DaemonRuntime:
             signature = server.object_signature(
                 normalized["object_name"],
                 version=self._remote_ref_version(normalized),
-                owner_id=cache_ref.get("owner_id"),
+                owner_id=normalized.get("owner_id") or cache_ref.get("owner_id"),
                 library=normalized.get("library"),
                 function=normalized.get("function"),
             )
+            canonical_owner_id = self._server_record_owner(signature)
+            if canonical_owner_id is None:
+                canonical_owner_id = cache_ref.get("owner_id")
+            if canonical_owner_id is None:
+                raise ValueError("central server signature did not return a canonical owner_id")
+            canonical_owner_id = validate_name(str(canonical_owner_id))
             signature["remote"] = {
                 "url": normalized["server_url"],
                 "name": normalized["object_name"],
                 "function": normalized.get("function"),
                 "requested_version": normalized.get("version"),
                 "version_id": signature.get("version_id"),
-                "owner_id": signature.get("owner_id") or cache_ref.get("owner_id"),
-                "library": normalized.get("library") or (signature.get("library") or {}).get("slug"),
+                "owner_id": canonical_owner_id,
+                "library": self._server_record_library(signature) or normalized.get("library"),
             }
+            cache_ref = {**normalized, "owner_id": canonical_owner_id}
             self.store.save_remote_signature(cache_ref, signature)
             return signature
         except Exception as exc:
             if isinstance(exc, ServerClientError) and self._is_server_connectivity_error(exc):
-                self._mark_server_channel_failure(credentials)
+                self._mark_server_channel_failure(credentials, error=exc)
             if cache_ref.get("owner_id"):
                 self.store.mark_remote_signature_unavailable(cache_ref, repr(exc))
             if cached is not None and cached.get("signature"):
@@ -1154,6 +1530,8 @@ class DaemonRuntime:
         """Return the owner-concrete remote signature cache row for diagnostics."""
 
         normalized = self._normalize_remote_ref(ref)
+        if normalized.get("owner_id") is not None:
+            normalized["owner_id"] = self.resolve_user_ref(str(normalized["owner_id"]))
         cache_ref = self._remote_signature_cache_ref(normalized)
         if not cache_ref.get("owner_id"):
             return None
@@ -1178,8 +1556,17 @@ class DaemonRuntime:
             )
         except ServerClientError as exc:
             if self._is_server_connectivity_error(exc):
-                self._mark_server_channel_failure(credentials)
+                self._mark_server_channel_failure(credentials, error=exc)
             raise
+        canonical_owner_id = self._server_record_owner(record)
+        if canonical_owner_id is None:
+            canonical_owner_id = self._remote_signature_cache_ref(
+                normalized,
+                credentials=credentials,
+            ).get("owner_id")
+        if canonical_owner_id is None:
+            raise ValueError("central server object response did not return a canonical owner_id")
+        canonical_owner_id = validate_name(str(canonical_owner_id))
         return {
             "decomposition": record.get("decomposition") or {},
             "object": record,
@@ -1188,8 +1575,8 @@ class DaemonRuntime:
                 "name": normalized["object_name"],
                 "function": normalized.get("function"),
                 "requested_version": normalized.get("version"),
-                "owner_id": normalized.get("owner_id") or record.get("owner_id"),
-                "library": normalized.get("library") or (record.get("library") or {}).get("slug"),
+                "owner_id": canonical_owner_id,
+                "library": self._server_record_library(record) or normalized.get("library"),
                 "version_id": record.get("version_id"),
                 "object_id": record.get("id"),
             },
@@ -1231,16 +1618,20 @@ class DaemonRuntime:
         """Return the owner-concrete ref used for remote signature cache IO."""
 
         if ref.get("owner_id"):
-            return ref
+            try:
+                owner_id = validate_name(str(ref["owner_id"]))
+            except ValueError:
+                return {**ref, "owner_id": None}
+            return {**ref, "owner_id": owner_id}
         credentials = credentials if credentials is not None else self.store.current_server_connection_credentials()
         if credentials is None:
             return ref
         if credentials.get("server_url", "").rstrip("/") != ref["server_url"].rstrip("/"):
             return ref
-        owner_id = credentials.get("owner_id")
-        if not owner_id:
+        credentials_owner_id = credentials.get("owner_id")
+        if not credentials_owner_id:
             return ref
-        return {**ref, "owner_id": str(owner_id)}
+        return {**ref, "owner_id": str(credentials_owner_id)}
 
     def _split_remote_url(self, raw_url: str) -> tuple[str, str | None, str | None]:
         """Extract optional owner/library from NodeRemote.url.
@@ -1258,8 +1649,8 @@ class DaemonRuntime:
         owner_id = None
         library = None
         if len(parts) >= 4 and parts[-4] == "owners" and parts[-2] == "libraries":
-            owner_id = parts[-3]
-            library = parts[-1]
+            owner_id = unquote(parts[-3])
+            library = unquote(parts[-1])
             parts = parts[:-4]
         elif len(parts) >= 2 and parts[-2] == "libraries":
             library = parts[-1]
@@ -1285,12 +1676,7 @@ class DaemonRuntime:
                 "node requires daemon server credentials before it can resolve "
                 "or run"
             )
-        credentials = self._require_connected_server_credentials(credentials)
-        if not self._server_channel_is_live(credentials):
-            raise ServerOfflineError(
-                SERVER_OFFLINE_MESSAGE,
-                code=SERVER_UNREACHABLE_CODE,
-            )
+        credentials = self._require_live_server_channel_credentials(credentials)
         if credentials["server_url"].rstrip("/") != ref["server_url"].rstrip("/"):
             raise KeyError(
                 f"remote node points to a different server than the active daemon connection: {ref['server_url']}"
@@ -1330,7 +1716,7 @@ class DaemonRuntime:
         context: dict[str, Any] | None = None,
         offline_policy: str | None = None,
     ) -> dict[str, Any]:
-        """Create a server-side run through the next sync handshake."""
+        """Create a server-side run through the idempotent direct route."""
 
         object_name, function = split_object_function_ref(object_name, function)
         credentials = self._require_live_server_channel_credentials()
@@ -1365,21 +1751,24 @@ class DaemonRuntime:
         if context:
             payload["context"] = context
 
-        event_id = uuid4().hex
-        event = {
-            "id": event_id,
-            "kind": "remote_run_request",
-            "payload": payload,
-        }
+        idempotency_key = (
+            "remote_run_request_"
+            + hashlib.sha256(f"spl.remote_run_request:{correlation_id}".encode("utf-8")).hexdigest()
+            if correlation_id
+            else "remote_run_request_" + uuid4().hex
+        )
         if resolved_offline_policy == "fail_fast" and target_machine and target_machine != credentials["machine_id"]:
             self._raise_if_target_machine_offline(credentials, target_machine)
-        response = self.sync_once(extra_events=[event])
-        for result in response.get("event_results", []):
-            if result.get("event_id") == event_id:
-                if result.get("status") != "ok":
-                    raise RuntimeError(result.get("error") or "remote run request failed")
-                return cast(dict[str, Any], result["result"])
-        raise RuntimeError("server did not acknowledge remote run request")
+        server = self._server_client_for_credentials(credentials)
+        run = server.create_remote_run(
+            payload,
+            idempotency_key=idempotency_key,
+        )
+        # A separate sync may claim the new job for this machine. The keyed
+        # POST and all of its retries have completed before the sync lock is
+        # acquired by this background kick.
+        self._kick_server_sync(credentials["id"])
+        return run
 
     def _raise_if_target_machine_offline(
         self,
@@ -1690,6 +2079,13 @@ class DaemonRuntime:
             include_yaml=False,
             **server_scope,
         )
+        resolved_from = remote_current.get("resolved_from")
+
+        def with_resolution(record: dict[str, Any]) -> dict[str, Any]:
+            if not isinstance(resolved_from, dict):
+                return record
+            return {**record, "resolved_from": dict(resolved_from)}
+
         self._ensure_server_object_envs([remote_current])
         remote_object_id = remote_current["id"]
         remote_version_id = remote_current["version_id"]
@@ -1702,7 +2098,7 @@ class DaemonRuntime:
                 "source": "server",
                 "name": object_name,
                 "remote_object_id": remote_object_id,
-                "current_version": existing_current,
+                "current_version": with_resolution(existing_current),
                 "versions": [existing_current],
                 "refreshed": False,
             }
@@ -1762,13 +2158,13 @@ class DaemonRuntime:
             "source": "server",
             "name": object_name,
             "remote_object_id": remote_object_id,
-            "current_version": current_version,
+            "current_version": with_resolution(current_version),
             "versions": imported,
             "refreshed": True,
         }
 
     def _server_version_owner_id(self, version: dict[str, Any], fallback: str | None = None) -> str:
-        owner_id = version.get("owner_id") or version.get("owner") or fallback
+        owner_id = self._server_record_owner(version) or fallback
         return validate_name(str(owner_id or DEFAULT_OBJECT_OWNER_ID))
 
     def _server_version_library(self, version: dict[str, Any], fallback: str | None = None) -> str:
@@ -1811,7 +2207,7 @@ class DaemonRuntime:
         """
 
         credentials = self.store.current_server_connection_credentials()
-        if not self._server_channel_is_live(credentials):
+        if not self._server_channel_is_live(credentials, supervise_heartbeat=False):
             return None
 
         try:
@@ -1848,7 +2244,7 @@ class DaemonRuntime:
         extra_events: list[dict[str, Any]] | None = None,
         probe_server_channel: bool = False,
     ) -> dict[str, Any]:
-        """Exchange pending local events and jobs with the central server."""
+        """Renew the lease, then exchange bounded event batches and jobs."""
 
         credentials = (
             self.store.get_server_connection_credentials(connection_id)
@@ -1863,7 +2259,13 @@ class DaemonRuntime:
                 "sync": self.sync_visibility.summary(),
             }
 
-        if not probe_server_channel and not self._server_channel_is_live(credentials):
+        if probe_server_channel and credentials.get("status") == "needs_reconnect":
+            credentials = self._reconnect_server_credentials(credentials)
+
+        if not probe_server_channel and not self._server_channel_is_live(
+            credentials,
+            supervise_heartbeat=False,
+        ):
             return {
                 "connected": False,
                 "offline": True,
@@ -1880,7 +2282,7 @@ class DaemonRuntime:
             except ServerClientError as exc:
                 if not self._is_server_connectivity_error(exc):
                     raise
-                self._mark_server_channel_failure(credentials)
+                self._mark_server_channel_failure(credentials, error=exc)
                 self.store.record_server_connection_error(
                     credentials["id"],
                     status="connect_failed",
@@ -1898,48 +2300,19 @@ class DaemonRuntime:
             self._mark_server_channel_success(credentials)
 
         snapshot_hash, manifest_items = self.build_machine_library_snapshot_manifest()
-        pending = self.store.list_pending_sync_events(limit=None)
-        credentials_owner_id = str(credentials.get("owner_id") or DEFAULT_OBJECT_OWNER_ID)
-        sendable_pending, held_pending, adopted_count = self._sync_events_for_owner(
-            pending,
-            owner_id=credentials_owner_id,
-        )
-        if adopted_count:
-            LOGGER.info(
-                "adopted %s pre-enrollment events as %s",
-                adopted_count,
-                credentials_owner_id,
-                extra={
-                    "spl_event": "sync_events_adopted",
-                    "sync_event_count": adopted_count,
-                    "owner_id": credentials_owner_id,
-                },
-            )
-        if held_pending:
-            held_owner_ids = sorted(
-                {
-                    owner_id
-                    for event in held_pending
-                    if (owner_id := self._sync_event_owner_id(event.get("payload") or {})) is not None
-                }
-            )
-            LOGGER.info(
-                "held for another identity: %s sync events while connected as %s; event owners: %s",
-                len(held_pending),
-                credentials_owner_id,
-                ", ".join(held_owner_ids) or "unknown",
-                extra={
-                    "spl_event": "sync_events_held_for_another_identity",
-                    "sync_event_count": len(held_pending),
-                    "owner_id": credentials_owner_id,
-                    "held_owner_ids": held_owner_ids,
-                },
-            )
-        sync_before = self.sync_visibility.summary(pending)
-        snapshot_event = None
-
         with self._server_sync_lock:
-            server = self._server_client_for_credentials(credentials)
+            # Lock order: _server_sync_lock -> repository/store locks.  Each
+            # read -> bounded request -> acknowledgement cycle remains inside
+            # this section, so a second caller cannot resend an in-flight row.
+            # The explicit client timeout bounds every network hold to 15s.
+            server = self._server_client_for_credentials(
+                credentials,
+                request_timeout_seconds=SYNC_REQUEST_TIMEOUT_SECONDS,
+            )
+            credentials = self._renew_server_lease(server, credentials)
+            credentials_owner_id = str(credentials.get("owner_id") or DEFAULT_OBJECT_OWNER_ID)
+            sync_before = self.sync_visibility.summary()
+            snapshot_event = None
             if snapshot_hash != credentials.get("last_library_snapshot_hash"):
                 remote_snapshot_hash = self._server_latest_library_snapshot_hash(
                     server,
@@ -1956,65 +2329,297 @@ class DaemonRuntime:
                         manifest_items=manifest_items,
                     )
 
-            events = []
+            bootstrap_events: list[dict[str, Any]] = []
             if snapshot_event is not None:
-                events.append(snapshot_event)
-            events.extend(
-                [{"id": item["id"], "kind": item["kind"], "payload": item["payload"]} for item in sendable_pending]
-            )
-            events.extend(extra_events or [])
+                bootstrap_events.append(snapshot_event)
+            bootstrap_events.extend(extra_events or [])
+            attempted_ids: set[str] = set()
+            event_results: list[dict[str, Any]] = []
+            jobs: list[dict[str, Any]] = []
+            batches = 0
+            sent_request = False
+            drain_error: str | None = None
+            drain_status_code: int | None = None
+            snapshot_event_id = snapshot_event["id"] if snapshot_event is not None else None
+            held_count = 0
+            held_owner_ids: set[str] = set()
+            adopted_count = 0
 
-            try:
-                response = server.sync(
-                    connection_id=credentials["remote_connection_id"],
-                    machine_id=credentials["machine_id"],
-                    heartbeat_interval_seconds=float(credentials["heartbeat_interval_seconds"]),
-                    events=events,
-                )
-            except ServerClientError as exc:
-                if self._is_server_connectivity_error(exc):
-                    self._mark_server_channel_failure(credentials)
-                raise
-            except Exception:
-                self._mark_server_channel_failure(credentials)
-                raise
-
-        connection = response.get("connection")
-        if connection:
-            credentials = self.store.record_server_connection_heartbeat(
-                credentials["id"],
-                remote_connection=connection,
-            )
-        self._mark_server_channel_success(credentials)
-
-        snapshot_event_id = snapshot_event["id"] if snapshot_event is not None else None
-        pending_ids = {item["id"] for item in sendable_pending}
-        for result in response.get("event_results", []):
-            event_id = result.get("event_id")
-            if event_id == snapshot_event_id:
-                if result.get("status") == "ok":
-                    self.store.record_server_connection_library_snapshot(
-                        credentials["id"],
-                        snapshot_hash=snapshot_hash,
+            while True:
+                if bootstrap_events:
+                    events = self._take_ephemeral_sync_batch(bootstrap_events)
+                    pending_ids: set[str] = set()
+                else:
+                    events, batch_held_count, batch_held_owners, batch_adopted = self._next_pending_sync_batch(
+                        owner_id=credentials_owner_id,
+                        attempted_ids=attempted_ids,
                     )
-                continue
-            if event_id not in pending_ids:
-                continue
-            if result.get("status") == "ok":
-                self.store.mark_sync_event_sent(event_id)
-            else:
-                self.store.mark_sync_event_failed(
-                    event_id,
-                    result.get("error") or "sync event failed",
+                    held_count = max(held_count, batch_held_count)
+                    held_owner_ids.update(batch_held_owners)
+                    adopted_count += batch_adopted
+                    pending_ids = {str(event["id"]) for event in events}
+                    attempted_ids.update(pending_ids)
+
+                if not events and sent_request:
+                    break
+                try:
+                    if batches:
+                        credentials = self._renew_server_lease(server, credentials)
+                    response = server.sync(
+                        connection_id=credentials["remote_connection_id"],
+                        machine_id=credentials["machine_id"],
+                        heartbeat_interval_seconds=self._safe_heartbeat_interval(credentials),
+                        events=events,
+                    )
+                except ServerClientError as exc:
+                    if self._is_server_connectivity_error(exc):
+                        self._mark_server_channel_failure(credentials, error=exc)
+                    if sent_request:
+                        drain_error = exc.message
+                        drain_status_code = exc.status_code
+                        self.store.record_server_connection_error(
+                            credentials["id"],
+                            status=(
+                                SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
+                                if exc.status_code in {401, 403, 404, 409}
+                                else "heartbeat_failed"
+                            ),
+                            error=exc.message,
+                        )
+                        break
+                    raise
+                except Exception as exc:
+                    self._mark_server_channel_failure(credentials, error=exc)
+                    if sent_request:
+                        drain_error = repr(exc)
+                        self.store.record_server_connection_error(
+                            credentials["id"],
+                            status="heartbeat_failed",
+                            error=drain_error,
+                        )
+                        break
+                    raise
+
+                sent_request = True
+                batches += 1
+                connection = response.get("connection")
+                if connection:
+                    credentials = self.store.record_server_connection_heartbeat(
+                        credentials["id"],
+                        remote_connection=connection,
+                    )
+                self._mark_server_channel_success(credentials)
+                batch_results = list(response.get("event_results", []))
+                event_results.extend(batch_results)
+                jobs.extend(response.get("jobs", []))
+                for result in batch_results:
+                    event_id = result.get("event_id")
+                    if event_id == snapshot_event_id:
+                        if result.get("status") == "ok":
+                            self.store.record_server_connection_library_snapshot(
+                                credentials["id"],
+                                snapshot_hash=snapshot_hash,
+                            )
+                        continue
+                    if event_id not in pending_ids:
+                        continue
+                    if result.get("status") == "ok":
+                        self.store.mark_sync_event_sent(event_id)
+                    else:
+                        self.store.mark_sync_event_failed(
+                            event_id,
+                            result.get("error") or "sync event failed",
+                        )
+
+            if adopted_count:
+                LOGGER.info(
+                    "adopted %s pre-enrollment events as %s",
+                    adopted_count,
+                    credentials_owner_id,
+                    extra={
+                        "spl_event": "sync_events_adopted",
+                        "sync_event_count": adopted_count,
+                        "owner_id": credentials_owner_id,
+                    },
+                )
+            if held_count:
+                LOGGER.info(
+                    "held for another identity: %s sync events while connected as %s; event owners: %s",
+                    held_count,
+                    credentials_owner_id,
+                    ", ".join(sorted(held_owner_ids)) or "unknown",
+                    extra={
+                        "spl_event": "sync_events_held_for_another_identity",
+                        "sync_event_count": held_count,
+                        "owner_id": credentials_owner_id,
+                        "held_owner_ids": sorted(held_owner_ids),
+                    },
                 )
 
-        for job in response.get("jobs", []):
+        for job in jobs:
             self.accept_server_job(job, credentials["id"])
-        response["sync"] = {
-            "before": sync_before,
-            "after": self.sync_visibility.summary(),
+        response = {
+            "connection": self._remote_connection_snapshot(credentials),
+            "event_results": event_results,
+            "jobs": jobs,
+            "batches": batches,
+            "lease_renewed": True,
+            "partial": drain_error is not None,
+            "sync": {
+                "before": sync_before,
+                "after": self.sync_visibility.summary(),
+            },
         }
+        if drain_error is not None:
+            response["error"] = drain_error
+            response["partial_error"] = {
+                "message": drain_error,
+                "status_code": drain_status_code,
+            }
         return response
+
+    def _reconnect_server_credentials(self, credentials: dict[str, Any]) -> dict[str, Any]:
+        """Re-handshake a stored identity after its previous lease was rejected."""
+
+        server = self._server_client_for_credentials(
+            credentials,
+            request_timeout_seconds=SYNC_REQUEST_TIMEOUT_SECONDS,
+        )
+        try:
+            remote = server.connect_machine(
+                machine_id=credentials["machine_id"],
+                display_name=credentials.get("display_name"),
+                capabilities=credentials.get("capabilities") or {},
+                heartbeat_interval_seconds=self._safe_heartbeat_interval(credentials),
+            )
+        except Exception as exc:
+            self._mark_server_channel_failure(credentials, error=exc)
+            raise
+        connection = self.store.complete_server_connection(
+            credentials["id"],
+            remote_connection=remote,
+            heartbeat_interval_seconds=self._safe_heartbeat_interval(credentials),
+        )
+        refreshed = self.store.get_server_connection_credentials(connection["id"])
+        self._mark_server_channel_success(refreshed)
+        return refreshed
+
+    def _renew_server_lease(
+        self,
+        server: ServerClientProtocol,
+        credentials: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Renew the lease before any queued payload is considered."""
+
+        try:
+            remote = server.heartbeat_connection(
+                connection_id=credentials["remote_connection_id"],
+                machine_id=credentials["machine_id"],
+                heartbeat_interval_seconds=self._safe_heartbeat_interval(credentials),
+            )
+        except Exception as exc:
+            self._mark_server_channel_failure(credentials, error=exc)
+            raise
+        refreshed = self.store.record_server_connection_heartbeat(
+            credentials["id"],
+            remote_connection=remote,
+        )
+        self._mark_server_channel_success(refreshed)
+        return self.store.get_server_connection_credentials(refreshed["id"])
+
+    @staticmethod
+    def _safe_heartbeat_interval(credentials: dict[str, Any]) -> float:
+        try:
+            interval = float(credentials.get("heartbeat_interval_seconds") or 60.0)
+        except (TypeError, ValueError):
+            return 60.0
+        return interval if interval > 0 else 60.0
+
+    def _next_pending_sync_batch(
+        self,
+        *,
+        owner_id: str,
+        attempted_ids: set[str],
+    ) -> tuple[list[dict[str, Any]], int, set[str], int]:
+        batch: list[dict[str, Any]] = []
+        batch_bytes = 2
+        offset = 0
+        held_count = 0
+        held_owner_ids: set[str] = set()
+        adopted = 0
+        while len(batch) < SYNC_EVENT_BATCH_LIMIT:
+            page = self.store.list_pending_sync_events(
+                limit=SYNC_EVENT_SCAN_PAGE_LIMIT,
+                offset=offset,
+            )
+            if not page:
+                break
+            for stored_event in page:
+                event_id = str(stored_event["id"])
+                if event_id in attempted_ids:
+                    continue
+                event_owner_id = self._sync_event_owner_id(stored_event.get("payload") or {})
+                if event_owner_id not in {None, DEFAULT_OBJECT_OWNER_ID, owner_id}:
+                    assert event_owner_id is not None
+                    held_count += 1
+                    held_owner_ids.add(event_owner_id)
+                    continue
+                event = (
+                    self._sync_event_with_owner(stored_event, owner_id)
+                    if event_owner_id in {None, DEFAULT_OBJECT_OWNER_ID}
+                    else stored_event
+                )
+                wire_event = {"id": event["id"], "kind": event["kind"], "payload": event["payload"]}
+                try:
+                    event_bytes = self._sync_event_wire_bytes(wire_event)
+                except (TypeError, ValueError) as exc:
+                    self.store.mark_sync_event_failed(
+                        event_id,
+                        f"sync event is not JSON serializable: {exc}",
+                        retryable=False,
+                    )
+                    attempted_ids.add(event_id)
+                    continue
+                if event_bytes > SYNC_EVENT_MAX_BYTES:
+                    self.store.mark_sync_event_failed(
+                        event_id,
+                        f"sync event payload exceeds {SYNC_EVENT_MAX_BYTES} byte limit ({event_bytes} bytes)",
+                        retryable=False,
+                    )
+                    attempted_ids.add(event_id)
+                    continue
+                if batch and batch_bytes + event_bytes + 1 > SYNC_BATCH_MAX_BYTES:
+                    return batch, held_count, held_owner_ids, adopted
+                batch.append(wire_event)
+                batch_bytes += event_bytes + 1
+                if event_owner_id in {None, DEFAULT_OBJECT_OWNER_ID}:
+                    adopted += 1
+                if len(batch) >= SYNC_EVENT_BATCH_LIMIT:
+                    break
+            if len(page) < SYNC_EVENT_SCAN_PAGE_LIMIT or batch:
+                break
+            offset += len(page)
+        return batch, held_count, held_owner_ids, adopted
+
+    def _take_ephemeral_sync_batch(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        batch: list[dict[str, Any]] = []
+        batch_bytes = 2
+        while events and len(batch) < SYNC_EVENT_BATCH_LIMIT:
+            event = events[0]
+            event_bytes = self._sync_event_wire_bytes(event)
+            if event_bytes > SYNC_EVENT_MAX_BYTES:
+                raise ValueError(
+                    f"ephemeral sync event payload exceeds {SYNC_EVENT_MAX_BYTES} byte limit ({event_bytes} bytes)"
+                )
+            if batch and batch_bytes + event_bytes + 1 > SYNC_BATCH_MAX_BYTES:
+                break
+            batch.append(events.pop(0))
+            batch_bytes += event_bytes + 1
+        return batch
+
+    @staticmethod
+    def _sync_event_wire_bytes(event: dict[str, Any]) -> int:
+        return len(json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
     def _sync_events_for_owner(
         self,
@@ -2133,9 +2738,21 @@ class DaemonRuntime:
                 source="local",
                 report_local_run=False,
             )
+            credentials = self.store.get_server_connection_credentials(connection_id)
+            progress_interval = max(
+                1.0,
+                min(float(credentials["heartbeat_interval_seconds"]), 60.0),
+            )
             final_state = self._wait_local_run(
                 local_run["id"],
                 timeout_seconds=run.get("timeout_seconds"),
+                progress_callback=lambda: self._send_server_run_update(
+                    connection_id,
+                    run_id=run_id,
+                    status="running",
+                    message="remote run lease renewed",
+                ),
+                progress_interval_seconds=progress_interval,
             )
             if final_state["status"] != "succeeded":
                 self._send_server_run_update(
@@ -2206,14 +2823,21 @@ class DaemonRuntime:
         run_id: str,
         *,
         timeout_seconds: float | None,
+        progress_callback: Callable[[], None] | None = None,
+        progress_interval_seconds: float = 60.0,
     ) -> dict[str, Any]:
         started = time.monotonic()
+        next_progress = started + progress_interval_seconds
         while True:
             state = self.store.get_run(run_id)
             if state["status"] in {"succeeded", "failed"}:
                 return state
-            if timeout_seconds is not None and time.monotonic() - started > timeout_seconds:
+            now = time.monotonic()
+            if timeout_seconds is not None and now - started > timeout_seconds:
                 raise TimeoutError(f"local run did not finish within {timeout_seconds} seconds")
+            if progress_callback is not None and now >= next_progress:
+                progress_callback()
+                next_progress = now + progress_interval_seconds
             time.sleep(0.25)
 
     def _wait_server_run(
@@ -2253,8 +2877,14 @@ class DaemonRuntime:
             or (signature.get("execution") or {}).get("default_machine_id")
         )
         remote_ref = signature.get("remote_ref") or {}
-        object_owner_id = ref.get("owner_id") or remote_ref.get("owner_id")
-        library = ref.get("library") or remote_ref.get("library")
+        signature_remote = signature.get("remote") or {}
+        object_owner_id = (
+            signature_remote.get("owner_id")
+            or remote_ref.get("owner_id")
+            or signature.get("owner_id")
+            or ref.get("owner_id")
+        )
+        library = signature_remote.get("library") or remote_ref.get("library") or ref.get("library")
 
         output = self._remote_node_output_selector(signature)
         if not target_machine:
@@ -2274,6 +2904,7 @@ class DaemonRuntime:
             timeout_seconds=timeout_seconds,
             object_version_id=signature.get("version_id"),
             function=ref.get("function") or signature.get("function"),
+            correlation_id=uuid4().hex,
             context={
                 "remote_ref": remote_ref,
                 "node": {
@@ -2490,17 +3121,19 @@ class DaemonRuntime:
             raise ValueError("source must be 'auto' or 'local'")
 
         object_name, function = split_object_function_ref(object_name, function)
+        server_owner_ref = object_owner_id
         resolved_version_id = object_version_id
         if source == "auto" and object_version_id is None:
             refresh = self.refresh_server_object_if_available(
                 object_name,
                 version=version,
-                owner_id=object_owner_id,
+                owner_id=server_owner_ref,
                 library=library,
             )
             if refresh and refresh.get("current_version"):
                 resolved_version_id = refresh["current_version"]["version_id"]
 
+        local_owner_id = self.resolve_user_ref(str(server_owner_ref)) if server_owner_ref is not None else None
         try:
             state = self.store.create_run(
                 object_name,
@@ -2511,7 +3144,7 @@ class DaemonRuntime:
                 version=version,
                 object_version_id=resolved_version_id,
                 function=function,
-                owner_id=object_owner_id,
+                owner_id=local_owner_id,
                 library=library,
                 runtimes=runtimes,
                 keep=keep,
@@ -2526,10 +3159,13 @@ class DaemonRuntime:
             imported = self.import_server_object(
                 object_name,
                 version=version,
-                owner_id=object_owner_id,
+                owner_id=server_owner_ref,
                 library=library,
             )
             resolved_version_id = imported["current_version"]["version_id"]
+            imported_owner_id = imported["current_version"].get("owner_id")
+            if imported_owner_id is not None:
+                local_owner_id = validate_name(str(imported_owner_id))
             state = self.store.create_run(
                 object_name,
                 args=args,
@@ -2539,7 +3175,7 @@ class DaemonRuntime:
                 version=version,
                 object_version_id=resolved_version_id,
                 function=function,
-                owner_id=object_owner_id,
+                owner_id=local_owner_id,
                 library=library,
                 runtimes=runtimes,
                 keep=keep,
@@ -2548,12 +3184,13 @@ class DaemonRuntime:
             state = self._prepare_node_runtime_environments_for_run(state, report_local_run=report_local_run)
         except Exception as exc:
             return self._fail_run_before_worker(state, report_local_run=report_local_run, error=str(exc) or repr(exc))
-        self._start_run_thread(state["id"], report_local_run)
-        return self._update_local_run(
+        self._update_local_run(
             state["id"],
             report_local_run=report_local_run,
             status="starting",
         )
+        self._start_run_thread(state["id"], report_local_run)
+        return self.store.get_run(state["id"])
 
     def resume_run(
         self,
@@ -2642,12 +3279,13 @@ class DaemonRuntime:
             state = self._prepare_node_runtime_environments_for_run(state, report_local_run=report_local_run)
         except Exception as exc:
             return self._fail_run_before_worker(state, report_local_run=report_local_run, error=str(exc) or repr(exc))
-        self._start_run_thread(state["id"], report_local_run)
-        return self._update_local_run(
+        self._update_local_run(
             state["id"],
             report_local_run=report_local_run,
             status="starting",
         )
+        self._start_run_thread(state["id"], report_local_run)
+        return self.store.get_run(state["id"])
 
     def _start_run_thread(self, run_id: str, report_local_run: bool) -> None:
         thread = threading.Thread(
@@ -3131,7 +3769,7 @@ class DaemonRuntime:
         )
         if credentials is None:
             return
-        if not self._server_channel_is_live(credentials):
+        if not self._server_channel_is_live(credentials, supervise_heartbeat=False):
             return
         thread = threading.Thread(
             target=self._sync_once_safely,
@@ -3146,7 +3784,10 @@ class DaemonRuntime:
             self.sync_once(connection_id=connection_id)
         except Exception as exc:
             try:
-                self._mark_server_channel_failure(self.store.get_server_connection_credentials(connection_id))
+                self._mark_server_channel_failure(
+                    self.store.get_server_connection_credentials(connection_id),
+                    error=exc,
+                )
                 self.store.record_server_connection_error(
                     connection_id,
                     status="heartbeat_failed",

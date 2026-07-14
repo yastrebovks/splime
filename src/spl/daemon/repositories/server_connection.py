@@ -156,10 +156,15 @@ class ServerConnectionRepository(RepositoryBase):
             self._conn.execute(
                 """
                 UPDATE server_connections
-                SET status = ?
+                SET status = ?,
+                    error = COALESCE(NULLIF(error, ''), ?)
                 WHERE id = ?
                 """,
-                (SERVER_CONNECTION_STATUS_NEEDS_RECONNECT, row["id"]),
+                (
+                    SERVER_CONNECTION_STATUS_NEEDS_RECONNECT,
+                    "legacy stale lease requires reconnect",
+                    row["id"],
+                ),
             )
         return {"recovered": True, "id": row["id"]}
 

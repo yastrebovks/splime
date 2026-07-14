@@ -756,10 +756,36 @@ class Client:
 
         return _as_json_dict(self._json_request("POST", "/server/disconnect"))
 
-    def server_connection(self) -> dict[str, Any]:
-        """Return the local daemon's current central-server connection state."""
+    def server_connection(self, *, probe: bool = True) -> dict[str, Any]:
+        """Return central-server state, probing an open breaker by default."""
 
-        return _as_json_dict(self._json_request("GET", "/server/connection"))
+        path = "/server/connection" if probe else "/server/connection?probe=0"
+        return _as_json_dict(self._json_request("GET", path))
+
+    def sync_status(self) -> dict[str, Any]:
+        """Return sync-queue counts and heartbeat liveness diagnostics."""
+
+        return _as_json_dict(self._json_request("GET", "/server/sync/status"))
+
+    def prune_sync_events(
+        self,
+        *,
+        status: str,
+        older_than_days: int = 0,
+        include_protected: bool = False,
+        limit: int = 1_000,
+    ) -> dict[str, Any]:
+        """Prune a bounded queue slice; non-telemetry rows need opt-in."""
+
+        query = urlencode(
+            {
+                "status": status,
+                "older_than_days": str(older_than_days),
+                "include_protected": "1" if include_protected else "0",
+                "limit": str(limit),
+            }
+        )
+        return _as_json_dict(self._json_request("POST", f"/server/sync/prune?{query}"))
 
     def server_connections(self) -> list[dict[str, Any]]:
         """Return stored central-server connection attempts."""
@@ -786,6 +812,17 @@ class Client:
         """Return machines visible to the connected user."""
 
         return _as_json_dict(self._json_request("GET", "/server/machines"))
+
+    def server_users(self, *, handle: str | None = None) -> list[dict[str, Any]]:
+        """Return the connected server's email-free user directory."""
+
+        suffix = f"?{urlencode({'handle': handle})}" if handle is not None else ""
+        return _as_json_dict_list(self._json_request("GET", f"/server/users{suffix}"))
+
+    def server_whoami(self) -> dict[str, Any]:
+        """Return the daemon's connected or cached canonical user identity."""
+
+        return _as_json_dict(self._json_request("GET", "/server/whoami"))
 
     def server_objects(
         self,
@@ -913,15 +950,20 @@ class Client:
     def server_libraries(
         self,
         *,
+        owner: str | None = None,
         include_accessible: bool = True,
     ) -> list[dict[str, Any]]:
         """Return libraries visible to the connected central-server user."""
 
         include = "1" if include_accessible else "0"
+        query = []
+        if owner is not None:
+            query.append(f"owner={quote(owner)}")
+        query.append(f"include_accessible={include}")
         return _as_json_dict_list(
             self._json_request(
                 "GET",
-                f"/server/libraries?include_accessible={include}",
+                f"/server/libraries?{'&'.join(query)}",
             )
         )
 
@@ -930,10 +972,21 @@ class Client:
 
         return _as_json_dict(self._json_request("POST", "/server/libraries", payload))
 
-    def get_server_library(self, library_ref: str) -> dict[str, Any]:
+    def get_server_library(
+        self,
+        library_ref: str,
+        *,
+        owner: str | None = None,
+    ) -> dict[str, Any]:
         """Return one central-server library."""
 
-        return _as_json_dict(self._json_request("GET", f"/server/libraries/{quote(library_ref)}"))
+        suffix = f"?owner={quote(owner)}" if owner is not None else ""
+        return _as_json_dict(
+            self._json_request(
+                "GET",
+                f"/server/libraries/{quote(library_ref)}{suffix}",
+            )
+        )
 
     def update_server_library(
         self,
@@ -955,13 +1008,19 @@ class Client:
 
         raise NotImplementedError(LIBRARY_DELETE_UNSUPPORTED_MESSAGE)
 
-    def server_library_grants(self, library_ref: str) -> list[dict[str, Any]]:
+    def server_library_grants(
+        self,
+        library_ref: str,
+        *,
+        owner: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Return grants for one central-server library."""
 
+        suffix = f"?owner={quote(owner)}" if owner is not None else ""
         return _as_json_dict_list(
             self._json_request(
                 "GET",
-                f"/server/libraries/{quote(library_ref)}/grants",
+                f"/server/libraries/{quote(library_ref)}/grants{suffix}",
             )
         )
 
@@ -1298,6 +1357,8 @@ class Client:
         try:
             return _as_json_dict(self._json_request("GET", path))
         except ClientError as local_error:
+            if library is not None:
+                raise
             if owner_id is None and library is None:
                 raise
             if not str(local_error).startswith("404:"):

@@ -5,13 +5,17 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import socket
+import ssl
+import time
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request
 
 from spl._http import (
+    ConnectionPhaseError,
     DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS,
     DEFAULT_HTTP_TIMEOUT_SECONDS,
     urlopen_verified,
@@ -25,6 +29,10 @@ LIBRARY_DELETE_UNSUPPORTED_MESSAGE = (
     "Use the Console archive action to hide a library, or remove individual "
     "entries with client.library.remove_entry()."
 )
+SERVER_GET_RETRY_DELAY_SECONDS = 0.5
+SERVER_MAX_TRANSPORT_ATTEMPTS = 3
+TRANSIENT_SERVER_STATUS_CODES = frozenset({502, 503, 504})
+FailurePhase = Literal["connection", "post_send", "application"]
 
 
 class ServerClientError(RuntimeError):
@@ -42,6 +50,60 @@ def _as_json_dict(value: Any) -> dict[str, Any]:
 
 def _as_json_list(value: Any) -> list[dict[str, Any]]:
     return cast(list[dict[str, Any]], value)
+
+
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    """Return causes plus ``URLError.reason`` without following cycles."""
+
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    chain: list[BaseException] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        chain.append(current)
+        if isinstance(current, URLError) and isinstance(current.reason, BaseException):
+            pending.append(current.reason)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return chain
+
+
+def _is_connection_phase_failure(exc: BaseException) -> bool:
+    """Return whether evidence proves failure before the request was sent."""
+
+    for cause in _exception_chain(exc):
+        if isinstance(cause, ConnectionPhaseError):
+            return True
+        if isinstance(
+            cause,
+            (socket.gaierror, ConnectionRefusedError, ssl.SSLCertVerificationError),
+        ):
+            return True
+        # A raw SSL/timeout error is ambiguous unless it names the handshake.
+        # Production transport wraps all connect/handshake failures above;
+        # this branch also recognizes the stdlib evidence from the pilot.
+        if isinstance(cause, (ssl.SSLError, TimeoutError)) and "handshake" in str(cause).casefold():
+            return True
+    return False
+
+
+def _failure_phase(exc: BaseException) -> FailurePhase:
+    """Classify transport/application failure with a conservative default."""
+
+    if isinstance(exc, HTTPError):
+        if exc.code in TRANSIENT_SERVER_STATUS_CODES:
+            return "post_send"
+        return "application"
+    if _is_connection_phase_failure(exc):
+        return "connection"
+    if isinstance(exc, (URLError, OSError)):
+        return "post_send"
+    return "application"
 
 
 class ServerClient:
@@ -86,9 +148,16 @@ class ServerClient:
         payload: dict[str, Any] | None = None,
         *,
         auth: str = "machine",
+        extra_headers: dict[str, str] | None = None,
+        post_send_retry_safe: bool = False,
+        allow_transport_retries: bool = True,
+        max_transport_attempts: int = SERVER_MAX_TRANSPORT_ATTEMPTS,
     ) -> Any:
+        if max_transport_attempts < 1:
+            raise ValueError("max_transport_attempts must be at least 1")
         body = None
         headers = self._headers(auth=auth)
+        headers.update(extra_headers or {})
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             headers["Content-Type"] = "application/json; charset=utf-8"
@@ -99,22 +168,85 @@ class ServerClient:
             headers=headers,
             method=method,
         )
-        try:
-            with urlopen_verified(request, timeout=self.request_timeout_seconds) as response:
-                raw = response.read().decode("utf-8")
-        except HTTPError as exc:
-            raw = exc.read().decode("utf-8")
+        method_is_get = method.upper() == "GET"
+        connection_retries = 0
+        post_send_retried = False
+        attempt = 0
+        while attempt < max_transport_attempts:
+            attempt += 1
             try:
-                message = json.loads(raw).get("error", raw)
-            except json.JSONDecodeError:
-                message = raw
-            message = f"central SPL daemon server returned {exc.code} at {self.base_url}{path}: {message}"
-            raise ServerClientError(exc.code, message) from exc
-        except URLError as exc:
-            raise ServerClientError(
-                502,
-                (f"central SPL daemon server is not reachable at {self.base_url}: {exc.reason}"),
-            ) from exc
+                with urlopen_verified(request, timeout=self.request_timeout_seconds) as response:
+                    raw = response.read().decode("utf-8")
+            except HTTPError as exc:
+                raw = exc.read().decode("utf-8")
+                try:
+                    message = json.loads(raw).get("error", raw)
+                except json.JSONDecodeError:
+                    message = raw
+                message = f"central SPL daemon server returned {exc.code} at {self.base_url}{path}: {message}"
+                phase = _failure_phase(exc)
+                if (
+                    phase == "post_send"
+                    and allow_transport_retries
+                    and (method_is_get or post_send_retry_safe)
+                    and not post_send_retried
+                    and attempt < max_transport_attempts
+                ):
+                    post_send_retried = True
+                    time.sleep(SERVER_GET_RETRY_DELAY_SECONDS)
+                    continue
+                raise ServerClientError(exc.code, message) from exc
+            except URLError as exc:
+                message = f"central SPL daemon server is not reachable at {self.base_url}: {exc.reason}"
+                phase = _failure_phase(exc)
+                if (
+                    phase == "connection"
+                    and allow_transport_retries
+                    and connection_retries < 2
+                    and attempt < max_transport_attempts
+                ):
+                    delay = SERVER_GET_RETRY_DELAY_SECONDS * (1 if connection_retries == 0 else 3)
+                    connection_retries += 1
+                    time.sleep(delay)
+                    continue
+                if (
+                    phase == "post_send"
+                    and allow_transport_retries
+                    and (method_is_get or post_send_retry_safe)
+                    and not post_send_retried
+                    and attempt < max_transport_attempts
+                ):
+                    post_send_retried = True
+                    time.sleep(SERVER_GET_RETRY_DELAY_SECONDS)
+                    continue
+                raise ServerClientError(502, message) from exc
+            except OSError as exc:
+                message = f"central SPL daemon server is not reachable at {self.base_url}: {exc}"
+                phase = _failure_phase(exc)
+                if (
+                    phase == "connection"
+                    and allow_transport_retries
+                    and connection_retries < 2
+                    and attempt < max_transport_attempts
+                ):
+                    delay = SERVER_GET_RETRY_DELAY_SECONDS * (1 if connection_retries == 0 else 3)
+                    connection_retries += 1
+                    time.sleep(delay)
+                    continue
+                if (
+                    phase == "post_send"
+                    and allow_transport_retries
+                    and (method_is_get or post_send_retry_safe)
+                    and not post_send_retried
+                    and attempt < max_transport_attempts
+                ):
+                    post_send_retried = True
+                    time.sleep(SERVER_GET_RETRY_DELAY_SECONDS)
+                    continue
+                raise ServerClientError(502, message) from exc
+            break
+        else:  # pragma: no cover - every retry branch either succeeds or raises.
+            raise AssertionError("server retry loop exhausted without a result")
 
         if not raw:
             return None
@@ -231,10 +363,25 @@ class ServerClient:
         }
         if heartbeat_interval_seconds is not None:
             payload["heartbeat_interval_seconds"] = heartbeat_interval_seconds
-        return _as_json_dict(self._json_request("POST", "/connections/heartbeat", payload))
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                "/connections/heartbeat",
+                payload,
+                allow_transport_retries=False,
+            )
+        )
 
     def current_connection(self) -> dict[str, Any]:
-        return _as_json_dict(self._json_request("GET", "/connections/current"))
+        # State probes have a five-second single-flight envelope. Two attempts
+        # leave room for the phase backoff and the caller's probe bookkeeping.
+        return _as_json_dict(
+            self._json_request(
+                "GET",
+                "/connections/current",
+                max_transport_attempts=2,
+            )
+        )
 
     def disconnect_machine(self) -> dict[str, Any]:
         return _as_json_dict(self._json_request("POST", "/connections/disconnect"))
@@ -244,6 +391,10 @@ class ServerClient:
 
     def list_tokens(self) -> list[dict[str, Any]]:
         return _as_json_list(self._json_request("GET", "/tokens", auth="user"))
+
+    def list_users(self, *, handle: str | None = None) -> list[dict[str, Any]]:
+        suffix = f"?{urlencode({'handle': handle})}" if handle is not None else ""
+        return _as_json_list(self._json_request("GET", f"/users{suffix}", auth="user"))
 
     def list_libraries(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
         query = {"include_accessible": "1" if include_accessible else "0"}
@@ -255,14 +406,28 @@ class ServerClient:
             )
         )
 
+    def list_owner_libraries(self, owner: str) -> list[dict[str, Any]]:
+        return _as_json_list(
+            self._json_request(
+                "GET",
+                f"/owners/{quote(owner)}/libraries",
+                auth="user" if self.user_token else "machine",
+            )
+        )
+
     def create_library(self, payload: dict[str, Any]) -> dict[str, Any]:
         return _as_json_dict(self._json_request("POST", "/libraries", payload, auth="user"))
 
-    def get_library(self, library_ref: str) -> dict[str, Any]:
+    def get_library(self, library_ref: str, *, owner: str | None = None) -> dict[str, Any]:
+        path = (
+            f"/owners/{quote(owner)}/libraries/{quote(library_ref)}"
+            if owner is not None
+            else f"/libraries/{quote(library_ref)}"
+        )
         return _as_json_dict(
             self._json_request(
                 "GET",
-                f"/libraries/{quote(library_ref)}",
+                path,
                 auth="user" if self.user_token else "machine",
             )
         )
@@ -280,11 +445,17 @@ class ServerClient:
     def delete_library(self, library_ref: str) -> dict[str, Any]:
         raise NotImplementedError(LIBRARY_DELETE_UNSUPPORTED_MESSAGE)
 
-    def list_library_grants(self, library_ref: str) -> list[dict[str, Any]]:
+    def list_library_grants(
+        self,
+        library_ref: str,
+        *,
+        owner: str | None = None,
+    ) -> list[dict[str, Any]]:
+        suffix = f"?{urlencode({'owner': owner})}" if owner is not None else ""
         return _as_json_list(
             self._json_request(
                 "GET",
-                f"/libraries/{quote(library_ref)}/grants",
+                f"/libraries/{quote(library_ref)}/grants{suffix}",
                 auth="user",
             )
         )
@@ -353,16 +524,14 @@ class ServerClient:
         compact: bool = False,
     ) -> list[dict[str, Any]]:
         query: dict[str, Any] = {}
-        if library and owner_id is None:
+        if owner_id is not None:
+            query["owner"] = owner_id
+        if library:
             query["library"] = library
         if compact:
             query["view"] = "summary"
         suffix = f"?{urlencode(query)}" if query else ""
-        if owner_id:
-            path = f"/owners/{quote(owner_id)}/libraries/{quote(library or 'default')}/objects"
-        else:
-            path = "/objects"
-        return _as_json_list(self._json_request("GET", f"{path}{suffix}"))
+        return _as_json_list(self._json_request("GET", f"/objects{suffix}"))
 
     def latest_machine_library_snapshot(
         self,
@@ -375,6 +544,7 @@ class ServerClient:
             self._json_request(
                 "GET",
                 f"/machines/{quote(machine_id)}/library-snapshots/latest{suffix}",
+                allow_transport_retries=False,
             )
         )
 
@@ -475,6 +645,27 @@ class ServerClient:
                     "capabilities": capabilities or {},
                     "events": events,
                 },
+                allow_transport_retries=False,
+            )
+        )
+
+    def create_remote_run(
+        self,
+        payload: dict[str, Any],
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Create one idempotent remote run with user authentication."""
+
+        if not idempotency_key:
+            raise ValueError("idempotency_key must not be empty")
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                "/remote-runs",
+                payload,
+                extra_headers={"Idempotency-Key": idempotency_key},
+                post_send_retry_safe=True,
             )
         )
 

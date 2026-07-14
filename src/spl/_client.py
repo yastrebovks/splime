@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Any, Literal, cast, overload
 
 from spl._views import (
+    _owner_label,
+    _server_resolution_label,
     ActionReceiptView,
     ConnectionStatusView,
     DecompositionView,
@@ -40,10 +42,12 @@ from spl._views import (
     RunListView,
     RunRecordView,
     SignatureView,
+    VersionListView,
     object_catalog_title,
     object_scope_title,
     wrap_action,
 )
+from spl._owner_ref import normalize_owner_ref
 from spl.core import manifest as m_manifest
 from spl.core.entities.node import DEFAULT_PORT
 from spl.daemon_client import (
@@ -295,7 +299,8 @@ def _catalog_rows(
                 "name": str(record.get("display_name") or record.get("name") or ""),
                 "kind": str(record.get("kind") or ""),
                 "version": str(version_value or ""),
-                "owner": str(record.get("owner_id") or ""),
+                "owner": _owner_label(record),
+                "owner_visible": str("owner_handle" in record),
                 "library": str(library_name or ""),
                 "inputs": str(len(record.get("inputs") or [])),
             }
@@ -306,7 +311,8 @@ def _catalog_rows(
 def _catalog_headers(rows: list[dict[str, str]]) -> tuple[str, ...]:
     owners = {row.get("owner") or "" for row in rows}
     owners.discard("")
-    return _CATALOG_HEADERS_WITH_OWNER if len(owners) > 1 else _CATALOG_HEADERS
+    owner_visible = any(row.get("owner_visible") == "True" for row in rows)
+    return _CATALOG_HEADERS_WITH_OWNER if owner_visible or len(owners) > 1 else _CATALOG_HEADERS
 
 
 def _rows_to_text(rows: list[dict[str, str]], title: str) -> str:
@@ -353,6 +359,27 @@ def _server_record_library(record: Mapping[str, Any]) -> str | None:
     return _record_string(record.get("library"), "slug", "name", "display_name")
 
 
+def _library_record_slug(record: Mapping[str, Any]) -> str | None:
+    return _record_string(record.get("slug")) or _record_string(record.get("library"), "slug", "name")
+
+
+def _library_record_owner(record: Mapping[str, Any]) -> str | None:
+    return _record_string(record.get("owner_id")) or _record_string(record.get("owner"), "id", "owner_id")
+
+
+def _library_record_owner_ref(record: Mapping[str, Any]) -> str | None:
+    handle = _record_string(record.get("owner_handle"))
+    if handle is not None:
+        return f"@{handle}"
+    return _library_record_owner(record)
+
+
+def _library_candidate_label(record: Mapping[str, Any]) -> str:
+    owner_ref = _library_record_owner_ref(record) or "<unknown owner>"
+    slug = _library_record_slug(record) or "<unknown library>"
+    return "{}/{}".format(owner_ref, slug)
+
+
 def _server_record_version(record: Mapping[str, Any]) -> str | None:
     current = record.get("current_version")
     if isinstance(current, Mapping):
@@ -386,19 +413,6 @@ def _resolved_from_server_record(ref: _BareServerRef) -> dict[str, str]:
     if ref.owner_id is not None:
         record["owner_id"] = ref.owner_id
     return record
-
-
-def _server_resolution_label(value: Any) -> str | None:
-    if not isinstance(value, Mapping):
-        return None
-    parts = []
-    library = value.get("library")
-    owner = value.get("owner_id")
-    if isinstance(library, str) and library:
-        parts.append("library {!r}".format(library))
-    if isinstance(owner, str) and owner:
-        parts.append("owner {}".format(owner))
-    return ", ".join(parts) if parts else "server catalog"
 
 
 def _int_version(value: Any) -> int | None:
@@ -447,6 +461,19 @@ def _server_freshness_line(
 def _local_object_missing(exc: Exception) -> bool:
     message = str(exc)
     return isinstance(exc, ClientError) and message.startswith("404:") and "object is not registered" in message
+
+
+def _preserve_run_resolution(
+    previous: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Carry immediate D1 annotations through later run polling responses."""
+
+    merged = dict(current)
+    for key in ("resolution", "resolved_from"):
+        if key not in merged and key in previous:
+            merged[key] = previous[key]
+    return merged
 
 
 class ObjectList(list[dict[str, Any]]):
@@ -633,9 +660,10 @@ class RemoteRun:
         """Refresh and return the run state from the daemon."""
 
         if self.server_side:
-            self.state = RunRecordView(self._client._daemon.get_remote_run(self.id))
+            current = self._client._daemon.get_remote_run(self.id)
         else:
-            self.state = RunRecordView(self._client._daemon.get_run(self.id))
+            current = self._client._daemon.get_run(self.id)
+        self.state = RunRecordView(_preserve_run_resolution(self.state, current))
         return self.state
 
     def wait(
@@ -655,23 +683,20 @@ class RemoteRun:
 
         on_state = _progress_callback(progress)
         if self.server_side:
-            self.state = RunRecordView(
-                self._client._daemon.wait_remote_run(
-                    self.id,
-                    poll_interval=poll_interval,
-                    timeout_seconds=timeout_seconds,
-                    on_state=on_state,
-                )
+            current = self._client._daemon.wait_remote_run(
+                self.id,
+                poll_interval=poll_interval,
+                timeout_seconds=timeout_seconds,
+                on_state=on_state,
             )
         else:
-            self.state = RunRecordView(
-                self._client._daemon.wait_run(
-                    self.id,
-                    poll_interval=poll_interval,
-                    timeout_seconds=timeout_seconds,
-                    on_state=on_state,
-                )
+            current = self._client._daemon.wait_run(
+                self.id,
+                poll_interval=poll_interval,
+                timeout_seconds=timeout_seconds,
+                on_state=on_state,
             )
+        self.state = RunRecordView(_preserve_run_resolution(self.state, current))
         return self.state
 
     def result(self) -> dict[str, Any]:
@@ -748,8 +773,15 @@ class _LibraryAdmin:
     def __init__(self, client: "SPLClient") -> None:
         self._c = client
 
-    def list(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
-        return self._c.libraries(include_accessible=include_accessible)
+    def list(
+        self,
+        *,
+        owner: str | None = None,
+        include_accessible: bool = True,
+    ) -> builtins.list[dict[str, Any]]:
+        """Return visible libraries, optionally for one canonical id or ``@handle``."""
+
+        return self._c.libraries(owner=owner, include_accessible=include_accessible)
 
     def create(
         self,
@@ -779,11 +811,34 @@ class _LibraryAdmin:
             "library created",
         )
 
-    def get(self, ref: str) -> dict[str, Any]:
-        """Return one central-server library by slug or id."""
+    def get(self, ref: str, *, owner: str | None = None) -> dict[str, Any]:
+        """Return one library for an optional canonical owner id or ``@handle``."""
 
         self._c._require_server_connection("reading a library")
-        return wrap_action(self._c._daemon.get_server_library(ref), "library")
+        owner_ref = normalize_owner_ref(owner)
+        if owner_ref is None:
+            payload = self._c._daemon.get_server_library(ref)
+        else:
+            payload = self._c._daemon.get_server_library(ref, owner=owner_ref)
+        return wrap_action(payload, "library")
+
+    def grants(
+        self,
+        ref: str,
+        *,
+        owner: str | None = None,
+    ) -> builtins.list[dict[str, Any]]:
+        """Return owned-library grants; ``owner`` accepts an id or ``@handle``.
+
+        An explicit foreign owner is addressable but remains owner-authorized
+        by the server, so its 403 response is surfaced unchanged.
+        """
+
+        self._c._require_server_connection("reading library grants")
+        owner_ref = normalize_owner_ref(owner)
+        if owner_ref is None:
+            return self._c._daemon.server_library_grants(ref)
+        return self._c._daemon.server_library_grants(ref, owner=owner_ref)
 
     def update(
         self,
@@ -828,11 +883,12 @@ class _LibraryAdmin:
         grantee_type: str = "user",
         scopes: builtins.list[str] | None = None,
     ) -> dict[str, Any]:
-        """Grant a user or team access to one central-server library."""
+        """Grant access; a user ``grantee`` may be a canonical id or ``@handle``."""
 
         self._c._require_server_connection("granting library access")
+        grantee_ref = normalize_owner_ref(grantee) if grantee_type == "user" else grantee
         payload: dict[str, Any] = {
-            "grantee_id": grantee,
+            "grantee_id": grantee_ref,
             "grantee_type": grantee_type,
         }
         if scopes is not None:
@@ -843,11 +899,11 @@ class _LibraryAdmin:
         )
 
     def revoke(self, ref: str, grantee: str) -> dict[str, Any]:
-        """Revoke a grantee's access to one central-server library."""
+        """Revoke a grantee id or ``@handle`` from an owned library."""
 
         self._c._require_server_connection("revoking library access")
         return wrap_action(
-            self._c._daemon.revoke_server_library_grant(ref, grantee),
+            self._c._daemon.revoke_server_library_grant(ref, normalize_owner_ref(grantee)),
             "library grant revoked",
         )
 
@@ -861,15 +917,16 @@ class _LibraryAdmin:
         version: str | int | None = "latest",
         alias: str | None = None,
     ) -> dict[str, Any]:
-        """Add a live reference entry from another library into ``into_library``."""
+        """Add a live reference from a source owner id or ``@handle``."""
 
         self._c._require_server_connection("adding a library reference")
         payload: dict[str, Any] = {
             "name": name,
             "from_library": from_library,
         }
-        if owner is not None:
-            payload["from_owner"] = owner
+        owner_ref = normalize_owner_ref(owner)
+        if owner_ref is not None:
+            payload["from_owner"] = owner_ref
         if version is not None:
             payload["version"] = version
         if alias is not None:
@@ -889,15 +946,16 @@ class _LibraryAdmin:
         version: str | int | None = "latest",
         new_name: str | None = None,
     ) -> dict[str, Any]:
-        """Copy an object snapshot into a library owned by the connected user."""
+        """Copy from an optional canonical ``from_owner`` id or ``@handle``."""
 
         self._c._require_server_connection("copying an object into a library")
         payload: dict[str, Any] = {
             "name": name,
             "from_library": from_library,
         }
-        if from_owner is not None:
-            payload["from_owner"] = from_owner
+        owner_ref = normalize_owner_ref(from_owner)
+        if owner_ref is not None:
+            payload["from_owner"] = owner_ref
         if version is not None:
             payload["version"] = version
         if new_name is not None:
@@ -1022,11 +1080,11 @@ class SPLClient:
 
         return _LibraryAdmin(self)
 
-    def current_server_connection(self) -> dict[str, Any]:
-        """Return local daemon state for the central-server connection."""
+    def current_server_connection(self, *, probe: bool = True) -> dict[str, Any]:
+        """Return server state, probing an open channel unless ``probe=False``."""
 
         try:
-            state = self._daemon.server_connection()
+            state = self._daemon.server_connection() if probe else self._daemon.server_connection(probe=False)
         except Exception as exc:
             if _is_missing_server_connection(exc):
                 return ConnectionStatusView({"connected": False, "offline": False, "connection": None})
@@ -1035,42 +1093,86 @@ class SPLClient:
             raise
         return ConnectionStatusView(_normalize_server_connection_state(state))
 
-    def machines(self) -> dict[str, Any]:
-        """Return the user's machines, or an empty listing when not connected.
+    def sync_status(self) -> dict[str, Any]:
+        """Return outbound queue counts and heartbeat thread diagnostics."""
 
-        The connection-state endpoint is probed for health only: a missing
-        connection maps to an empty listing and any other state failure
-        re-raises (0.3.0 contract). A degraded-but-present state (for
-        example ``heartbeat_failed``) must not hide the daemon's machine
-        payload, so the state content itself does not gate the listing.
+        return self._daemon.sync_status()
+
+    def prune_sync_events(
+        self,
+        *,
+        status: str,
+        older_than_days: int = 0,
+        include_protected: bool = False,
+        limit: int = 1_000,
+    ) -> dict[str, Any]:
+        """Prune old sync rows, protecting object/version events by default."""
+
+        return self._daemon.prune_sync_events(
+            status=status,
+            older_than_days=older_than_days,
+            include_protected=include_protected,
+            limit=limit,
+        )
+
+    def machines(self) -> dict[str, Any]:
+        """Return the user's machines, or an empty listing without an identity.
+
+        A configured identity with a dead server channel raises the daemon's
+        offline error. Only an offline-by-design daemon with no server
+        identity keeps the historical empty-list behavior.
         """
 
-        if self.server_connection is None:
-            try:
-                self._daemon.server_connection()
-            except Exception as exc:
-                if not _is_server_unavailable(exc):
-                    raise
-                return MachineListView({"current_machine_id": None, "machines": []})
-        try:
-            machines = self._daemon.server_machines()
-        except Exception as exc:
-            if not _is_server_unavailable(exc):
-                raise
+        if not self._server_identity_present():
             return MachineListView({"current_machine_id": None, "machines": []})
-        return MachineListView(machines)
+        return MachineListView(self._daemon.server_machines())
 
-    def libraries(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
-        """Return visible libraries, or an empty list when not connected."""
+    def whoami(self) -> dict[str, Any]:
+        """Return the daemon's live or cached canonical server identity.
 
-        if not self._has_server_connection():
+        The exact mapping includes id/owner id, handle, display name, server,
+        machine, connection status, and ``live``. With no identity-bearing
+        connection, the daemon's actionable ``connect_server(...)`` error is
+        surfaced unchanged.
+        """
+
+        return self._daemon.server_whoami()
+
+    def users(self, handle: str | None = None) -> list[dict[str, Any]]:
+        """Return the email-free server user directory.
+
+        ``handle`` accepts either ``alice`` or ``@alice`` and is forwarded to
+        the server without a client-side directory lookup. Rows contain only
+        id, handle, display name, and status.
+        """
+
+        handle_ref = normalize_owner_ref(handle)
+        return self._daemon.server_users(handle=handle_ref)
+
+    def libraries(
+        self,
+        *,
+        owner: str | None = None,
+        include_accessible: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Return visible libraries, optionally for an owner id or ``@handle``.
+
+        The owner is forwarded unchanged for server-side resolution. An
+        ownerless offline catalog keeps the existing empty-list behavior;
+        explicit owner requests surface connection/server errors instead of
+        silently selecting another namespace.
+        """
+
+        owner_ref = normalize_owner_ref(owner)
+        if owner_ref is None and not self._server_identity_present():
             return LibraryListView([])
-        try:
+        if owner_ref is None:
             libraries = self._daemon.server_libraries(include_accessible=include_accessible)
-        except Exception as exc:
-            if not _is_server_unavailable(exc):
-                raise
-            libraries = []
+        else:
+            libraries = self._daemon.server_libraries(
+                owner=owner_ref,
+                include_accessible=include_accessible,
+            )
         return LibraryListView(libraries)
 
     # The flat library aliases (create_library, get_library, update_library,
@@ -1118,6 +1220,10 @@ class SPLClient:
         ``dependency_frame_offset`` is only needed when ``publish`` itself is
         wrapped by user helper functions.  Leave it at ``0`` for direct notebook
         use.
+
+        Live functions are validated while producing YAML.  Signatures and
+        closures that the 0.4.x format cannot represent raise before the daemon
+        registration request is made.
 
         ``library`` targets a central-server library during sync.  Missing
         non-default libraries are rejected unless ``create=True`` is passed.
@@ -1179,7 +1285,10 @@ class SPLClient:
         YAML text.  This method covers the explicit requirement "send generated
         YAML" and is useful when the object was exported earlier or produced by
         another process.  ``create=True`` asks the server to create the target
-        library if it does not already exist.
+        library if it does not already exist.  Because this path accepts an
+        already-serialized document rather than a live callable, it does not
+        run live-function signature or closure validation; existing
+        ``!DFunction`` YAML remains compatible and is registered unchanged.
         """
 
         yaml_text = read_yaml_input(yaml)
@@ -1211,6 +1320,30 @@ class SPLClient:
 
     # ``local_objects()``/``server_objects()`` warned through 0.1.4/0.1.5 and
     # were removed in 0.2.0 — use ``objects(scope='local'/'server')``.
+
+    def _owner_for_library_listing(self, library: str) -> str | None:
+        """Return the sole foreign owner or reject an ambiguous library slug."""
+
+        matches = [
+            record
+            for record in self.libraries()
+            if isinstance(record, Mapping) and _library_record_slug(record) == library
+        ]
+        matches.sort(key=lambda record: (_library_record_owner(record) or "", _library_record_slug(record) or ""))
+        if len(matches) > 1:
+            candidates = ", ".join(_library_candidate_label(record) for record in matches)
+            first_owner = _library_record_owner_ref(matches[0]) or "<owner>"
+            raise ClientError(
+                "library {!r} is ambiguous across accessible owners: {}. "
+                "Pass owner=... to choose one (for example, owner={!r}).".format(
+                    library,
+                    candidates,
+                    first_owner,
+                )
+            )
+        if len(matches) == 1 and matches[0].get("owned") is False:
+            return _library_record_owner(matches[0])
+        return None
 
     @overload
     def objects(
@@ -1266,39 +1399,56 @@ class SPLClient:
         and ``json.dumps`` keep working; they only add a compact ``repr`` and a
         ``.raw`` property with the plain payload. ``scope="auto"`` means the
         accessible server catalog when connected and local-only when offline.
+
+        ``owner`` accepts a canonical user id or ``@handle`` and is resolved by
+        the server. When ``library`` is set without ``owner`` on a connected
+        server leg, the SDK intentionally disambiguates more strictly than the
+        legacy server endpoint: multiple accessible owners raise with
+        copy-pasteable candidates, while one foreign owner is sent explicitly.
         """
 
+        owner_ref = normalize_owner_ref(owner)
         requested_scope = scope
         if scope == "auto":
-            scope = "server" if owner is not None or library is not None or self._has_server_connection() else "local"
+            scope = (
+                "server" if owner_ref is not None or library is not None or self._has_server_connection() else "local"
+            )
         if scope == "local":
-            if owner is not None or library is not None:
+            if owner_ref is not None or library is not None:
                 raise ValueError("owner/library require scope='server', scope='all', or scope='auto'")
             return _wrap_objects(self._daemon.list_objects(compact=compact), title=object_scope_title("local"))
+        listing_owner = owner_ref
+        if (
+            scope in {"server", "all"}
+            and listing_owner is None
+            and library is not None
+            and self._has_server_connection()
+        ):
+            listing_owner = self._owner_for_library_listing(library)
         if scope == "server":
-            if owner is None and library is None and not self._has_server_connection():
+            if listing_owner is None and library is None and not self._server_identity_present():
                 return ObjectList([], title=object_scope_title("server"))
             try:
                 server_objects = self._daemon.server_objects(
-                    owner_id=owner,
+                    owner_id=listing_owner,
                     library=library,
                     compact=compact,
                 )
             except Exception as exc:
                 if not _is_server_unavailable(exc):
                     raise
-                if requested_scope == "auto" and owner is None and library is None:
+                if requested_scope == "auto" and listing_owner is None and library is None:
                     return _wrap_objects(self._daemon.list_objects(compact=compact), title=object_scope_title("local"))
-                server_objects = []
+                raise
             return _wrap_objects(server_objects, title=object_scope_title("server"))
         if scope == "all":
             local_objects = self._daemon.list_objects(compact=compact)
-            if owner is None and library is None and not self._has_server_connection():
+            if listing_owner is None and library is None and not self._has_server_connection():
                 server_objects = []
             else:
                 try:
                     server_objects = self._daemon.server_objects(
-                        owner_id=owner,
+                        owner_id=listing_owner,
                         library=library,
                         compact=compact,
                     )
@@ -1321,10 +1471,15 @@ class SPLClient:
         owner: str | None = None,
         library: str | None = None,
     ) -> dict[str, Any]:
-        """Remove one local daemon object without requiring a server connection."""
+        """Remove one local object for an optional owner id or ``@handle``.
 
+        Handles are resolved only by the daemon's local boundary. Offline
+        handle input therefore surfaces its actionable server-connection error.
+        """
+
+        owner_ref = normalize_owner_ref(owner)
         return wrap_action(
-            _with_local_cache_warning(self._daemon.forget(name, owner_id=owner, library=library)),
+            _with_local_cache_warning(self._daemon.forget(name, owner_id=owner_ref, library=library)),
             "object forgotten",
         )
 
@@ -1335,7 +1490,7 @@ class SPLClient:
         owner: str | None = None,
         library: str | None = None,
     ) -> dict[str, Any]:
-        """Alias for :meth:`forget`."""
+        """Alias for :meth:`forget`; ``owner`` accepts an id or ``@handle``."""
 
         return self.forget(name, owner=owner, library=library)
 
@@ -1347,14 +1502,15 @@ class SPLClient:
         owner: str | None = None,
         library: str | None = None,
     ) -> dict[str, Any]:
-        """Remove one local object version without contacting the server."""
+        """Remove one local version for an optional owner id or ``@handle``."""
 
+        owner_ref = normalize_owner_ref(owner)
         return wrap_action(
             _with_local_cache_warning(
                 self._daemon.forget_version(
                     name,
                     version,
-                    owner_id=owner,
+                    owner_id=owner_ref,
                     library=library,
                 )
             ),
@@ -1367,10 +1523,11 @@ class SPLClient:
         owner: str | None = None,
         library: str | None = None,
     ) -> dict[str, Any]:
-        """Remove locally cached server-origin mirror rows."""
+        """Prune mirrors for an optional canonical owner id or ``@handle``."""
 
+        owner_ref = normalize_owner_ref(owner)
         return wrap_action(
-            self._daemon.prune_stale_mirrors(owner_id=owner, library=library),
+            self._daemon.prune_stale_mirrors(owner_id=owner_ref, library=library),
             "stale mirrors pruned",
         )
 
@@ -1388,15 +1545,16 @@ class SPLClient:
         A pulled server-origin mirror can be inspected and called while the
         daemon is offline. The method requires an active server connection for
         the download itself; repeat pulls are idempotent and report unchanged
-        versions under ``skipped``.
+        versions under ``skipped``. ``owner`` accepts a canonical id or
+        ``@handle`` and is forwarded for server-side resolution.
         """
 
+        owner_id = normalize_owner_ref(owner)
         if not self._has_server_connection():
             raise ClientError(self._pull_requires_server_connection_message())
         resolved_name = name
-        owner_id = owner
         resolved_library = library
-        if owner is None and library is None:
+        if owner_id is None and library is None:
             ref = self._resolve_bare_server_ref(name, example_method="pull")
             resolved_name = ref.name
             owner_id = ref.owner_id
@@ -1425,14 +1583,16 @@ class SPLClient:
         The visible catalog can be large. Start with ``dry_run=True`` and
         narrow the batch with ``owner=`` or ``library=`` before downloading a
         whole catalog. ``dry_run`` returns the same receipt shape without
-        writing local mirror rows or YAML files.
+        writing local mirror rows or YAML files. ``owner`` accepts a canonical
+        id or ``@handle`` and is resolved by the server.
         """
 
+        owner_ref = normalize_owner_ref(owner)
         if not self._has_server_connection():
             raise ClientError(self._pull_all_requires_server_connection_message())
         return wrap_action(
             self._daemon.pull_all_server_objects(
-                owner_id=owner,
+                owner_id=owner_ref,
                 library=library,
                 all_versions=all_versions,
                 dry_run=dry_run,
@@ -1450,6 +1610,26 @@ class SPLClient:
                 return False
             raise
         return _state_has_server_connection(state)
+
+    def _server_identity_present(self) -> bool:
+        """Return whether the daemon has a stored central-server identity."""
+
+        state = self.server_connection
+        if state is None:
+            try:
+                state = self._daemon.server_connection()
+            except Exception as exc:
+                if _is_missing_server_connection(exc):
+                    return False
+                if _is_server_unreachable(exc):
+                    return False
+                raise
+        if not isinstance(state, Mapping):
+            return False
+        explicit = state.get("identity_present")
+        if explicit is not None:
+            return bool(explicit)
+        return bool(_server_connection_mapping(state)) or _state_has_server_connection(state)
 
     def _server_connection_label(self) -> str:
         state = self.server_connection
@@ -1567,16 +1747,17 @@ class SPLClient:
         library: str | None,
         function: str | None,
     ) -> dict[str, Any]:
+        owner_ref = normalize_owner_ref(owner)
         try:
             return self._daemon.signature(
                 name,
                 version=version,
-                owner_id=owner,
+                owner_id=owner_ref,
                 library=library,
                 function=function,
             )
         except ClientError as exc:
-            if owner is not None or library is not None or not _local_object_missing(exc):
+            if owner_ref is not None or library is not None or not _local_object_missing(exc):
                 raise
             ref = self._resolve_bare_server_ref(name)
             signature = dict(
@@ -1623,7 +1804,8 @@ class SPLClient:
         Bare names still resolve locally first. When connected to the server and
         the local registry returns 404, the client looks up the exact name in the
         accessible server catalog and retries only if that catalog has a single
-        unambiguous match.
+        unambiguous match. ``owner`` accepts a canonical user id or ``@handle``;
+        the SDK forwards it unchanged and performs no directory lookup.
         """
 
         return SignatureView(
@@ -1645,25 +1827,26 @@ class SPLClient:
         library: str | None = None,
         function: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return the inputs that can be passed through ``kwargs``."""
+        """Return inputs; ``owner`` accepts a canonical id or ``@handle``."""
 
+        owner_ref = normalize_owner_ref(owner)
         try:
             return InputListView(
                 self._daemon.inputs(
                     name,
                     version=version,
-                    owner_id=owner,
+                    owner_id=owner_ref,
                     library=library,
                     function=function,
                 )
             )
         except ClientError as exc:
-            if owner is not None or library is not None or not _local_object_missing(exc):
+            if owner_ref is not None or library is not None or not _local_object_missing(exc):
                 raise
             signature = self._signature_payload(
                 name,
                 version=version,
-                owner=owner,
+                owner=owner_ref,
                 library=library,
                 function=function,
             )
@@ -1678,29 +1861,47 @@ class SPLClient:
         library: str | None = None,
         function: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return output selectors and how to read ``result.value``."""
+        """Return outputs; ``owner`` accepts a canonical id or ``@handle``."""
 
+        owner_ref = normalize_owner_ref(owner)
         try:
             return OutputListView(
                 self._daemon.outputs(
                     name,
                     version=version,
-                    owner_id=owner,
+                    owner_id=owner_ref,
                     library=library,
                     function=function,
                 )
             )
         except ClientError as exc:
-            if owner is not None or library is not None or not _local_object_missing(exc):
+            if owner_ref is not None or library is not None or not _local_object_missing(exc):
                 raise
             signature = self._signature_payload(
                 name,
                 version=version,
-                owner=owner,
+                owner=owner_ref,
                 library=library,
                 function=function,
             )
             return OutputListView(signature["outputs"])
+
+    def versions(
+        self,
+        name: str,
+        *,
+        owner: str | None = None,
+        library: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return object versions for an optional owner id or ``@handle``."""
+
+        return VersionListView(
+            self._daemon.object_versions(
+                name,
+                owner_id=normalize_owner_ref(owner),
+                library=library,
+            )
+        )
 
     def decomposition(
         self,
@@ -1710,16 +1911,17 @@ class SPLClient:
         owner: str | None = None,
         library: str | None = None,
     ) -> dict[str, Any]:
-        """Return normalized function/node/link metadata for one object."""
+        """Return decomposition for an optional owner id or ``@handle``."""
 
         if self._is_node_remote(name):
             return DecompositionView(self._remote_decomposition_response(name, version=version)["decomposition"])
-        if owner is not None or library is not None:
+        owner_ref = normalize_owner_ref(owner)
+        if owner_ref is not None or library is not None:
             response = self._remote_decomposition_response(
                 {
                     "name": str(name),
                     "version": version,
-                    "owner_id": owner,
+                    "owner_id": owner_ref,
                     "library": library,
                 }
             )
@@ -1895,7 +2097,7 @@ class SPLClient:
         library: str | None = None,
         function: str | None = None,
     ) -> str:
-        """Return a readable object description for notebooks and logs."""
+        """Describe an object for an optional canonical owner id or ``@handle``."""
 
         signature = self.signature(
             name,
@@ -1905,7 +2107,12 @@ class SPLClient:
             function=function,
         )
         freshness_line = None
-        if function is None and "resolved_from_server" not in signature and self._has_server_connection():
+        if (
+            function is None
+            and "resolved_from_server" not in signature
+            and "resolved_from" not in signature
+            and self._has_server_connection()
+        ):
             try:
                 server_records = self._daemon.server_objects(compact=True)
             except Exception as exc:
@@ -1920,7 +2127,10 @@ class SPLClient:
                 )
         display_name = signature.get("display_name") or signature["name"]
         lines = [(f"{display_name} v{signature['version']} ({signature['kind']})")]
-        server_resolution = _server_resolution_label(signature.get("resolved_from_server"))
+        resolution = signature.get("resolved_from_server")
+        if not isinstance(resolution, Mapping):
+            resolution = signature.get("resolved_from")
+        server_resolution = _server_resolution_label(resolution)
         if server_resolution is not None:
             lines.append(f"Resolved from server: {server_resolution}")
         if signature.get("description"):
@@ -2106,14 +2316,16 @@ class SPLClient:
                 "SPLClient daemon runs cannot serialize Python adapter callables yet"
             )
 
-        remote = target_machine is not None or owner is not None or library is not None
+        owner_ref = normalize_owner_ref(owner)
+        scoped = owner_ref is not None or library is not None
+        remote = target_machine is not None or (source != "local" and scoped and self._has_server_connection())
         run_kwargs: dict[str, Any] = {
             "args": args,
             "kwargs": kwargs,
             "output": output,
             "timeout_seconds": timeout_seconds,
             "target_machine": target_machine,
-            "object_owner_id": owner,
+            "object_owner_id": owner_ref,
             "library": library,
             "offline_policy": offline_policy,
             "function": function,
@@ -2151,10 +2363,13 @@ class SPLClient:
         """Canonical async entry point: start a run, return a handle immediately.
 
         The default path is local daemon execution.  Passing ``target_machine``,
-        ``owner``, or ``library`` intentionally selects central-server remote
-        execution through the connected daemon.  ``adapters`` is reserved for
-        run-level adapter overrides and currently raises because daemon runs do
-        not serialize Python adapter callables.
+        or passing ``owner``/``library`` while connected selects central-server
+        remote execution through the daemon. Offline scoped calls remain local
+        first; a canonical owner id can address a local mirror, while an
+        ``@handle`` is rejected by the daemon with the actionable offline
+        handle message. The SDK never resolves the handle. ``adapters`` is
+        reserved for run-level adapter overrides and currently raises because
+        daemon runs do not serialize Python adapter callables.
         """
 
         return self._start_run(
@@ -2200,8 +2415,10 @@ class SPLClient:
         """Run an object, wait for completion, and return result/artifacts.
 
         With only ``name``/``args``/``kwargs`` this is a local daemon worker
-        call.  Passing ``target_machine``, ``owner``, or ``library`` makes it a
-        server-side remote run through the daemon.  The returned
+        call. Passing ``target_machine``, or passing ``owner``/``library`` while
+        connected, makes it a server-side remote run through the daemon.
+        ``owner`` accepts a canonical user id or ``@handle`` and is forwarded
+        unchanged for daemon/server resolution. The returned
         ``RemoteResult.mode`` is therefore either ``"local"`` or ``"server"``.
 
         While waiting, slow phases (a first-run environment build, a queued

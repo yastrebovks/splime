@@ -5,6 +5,63 @@ All notable changes to the `splime` package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-07-14
+
+### Added
+
+- Owner-scoped library reads now distinguish same-slug libraries across users;
+  canonical ids and unique `@handle` references are accepted throughout the
+  server, daemon, and SDK read/run boundaries.
+- `SPLClient.whoami()`, `SPLClient.users()`, owner-aware
+  `client.library.list/get/grants`, owner annotations, `owned` library rows, and
+  D1 resolution receipts are available without changing old payloads.
+- Console Settings supports a one-shot handle claim and shared-library views
+  show owner badges only when a same-slug collision is visible.
+
+### Changed
+
+- Library-scoped reads and runs now auto-resolve exactly one accessible foreign
+  same-slug match after the caller's own namespace misses. Ambiguity is a loud,
+  sorted candidate error; writes never auto-resolve.
+- Destructive boolean inputs are strict and invalid spellings return 400.
+- Live functions with positional-only, keyword-only, variadic, or captured
+  closure inputs are rejected before publication because the current YAML
+  shape cannot preserve them.
+
+### Fixed
+
+- Acceptance hotfixes (F-01..F-04c): the closure guard no longer rejects functions whose
+  comprehension or generator reads their own parameters (a nested generator lists enclosing
+  parameters as free variables); the server-channel heartbeat records a cause on every failure
+  path, backs off, re-handshakes and is restarted by a watchdog, and the sync queue drains in
+  bounded batches with a terminal-failure guard for oversized/unserializable events; D1
+  auto-resolve applies to the daemon's machine token, not only to console users; the channel
+  breaker opens on a threshold, recovers through a coalesced half-open probe, state surfaces
+  probe as well, and retries are decided by failure phase (a TLS handshake timeout never reached
+  the server and is retried for any method).
+
+
+- Provider identities no longer derive canonical account ids from lossy email
+  normalization; immutable provider subjects map to opaque user ids, with
+  exact-email legacy adoption and fail-closed mismatches.
+- Invalid or offset-misordered token expiry values can no longer keep a token
+  active; legacy malformed values are quarantined with audit records.
+- Team-policy grant provenance and transactional recomputation remove derived
+  access when membership or policy state changes.
+- Sync retries are idempotent through daemon locking and a transactional server
+  inbox that returns stored results on replay.
+- Local and server run transitions use guarded compare-and-set semantics,
+  persist `starting` before worker launch, recover stale nonterminal work, and
+  freeze terminal results.
+- Fixed full-admin development credentials and Console token-secret inference
+  are removed; dev sessions are random and loopback-only.
+
+### Operations
+
+- Run `spl-server reconcile-team-policy-grants --home <server-home>` once after
+  upgrading and inspect skipped legacy grants. Refactor and republish any live
+  functions that the stricter serializer rejects; existing YAML is unchanged.
+
 ## [0.4.3] - 2026-07-11
 
 ### Added

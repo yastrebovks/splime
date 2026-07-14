@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
 import sqlite3
 from datetime import UTC, datetime
@@ -21,6 +22,11 @@ from spl.core.manifest import (
     retention_record,
 )
 from spl.daemon.runtime_config import normalize_runtime_config
+from spl.daemon.run_lifecycle import (
+    LOCAL_RUN_STATUSES,
+    TERMINAL_RUN_STATUSES,
+    allowed_predecessors,
+)
 from spl.daemon.storage_base import (
     RepositoryBase,
     json_dumps,
@@ -31,6 +37,13 @@ from spl.daemon.storage_base import (
     write_json,
 )
 from spl.daemon.worker_runtime_marker import WORKER_RUNTIME_MARKER_FILE
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+class RunTransitionError(RuntimeError):
+    """Raised when a stale local writer attempts an illegal transition."""
 
 
 class RunRepository(RepositoryBase):
@@ -185,21 +198,58 @@ class RunRepository(RepositoryBase):
         """Merge changes into a run row and return the new state."""
 
         run_id = validate_name(run_id)
+        target_status = changes.get("status")
+        if target_status is not None and target_status not in LOCAL_RUN_STATUSES:
+            raise ValueError(f"unknown local run status: {target_status}")
         column_values: dict[str, Any] = {}
         for key, value in changes.items():
             column, stored_value = self._run_change_to_column(key, value)
             column_values[column] = stored_value
 
         if column_values:
-            assignments = ", ".join(f"{column} = ?" for column in column_values)
-            values = [*column_values.values(), run_id]
             with self._lock, self._conn:
-                cursor = self._conn.execute(
-                    f"UPDATE runs SET {assignments} WHERE id = ?",
-                    values,
-                )
-            if cursor.rowcount == 0:
-                raise KeyError(f"run is not found: {run_id}")
+                current = self._conn.execute(
+                    "SELECT status FROM runs WHERE id = ?",
+                    (run_id,),
+                ).fetchone()
+                if current is None:
+                    raise KeyError(f"run is not found: {run_id}")
+                current_status = str(current["status"])
+                if target_status == current_status and current_status in TERMINAL_RUN_STATUSES:
+                    return self.get_run(run_id)
+
+                assignments = ", ".join(f"{column} = ?" for column in column_values)
+                values = list(column_values.values())
+                if target_status is None or target_status == current_status:
+                    cursor = self._conn.execute(
+                        f"UPDATE runs SET {assignments} WHERE id = ? AND status = ?",
+                        (*values, run_id, current_status),
+                    )
+                else:
+                    predecessors = sorted(allowed_predecessors(str(target_status), mode="local") & LOCAL_RUN_STATUSES)
+                    if not predecessors:
+                        self._raise_transition_error(
+                            run_id,
+                            current_status=current_status,
+                            target_status=str(target_status),
+                        )
+                    placeholders = ", ".join("?" for _ in predecessors)
+                    cursor = self._conn.execute(
+                        f"UPDATE runs SET {assignments} WHERE id = ? AND status IN ({placeholders})",
+                        (*values, run_id, *predecessors),
+                    )
+                if cursor.rowcount != 1:
+                    observed = self._conn.execute(
+                        "SELECT status FROM runs WHERE id = ?",
+                        (run_id,),
+                    ).fetchone()
+                    if observed is None:
+                        raise KeyError(f"run is not found: {run_id}")
+                    self._raise_transition_error(
+                        run_id,
+                        current_status=str(observed["status"]),
+                        target_status=str(target_status or current_status),
+                    )
 
         state = self.get_run(run_id)
         if "status" in changes and state.get("manifest") is not None:
@@ -212,6 +262,25 @@ class RunRepository(RepositoryBase):
             state = self.get_run(run_id)
         self._write_run_state_file(state)
         return self.get_run(run_id)
+
+    def _raise_transition_error(
+        self,
+        run_id: str,
+        *,
+        current_status: str,
+        target_status: str,
+    ) -> None:
+        LOGGER.warning(
+            "stale local run transition ignored",
+            extra={
+                "run_id": run_id,
+                "from_status": current_status,
+                "to_status": target_status,
+            },
+        )
+        raise RunTransitionError(
+            f"stale local run update ignored: {run_id} cannot transition from {current_status} to {target_status}"
+        )
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         """Read a run state by id."""

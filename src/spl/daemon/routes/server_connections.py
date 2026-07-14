@@ -5,7 +5,6 @@ from __future__ import annotations
 from http import HTTPStatus
 from typing import Any
 
-from spl.daemon.repositories.server_connection import OFFLINE_SERVER_CONNECTION_STATUSES
 from spl.daemon.remote_client import DEFAULT_SERVER_URL, ServerClientError
 from spl.daemon.routes._helpers import RouteContext, RouteRegistrar
 
@@ -22,23 +21,33 @@ def register_server_connection_routes(
     @app.get("/server/connection")
     @route_errors
     async def current_server_connection() -> Any:
-        connection = runtime.store.current_server_connection()
         return json_response(
-            {
-                "connected": (
-                    connection is not None
-                    and connection["status"] == "connected"
-                    and bool(connection.get("remote_connection_id"))
-                ),
-                "offline": (connection is not None and connection["status"] in OFFLINE_SERVER_CONNECTION_STATUSES),
-                "connection": connection,
-            }
+            await context.run_blocking(
+                runtime.server_connection_state,
+                probe=context.query_bool("probe", default=True),
+            )
         )
 
     @app.get("/server/connections")
     @route_errors
     async def list_server_connections() -> Any:
         return json_response(runtime.store.list_server_connections())
+
+    @app.get("/server/users")
+    @route_errors
+    async def list_server_users() -> Any:
+        _, server = await context.connected_server_client_async()
+        return json_response(
+            await context.run_blocking(
+                server.list_users,
+                handle=context.first_query_value("handle"),
+            )
+        )
+
+    @app.get("/server/whoami")
+    @route_errors
+    async def server_whoami() -> Any:
+        return json_response(await context.run_blocking(runtime.server_whoami))
 
     @app.post("/server/connections/prune")
     @route_errors
@@ -47,14 +56,36 @@ def register_server_connection_routes(
         return json_response(
             runtime.store.prune_server_connections(
                 older_than_days=30 if older_than_days is None else older_than_days,
-                dry_run=context.query_bool("dry_run", default=False),
+                dry_run=context.strict_query_bool("dry_run"),
+            )
+        )
+
+    @app.get("/server/sync/status")
+    @route_errors
+    async def sync_status() -> Any:
+        return json_response(runtime.sync_status())
+
+    @app.post("/server/sync/prune")
+    @route_errors
+    async def prune_sync_events() -> Any:
+        status = context.first_query_value("status")
+        if not status:
+            raise ValueError("status is required")
+        older_than_days = context.optional_int_query("older_than_days")
+        limit = context.optional_int_query("limit")
+        return json_response(
+            runtime.prune_sync_events(
+                status=status,
+                older_than_days=0 if older_than_days is None else older_than_days,
+                include_protected=context.strict_query_bool("include_protected"),
+                limit=1_000 if limit is None else limit,
             )
         )
 
     @app.get("/server/machines")
     @route_errors
     async def list_server_machines() -> Any:
-        credentials, server = context.connected_server_client()
+        credentials, server = await context.connected_server_client_async()
         return json_response(await context.run_blocking(_server_machines_payload, credentials, server))
 
     @app.post("/server/connect")

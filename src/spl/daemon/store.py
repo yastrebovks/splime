@@ -365,8 +365,13 @@ class RegistryStore:
     def get_sync_event(self, event_id: str) -> dict[str, Any]:
         return self.sync_events.get_sync_event(event_id)
 
-    def list_pending_sync_events(self, limit: int | None = 100) -> list[dict[str, Any]]:
-        return self.sync_events.list_pending_sync_events(limit)
+    def list_pending_sync_events(
+        self,
+        limit: int | None = 100,
+        *,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        return self.sync_events.list_pending_sync_events(limit, offset=offset)
 
     def pending_sync_event_identity_summary(
         self,
@@ -377,8 +382,32 @@ class RegistryStore:
     def mark_sync_event_sent(self, event_id: str) -> dict[str, Any]:
         return self.sync_events.mark_sync_event_sent(event_id)
 
-    def mark_sync_event_failed(self, event_id: str, error: str) -> dict[str, Any]:
-        return self.sync_events.mark_sync_event_failed(event_id, error)
+    def mark_sync_event_failed(
+        self,
+        event_id: str,
+        error: str,
+        *,
+        retryable: bool = True,
+    ) -> dict[str, Any]:
+        return self.sync_events.mark_sync_event_failed(event_id, error, retryable=retryable)
+
+    def sync_event_status_summary(self) -> dict[str, Any]:
+        return self.sync_events.sync_event_status_summary()
+
+    def prune_sync_events(
+        self,
+        *,
+        status: str,
+        older_than_days: int,
+        include_protected: bool = False,
+        limit: int = 1_000,
+    ) -> dict[str, Any]:
+        return self.sync_events.prune_sync_events(
+            status=status,
+            older_than_days=older_than_days,
+            include_protected=include_protected,
+            limit=limit,
+        )
 
     def remote_signature_key_for(self, ref: dict[str, Any]) -> str:
         return self.libraries.remote_signature_key_for(ref)

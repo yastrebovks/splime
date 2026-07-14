@@ -225,6 +225,7 @@ class TestRunEndpoint:
                 spec_hash=spec_hash,
                 log_lines=["Creating venv", "Collecting pyyaml"],
             )
+            store.update_run(run_state["id"], status="starting")
             store.update_run(run_state["id"], status="preparing_environment")
 
             status, body = _json_from_app(app, f"/runs/{run_state['id']}")

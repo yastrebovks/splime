@@ -237,6 +237,12 @@ class _NoopHeartbeats:
     def start_server_heartbeat(self, connection, *, token: str) -> None:
         pass
 
+    def ensure_server_heartbeat(self, connection=None) -> None:
+        pass
+
+    def status(self, connection_id: str | None = None) -> dict[str, object]:
+        return {"connection_id": connection_id, "thread_alive": False, "last_tick_at": None}
+
     def stop_server_heartbeat(self, connection_id: str) -> None:
         pass
 
@@ -408,6 +414,13 @@ def _mark_current_server_channel_live(runtime: DaemonRuntime) -> None:
     runtime._mark_server_channel_success(runtime.store.get_server_connection_credentials(credentials["id"]))
 
 
+def _heartbeat_ok(**kwargs: Any) -> dict[str, Any]:
+    return {
+        "status": "connected",
+        "heartbeat_interval_seconds": kwargs.get("heartbeat_interval_seconds") or 60,
+    }
+
+
 class _CapturingSyncServerClient:
     calls: list[dict[str, Any]] = []
 
@@ -430,6 +443,9 @@ class _CapturingSyncServerClient:
     def latest_machine_library_snapshot(self, machine_id: str) -> dict[str, Any] | None:
         _ = machine_id
         return {}
+
+    def heartbeat_connection(self, **kwargs: Any) -> dict[str, Any]:
+        return _heartbeat_ok(**kwargs)
 
     def sync(
         self,
@@ -589,7 +605,146 @@ def test_sync_flush_adopts_legacy_pre_enrollment_events_under_current_owner(tmp_
         store.close()
 
 
-def test_sync_opens_circuit_and_next_non_probe_sync_fails_fast(tmp_path) -> None:
+def test_sync_lock_prevents_two_threads_from_sending_the_same_event(tmp_path) -> None:
+    class ObservedLock:
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self._attempts_lock = threading.Lock()
+            self._attempts = 0
+            self.second_attempt = threading.Event()
+
+        def __enter__(self) -> None:
+            with self._attempts_lock:
+                self._attempts += 1
+                if self._attempts == 2:
+                    self.second_attempt.set()
+            self._lock.acquire()
+
+        def __exit__(self, *_args: object) -> None:
+            self._lock.release()
+
+    class BlockingSyncServerClient:
+        calls: list[list[dict[str, Any]]] = []
+        first_call_started = threading.Event()
+        release_first_call = threading.Event()
+        calls_lock = threading.Lock()
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def latest_machine_library_snapshot(
+            self,
+            machine_id: str,
+        ) -> dict[str, Any]:
+            _ = machine_id
+            return {}
+
+        def heartbeat_connection(self, **kwargs: Any) -> dict[str, Any]:
+            return _heartbeat_ok(**kwargs)
+
+        def sync(self, **kwargs: Any) -> dict[str, Any]:
+            events = kwargs["events"]
+            with type(self).calls_lock:
+                type(self).calls.append(events)
+                call_number = len(type(self).calls)
+            if call_number == 1:
+                type(self).first_call_started.set()
+                if not type(self).release_first_call.wait(timeout=5):
+                    raise TimeoutError("test did not release the first sync call")
+            return {
+                "event_results": [
+                    {
+                        "event_id": event["id"],
+                        "kind": event["kind"],
+                        "status": "ok",
+                        "result": {},
+                    }
+                    for event in events
+                ],
+                "jobs": [],
+            }
+
+    store = RegistryStore(tmp_path)
+    runtime = None
+    errors: list[BaseException] = []
+    try:
+        connection = _save_connected_owner(
+            store,
+            owner_id="owner-a",
+            connection_id="connection-a",
+        )
+        runtime = DaemonRuntime(
+            store,
+            heartbeat_service=_NoopHeartbeats(),
+            server_client_factory=BlockingSyncServerClient,
+        )
+        _mark_current_server_channel_live(runtime)
+        snapshot_hash, _ = runtime.build_machine_library_snapshot_manifest()
+        store.record_server_connection_library_snapshot(
+            connection["id"],
+            snapshot_hash=snapshot_hash,
+        )
+        event = store.enqueue_sync_event(
+            "object_version",
+            {"name": "single_send", "owner_id": "owner-a"},
+        )
+        observed_lock = ObservedLock()
+        runtime._server_sync_lock = observed_lock
+
+        def run_sync() -> None:
+            try:
+                runtime.sync_once()
+            except BaseException as exc:  # pragma: no cover - assertion below.
+                errors.append(exc)
+
+        first = threading.Thread(target=run_sync, name="sync-race-first")
+        second = threading.Thread(target=run_sync, name="sync-race-second")
+        first.start()
+        assert BlockingSyncServerClient.first_call_started.wait(timeout=5)
+        second.start()
+        assert observed_lock.second_attempt.wait(timeout=5)
+        BlockingSyncServerClient.release_first_call.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors == []
+        sent_ids = [item["id"] for events in BlockingSyncServerClient.calls for item in events]
+        assert sent_ids.count(event["id"]) == 1
+        assert store.get_sync_event(event["id"])["status"] == "sent"
+    finally:
+        BlockingSyncServerClient.release_first_call.set()
+        if runtime is not None:
+            runtime.shutdown()
+        store.close()
+
+
+def test_machine_library_snapshot_event_id_is_stable_for_same_hash(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    runtime = DaemonRuntime(store, heartbeat_service=_NoopHeartbeats())
+    try:
+        first = runtime.build_machine_library_snapshot_event(
+            snapshot_hash="snapshot-hash-a",
+            manifest_items=[],
+        )
+        replay = runtime.build_machine_library_snapshot_event(
+            snapshot_hash="snapshot-hash-a",
+            manifest_items=[],
+        )
+        changed = runtime.build_machine_library_snapshot_event(
+            snapshot_hash="snapshot-hash-b",
+            manifest_items=[],
+        )
+
+        assert replay["id"] == first["id"]
+        assert changed["id"] != first["id"]
+    finally:
+        runtime.shutdown()
+        store.close()
+
+
+def test_successful_lease_resets_breaker_between_sync_payload_failures(tmp_path) -> None:
     class FailingSyncServerClient:
         calls = 0
 
@@ -598,6 +753,9 @@ def test_sync_opens_circuit_and_next_non_probe_sync_fails_fast(tmp_path) -> None
 
         def latest_machine_library_snapshot(self, machine_id: str) -> dict[str, Any]:
             return {}
+
+        def heartbeat_connection(self, **kwargs: Any) -> dict[str, Any]:
+            return _heartbeat_ok(**kwargs)
 
         def sync(self, **kwargs: Any) -> dict[str, Any]:
             type(self).calls += 1
@@ -616,12 +774,15 @@ def test_sync_opens_circuit_and_next_non_probe_sync_fails_fast(tmp_path) -> None
 
         with pytest.raises(ServerClientError):
             runtime.sync_once()
-        retry = runtime.sync_once()
+        with pytest.raises(ServerClientError):
+            runtime.sync_once()
 
-        assert FailingSyncServerClient.calls == 1
-        assert retry["connected"] is False
-        assert retry["offline"] is True
-        assert retry["code"] == "central_server_unreachable"
+        assert FailingSyncServerClient.calls == 2
+        assert runtime.server_connection_state()["breaker"] == {
+            "state": "closed",
+            "consecutive_failures": 1,
+            "last_probe_result": None,
+        }
     finally:
         if runtime is not None:
             runtime.shutdown()
@@ -637,6 +798,9 @@ def test_offline_heartbeat_preserves_identity_row_and_secrets_across_restarts(tm
 
         def latest_machine_library_snapshot(self, machine_id: str) -> dict[str, Any]:
             return {}
+
+        def heartbeat_connection(self, **kwargs: Any) -> dict[str, Any]:
+            return _heartbeat_ok(**kwargs)
 
         def sync(self, **kwargs: Any) -> dict[str, Any]:
             type(self).sync_calls += 1
@@ -673,7 +837,12 @@ def test_offline_heartbeat_preserves_identity_row_and_secrets_across_restarts(tm
                     stop_event.set()
                 return runtime.sync_once(**kwargs)
 
-            HeartbeatService(store, heartbeat_sync_once)._server_heartbeat_loop(
+            HeartbeatService(
+                store,
+                heartbeat_sync_once,
+                initial_backoff_seconds=0.001,
+                max_backoff_seconds=0.002,
+            )._server_heartbeat_loop(
                 credentials["id"],
                 credentials["token"],
                 stop_event,
@@ -713,6 +882,9 @@ def test_run_update_sync_kick_does_not_block_local_run_path(tmp_path) -> None:
 
         def latest_machine_library_snapshot(self, machine_id: str) -> dict[str, Any]:
             return {}
+
+        def heartbeat_connection(self, **kwargs: Any) -> dict[str, Any]:
+            return _heartbeat_ok(**kwargs)
 
         def sync(self, **kwargs: Any) -> dict[str, Any]:
             type(self).started.set()
@@ -874,6 +1046,66 @@ def test_local_run_update_payload_includes_object_owner_id(tmp_path) -> None:
         payload = runtime._local_run_sync_payload(run)  # noqa: SLF001 - I-02 payload identity regression.
 
         assert payload["owner_id"] == "owner-a"
+    finally:
+        if runtime is not None:
+            runtime.shutdown()
+        store.close()
+
+
+def test_fast_worker_cannot_be_overwritten_by_starting(tmp_path, monkeypatch) -> None:
+    """The parent must persist ``starting`` before a worker can complete."""
+
+    store = RegistryStore(tmp_path)
+    runtime = None
+    try:
+        store.register_env("default", sys.executable)
+        runtime = DaemonRuntime(
+            store,
+            auto_build_envs=False,
+            heartbeat_service=_NoopHeartbeats(),
+        )
+        runtime.register_object(
+            "demo_obj",
+            "demo_obj",
+            "default",
+            yaml_text=REMOTE_FUNCTION_YAML,
+        )
+        observed_statuses: list[str] = []
+
+        def complete_synchronously(run_id: str, report_local_run: bool) -> None:
+            observed_statuses.append(store.get_run(run_id)["status"])
+            runtime._update_local_run(  # noqa: SLF001 - deterministic fast-worker race.
+                run_id,
+                report_local_run=report_local_run,
+                status="preparing_environment",
+            )
+            runtime._update_local_run(  # noqa: SLF001 - deterministic fast-worker race.
+                run_id,
+                report_local_run=report_local_run,
+                status="running",
+                started_at=utc_now(),
+            )
+            runtime._update_local_run_terminal(  # noqa: SLF001 - deterministic fast-worker race.
+                run_id,
+                report_local_run=report_local_run,
+                status="succeeded",
+                result={"value": 1},
+                finished_at=utc_now(),
+            )
+
+        monkeypatch.setattr(runtime, "_start_run_thread", complete_synchronously)
+
+        returned = runtime.start_run(
+            "demo_obj",
+            source="local",
+            report_local_run=False,
+        )
+        stored = store.get_run(returned["id"])
+
+        assert observed_statuses == ["starting"]
+        assert returned["status"] == "succeeded"
+        assert stored["status"] == "succeeded"
+        assert stored["result"] == {"value": 1}
     finally:
         if runtime is not None:
             runtime.shutdown()
@@ -1326,7 +1558,12 @@ def test_node_docker_resume_override_prepares_image(tmp_path, monkeypatch) -> No
         assert parent_final["status"] == "succeeded"
         assert docker_manager.calls == []
 
-        monkeypatch.setattr(runtime, "_execute_run", lambda run_id, report_local_run=True: None)
+        observed_statuses: list[str] = []
+        monkeypatch.setattr(
+            runtime,
+            "_start_run_thread",
+            lambda run_id, report_local_run: observed_statuses.append(store.get_run(run_id)["status"]),
+        )
         resumed = runtime.resume_run(
             parent["id"],
             from_="consumer",
@@ -1336,7 +1573,11 @@ def test_node_docker_resume_override_prepares_image(tmp_path, monkeypatch) -> No
         )
 
         state = store.get_run(resumed["id"])
+        assert observed_statuses == ["starting"]
         assert resumed["status"] == "starting"
+        assert resumed["id"] != parent_final["id"]
+        assert resumed["parent_run_id"] == parent_final["id"]
+        assert store.get_run(parent_final["id"])["status"] == "succeeded"
         assert len(docker_manager.calls) == 1
         assert state["input"]["node_runtime_environments"]["docker"]["image_tag"] == "splime-runtime:from-resume"
     finally:
@@ -1525,6 +1766,12 @@ def test_runtime_shutdown_joins_run_threads_before_store_close(tmp_path, monkeyp
         active_runtime = runtime
 
         def slow_execute_run(run_id: str, report_local_run: bool = True) -> None:
+            active_runtime._update_local_run(
+                run_id,
+                report_local_run=report_local_run,
+                status="running",
+                started_at=utc_now(),
+            )
             run_started.set()
             assert release_run.wait(2)
             active_runtime._update_local_run(

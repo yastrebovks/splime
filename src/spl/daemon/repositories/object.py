@@ -1513,6 +1513,14 @@ class ObjectRepository(RepositoryBase):
             version=version,
         )
         if own_library_rows:
+            if all(row["object_origin"] == "server" for row in own_library_rows):
+                cross_owner_rows = self._object_rows_for_clause_locked(
+                    "o.owner_id != ? AND o.name = ? AND o.origin = 'server'",
+                    (caller_owner_id, name_or_id),
+                    version=version,
+                )
+                if cross_owner_rows:
+                    return []
             return own_library_rows
 
         own_rows = self._object_rows_for_clause_locked(
@@ -1834,10 +1842,10 @@ class ObjectRepository(RepositoryBase):
     def _cross_owner_name_hint_locked(self, name: str) -> str | None:
         caller_owner_id = self._caller_owner_id()
         rows = self._object_identity_rows_for_clause_locked(
-            "owner_id != ? AND name = ?",
-            (caller_owner_id, name),
+            "name = ?",
+            (name,),
         )
-        if not rows:
+        if not rows or not any(str(row["owner_id"]) != caller_owner_id for row in rows):
             return None
         libraries_by_owner: dict[str, list[str]] = {}
         for row in rows:
@@ -1846,25 +1854,33 @@ class ObjectRepository(RepositoryBase):
             [(owner_id, libraries)] = libraries_by_owner.items()
             unique_libraries = sorted(set(libraries))
             if len(unique_libraries) == 1:
+                canonical = f"{owner_id}/{unique_libraries[0]}/{name}"
                 return (
                     f"{name!r} is registered locally under owner {owner_id!r} "
-                    f"(library {unique_libraries[0]!r}); pass owner=/library=, "
+                    f"(library {unique_libraries[0]!r}); canonical candidate: "
+                    f"{canonical}; pass owner=/library=, "
                     "or reconnect under that identity"
                 )
             library_list = ", ".join(repr(item) for item in unique_libraries)
+            canonical_labels = ", ".join(f"{owner_id}/{item}/{name}" for item in unique_libraries)
             return (
                 f"{name!r} is registered locally under owner {owner_id!r} "
-                f"(libraries {library_list}); pass owner=/library=, "
+                f"(libraries {library_list}); canonical candidates: {canonical_labels}; "
+                "pass owner=/library=, "
                 "or reconnect under that identity"
             )
         owner_parts = []
+        canonical_candidates: list[str] = []
         for owner_id, libraries in sorted(libraries_by_owner.items()):
-            library_list = ", ".join(repr(item) for item in sorted(set(libraries)))
+            unique_libraries = sorted(set(libraries))
+            library_list = ", ".join(repr(item) for item in unique_libraries)
             label = "library" if len(set(libraries)) == 1 else "libraries"
             owner_parts.append(f"owner {owner_id!r} ({label} {library_list})")
+            canonical_candidates.extend(f"{owner_id}/{library}/{name}" for library in unique_libraries)
         return (
             f"{name!r} is registered locally under other owners: "
-            f"{', '.join(owner_parts)}; pass owner=/library=, "
+            f"{', '.join(owner_parts)}; canonical candidates: {', '.join(canonical_candidates)}; "
+            "pass owner=/library=, "
             "or reconnect under that identity"
         )
 

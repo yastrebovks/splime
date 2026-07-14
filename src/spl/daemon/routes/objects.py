@@ -22,13 +22,9 @@ def register_object_routes(
     @app.get("/server/objects")
     @route_errors
     async def list_server_objects() -> Any:
-        _, server = context.connected_server_client()
+        _, server = await context.connected_server_client_async()
         view = (context.first_query_value("view") or "").lower()
-        compact = (context.first_query_value("compact") or "").lower() in {
-            "1",
-            "true",
-            "yes",
-        }
+        compact = context.query_bool("compact", accept_on=False)
         return json_response(
             await context.run_blocking(
                 server.list_objects,
@@ -54,8 +50,8 @@ def register_object_routes(
                 version=version,
                 owner_id=body.get("owner_id") or body.get("owner"),
                 library=body.get("library"),
-                all_versions=str(body.get("all_versions", "")).strip().lower() in {"1", "true", "yes", "on"},
-                dry_run=str(body.get("dry_run", "")).strip().lower() in {"1", "true", "yes", "on"},
+                all_versions=context.strict_body_bool(body, "all_versions"),
+                dry_run=context.strict_body_bool(body, "dry_run"),
             )
         )
 
@@ -64,11 +60,7 @@ def register_object_routes(
     async def list_objects() -> Any:
         query = context.first_query_value("q", "query")
         view = (context.first_query_value("view") or "").lower()
-        compact = (context.first_query_value("compact") or "").lower() in {
-            "1",
-            "true",
-            "yes",
-        }
+        compact = context.query_bool("compact", accept_on=False)
         if query is None:
             records = runtime.store.list_objects()
             if view == "summary" or compact:
@@ -88,9 +80,10 @@ def register_object_routes(
     @app.post("/objects/prune-stale-mirrors")
     @route_errors
     async def prune_stale_mirrors() -> Any:
+        owner_id = context.first_query_value("owner", "owner_id")
         return json_response(
             runtime.store.prune_stale_mirrors(
-                owner_id=context.first_query_value("owner", "owner_id"),
+                owner_id=runtime.resolve_user_ref(owner_id) if owner_id is not None else None,
                 library=context.first_query_value("library"),
             )
         )
@@ -98,11 +91,7 @@ def register_object_routes(
     @app.get("/objects/<name_or_id>")
     @route_errors
     async def get_object(name_or_id: str) -> Any:
-        include_yaml = (context.first_query_value("include_yaml") or "").lower() in {
-            "1",
-            "true",
-            "yes",
-        }
+        include_yaml = context.query_bool("include_yaml", accept_on=False)
         return json_response(
             await context.object_from_local_or_server_async(
                 validate_name(name_or_id),
@@ -115,6 +104,7 @@ def register_object_routes(
     async def forget_object(name_or_id: str) -> Any:
         version = context.first_query_value("version")
         owner_id = context.first_query_value("owner", "owner_id")
+        owner_id = runtime.resolve_user_ref(owner_id) if owner_id is not None else None
         library = context.first_query_value("library")
         if version is not None and version != "":
             return json_response(
@@ -185,6 +175,7 @@ def register_object_routes(
         )
         if refresh and refresh.get("current_version"):
             name_or_id = refresh["current_version"]["name"]
+        owner_id = runtime.resolve_user_ref(owner_id) if owner_id is not None else None
         return json_response(
             runtime.store.list_object_versions(
                 validate_name(name_or_id),
@@ -196,11 +187,12 @@ def register_object_routes(
     @app.delete("/objects/<name_or_id>/versions/<version_ref>")
     @route_errors
     async def forget_object_version(name_or_id: str, version_ref: str) -> Any:
+        owner_id = context.first_query_value("owner", "owner_id")
         return json_response(
             runtime.store.forget_object_version(
                 validate_name(name_or_id),
                 version_ref,
-                owner_id=context.first_query_value("owner", "owner_id"),
+                owner_id=runtime.resolve_user_ref(owner_id) if owner_id is not None else None,
                 library=context.first_query_value("library"),
             )
         )
@@ -209,12 +201,9 @@ def register_object_routes(
     @route_errors
     async def register_object() -> Any:
         body = await context.read_json_body()
-        create_library = str(body.get("create_library", body.get("create"))).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        create_library_field = "create_library" if "create_library" in body else "create"
+        create_library = context.strict_body_bool(body, create_library_field)
+        local_only = context.strict_body_bool(body, "local_only")
         record = runtime.register_object(
             body["name"],
             body["entrypoint"],
@@ -229,7 +218,7 @@ def register_object_routes(
             library=body.get("library") or body.get("library_slug"),
             runtime_config=body.get("runtime_config"),
         )
-        if not body.get("local_only", False):
+        if not local_only:
             record["sync_event"] = runtime.enqueue_object_sync(
                 record,
                 library=body.get("library") or body.get("library_slug"),

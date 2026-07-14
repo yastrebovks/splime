@@ -216,6 +216,10 @@ class ServerClientProtocol(Protocol):
         """Send one server heartbeat."""
         ...
 
+    def current_connection(self) -> dict[str, Any]:
+        """Return the authenticated machine connection used by channel probes."""
+        ...
+
     def disconnect_machine(self) -> dict[str, Any]:
         """Disconnect this machine from the central server."""
         ...
@@ -228,15 +232,23 @@ class ServerClientProtocol(Protocol):
         """Return tokens visible to the connected user identity."""
         ...
 
+    def list_users(self, *, handle: str | None = None) -> list[dict[str, Any]]:
+        """Return the email-free user directory, optionally filtered by handle."""
+        ...
+
     def list_libraries(self, *, include_accessible: bool = True) -> list[dict[str, Any]]:
         """Return visible server libraries."""
+        ...
+
+    def list_owner_libraries(self, owner: str) -> list[dict[str, Any]]:
+        """Return visible libraries for one owner reference."""
         ...
 
     def create_library(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Create a server library."""
         ...
 
-    def get_library(self, library_ref: str) -> dict[str, Any]:
+    def get_library(self, library_ref: str, *, owner: str | None = None) -> dict[str, Any]:
         """Return a server library."""
         ...
 
@@ -248,7 +260,12 @@ class ServerClientProtocol(Protocol):
         """Delete a server library when upstream support is added."""
         ...
 
-    def list_library_grants(self, library_ref: str) -> list[dict[str, Any]]:
+    def list_library_grants(
+        self,
+        library_ref: str,
+        *,
+        owner: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Return library grants."""
         ...
 
@@ -344,6 +361,15 @@ class ServerClientProtocol(Protocol):
         capabilities: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Send one sync request."""
+        ...
+
+    def create_remote_run(
+        self,
+        payload: dict[str, Any],
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Create one server run through the idempotent direct route."""
         ...
 
     def get_remote_run(self, run_id: str) -> dict[str, Any]:
@@ -469,6 +495,14 @@ class HeartbeatsProtocol(Protocol):
         token: str,
     ) -> None:
         """Start heartbeat for one connection."""
+        ...
+
+    def ensure_server_heartbeat(self, connection: dict[str, Any] | None = None) -> None:
+        """Start or recover the heartbeat for a stored identity."""
+        ...
+
+    def status(self, connection_id: str | None = None) -> dict[str, Any]:
+        """Return heartbeat liveness diagnostics."""
         ...
 
     def stop_server_heartbeat(self, connection_id: str) -> None:

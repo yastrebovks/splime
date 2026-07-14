@@ -16,7 +16,7 @@ import time
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import pytest
 
@@ -32,6 +32,147 @@ from spl.daemon_client import Client
 pytestmark = pytest.mark.smoke
 
 SMOKE_OBJECT = "cookbook_smoke_daily_total"
+
+
+class SharedLibraryCookbookDaemon:
+    """Minimal connected daemon contract for the shared-library recipe."""
+
+    resolution = {
+        "auto_resolved": True,
+        "requested_library": "default",
+        "resolved_owner_id": "alice-example-com",
+        "resolved_owner_handle": "alice",
+        "resolved_library": "default",
+        "resolved_library_id": "library-alice-default",
+    }
+
+    def server_connection(self) -> dict[str, Any]:
+        return {
+            "connected": True,
+            "connection": {"status": "connected", "owner_id": "bob-example-com"},
+        }
+
+    def server_whoami(self) -> dict[str, Any]:
+        return {
+            "id": "bob-example-com",
+            "owner_id": "bob-example-com",
+            "handle": "bob",
+            "display_name": "Bob",
+            "server_url": "https://spl.example",
+            "machine_id": "bob-machine",
+            "connection_status": "connected",
+            "live": True,
+        }
+
+    def server_users(self, *, handle: str | None = None) -> list[dict[str, Any]]:
+        assert handle in {None, "@alice"}
+        return [
+            {
+                "id": "alice-example-com",
+                "handle": "alice",
+                "display_name": "Alice",
+                "status": "active",
+            }
+        ]
+
+    def server_libraries(
+        self,
+        *,
+        owner: str | None = None,
+        include_accessible: bool = True,
+    ) -> list[dict[str, Any]]:
+        assert owner is None
+        assert include_accessible is True
+        return [
+            {
+                "slug": "default",
+                "owner_id": "alice-example-com",
+                "owner_handle": "alice",
+                "owned": False,
+            },
+            {
+                "slug": "default",
+                "owner_id": "bob-example-com",
+                "owner_handle": "bob",
+                "owned": True,
+            },
+        ]
+
+    def get_server_library(self, ref: str, *, owner: str | None = None) -> dict[str, Any]:
+        assert (ref, owner) == ("default", "@alice")
+        return {
+            "slug": "default",
+            "owner_id": "alice-example-com",
+            "owner_handle": "alice",
+            "owned": False,
+        }
+
+    def server_objects(
+        self,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+        compact: bool = False,
+    ) -> list[dict[str, Any]]:
+        assert (owner_id, library, compact) == ("@alice", "default", False)
+        return [
+            {
+                "name": "shared_fn",
+                "owner_id": "alice-example-com",
+                "owner_handle": "alice",
+                "library": "default",
+            }
+        ]
+
+    def signature(self, name: str, **kwargs: Any) -> dict[str, Any]:
+        assert name == "shared_fn"
+        assert kwargs["owner_id"] == "@alice"
+        assert kwargs["library"] == "default"
+        return {
+            "name": name,
+            "display_name": name,
+            "version": 1,
+            "kind": "function",
+            "description": "",
+            "inputs": [],
+            "outputs": [],
+        }
+
+    def run(self, object_name: str, **kwargs: Any) -> dict[str, Any]:
+        assert object_name == "shared_fn"
+        assert kwargs["library"] == "default"
+        state: dict[str, Any] = {
+            "id": "run-shared-fn",
+            "status": "queued",
+            "object_name": object_name,
+        }
+        if kwargs["object_owner_id"] is None:
+            state["resolution"] = dict(self.resolution)
+        else:
+            assert kwargs["object_owner_id"] == "@alice"
+        return state
+
+    def wait_remote_run(
+        self,
+        run_id: str,
+        *,
+        poll_interval: float,
+        timeout_seconds: float | None,
+        on_state: Any | None = None,
+    ) -> dict[str, Any]:
+        del poll_interval, timeout_seconds, on_state
+        return {
+            "id": run_id,
+            "status": "succeeded",
+            "result": {"result": 44, "artifacts": {}},
+        }
+
+    def get_remote_run(self, run_id: str) -> dict[str, Any]:
+        return {
+            "id": run_id,
+            "status": "succeeded",
+            "result": {"result": 44, "artifacts": {}},
+        }
 
 
 def cookbook_smoke_daily_total(date: str) -> float:
@@ -228,6 +369,49 @@ def test_cache_warming_recipe_is_safe_without_server(client: SPLClient) -> None:
         library=library if isinstance(library, str) else None,
     )
     assert {"pulled", "skipped", "failed", "ambiguous_names"} <= set(receipt)
+
+
+def test_shared_library_cookbook_recipe_matches_connected_d1_contract() -> None:
+    """Connected cookbook: discover, list, read, call, and inspect D1 receipt."""
+
+    client = SPLClient(daemon_port=8765)
+    client._daemon = SharedLibraryCookbookDaemon()
+
+    me = client.whoami()
+    alice = client.users(handle="@alice")[0]
+    libraries = client.library.list()
+    shared = client.library.get("default", owner="@alice")
+    objects = client.objects(
+        scope="server",
+        owner="@alice",
+        library="default",
+    )
+    signature = client.signature(
+        "shared_fn",
+        owner="@alice",
+        library="default",
+    )
+    explicit = client.call(
+        "shared_fn",
+        owner="@alice",
+        library="default",
+        progress=False,
+    )
+    automatic = client.call(
+        "shared_fn",
+        library="default",
+        progress=False,
+    )
+
+    assert me["handle"] == "bob"
+    assert alice["handle"] == "alice"
+    assert {row["owned"] for row in libraries} == {False, True}
+    assert shared["owned"] is False
+    assert any(row["name"] == "shared_fn" for row in objects)
+    assert signature["name"] == "shared_fn"
+    assert explicit.output == 44
+    assert automatic.run.raw["resolution"]["resolved_owner_handle"] == "alice"
+    assert "@alice/default" in repr(automatic.run)
 
 
 def test_converter_node_recipe_warns_then_runs() -> None:

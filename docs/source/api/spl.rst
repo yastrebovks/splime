@@ -40,6 +40,15 @@ spl.\_http module
    :show-inheritance:
    :undoc-members:
 
+spl.\_owner\_ref module
+-----------------------
+
+.. automodule:: spl._owner_ref
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.\_views module
 ------------------
 

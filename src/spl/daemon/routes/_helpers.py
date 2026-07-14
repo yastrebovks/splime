@@ -12,7 +12,12 @@ from typing import Any, Awaitable, Callable, Protocol, TypeVar, cast
 
 from spl.daemon.remote_client import ServerClientError
 from spl.daemon.runtime_dependencies import ServerClientProtocol
-from spl.daemon.server_connection import SERVER_PROXY_TIMEOUT_SECONDS, SERVER_UNREACHABLE_CODE, ServerOfflineError
+from spl.daemon.server_connection import (
+    SERVER_PROXY_TIMEOUT_SECONDS,
+    SERVER_UNREACHABLE_CODE,
+    HandleRequiresServerConnectionError,
+    ServerOfflineError,
+)
 from spl.daemon.store import split_object_function_ref
 
 RouteHandler = TypeVar("RouteHandler", bound=Callable[..., Awaitable[Any]])
@@ -64,6 +69,15 @@ class RouteContext:
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
             try:
                 return await handler(*args, **kwargs)
+            except HandleRequiresServerConnectionError as exc:
+                return self.json_response(
+                    {
+                        "error": str(exc),
+                        "code": exc.code,
+                        "owner": exc.owner,
+                    },
+                    HTTPStatus.NOT_FOUND,
+                )
             except KeyError as exc:
                 return self.json_response({"error": str(exc)}, HTTPStatus.NOT_FOUND)
             except ValueError as exc:
@@ -73,6 +87,9 @@ class RouteContext:
                 code = getattr(exc, "code", None)
                 if code:
                     body["code"] = code
+                detail = getattr(exc, "detail", None)
+                if detail:
+                    body["detail"] = detail
                 return self.json_response(
                     body,
                     HTTPStatus.SERVICE_UNAVAILABLE,
@@ -83,7 +100,7 @@ class RouteContext:
                     "upstream_status": exc.status_code,
                 }
                 if self.runtime._is_server_connectivity_error(exc):
-                    self.runtime._mark_current_server_channel_failure()
+                    self.runtime._mark_current_server_channel_failure(error=exc)
                     body["offline"] = True
                     body["code"] = SERVER_UNREACHABLE_CODE
                 try:
@@ -130,17 +147,69 @@ class RouteContext:
             return None
         return int(value)
 
-    def query_bool(self, name: str, *, default: bool = False) -> bool:
+    def query_bool(
+        self,
+        name: str,
+        *,
+        default: bool = False,
+        accept_on: bool = True,
+    ) -> bool:
+        """Parse a compatibility boolean for read-only query options only.
+
+        ``1``, ``true``, and ``yes`` are true; routes that historically did so
+        may also accept ``on``. Unknown values retain the historical false-like
+        behavior. Mutation and destructive routes must use
+        :meth:`strict_query_bool` instead.
+        """
+
         value = self.first_query_value(name)
         if value is None:
             return default
-        return value.lower() in {"1", "true", "yes", "on"}
+        normalized = value.lower()
+        return normalized in {"1", "true", "yes"} or (accept_on and normalized == "on")
+
+    def strict_query_bool(self, name: str, *, default: bool = False) -> bool:
+        """Accept only case-insensitive ``1``, ``true``, ``0``, or ``false``."""
+
+        value = self.first_query_value(name)
+        if value is None:
+            return default
+        normalized = value.casefold()
+        if normalized in {"1", "true"}:
+            return True
+        if normalized in {"0", "false"}:
+            return False
+        raise ValueError(f"query parameter {name!r} must be one of: 0, 1, false, true; received {value!r}")
+
+    @staticmethod
+    def strict_body_bool(
+        body: dict[str, Any],
+        name: str,
+        *,
+        default: bool = False,
+    ) -> bool:
+        """Accept only a real JSON boolean; use ``default`` when absent."""
+
+        if name not in body:
+            return default
+        value = body[name]
+        if isinstance(value, bool):
+            return value
+        raise ValueError(f"JSON field {name!r} must be a boolean; received {value!r}")
 
     def connected_server_client(self) -> tuple[dict[str, Any], ServerClientProtocol]:
         credentials = self.runtime._require_live_server_channel_credentials()
         return credentials, self.runtime._server_client_for_credentials(
             credentials,
             request_timeout_seconds=SERVER_PROXY_TIMEOUT_SECONDS,
+        )
+
+    async def connected_server_client_async(self) -> tuple[dict[str, Any], ServerClientProtocol]:
+        """Acquire a live server client without blocking the daemon event loop."""
+
+        return cast(
+            tuple[dict[str, Any], ServerClientProtocol],
+            await self.run_blocking(self.connected_server_client),
         )
 
     def object_function_ref(self, name_or_id: str) -> tuple[str, str | None]:
@@ -166,13 +235,18 @@ class RouteContext:
             library=library,
         )
         if refresh and refresh.get("current_version"):
-            return cast(
+            record = cast(
                 dict[str, Any],
                 self.runtime.store.get_object_version(
                     refresh["current_version"]["version_id"],
                     include_yaml=include_yaml,
                 ),
             )
+            resolved_from = refresh["current_version"].get("resolved_from")
+            if isinstance(resolved_from, dict):
+                record = {**record, "resolved_from": dict(resolved_from)}
+            return record
+        owner_id = self.runtime.resolve_user_ref(owner_id) if owner_id is not None else None
         return cast(
             dict[str, Any],
             self.runtime.store.get_object(

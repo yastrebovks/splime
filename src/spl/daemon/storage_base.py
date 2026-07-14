@@ -425,6 +425,7 @@ class StorageBase:
                     payload_json TEXT NOT NULL,
                     status TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
+                    retryable INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     sent_at TEXT,
@@ -541,6 +542,7 @@ class StorageBase:
             self._ensure_column("environment_builds", "image_tag", "TEXT")
             self._ensure_column("environment_builds", "base_image", "TEXT")
             self._ensure_column("sync_events", "attempts", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("sync_events", "retryable", "INTEGER NOT NULL DEFAULT 1")
             self._ensure_column("remote_signatures", "library", "TEXT")
             self._conn.execute(
                 """

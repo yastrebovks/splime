@@ -23,7 +23,10 @@ def register_library_routes(
     @app.get("/server/libraries")
     @route_errors
     async def list_server_libraries() -> Any:
-        _, server = context.connected_server_client()
+        _, server = await context.connected_server_client_async()
+        owner_id = context.first_query_value("owner", "owner_id")
+        if owner_id is not None:
+            return json_response(await context.run_blocking(server.list_owner_libraries, owner_id))
         return json_response(
             await context.run_blocking(
                 server.list_libraries,
@@ -37,7 +40,7 @@ def register_library_routes(
     @app.post("/server/libraries")
     @route_errors
     async def create_server_library() -> Any:
-        _, server = context.connected_server_client()
+        _, server = await context.connected_server_client_async()
         return json_response(
             await context.run_blocking(server.create_library, await context.read_json_body()),
             HTTPStatus.CREATED,
@@ -46,13 +49,22 @@ def register_library_routes(
     @app.get("/server/libraries/<library_ref>")
     @route_errors
     async def get_server_library(library_ref: str) -> Any:
-        _, server = context.connected_server_client()
-        return json_response(await context.run_blocking(server.get_library, validate_name(library_ref)))
+        _, server = await context.connected_server_client_async()
+        owner_id = context.first_query_value("owner", "owner_id")
+        if owner_id is None:
+            return json_response(await context.run_blocking(server.get_library, validate_name(library_ref)))
+        return json_response(
+            await context.run_blocking(
+                server.get_library,
+                validate_name(library_ref),
+                owner=owner_id,
+            )
+        )
 
     @app.put("/server/libraries/<library_ref>")
     @route_errors
     async def update_server_library(library_ref: str) -> Any:
-        _, server = context.connected_server_client()
+        _, server = await context.connected_server_client_async()
         return json_response(
             await context.run_blocking(
                 server.update_library,
@@ -73,13 +85,27 @@ def register_library_routes(
     @app.get("/server/libraries/<library_ref>/grants")
     @route_errors
     async def list_server_library_grants(library_ref: str) -> Any:
-        _, server = context.connected_server_client()
-        return json_response(await context.run_blocking(server.list_library_grants, validate_name(library_ref)))
+        _, server = await context.connected_server_client_async()
+        owner_id = context.first_query_value("owner", "owner_id")
+        if owner_id is None:
+            return json_response(
+                await context.run_blocking(
+                    server.list_library_grants,
+                    validate_name(library_ref),
+                )
+            )
+        return json_response(
+            await context.run_blocking(
+                server.list_library_grants,
+                validate_name(library_ref),
+                owner=owner_id,
+            )
+        )
 
     @app.post("/server/libraries/<library_ref>/grants")
     @route_errors
     async def grant_server_library(library_ref: str) -> Any:
-        _, server = context.connected_server_client()
+        _, server = await context.connected_server_client_async()
         return json_response(
             await context.run_blocking(
                 server.grant_library,
@@ -92,19 +118,19 @@ def register_library_routes(
     @app.post("/server/libraries/<library_ref>/grants/<grantee>/revoke")
     @route_errors
     async def revoke_server_library_grant(library_ref: str, grantee: str) -> Any:
-        _, server = context.connected_server_client()
+        _, server = await context.connected_server_client_async()
         return json_response(
             await context.run_blocking(
                 server.revoke_library_grant,
                 validate_name(library_ref),
-                validate_name(grantee),
+                grantee,
             )
         )
 
     @app.post("/server/libraries/<library_ref>/references")
     @route_errors
     async def add_server_library_reference(library_ref: str) -> Any:
-        _, server = context.connected_server_client()
+        _, server = await context.connected_server_client_async()
         return json_response(
             await context.run_blocking(
                 server.add_library_reference,
@@ -117,7 +143,7 @@ def register_library_routes(
     @app.post("/server/libraries/<library_ref>/copies")
     @route_errors
     async def copy_server_library_object(library_ref: str) -> Any:
-        _, server = context.connected_server_client()
+        _, server = await context.connected_server_client_async()
         return json_response(
             await context.run_blocking(
                 server.copy_object_into_library,
@@ -130,7 +156,7 @@ def register_library_routes(
     @app.delete("/server/libraries/<library_ref>/entries/<name>")
     @route_errors
     async def remove_server_library_entry(library_ref: str, name: str) -> Any:
-        _, server = context.connected_server_client()
+        _, server = await context.connected_server_client_async()
         return json_response(
             await context.run_blocking(
                 server.remove_library_entry,

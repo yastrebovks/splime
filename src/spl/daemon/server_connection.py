@@ -17,9 +17,33 @@ from spl.daemon.store import RegistryStore, validate_name
 class ServerOfflineError(RuntimeError):
     """Raised when a server-backed operation is requested while offline."""
 
-    def __init__(self, message: str, *, code: str = "central_server_offline"):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "central_server_offline",
+        detail: str | None = None,
+    ):
         self.code = code
+        self.detail = detail
         super().__init__(message)
+
+
+class HandleRequiresServerConnectionError(KeyError):
+    """Raised when a handle reaches local storage without a live server."""
+
+    code = "handle_requires_server_connection"
+
+    def __init__(self, owner: str):
+        self.owner = owner
+        self.message = (
+            f"cannot resolve owner {owner!r}: handles resolve on the server; "
+            "connect first with client.connect_server(...) or pass the canonical owner id"
+        )
+        super().__init__(self.message)
+
+    def __str__(self) -> str:
+        return self.message
 
 
 SERVER_OFFLINE_MESSAGE = (

@@ -9,6 +9,7 @@ reused across projects and executed locally or remotely.
    :caption: Guides
 
    cookbook
+   owners-libraries-handles
 
 .. toctree::
    :maxdepth: 2

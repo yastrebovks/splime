@@ -93,12 +93,18 @@ def test_store_close_serializes_against_run_updates(tmp_path) -> None:
         errors: list[BaseException] = []
 
         def update_loop() -> None:
-            status = "running"
+            update_number = 0
             while not stop.is_set():
                 try:
-                    store.update_run(str(run["id"]), status=status)
+                    # This is a close-vs-write serialization test, not a
+                    # lifecycle test. Mutate a non-status field so it does not
+                    # manufacture the now-illegal running -> queued edge.
+                    store.update_run(
+                        str(run["id"]),
+                        stdout_text=f"update-{update_number}",
+                    )
                     first_update.set()
-                    status = "queued" if status == "running" else "running"
+                    update_number += 1
                 except RuntimeError as exc:
                     if str(exc) == "store is closed":
                         return
@@ -117,6 +123,21 @@ def test_store_close_serializes_against_run_updates(tmp_path) -> None:
 
         assert not thread.is_alive()
         assert errors == []
+        store.close()
+
+
+def test_local_run_rejects_backward_status_transition(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        run = _seed_demo_run(store)
+        store.update_run(str(run["id"]), status="starting")
+        store.update_run(str(run["id"]), status="running")
+
+        with pytest.raises(RuntimeError, match="stale local run update ignored"):
+            store.update_run(str(run["id"]), status="queued")
+
+        assert store.get_run(str(run["id"]))["status"] == "running"
+    finally:
         store.close()
 
 

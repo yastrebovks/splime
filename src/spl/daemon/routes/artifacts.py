@@ -23,7 +23,7 @@ def register_artifact_routes(
     @app.get("/remote-runs/<run_id>/artifacts")
     @route_errors
     async def list_remote_artifacts(run_id: str) -> Any:
-        credentials = runtime._require_live_server_channel_credentials()
+        credentials = await context.run_blocking(runtime._require_live_server_channel_credentials)
         artifacts = await context.run_blocking(
             runtime._server_client_for_credentials(
                 credentials,
@@ -36,7 +36,7 @@ def register_artifact_routes(
     @app.get("/remote-runs/<run_id>/artifacts/<artifact_name>")
     @route_errors
     async def get_remote_artifact(run_id: str, artifact_name: str) -> Any:
-        credentials = runtime._require_live_server_channel_credentials()
+        credentials = await context.run_blocking(runtime._require_live_server_channel_credentials)
         data = await context.run_blocking(
             runtime._server_client_for_credentials(
                 credentials,

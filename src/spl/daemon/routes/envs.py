@@ -52,7 +52,7 @@ def register_env_routes(
     @route_errors
     async def rebuild_environment(spec_hash: str) -> Any:
         body = await context.read_json_body()
-        wait = bool(body.get("wait", False))
+        wait = context.strict_body_bool(body, "wait")
         resolved_spec_hash = validate_name(spec_hash)
         record = runtime.store.get_environment_build(resolved_spec_hash)
         if record is None:

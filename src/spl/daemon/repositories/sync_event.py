@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -48,16 +49,34 @@ class SyncEventRepository(RepositoryBase):
             raise KeyError(f"sync event is not found: {event_id}")
         return self._sync_event_row(row)
 
-    def list_pending_sync_events(self, limit: int | None = 100) -> list[dict[str, Any]]:
+    def list_pending_sync_events(
+        self,
+        limit: int | None = 100,
+        *,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
         limit_clause = "" if limit is None else "LIMIT ?"
-        args: tuple[Any, ...] = () if limit is None else (limit,)
+        offset_clause = "" if offset == 0 else "OFFSET ?"
+        args: tuple[Any, ...]
+        if limit is None:
+            if offset:
+                limit_clause = "LIMIT -1"
+                args = (offset,)
+            else:
+                args = ()
+        else:
+            args = (limit, offset) if offset else (limit,)
         with self._lock:
             rows = self._conn.execute(
                 f"""
                 SELECT * FROM sync_events
-                WHERE status IN ('pending', 'failed')
-                ORDER BY created_at
+                WHERE status = 'pending'
+                   OR (status = 'failed' AND retryable = 1)
+                ORDER BY created_at, id
                 {limit_clause}
+                {offset_clause}
                 """,
                 args,
             ).fetchall()
@@ -84,7 +103,8 @@ class SyncEventRepository(RepositoryBase):
                 """
                 SELECT payload_json
                 FROM sync_events
-                WHERE status IN ('pending', 'failed')
+                WHERE status = 'pending'
+                   OR (status = 'failed' AND retryable = 1)
                 """
             ).fetchall()
         for row in rows:
@@ -120,7 +140,13 @@ class SyncEventRepository(RepositoryBase):
             raise KeyError(f"sync event is not found: {event_id}")
         return self.get_sync_event(event_id)
 
-    def mark_sync_event_failed(self, event_id: str, error: str) -> dict[str, Any]:
+    def mark_sync_event_failed(
+        self,
+        event_id: str,
+        error: str,
+        *,
+        retryable: bool = True,
+    ) -> dict[str, Any]:
         event_id = validate_name(event_id)
         now = utc_now()
         with self._lock, self._conn:
@@ -129,11 +155,12 @@ class SyncEventRepository(RepositoryBase):
                 UPDATE sync_events
                 SET status = 'failed',
                     attempts = attempts + 1,
+                    retryable = ?,
                     updated_at = ?,
                     error = ?
                 WHERE id = ?
                 """,
-                (now, error, event_id),
+                (int(retryable), now, error, event_id),
             )
         if cursor.rowcount == 0:
             raise KeyError(f"sync event is not found: {event_id}")
@@ -142,7 +169,7 @@ class SyncEventRepository(RepositoryBase):
     def _sync_event_row(self, row: sqlite3.Row) -> dict[str, Any]:
         status = row["status"]
         attempts = int(row["attempts"] or 0)
-        will_retry = status in {"pending", "failed"}
+        will_retry = status in {"pending", "failed"} and bool(row["retryable"])
         return {
             "id": row["id"],
             "kind": row["kind"],
@@ -158,6 +185,104 @@ class SyncEventRepository(RepositoryBase):
                 "next_attempt": attempts + 1 if will_retry else None,
                 "last_error": row["error"],
             },
+        }
+
+    def sync_event_status_summary(self) -> dict[str, Any]:
+        """Return queue counts and oldest/error diagnostics without loading payloads."""
+
+        with self._lock:
+            count_rows = self._conn.execute(
+                "SELECT status, COUNT(*) AS count FROM sync_events GROUP BY status"
+            ).fetchall()
+            oldest = self._conn.execute(
+                """
+                SELECT id, kind, status, created_at
+                FROM sync_events
+                WHERE status = 'pending'
+                   OR (status = 'failed' AND retryable = 1)
+                ORDER BY created_at, id
+                LIMIT 1
+                """
+            ).fetchone()
+            last_error = self._conn.execute(
+                """
+                SELECT id, kind, error, updated_at
+                FROM sync_events
+                WHERE error IS NOT NULL
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return {
+            "by_status": {str(row["status"]): int(row["count"]) for row in count_rows},
+            "oldest_event": dict(oldest) if oldest is not None else None,
+            "last_error": dict(last_error) if last_error is not None else None,
+        }
+
+    def prune_sync_events(
+        self,
+        *,
+        status: str,
+        older_than_days: int,
+        include_protected: bool = False,
+        limit: int = 1_000,
+    ) -> dict[str, Any]:
+        """Delete a bounded set of old events, protecting non-telemetry kinds."""
+
+        allowed_statuses = {"pending", "failed", "sent"}
+        if status not in allowed_statuses:
+            raise ValueError("status must be one of: failed, pending, sent")
+        if older_than_days < 0:
+            raise ValueError("older_than_days must be non-negative")
+        if limit <= 0 or limit > 1_000:
+            raise ValueError("limit must be between 1 and 1000")
+        cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+        with self._lock, self._conn:
+            kind_clause = "" if include_protected else "AND kind = 'local_run_update'"
+            rows = self._conn.execute(
+                f"""
+                SELECT id, kind, status, created_at, updated_at
+                FROM sync_events
+                WHERE status = ? AND created_at <= ?
+                {kind_clause}
+                ORDER BY created_at, id
+                LIMIT ?
+                """,
+                (status, cutoff, limit + 1),
+            ).fetchall()
+            has_more = len(rows) > limit
+            removable = rows[:limit]
+            protected = (
+                []
+                if include_protected
+                else self._conn.execute(
+                    """
+                    SELECT id, kind, status, created_at, updated_at
+                    FROM sync_events
+                    WHERE status = ?
+                      AND created_at <= ?
+                      AND kind != 'local_run_update'
+                    ORDER BY created_at, id
+                    LIMIT ?
+                    """,
+                    (status, cutoff, limit),
+                ).fetchall()
+            )
+            if removable:
+                self._conn.executemany(
+                    "DELETE FROM sync_events WHERE id = ?",
+                    [(row["id"],) for row in removable],
+                )
+        return {
+            "status": status,
+            "older_than_days": older_than_days,
+            "include_protected": include_protected,
+            "limit": limit,
+            "pruned": [dict(row) for row in removable],
+            "pruned_count": len(removable),
+            "protected": [] if include_protected else [dict(row) for row in protected],
+            "protected_count": 0 if include_protected else len(protected),
+            "has_more": has_more,
         }
 
     def _payload_owner_id(self, payload: dict[str, Any]) -> str | None:

@@ -228,6 +228,26 @@ def build_parser() -> argparse.ArgumentParser:
         "server-machines",
         help="list machines visible to the connected user",
     )
+    subparsers.add_parser(
+        "sync-status",
+        help="show sync-queue and heartbeat diagnostics",
+    )
+    sync_prune = subparsers.add_parser(
+        "sync-prune",
+        help="prune a bounded set of old outbound sync events",
+    )
+    sync_prune.add_argument(
+        "--status",
+        choices=["pending", "failed", "sent"],
+        required=True,
+    )
+    sync_prune.add_argument("--older-than-days", type=int, default=0)
+    sync_prune.add_argument(
+        "--include-protected",
+        action="store_true",
+        help="also prune object/version events; disabled by default",
+    )
+    sync_prune.add_argument("--limit", type=int, default=1_000)
 
     env_add = subparsers.add_parser("env-add", help="register a Python executable")
     env_add.add_argument("name")
@@ -563,6 +583,17 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "server-machines":
             print_json(client.server_machines())
+        elif args.command == "sync-status":
+            print_json(client.sync_status())
+        elif args.command == "sync-prune":
+            print_json(
+                client.prune_sync_events(
+                    status=args.status,
+                    older_than_days=args.older_than_days,
+                    include_protected=args.include_protected,
+                    limit=args.limit,
+                )
+            )
         elif args.command == "env-add":
             print_json(client.register_env(args.name, args.python))
         elif args.command == "env-list":

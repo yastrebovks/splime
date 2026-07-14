@@ -52,26 +52,29 @@ def build_signature(
     inputs = _normalize_inputs(record.get("inputs") or [])
     outputs = _normalize_outputs(kind, record.get("outputs") or [])
     display_name = record.get("display_name") or record["name"]
-    return {
-        "name": record["name"],
-        "display_name": display_name,
-        "origin": record.get("origin", "local"),
-        "id": record["id"],
-        "version": record["version"],
-        "version_id": record["version_id"],
-        "env": record.get("env"),
-        "env_python": record.get("env_python"),
-        "env_python_version": record.get("env_python_version"),
-        "kind": kind,
-        "description": record.get("description") or "",
-        "inputs": inputs,
-        "outputs": outputs,
-        "pipeline_nodes": record.get("pipeline_nodes") or [],
-        "remote_nodes": [node for node in record.get("pipeline_nodes") or [] if node.get("kind") == "remote"],
-        "internal_objects": record.get("internal_objects") or [],
-        "internal_functions": _internal_functions(record),
-        "call": _call_help(display_name, kind, inputs, outputs),
-    }
+    return _copy_resolution_fields(
+        {
+            "name": record["name"],
+            "display_name": display_name,
+            "origin": record.get("origin", "local"),
+            "id": record["id"],
+            "version": record["version"],
+            "version_id": record["version_id"],
+            "env": record.get("env"),
+            "env_python": record.get("env_python"),
+            "env_python_version": record.get("env_python_version"),
+            "kind": kind,
+            "description": record.get("description") or "",
+            "inputs": inputs,
+            "outputs": outputs,
+            "pipeline_nodes": record.get("pipeline_nodes") or [],
+            "remote_nodes": [node for node in record.get("pipeline_nodes") or [] if node.get("kind") == "remote"],
+            "internal_objects": record.get("internal_objects") or [],
+            "internal_functions": _internal_functions(record),
+            "call": _call_help(display_name, kind, inputs, outputs),
+        },
+        record,
+    )
 
 
 def _build_internal_function_signature(
@@ -85,41 +88,57 @@ def _build_internal_function_signature(
     canonical_name = f"{parent_name}::{item['name']}"
     inputs = _normalize_inputs(item.get("inputs") or [])
     outputs = _normalize_outputs("function", item.get("outputs") or [])
-    return {
-        "name": canonical_name,
-        "display_name": display_name,
-        "origin": record.get("origin", "local"),
-        "id": record["id"],
-        "version": record["version"],
-        "version_id": record["version_id"],
-        "env": record.get("env"),
-        "env_python": record.get("env_python"),
-        "env_python_version": record.get("env_python_version"),
-        "kind": "function",
-        "description": record.get("description") or "",
-        "inputs": inputs,
-        "outputs": outputs,
-        "pipeline_nodes": [],
-        "remote_nodes": [],
-        "internal_objects": [],
-        "internal_functions": [],
-        "function": item["name"],
-        "entrypoint": item["name"],
-        "parent_object": {
-            "name": parent_name,
-            "display_name": parent_display_name,
-            "kind": record.get("kind") or record.get("type") or "unknown",
+    return _copy_resolution_fields(
+        {
+            "name": canonical_name,
+            "display_name": display_name,
+            "origin": record.get("origin", "local"),
+            "id": record["id"],
             "version": record["version"],
             "version_id": record["version_id"],
+            "env": record.get("env"),
+            "env_python": record.get("env_python"),
+            "env_python_version": record.get("env_python_version"),
+            "kind": "function",
+            "description": record.get("description") or "",
+            "inputs": inputs,
+            "outputs": outputs,
+            "pipeline_nodes": [],
+            "remote_nodes": [],
+            "internal_objects": [],
+            "internal_functions": [],
+            "function": item["name"],
+            "entrypoint": item["name"],
+            "parent_object": {
+                "name": parent_name,
+                "display_name": parent_display_name,
+                "kind": record.get("kind") or record.get("type") or "unknown",
+                "version": record["version"],
+                "version_id": record["version_id"],
+            },
+            "call": _call_help(
+                parent_display_name,
+                "function",
+                inputs,
+                outputs,
+                function=item["name"],
+            ),
         },
-        "call": _call_help(
-            parent_display_name,
-            "function",
-            inputs,
-            outputs,
-            function=item["name"],
-        ),
-    }
+        record,
+    )
+
+
+def _copy_resolution_fields(
+    payload: dict[str, Any],
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve transient server-resolution annotations without persisting them."""
+
+    for key in ("resolved_from", "resolution"):
+        value = record.get(key)
+        if isinstance(value, dict):
+            payload[key] = dict(value)
+    return payload
 
 
 def _internal_functions(record: dict[str, Any]) -> list[dict[str, Any]]:

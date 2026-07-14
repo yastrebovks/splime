@@ -329,6 +329,13 @@ def _wait_store_run(store: RegistryStore, run_id: str, *, timeout: float = 10.0)
     raise TimeoutError(f"run did not finish: {run_id}")
 
 
+def _create_failed_run(store: RegistryStore, name: str = "dry_run_probe") -> dict:
+    store.register_env("default", sys.executable)
+    store.register_object(name, "demo_obj", "default", yaml_text=REMOTE_FUNCTION_YAML)
+    run = store.create_run(name, keep=True)
+    return store.update_run(run["id"], status="failed")
+
+
 def _manifest_node_by_alias(manifest: dict, alias: str) -> dict:
     return next(node for node in manifest["nodes"].values() if node["alias"] == alias)
 
@@ -631,6 +638,60 @@ def test_connection_hygiene_cli_commands(monkeypatch, capsys) -> None:
         ("server_connections",),
         ("init", None),
         ("prune_server_connections", 7, True),
+    ]
+
+
+def test_sync_operator_cli_commands(monkeypatch, capsys) -> None:
+    import spl.daemon.cli as cli_module
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, url=None) -> None:
+            calls.append(("init", url))
+
+        def sync_status(self):
+            calls.append(("sync_status",))
+            return {"by_status": {"pending": 3}, "heartbeat": {"thread_alive": True}}
+
+        def prune_sync_events(
+            self,
+            *,
+            status,
+            older_than_days=0,
+            include_protected=False,
+            limit=1_000,
+        ):
+            calls.append(("prune_sync_events", status, older_than_days, include_protected, limit))
+            return {"pruned_count": 3}
+
+    monkeypatch.setattr(cli_module, "Client", FakeClient)
+
+    assert cli_module.main(["sync-status"]) == 0
+    assert (
+        cli_module.main(
+            [
+                "sync-prune",
+                "--status",
+                "pending",
+                "--older-than-days",
+                "2",
+                "--include-protected",
+                "--limit",
+                "25",
+            ]
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    assert '"thread_alive": true' in captured.out
+    assert '"pruned_count": 3' in captured.out
+    assert calls == [
+        ("init", None),
+        ("sync_status",),
+        ("init", None),
+        ("prune_sync_events", "pending", 2, True, 25),
     ]
 
 
@@ -946,6 +1007,48 @@ def test_health_and_diagnostics_include_sync_retry_visibility(tmp_path) -> None:
         assert diagnostics["sync"]["retryable"] == 1
         assert diagnostics["pending_sync_events"][0]["retry"]["will_retry"] is True
         assert diagnostics["pending_sync_events"][0]["retry"]["next_attempt"] == 2
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_sync_status_and_prune_routes_are_bounded_and_protect_object_events(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        protected = store.enqueue_sync_event("object_version", {"name": "important"})
+        telemetry = store.enqueue_sync_event("local_run_update", {"run": {"id": "run-1"}})
+        app = create_app(store, auto_build_envs=False)
+
+        connection_status, connection = _json_from_app(app, "/server/connection")
+        status_code, status = _json_from_app(app, "/server/sync/status")
+        prune_code, pruned = _post_json_from_app(
+            app,
+            "/server/sync/prune?status=pending&older_than_days=0&limit=1000",
+            {},
+        )
+
+        assert connection_status == 200
+        assert connection == {
+            "connected": False,
+            "live": False,
+            "identity_present": False,
+            "offline": False,
+            "connection": None,
+            "breaker": {
+                "state": "closed",
+                "consecutive_failures": 0,
+                "last_probe_result": None,
+            },
+        }
+        assert status_code == 200
+        assert status["breaker"] == connection["breaker"]
+        assert status["by_status"] == {"pending": 2}
+        assert status["heartbeat"]["thread_alive"] is False
+        assert prune_code == 200
+        assert [row["id"] for row in pruned["pruned"]] == [telemetry["id"]]
+        assert [row["id"] for row in pruned["protected"]] == [protected["id"]]
+        assert store.get_sync_event(protected["id"])["status"] == "pending"
     finally:
         _shutdown_app(app)
         store.close()
@@ -2070,6 +2173,15 @@ def test_blocking_heartbeat_does_not_block_local_object_registration(tmp_path, m
         def latest_machine_library_snapshot(self, machine_id):
             return {}
 
+        def heartbeat_connection(self, **kwargs):
+            return {
+                "status": "connected",
+                "heartbeat_interval_seconds": kwargs.get("heartbeat_interval_seconds") or 60,
+            }
+
+        def get_object(self, *args, **kwargs):
+            raise daemon_server.ServerClientError(502, "server catalog unavailable")
+
         def sync(self, **kwargs):
             type(self).started.set()
             type(self).release.wait(timeout=5)
@@ -2097,7 +2209,7 @@ def test_blocking_heartbeat_does_not_block_local_object_registration(tmp_path, m
         )
         elapsed = time.monotonic() - started
 
-        assert status == 201
+        assert status == 201, body
         assert body["owner_id"] == "owner-1"
         assert elapsed < 2.0
     finally:
@@ -2315,6 +2427,113 @@ def test_run_management_routes_list_show_prune_and_delete(tmp_path) -> None:
         assert status == 200
         assert deleted["pruned"][0]["id"] == run["id"]
         assert not Path(run["run_dir"]).exists()
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_sol_008_typoed_delete_dry_run_is_400_and_run_survives(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        run = _create_failed_run(store)
+        app = create_app(store, auto_build_envs=False)
+
+        status, body = _delete_json_from_app(app, f"/runs/{run['id']}?dry_run=tru")
+
+        assert status == 400
+        assert body == {"error": "query parameter 'dry_run' must be one of: 0, 1, false, true; received 'tru'"}
+        assert store.get_run(run["id"])["status"] == "failed"
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_sol_008_string_body_dry_run_is_400_and_nothing_is_pruned(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        run = _create_failed_run(store)
+        app = create_app(store, auto_build_envs=False)
+
+        status, body = _post_json_from_app(
+            app,
+            "/runs/prune",
+            {"run_id": run["id"], "dry_run": "false"},
+        )
+
+        assert status == 400
+        assert body == {"error": "JSON field 'dry_run' must be a boolean; received 'false'"}
+        assert store.get_run(run["id"])["status"] == "failed"
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_sol_008_real_false_body_executes_and_true_query_previews(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        previewed = _create_failed_run(store, "dry_run_preview")
+        executed = _create_failed_run(store, "dry_run_execute")
+        app = create_app(store, auto_build_envs=False)
+
+        preview_status, preview = _delete_json_from_app(
+            app,
+            f"/runs/{previewed['id']}?dry_run=true",
+        )
+        execute_status, executed_body = _post_json_from_app(
+            app,
+            "/runs/prune",
+            {"run_id": executed["id"], "dry_run": False},
+        )
+
+        assert preview_status == 200
+        assert preview["dry_run"] is True
+        assert store.get_run(previewed["id"])["status"] == "failed"
+        assert execute_status == 200
+        assert executed_body["dry_run"] is False
+        with pytest.raises(KeyError):
+            store.get_run(executed["id"])
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_run_prune_rejects_explicit_empty_statuses_without_pruning(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        run = _create_failed_run(store)
+        app = create_app(store, auto_build_envs=False)
+
+        status, body = _post_json_from_app(app, "/runs/prune", {"statuses": []})
+
+        assert status == 400
+        assert body == {"error": "statuses must not be empty; provide statuses or omit the field"}
+        assert store.get_run(run["id"])["status"] == "failed"
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_connections_prune_rejects_invalid_dry_run_before_store_call(tmp_path, monkeypatch) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    calls: list[dict] = []
+    try:
+        monkeypatch.setattr(
+            store,
+            "prune_server_connections",
+            lambda **kwargs: calls.append(kwargs) or {"count": 0},
+        )
+        app = create_app(store, auto_build_envs=False)
+
+        status, body = _post_json_from_app(app, "/server/connections/prune?dry_run=maybe", {})
+
+        assert status == 400
+        assert body == {"error": "query parameter 'dry_run' must be one of: 0, 1, false, true; received 'maybe'"}
+        assert calls == []
     finally:
         _shutdown_app(app)
         store.close()

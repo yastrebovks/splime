@@ -8,7 +8,6 @@ from spl.daemon.interpreter_visibility import (
     interpreter_substitution_from_resolution,
     python_minor_mismatch,
 )
-from spl.daemon.repositories.server_connection import OFFLINE_SERVER_CONNECTION_STATUSES
 from spl.daemon.routes._helpers import RouteErrorDecorator, RouteRegistrar
 from spl.daemon.services.sync import SyncVisibilityService
 from spl.daemon.store import utc_now
@@ -41,7 +40,7 @@ def register_diagnostics_routes(
             status = str(build["status"])
             build_statuses[status] = build_statuses.get(status, 0) + 1
 
-        connection = runtime.store.current_server_connection()
+        connection_state = runtime.server_connection_state(probe=False)
         connection_summary = runtime.store.server_connection_summary()
         sync_summary = sync_visibility.summary()
         return json_response(
@@ -60,14 +59,9 @@ def register_diagnostics_routes(
                     "remote_signatures": len(remote_signatures),
                 },
                 "server": {
-                    "connected": (
-                        connection is not None
-                        and connection["status"] == "connected"
-                        and bool(connection.get("remote_connection_id"))
-                    ),
-                    "offline": (connection is not None and connection["status"] in OFFLINE_SERVER_CONNECTION_STATUSES),
-                    "connection": connection,
+                    **connection_state,
                     "connection_summary": connection_summary,
+                    "heartbeat": runtime.heartbeat_service.status((connection_state.get("connection") or {}).get("id")),
                 },
                 "sync": sync_summary,
                 "interpreter_substitutions": interpreter_substitutions,
@@ -83,7 +77,8 @@ def register_diagnostics_routes(
     @app.get("/diagnostics")
     @route_errors
     async def diagnostics() -> Any:
-        connection = runtime.store.current_server_connection()
+        connection_state = runtime.server_connection_state(probe=False)
+        connection = connection_state.get("connection")
         pending_sync_events = sync_visibility.pending_events(limit=200)
         environment_builds = runtime.store.list_environment_builds()
         runs = runtime.store.list_runs()
@@ -96,9 +91,11 @@ def register_diagnostics_routes(
                 "home": str(runtime.store.home),
                 "db_path": str(runtime.store.db_path),
                 "server": {
+                    **connection_state,
                     "connection": connection,
                     "pending_sync_events": len(pending_sync_events),
                     "last_error": connection.get("error") if connection else None,
+                    "heartbeat": runtime.heartbeat_service.status((connection or {}).get("id")),
                 },
                 "sync": sync_visibility.summary(pending_sync_events),
                 "counts": {
