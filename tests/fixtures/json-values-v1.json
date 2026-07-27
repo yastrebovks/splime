@@ -1,0 +1,39 @@
+{
+  "contract": "splime-json-value-v1",
+  "description": "Shared framework, daemon, server, and Console JSON value contract fixtures. The serialized field pins Python, daemon, and server bytes; Console tests omit byte equality only where assert_browser_serialized is false.",
+  "cases": [
+    { "id": "null", "construct": "literal", "value": null, "accepted": true, "serialized": "null" },
+    { "id": "zero", "construct": "literal", "value": 0, "accepted": true, "serialized": "0" },
+    { "id": "negative-zero", "construct": "negative_zero", "accepted": true, "serialized": "-0.0" },
+    { "id": "false", "construct": "literal", "value": false, "accepted": true, "serialized": "false" },
+    { "id": "empty-string", "construct": "literal", "value": "", "accepted": true, "serialized": "\"\"" },
+    { "id": "empty-array", "construct": "literal", "value": [], "accepted": true, "serialized": "[]" },
+    { "id": "empty-object", "construct": "literal", "value": {}, "accepted": true, "serialized": "{}" },
+    { "id": "object-key-order", "construct": "literal", "value": { "😀": 1, "z": 3, "�": 2, "a": 4 }, "accepted": true, "serialized": "{\"a\":4,\"z\":3,\"�\":2,\"😀\":1}" },
+    { "id": "nested-nulls", "construct": "literal", "value": { "items": [null, { "value": null }] }, "accepted": true, "serialized": "{\"items\":[null,{\"value\":null}]}" },
+    { "id": "ordinary-float", "construct": "literal", "value": 1.25, "accepted": true, "serialized": "1.25" },
+    { "id": "finite-exponent-float", "construct": "literal", "value": 1.25e-100, "accepted": true, "serialized": "1.25e-100" },
+    { "id": "large-safe-integer", "construct": "literal", "value": 9007199254740991, "accepted": true, "serialized": "9007199254740991" },
+    { "id": "large-safe-negative-integer", "construct": "literal", "value": -9007199254740991, "accepted": true, "serialized": "-9007199254740991" },
+    { "id": "first-js-unsafe-positive-integer", "construct": "unsafe_integer", "token": "9007199254740992", "accepted": true, "serialized": "9007199254740992", "assert_browser_serialized": false },
+    { "id": "first-js-unsafe-negative-integer", "construct": "unsafe_integer", "token": "-9007199254740992", "accepted": true, "serialized": "-9007199254740992", "assert_browser_serialized": false },
+    { "id": "rounding-js-unsafe-positive-integer", "construct": "unsafe_integer", "token": "9007199254740993", "accepted": true, "serialized": "9007199254740993", "assert_browser_serialized": false },
+    { "id": "rounding-js-unsafe-negative-integer", "construct": "unsafe_integer", "token": "-9007199254740993", "accepted": true, "serialized": "-9007199254740993", "assert_browser_serialized": false },
+    { "id": "larger-positive-integer", "construct": "unsafe_integer", "token": "123456789012345678901234567890", "accepted": true, "serialized": "123456789012345678901234567890", "assert_browser_serialized": false },
+    { "id": "larger-negative-integer", "construct": "unsafe_integer", "token": "-123456789012345678901234567890", "accepted": true, "serialized": "-123456789012345678901234567890", "assert_browser_serialized": false },
+    { "id": "positive-integral-float", "construct": "literal", "value": 1e20, "accepted": true, "serialized": "1e+20", "assert_browser_serialized": false },
+    { "id": "negative-integral-float", "construct": "literal", "value": -1e20, "accepted": true, "serialized": "-1e+20", "assert_browser_serialized": false },
+    { "id": "unicode", "construct": "literal", "value": { "message": "Γειά σου 🌍" }, "accepted": true, "serialized": "{\"message\":\"Γειά σου 🌍\"}" },
+    { "id": "lone-high-surrogate", "construct": "lone_surrogate", "token": "high", "accepted": false, "path": "$" },
+    { "id": "lone-low-surrogate", "construct": "lone_surrogate", "token": "low", "accepted": false, "path": "$" },
+    { "id": "nested-lone-surrogate", "construct": "nested_lone_surrogate", "token": "high", "marker": "__SPL_LONE_SURROGATE__", "value": { "outer": [true, { "value": "__SPL_LONE_SURROGATE__" }] }, "accepted": false, "path": "$[\"outer\"][1][\"value\"]" },
+    { "id": "nan", "construct": "non_finite", "token": "nan", "accepted": false, "path": "$" },
+    { "id": "positive-infinity", "construct": "non_finite", "token": "infinity", "accepted": false, "path": "$" },
+    { "id": "negative-infinity", "construct": "non_finite", "token": "negative_infinity", "accepted": false, "path": "$" },
+    { "id": "nested-nan", "construct": "nested_non_finite", "token": "nan", "marker": "__SPL_NON_FINITE__", "value": { "outer": [true, { "value": "__SPL_NON_FINITE__" }] }, "accepted": false, "path": "$[\"outer\"][1][\"value\"]" },
+    { "id": "non-string-key", "construct": "non_string_key", "key": 7, "value": "seven", "accepted": false, "path": "$" }
+  ],
+  "result_transport_cases": [
+    { "id": "worker-none", "daemon_result": { "result": null, "artifacts": {} }, "result_present": true, "expected_result_value": null }
+  ]
+}

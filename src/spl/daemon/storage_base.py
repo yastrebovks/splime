@@ -21,7 +21,12 @@ from threading import RLock
 from typing import Any, Callable
 from uuid import uuid4
 
+from spl.core import json_contract as m_json_contract
 from spl.daemon.secret_store import SecretStore
+from spl.daemon.telemetry import (
+    TELEMETRY_PAYLOAD_TTL_SECONDS,
+    local_run_proof,
+)
 
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 FUNCTION_REF_SEPARATOR = "::"
@@ -32,6 +37,13 @@ DEFAULT_OBJECT_LIBRARY = "default"
 OBJECT_IDENTITY_MIGRATION_ID = "20260702_object_identity_v1"
 OBJECT_IDENTITY_HEAL_MIGRATION_ID = "20260702_object_identity_heal_v1"
 OBJECT_IDENTITY_SCHEMA_VERSION = 1
+RUN_RETENTION_MIGRATION_ID = "20260715_run_retention_v1"
+RUN_RETENTION_SCHEMA_VERSION = 2
+RUN_RETENTION_DELIVERY_MIGRATION_ID = "20260715_run_retention_delivery_v2"
+RUN_RETENTION_DELIVERY_SCHEMA_VERSION = 3
+SYNC_EVENT_TELEMETRY_MIGRATION_ID = "20260715_sync_event_telemetry_v1"
+SYNC_EVENT_TELEMETRY_SCHEMA_VERSION = 4
+DEFAULT_RUN_DELIVERY_LEASE_SECONDS = 15 * 60.0
 
 
 def utc_now() -> str:
@@ -111,7 +123,10 @@ def write_json(path: Path, value: Any) -> None:
     _chmod_owner_dir(path.parent)
     tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
-        _write_text_owner_only(tmp_path, json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+        _write_text_owner_only(
+            tmp_path,
+            m_json_contract.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, separators=None),
+        )
         tmp_path.replace(path)
         _chmod_owner_file(path)
     finally:
@@ -121,7 +136,7 @@ def write_json(path: Path, value: Any) -> None:
 def json_dumps(value: Any) -> str:
     """Serialize stable JSON for SQLite text columns."""
 
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return m_json_contract.dumps(value, ensure_ascii=False, sort_keys=True, separators=None)
 
 
 def json_loads(value: str | None, default: Any) -> Any:
@@ -130,6 +145,19 @@ def json_loads(value: str | None, default: Any) -> Any:
     if value is None:
         return default
     return json.loads(value)
+
+
+def json_value_loads(value: str | None, default: Any) -> tuple[Any, bool]:
+    """Decode one stored JSON value and report whether it meets the contract."""
+
+    if value is None:
+        return default, True
+    try:
+        decoded = json.loads(value)
+        m_json_contract.validate_json_value(decoded)
+    except (json.JSONDecodeError, ValueError):
+        return default, False
+    return decoded, True
 
 
 def _write_text_owner_only(path: Path, text: str) -> None:
@@ -385,6 +413,15 @@ class StorageBase:
                     stderr_text TEXT,
                     keep TEXT NOT NULL DEFAULT 'on_failure',
                     manifest_json TEXT,
+                    retention_enforced INTEGER NOT NULL DEFAULT 0,
+                    retention_report_mode TEXT NOT NULL DEFAULT 'legacy',
+                    retention_sync_required INTEGER NOT NULL DEFAULT 0,
+                    retention_terminal_queued INTEGER NOT NULL DEFAULT 0,
+                    retention_delivery_required INTEGER NOT NULL DEFAULT 0,
+                    retention_delivery_acked INTEGER NOT NULL DEFAULT 0,
+                    retention_delivery_expires_at TEXT,
+                    retention_effective_status TEXT,
+                    retention_outcome_reason TEXT,
                     FOREIGN KEY(object_id) REFERENCES objects(id),
                     FOREIGN KEY(object_version_id) REFERENCES object_versions(id)
                 );
@@ -429,7 +466,10 @@ class StorageBase:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     sent_at TEXT,
-                    error TEXT
+                    error TEXT,
+                    local_run_id TEXT,
+                    payload_expires_at TEXT,
+                    FOREIGN KEY(local_run_id) REFERENCES runs(id) ON DELETE CASCADE
                 );
 
                 CREATE TABLE IF NOT EXISTS remote_signatures (
@@ -583,6 +623,8 @@ class StorageBase:
                 (OBJECT_IDENTITY_MIGRATION_ID, utc_now()),
             )
             self._conn.execute(f"PRAGMA user_version = {OBJECT_IDENTITY_SCHEMA_VERSION}")
+            self._migrate_run_retention_schema_locked()
+            self._migrate_sync_event_telemetry_schema_locked()
             self._conn.commit()
 
     def close(self) -> None:
@@ -621,6 +663,239 @@ class StorageBase:
         existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_xinfo({table})").fetchall()}
         if column not in existing:
             self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+    def _migrate_run_retention_schema_locked(self) -> None:
+        """Install retention lifecycle markers without enrolling historical rows."""
+
+        base_required = {
+            "retention_enforced": "INTEGER NOT NULL DEFAULT 0",
+            "retention_report_mode": "TEXT NOT NULL DEFAULT 'legacy'",
+            "retention_sync_required": "INTEGER NOT NULL DEFAULT 0",
+            "retention_terminal_queued": "INTEGER NOT NULL DEFAULT 0",
+        }
+        delivery_required = {
+            "retention_delivery_required": "INTEGER NOT NULL DEFAULT 0",
+            "retention_delivery_acked": "INTEGER NOT NULL DEFAULT 0",
+            "retention_delivery_expires_at": "TEXT",
+            "retention_effective_status": "TEXT",
+            "retention_outcome_reason": "TEXT",
+        }
+        self._migrate_additive_run_columns_locked(
+            migration_id=RUN_RETENTION_MIGRATION_ID,
+            schema_version=RUN_RETENTION_SCHEMA_VERSION,
+            required=base_required,
+            label="run retention",
+        )
+        self._migrate_additive_run_columns_locked(
+            migration_id=RUN_RETENTION_DELIVERY_MIGRATION_ID,
+            schema_version=RUN_RETENTION_DELIVERY_SCHEMA_VERSION,
+            required=delivery_required,
+            label="run retention delivery",
+        )
+
+    def _migrate_additive_run_columns_locked(
+        self,
+        *,
+        migration_id: str,
+        schema_version: int,
+        required: dict[str, str],
+        label: str,
+    ) -> None:
+        """Apply one immutable additive migration to the local runs table."""
+
+        columns = self._table_columns_locked("runs")
+        applied = self._conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE id = ?",
+            (migration_id,),
+        ).fetchone()
+        if applied is not None and not set(required).issubset(columns):
+            missing = ", ".join(sorted(set(required) - columns))
+            raise RuntimeError(f"{label} migration is recorded but required columns are missing: {missing}")
+        if applied is not None:
+            current_version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+            self._conn.execute(f"PRAGMA user_version = {max(current_version, schema_version)}")
+            return
+
+        savepoint = validate_name(f"{label.replace(' ', '_')}_migration")
+        self._conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            for column, declaration in required.items():
+                if column not in columns:
+                    self._conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {declaration}")
+            self._conn.execute(
+                "INSERT INTO schema_migrations(id, applied_at) VALUES(?, ?)",
+                (migration_id, utc_now()),
+            )
+            current_version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+            self._conn.execute(f"PRAGMA user_version = {max(current_version, schema_version)}")
+            violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                details = "; ".join(str(tuple(row)) for row in violations)
+                raise RuntimeError(f"{label} migration produced foreign-key violations: {details}")
+            integrity = self._conn.execute("PRAGMA integrity_check").fetchall()
+            if [str(row[0]) for row in integrity] != ["ok"]:
+                details = "; ".join(str(row[0]) for row in integrity)
+                raise RuntimeError(f"{label} migration failed integrity_check: {details}")
+        except Exception:
+            self._conn.execute(f"ROLLBACK TO {savepoint}")
+            self._conn.execute(f"RELEASE {savepoint}")
+            raise
+        self._conn.execute(f"RELEASE {savepoint}")
+
+    def _migrate_sync_event_telemetry_schema_locked(self) -> None:
+        """Add run-linked payload expiry with an authentic cascade constraint."""
+
+        required = {"local_run_id", "payload_expires_at"}
+        columns = self._table_columns_locked("sync_events")
+        applied = self._conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE id = ?",
+            (SYNC_EVENT_TELEMETRY_MIGRATION_ID,),
+        ).fetchone()
+        if applied is not None:
+            missing = required - columns
+            if missing:
+                raise RuntimeError(
+                    "sync event telemetry migration is recorded but required columns are missing: {}".format(
+                        ", ".join(sorted(missing))
+                    )
+                )
+            self._verify_sync_event_telemetry_schema_locked()
+            self._conn.execute(f"PRAGMA user_version = {SYNC_EVENT_TELEMETRY_SCHEMA_VERSION}")
+            return
+
+        self._conn.execute("SAVEPOINT sync_event_telemetry_migration")
+        try:
+            if not required.issubset(columns) or not self._sync_event_run_cascade_exists_locked():
+                self._rebuild_sync_events_for_telemetry_locked()
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_sync_events_local_run
+                ON sync_events(local_run_id, status)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_sync_events_payload_expiry
+                ON sync_events(payload_expires_at)
+                """
+            )
+            self._conn.execute(
+                "INSERT INTO schema_migrations(id, applied_at) VALUES(?, ?)",
+                (SYNC_EVENT_TELEMETRY_MIGRATION_ID, utc_now()),
+            )
+            self._conn.execute(f"PRAGMA user_version = {SYNC_EVENT_TELEMETRY_SCHEMA_VERSION}")
+            self._verify_sync_event_telemetry_schema_locked()
+            violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                details = "; ".join(str(tuple(row)) for row in violations)
+                raise RuntimeError("sync event telemetry migration produced foreign-key violations: {}".format(details))
+            integrity = self._conn.execute("PRAGMA integrity_check").fetchall()
+            if [str(row[0]) for row in integrity] != ["ok"]:
+                details = "; ".join(str(row[0]) for row in integrity)
+                raise RuntimeError("sync event telemetry migration failed integrity_check: {}".format(details))
+        except Exception:
+            self._conn.execute("ROLLBACK TO sync_event_telemetry_migration")
+            self._conn.execute("RELEASE sync_event_telemetry_migration")
+            raise
+        self._conn.execute("RELEASE sync_event_telemetry_migration")
+
+    def _rebuild_sync_events_for_telemetry_locked(self) -> None:
+        rows = self._conn.execute("SELECT * FROM sync_events ORDER BY created_at, id").fetchall()
+        run_ids = {str(row["id"]) for row in self._conn.execute("SELECT id FROM runs").fetchall()}
+        self._conn.execute("DROP TABLE IF EXISTS sync_events_telemetry_new")
+        self._conn.execute(
+            """
+            CREATE TABLE sync_events_telemetry_new (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                retryable INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                sent_at TEXT,
+                error TEXT,
+                local_run_id TEXT,
+                payload_expires_at TEXT,
+                FOREIGN KEY(local_run_id) REFERENCES runs(id) ON DELETE CASCADE
+            )
+            """
+        )
+        for row in rows:
+            kind = str(row["kind"])
+            payload = json_loads(str(row["payload_json"]), {})
+            proof = local_run_proof(kind, payload)
+            local_run_id = proof[0] if proof is not None and proof[0] in run_ids else None
+            existing_local_run_id = self._row_value(row, "local_run_id")
+            if isinstance(existing_local_run_id, str) and existing_local_run_id in run_ids:
+                local_run_id = existing_local_run_id
+            payload_expires_at = self._row_value(row, "payload_expires_at")
+            if payload_expires_at is None and local_run_id is not None:
+                payload_expires_at = self._timestamp_after(
+                    str(row["created_at"]),
+                    TELEMETRY_PAYLOAD_TTL_SECONDS,
+                )
+            self._conn.execute(
+                """
+                INSERT INTO sync_events_telemetry_new(
+                    id, kind, payload_json, status, attempts, retryable,
+                    created_at, updated_at, sent_at, error,
+                    local_run_id, payload_expires_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    kind,
+                    row["payload_json"],
+                    row["status"],
+                    int(self._row_value(row, "attempts") or 0),
+                    int(self._row_value(row, "retryable") if self._row_value(row, "retryable") is not None else 1),
+                    row["created_at"],
+                    row["updated_at"],
+                    row["sent_at"],
+                    row["error"],
+                    local_run_id,
+                    payload_expires_at,
+                ),
+            )
+        self._conn.execute("DROP TABLE sync_events")
+        self._conn.execute("ALTER TABLE sync_events_telemetry_new RENAME TO sync_events")
+
+    def _verify_sync_event_telemetry_schema_locked(self) -> None:
+        if not self._sync_event_run_cascade_exists_locked():
+            raise RuntimeError("sync event telemetry migration requires local_run_id to cascade on run deletion")
+        indexes = {str(row["name"]) for row in self._conn.execute("PRAGMA index_list(sync_events)").fetchall()}
+        required_indexes = {
+            "idx_sync_events_local_run",
+            "idx_sync_events_payload_expiry",
+        }
+        if not required_indexes.issubset(indexes):
+            raise RuntimeError(
+                "sync event telemetry migration is missing required indexes: {}".format(
+                    ", ".join(sorted(required_indexes - indexes))
+                )
+            )
+
+    def _sync_event_run_cascade_exists_locked(self) -> bool:
+        return any(
+            str(row["from"]) == "local_run_id"
+            and str(row["table"]) == "runs"
+            and str(row["to"]) == "id"
+            and str(row["on_delete"]).upper() == "CASCADE"
+            for row in self._conn.execute("PRAGMA foreign_key_list(sync_events)").fetchall()
+        )
+
+    @staticmethod
+    def _timestamp_after(value: str, seconds: float) -> str:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = datetime.now(UTC)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return (parsed + timedelta(seconds=seconds)).isoformat()
 
     def migrate_object_identity_schema(self, *, dry_run: bool = False) -> dict[str, Any]:
         """Apply the object identity schema migration.

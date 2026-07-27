@@ -147,8 +147,60 @@ def test_failed_default_run_retains_manifest_and_completed_artifacts(
     assert edge_summary[0]["target"] == "consumer.box"
     assert edge_summary[0]["tag"] == "box"
     assert edge_summary[0]["source_level"] == "pipeline"
+    assert edge_summary[0]["save_level"] == "pipeline"
+    assert edge_summary[0]["load_level"] == "pipeline"
     assert "_save_box" in edge_summary[0]["save"]
     assert "_load_box" in edge_summary[0]["load"]
+
+
+def test_edge_adapter_summary_surfaces_run_override_across_halves() -> None:
+    """A run-level load override must not be masked by the save half.
+
+    Regression for the cookbook §33 acceptance: a resume that overrides only
+    the load half at run level previously reported ``source_level`` as
+    ``pipeline`` because the save half's source was consulted first.
+    """
+
+    manifest = {
+        "nodes": {
+            "n-extract": {"alias": "extract", "status": "frozen"},
+            "n-parse": {"alias": "parse", "status": "succeeded"},
+        },
+        "edges": [
+            {
+                "source": {"node_id": "n-extract", "port": DEFAULT_PORT},
+                "target": {"node_id": "n-parse", "port": "batch"},
+                "artifact": {"tag": "ledger-v1"},
+                "adapter": {
+                    "save": {"name": "save_ledger", "source": "pipeline"},
+                    "load": {"name": "load_ledger_v1", "source": "run-override"},
+                },
+            }
+        ],
+    }
+
+    (row,) = m_manifest.edge_adapter_summary(manifest)
+    assert row["save_level"] == "pipeline"
+    assert row["load_level"] == "run-override"
+    assert row["source_level"] == "run-override"
+
+
+def test_edge_adapter_summary_source_level_handles_missing_halves() -> None:
+    """One-sided or absent half sources degrade without inventing a level."""
+
+    def edge(save: dict[str, Any] | None, load: dict[str, Any] | None) -> dict[str, Any]:
+        return {
+            "source": {"node_id": "n-a", "port": DEFAULT_PORT},
+            "target": {"node_id": "n-b", "port": "x"},
+            "adapter": {"save": save or {}, "load": load or {}},
+        }
+
+    only_load = m_manifest.edge_adapter_summary({"nodes": {}, "edges": [edge(None, {"source": "edge"})]})
+    assert only_load[0]["source_level"] == "edge"
+    assert only_load[0]["save_level"] is None
+
+    neither = m_manifest.edge_adapter_summary({"nodes": {}, "edges": [edge(None, None)]})
+    assert neither[0]["source_level"] is None
 
 
 def test_failed_default_json_run_materializes_deferred_manifest(

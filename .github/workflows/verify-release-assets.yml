@@ -1,0 +1,68 @@
+name: Verify published release assets
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify-urls:
+    name: Verify URLs, checksums, Console cache, and Docker tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python tools/verify_published_release.py
+
+  clean-install:
+    name: Clean PyPI install (${{ matrix.os }})
+    needs: verify-urls
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install and inspect the exact public package
+        shell: bash
+        run: |
+          python -m venv release-smoke
+          if [ -x release-smoke/Scripts/python.exe ]; then
+            PYTHON=release-smoke/Scripts/python.exe
+          else
+            PYTHON=release-smoke/bin/python
+          fi
+          "$PYTHON" -m pip install --upgrade pip
+          "$PYTHON" -m pip install "splime==0.4.5"
+          "$PYTHON" -c "from spl import SPLClient; print(SPLClient)"
+          "$PYTHON" -m spl.daemon --version
+
+  docker-smoke:
+    name: Pull and health-check published Docker image
+    needs: verify-urls
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pull exact tag and verify release label
+        run: |
+          docker pull yastrebovks/spl-daemon:0.4.5
+          test "$(docker image inspect yastrebovks/spl-daemon:0.4.5 --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')" = "0.4.5"
+      - name: Start release image
+        run: docker run -d --name splime-release-smoke yastrebovks/spl-daemon:0.4.5
+      - name: Wait for container health
+        run: |
+          for attempt in $(seq 1 60); do
+            status="$(docker inspect --format '{{.State.Health.Status}}' splime-release-smoke)"
+            if [ "$status" = "healthy" ]; then exit 0; fi
+            if [ "$status" = "unhealthy" ]; then docker logs splime-release-smoke; exit 1; fi
+            sleep 2
+          done
+          docker logs splime-release-smoke
+          exit 1
+      - name: Stop smoke container
+        if: always()
+        run: docker rm -f splime-release-smoke || true

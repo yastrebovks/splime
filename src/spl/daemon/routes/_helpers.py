@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-import json
-import secrets
 import asyncio
+import secrets
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 from http import HTTPStatus
 from typing import Any, Awaitable, Callable, Protocol, TypeVar, cast
 
+from spl.core import json_contract as m_json_contract
+from spl.daemon.callback_capability import (
+    CallbackCapabilityAuthority,
+    CallbackCapabilityPrincipal,
+)
 from spl.daemon.remote_client import ServerClientError
 from spl.daemon.runtime_dependencies import ServerClientProtocol
 from spl.daemon.server_connection import (
@@ -21,6 +26,10 @@ from spl.daemon.server_connection import (
 from spl.daemon.store import split_object_function_ref
 
 RouteHandler = TypeVar("RouteHandler", bound=Callable[..., Awaitable[Any]])
+_CALLBACK_PRINCIPAL: ContextVar[CallbackCapabilityPrincipal | None] = ContextVar(
+    "spl_daemon_callback_principal",
+    default=None,
+)
 
 
 class RouteErrorDecorator(Protocol):
@@ -45,13 +54,14 @@ class RouteContext:
     response_cls: Any
     request: Any
     local_api_token: str
+    callback_capabilities: CallbackCapabilityAuthority | None = None
 
     def json_response(
         self,
         value: Any,
         status: HTTPStatus = HTTPStatus.OK,
     ) -> Any:
-        body = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+        body = m_json_contract.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, separators=None)
         return self.response_cls(
             body,
             status=int(status),
@@ -121,14 +131,29 @@ class RouteContext:
         return cast(RouteHandler, wrapper)
 
     async def require_local_api_auth(self) -> Any:
+        _CALLBACK_PRINCIPAL.set(None)
         auth_header = self.request.headers.get("Authorization") or ""
         scheme, _, token = auth_header.partition(" ")
         if scheme.casefold() == "bearer" and token and secrets.compare_digest(token, self.local_api_token):
             return None
+        if scheme.casefold() == "bearer" and token and self.callback_capabilities is not None:
+            principal = self.callback_capabilities.authenticate(
+                token,
+                method=str(self.request.method),
+                path=str(self.request.path),
+            )
+            if principal is not None:
+                _CALLBACK_PRINCIPAL.set(principal)
+                return None
         return self.json_response(
             {"error": "missing or invalid local daemon API token"},
             HTTPStatus.UNAUTHORIZED,
         )
+
+    def callback_principal(self) -> CallbackCapabilityPrincipal | None:
+        """Return the scoped worker principal for the current request, if any."""
+
+        return _CALLBACK_PRINCIPAL.get()
 
     async def read_json_body(self) -> dict[str, Any]:
         body = await self.request.get_json(silent=True)

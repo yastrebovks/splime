@@ -13,10 +13,11 @@ from spl.core.entities.function import get_function_metadata
 from spl.core.ir.common import DBase
 from spl.core.ir.parse import _branch, ir_parse
 from spl.core.ir.unparse import ir_unparse
+from spl.core.json_contract import JSON_SCALARS, dumps as json_dumps
 
 JSON_ADAPTER_FORMAT = "json"
 JSON_ADAPTER_KEY = "spl.core.json@json"
-JSON_NATIVE_TYPES = frozenset({str, int, float, bool, dict, list})
+JSON_NATIVE_TYPES = JSON_SCALARS | frozenset({dict, list})
 
 
 def _validate_non_empty_string(name: str, value: str) -> None:
@@ -167,8 +168,9 @@ def adapter_identity(adapter: RuntimeAdapter) -> dict[str, Any]:
 
 
 def _json_save(path: str, obj: Any) -> None:
+    payload = json_dumps(obj)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"))
+        f.write(payload)
 
 
 def _json_load(path: str) -> Any:
@@ -331,6 +333,110 @@ class DLoadAdapter(DBase):
         return hash((self.key, self.accepted_tags, self.load, self.distributions))
 
 
+@dataclass(frozen=True)
+class SplitSaveAdapter:
+    """Runtime save half reconstructed from ``DSaveAdapter`` YAML."""
+
+    key: str
+    save: Callable[..., Any]
+    tag: str
+    distributions: tuple[DDistribution, ...] = ()
+
+    def __post_init__(self) -> None:
+        _validate_function("save", self.save)
+        if _format_from_key(self.key) != self.tag:
+            raise ValueError("save adapter key format does not match tag")
+        object.__setattr__(self, "distributions", _normalize_distributions(self.distributions))
+
+    def __hash__(self) -> int:
+        return hash((self.key, self.tag, _function_name(self.save), self.distributions))
+
+    def serialized_half(self) -> DSaveAdapter:
+        """Return the additive YAML shape used to construct this save half."""
+
+        return DSaveAdapter(
+            key=self.key,
+            tag=self.tag,
+            save=_function_name(self.save),
+            distributions=self.distributions,
+        )
+
+
+@dataclass(frozen=True)
+class SplitLoadAdapter:
+    """Runtime load half reconstructed from ``DLoadAdapter`` YAML."""
+
+    key: str
+    load: Callable[..., Any]
+    accepted_tags_value: tuple[str, ...]
+    distributions: tuple[DDistribution, ...] = ()
+
+    def __post_init__(self) -> None:
+        _format_from_key(self.key)
+        _validate_function("load", self.load)
+        object.__setattr__(self, "accepted_tags_value", _normalize_tags(self.accepted_tags_value))
+        object.__setattr__(self, "distributions", _normalize_distributions(self.distributions))
+
+    def __hash__(self) -> int:
+        return hash((self.key, tuple(sorted(self.accepted_tags)), _function_name(self.load), self.distributions))
+
+    @property
+    def accepted_tags(self) -> frozenset[str]:
+        """Return the artifact tags accepted by this load half."""
+
+        return frozenset(self.accepted_tags_value)
+
+    @property
+    def legacy_key_guard(self) -> bool:
+        """Allow cross-key decoding when the artifact tag is compatible."""
+
+        return False
+
+    def serialized_half(self) -> DLoadAdapter:
+        """Return the additive YAML shape used to construct this load half."""
+
+        return DLoadAdapter(
+            key=self.key,
+            accepted_tags=self.accepted_tags_value,
+            load=_function_name(self.load),
+            distributions=self.distributions,
+        )
+
+
+def save_adapter_identity(adapter: SaveAdapter) -> dict[str, Any]:
+    """Return a JSON-serializable identity for one resolved save half."""
+
+    if isinstance(adapter, Adapter | BuiltInJsonAdapter):
+        return adapter_identity(adapter)
+    return {
+        "key": adapter.key,
+        "tag": adapter.tag,
+        "accepted_tags": [],
+        "save": _callable_identity(adapter.save),
+        "load": None,
+        "distributions": [
+            {"package": distribution.package, "version": distribution.version} for distribution in adapter.distributions
+        ],
+    }
+
+
+def load_adapter_identity(adapter: LoadAdapter) -> dict[str, Any]:
+    """Return a JSON-serializable identity for one resolved load half."""
+
+    if isinstance(adapter, Adapter | BuiltInJsonAdapter):
+        return adapter_identity(adapter)
+    return {
+        "key": adapter.key,
+        "tag": None,
+        "accepted_tags": sorted(adapter.accepted_tags),
+        "save": None,
+        "load": _callable_identity(adapter.load),
+        "distributions": [
+            {"package": distribution.package, "version": distribution.version} for distribution in adapter.distributions
+        ],
+    }
+
+
 yaml.add_representer(
     DAdapter,
     lambda dumper, data: dumper.represent_mapping(
@@ -405,6 +511,56 @@ def _unparse_distributions(distributions: tuple[DDistribution, ...]) -> ast.Tupl
             for x in distributions
         ],
         ctx=ast.Load(),
+    )
+
+
+@ir_parse.register(lambda x: isinstance(x, SplitSaveAdapter))
+def _ir_parse__split_save_adapter(x: SplitSaveAdapter, name: str | None = None) -> _branch:
+    return _branch(x, x.serialized_half, lambda frame_offset: (ir_parse(x.save),))
+
+
+@ir_parse.register(lambda x: isinstance(x, SplitLoadAdapter))
+def _ir_parse__split_load_adapter(x: SplitLoadAdapter, name: str | None = None) -> _branch:
+    return _branch(x, x.serialized_half, lambda frame_offset: (ir_parse(x.load),))
+
+
+@ir_unparse.register(lambda x: isinstance(x, DSaveAdapter))
+def _ir_unparse__save_adapter(x: DSaveAdapter, source: Path) -> Generator[ast.stmt]:
+    del source
+    yield ast.Assign(
+        targets=[ast.Name(id="_save_adapter", ctx=ast.Store())],
+        value=ast.Call(
+            func=ast.Name(id="SplitSaveAdapter", ctx=ast.Load()),
+            keywords=[
+                ast.keyword(arg="key", value=ast.Constant(value=x.key)),
+                ast.keyword(arg="save", value=ast.Name(id=x.save, ctx=ast.Load())),
+                ast.keyword(arg="tag", value=ast.Constant(value=x.tag)),
+                ast.keyword(arg="distributions", value=_unparse_distributions(x.distributions)),
+            ],
+        ),
+    )
+
+
+@ir_unparse.register(lambda x: isinstance(x, DLoadAdapter))
+def _ir_unparse__load_adapter(x: DLoadAdapter, source: Path) -> Generator[ast.stmt]:
+    del source
+    yield ast.Assign(
+        targets=[ast.Name(id="_load_adapter", ctx=ast.Store())],
+        value=ast.Call(
+            func=ast.Name(id="SplitLoadAdapter", ctx=ast.Load()),
+            keywords=[
+                ast.keyword(arg="key", value=ast.Constant(value=x.key)),
+                ast.keyword(arg="load", value=ast.Name(id=x.load, ctx=ast.Load())),
+                ast.keyword(
+                    arg="accepted_tags_value",
+                    value=ast.Tuple(
+                        elts=[ast.Constant(value=tag) for tag in x.accepted_tags],
+                        ctx=ast.Load(),
+                    ),
+                ),
+                ast.keyword(arg="distributions", value=_unparse_distributions(x.distributions)),
+            ],
+        ),
     )
 
 

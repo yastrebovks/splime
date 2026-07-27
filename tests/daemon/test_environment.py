@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Iterator
@@ -122,14 +123,14 @@ def test_build_spec_caches_python_version_by_path_and_mtime(
 
     def fake_run(command: list[str], **kwargs: Any) -> Any:
         calls.append(command)
-        return environment_module.subprocess.CompletedProcess(
+        return subprocess.CompletedProcess(
             command,
             0,
             stdout="Python 3.13.cached\n",
             stderr="",
         )
 
-    monkeypatch.setattr(environment_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(environment_module, "run_process_tree", fake_run)
     record = _object_record()
     record.pop("env_python_version")
     record["env_python"] = str(python)

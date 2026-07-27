@@ -17,13 +17,15 @@ from pathlib import Path
 from typing import Any, Literal, TextIO, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from spl._http import DEFAULT_HTTP_TIMEOUT_SECONDS, urlopen_verified
+from spl.core import json_contract as m_json_contract
 
 DEFAULT_DAEMON_HOST = "127.0.0.1"
 DEFAULT_DAEMON_PORT = 8765
 DEFAULT_URL = f"http://{DEFAULT_DAEMON_HOST}:{DEFAULT_DAEMON_PORT}"
 DEFAULT_SERVER_URL = "https://splime.io/api"
-DEFAULT_HTTP_TIMEOUT_SECONDS = 60.0
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60.0
 DAEMON_ENDPOINT_FILENAME = "daemon-endpoint.json"
 DAEMON_API_TOKEN_ENV = "SPL_DAEMON_API_TOKEN"
@@ -82,7 +84,7 @@ def _write_json_file(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f"{path.name}.tmp")
     tmp_path.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True),
+        m_json_contract.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, separators=None),
         encoding="utf-8",
     )
     try:
@@ -354,6 +356,11 @@ class ClientError(RuntimeError):
 
 def _client_error_from_http_error(exc: HTTPError, raw: str) -> ClientError:
     payload: dict[str, Any] | None = None
+    if 300 <= exc.code < 400:
+        return ClientError(
+            f"{exc.code}: {exc.reason}",
+            status_code=exc.code,
+        )
     message = raw
     try:
         decoded = json.loads(raw)
@@ -672,15 +679,20 @@ class Client:
     ) -> Any:
         """Send one JSON request and decode the JSON response.
 
-        Control-plane calls use the 60 second default.  Blocking execution
-        calls pass ``None`` here when the user did not set ``timeout_seconds``
-        because urllib cannot split connect and read timeouts.
+        Control-plane calls use the 60 second read default. Blocking execution
+        calls pass ``None`` for an unbounded read while the shared transport
+        retains its bounded connection timeout.
         """
 
         body = None
         headers = self._headers()
         if payload is not None:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            body = m_json_contract.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=False,
+                separators=None,
+            ).encode("utf-8")
             headers["Content-Type"] = "application/json; charset=utf-8"
 
         request = Request(
@@ -689,9 +701,14 @@ class Client:
             headers=headers,
             method=method,
         )
+        body_contains_credentials = bool(payload and any(payload.get(name) for name in ("machine_token", "user_token")))
 
         try:
-            with urlopen(request, timeout=timeout) as response:  # noqa: S310 - local daemon URL.
+            with urlopen_verified(
+                request,
+                timeout=timeout,
+                contains_credentials=body_contains_credentials,
+            ) as response:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")
@@ -712,7 +729,7 @@ class Client:
             method="GET",
         )
         try:
-            with urlopen(request, timeout=DEFAULT_HTTP_TIMEOUT_SECONDS) as response:  # noqa: S310 - local daemon URL.
+            with urlopen_verified(request, timeout=DEFAULT_HTTP_TIMEOUT_SECONDS) as response:
                 return cast(bytes, response.read())
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")
@@ -1776,6 +1793,11 @@ class Client:
         """Return a completed run's result payload."""
 
         return _as_json_dict(self._json_request("GET", f"/runs/{quote(run_id)}/result"))
+
+    def acknowledge_run_delivery(self, run_id: str) -> dict[str, Any]:
+        """Tell a compatible daemon that terminal result/artifact delivery completed."""
+
+        return _as_json_dict(self._json_request("POST", f"/runs/{quote(run_id)}/delivery-ack"))
 
     def list_artifacts(self, run_id: str) -> list[str]:
         """List artifact names for a run."""

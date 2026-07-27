@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from spl.daemon.server import DaemonRuntime
+from spl.daemon.remote_client import ServerClientError
 from spl.daemon.store import RegistryStore
 
 from .test_object_identity import FUNCTION_YAML, FUNCTION_YAML_V2
@@ -132,3 +133,32 @@ def test_reconcile_fetches_yaml_only_for_unknown_versions(
     )
     assert second["status"] == "linked"
     assert server.yaml_fetches == []
+
+
+def test_reconcile_404_queues_non_reviving_object_sync(
+    runtime: DaemonRuntime,
+) -> None:
+    runtime.register_object(
+        "demo_obj",
+        "demo_obj",
+        "default",
+        yaml_text=FUNCTION_YAML,
+        owner_id=OWNER,
+    )
+
+    class MissingObjectServer:
+        def get_object(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            del args, kwargs
+            raise ServerClientError(404, "object is not found")
+
+    report = runtime._reconcile_connected_object(
+        MissingObjectServer(),
+        {"name": "demo_obj", "library": "default"},
+        owner_id=OWNER,
+    )
+
+    assert report["status"] == "local_only"
+    assert len(report["pending_sync_events"]) == 1
+    payload = report["pending_sync_events"][0]["payload"]
+    assert payload["revive_removed"] is False
+    assert payload["dedupe_key"].startswith("object_version:")

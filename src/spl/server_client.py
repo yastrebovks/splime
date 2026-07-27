@@ -17,6 +17,7 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request
 
 from spl._http import DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS, urlopen_verified
+from spl.core import json_contract as m_json_contract
 from spl._views import (
     ArtifactListView,
     DecompositionView,
@@ -43,6 +44,16 @@ RemoteRunScope = Literal["owned", "target", "object", "all"]
 
 def _url_part(value: str) -> str:
     return quote(value, safe="")
+
+
+def _http_error_message(exc: HTTPError, raw: str) -> Any:
+    if 300 <= exc.code < 400:
+        return str(exc.reason)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    return payload.get("error", raw) if isinstance(payload, dict) else raw
 
 
 class ServerClientError(RuntimeError):
@@ -239,7 +250,12 @@ class SPLServerClient:
         body = None
         headers = self._headers()
         if payload is not None:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            body = m_json_contract.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=False,
+                separators=None,
+            ).encode("utf-8")
             headers["Content-Type"] = "application/json; charset=utf-8"
         request = Request(
             f"{self.base_url}{path}",
@@ -252,10 +268,7 @@ class SPLServerClient:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")
-            try:
-                message = json.loads(raw).get("error", raw)
-            except json.JSONDecodeError:
-                message = raw
+            message = _http_error_message(exc, raw)
             raise ServerClientError(
                 exc.code,
                 f"central SPL server returned {exc.code} at {self.base_url}{path}: {message}",
@@ -276,10 +289,7 @@ class SPLServerClient:
                 return cast(bytes, response.read())
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")
-            try:
-                message = json.loads(raw).get("error", raw)
-            except json.JSONDecodeError:
-                message = raw
+            message = _http_error_message(exc, raw)
             raise ServerClientError(
                 exc.code,
                 f"central SPL server returned {exc.code} at {self.base_url}{path}: {message}",

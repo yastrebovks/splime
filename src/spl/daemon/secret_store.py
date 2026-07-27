@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 from typing import Protocol
 
+from spl.core import json_contract as m_json_contract
+
 SECRET_BACKEND_ENV = "SPL_DAEMON_SECRET_BACKEND"
 KEYRING_SERVICE = "io.splime.daemon"
 FILE_BACKEND_NAME = "file"
@@ -88,7 +90,7 @@ class FileSecretBackend:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.path.with_name(f"{self.path.name}.tmp")
         tmp_path.write_text(
-            json.dumps(values, ensure_ascii=False, indent=2, sort_keys=True),
+            m_json_contract.dumps(values, ensure_ascii=False, indent=2, sort_keys=True, separators=None),
             encoding="utf-8",
         )
         try:

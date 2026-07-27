@@ -44,6 +44,7 @@ Endpoints:
     POST /runs
     GET  /runs/<id>
     GET  /runs/<id>/result
+    POST /runs/<id>/delivery-ack
     GET  /runs/<id>/artifacts
     GET  /runs/<id>/artifacts/<name>
 """
@@ -61,27 +62,48 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, cast
 from urllib.parse import unquote, urlparse, urlunparse
 from uuid import uuid4
 
+from spl._process import run_process_tree
+from spl._timeout import TimeoutDomain, validate_timeout_seconds
+from spl.core import json_contract as m_json_contract
+from spl.core import manifest as m_manifest
 from spl.core import resume as m_resume
 from spl.core.node_runtime import DOCKER_NODE_RUNTIME, RUNTIME_TAG_NAME, explicit_docker_image_spec_hash
 from spl.core.entities.pipeline import Pipeline
 from spl.core.ir.utils import spl_import_from_file
+from spl.daemon.callback_capability import (
+    CALLBACK_CAPABILITY_ENV,
+    CallbackCapabilityAuthority,
+    callback_capability_ttl_seconds,
+)
+from spl.daemon.artifact_access import (
+    LOCAL_ARTIFACT_SCAN_MAX_ENTRIES,
+    ArtifactDirectory,
+)
 from spl.daemon.docker_environment import DockerEnvironmentManager
 from spl.daemon.docker_pool import DockerPool
 from spl.daemon.environment import EnvironmentBuildError
 from spl.daemon.environment import EnvironmentManager as VenvEnvironmentManager
 from spl.daemon.environment_base import EnvironmentManagerProtocol
 from spl.daemon.heartbeat_service import HeartbeatService
+from spl.daemon.home_lock import DaemonHomeLock, DaemonInstanceIdentity
 from spl.daemon.interpreter_visibility import environment_record_interpreter_substitution
 from spl.daemon.repositories.server_connection import SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
 from spl.daemon.remote_client import (
+    RUN_CLAIM_FENCING_CAPABILITY,
+    RUN_CLAIM_FENCING_VERSION,
+    RUN_CLAIM_PRIVATE_FIELD,
+    STALE_RUN_CLAIM_ERROR_CODE,
     ServerClient,
     ServerClientError,
+    is_stale_run_claim_error,
+    is_sync_event_identity_collision_error,
 )
 from spl.daemon.routes._helpers import RouteContext
 from spl.daemon.routes.artifacts import register_artifact_routes
@@ -129,15 +151,37 @@ from spl.daemon.store import (
     validate_name,
     write_json,
 )
+from spl.daemon.storage_base import DEFAULT_RUN_DELIVERY_LEASE_SECONDS
+from spl.daemon.telemetry import (
+    DEFAULT_TELEMETRY_LEVEL,
+    SYNC_BATCH_MAX_BYTES,
+    SYNC_EVENT_BATCH_LIMIT,
+    SYNC_EVENT_MAX_BYTES,
+    SYNC_EVENT_PAYLOAD_BUDGET,
+    SYNC_EVENT_SCAN_PAGE_LIMIT,
+    TelemetryLevel,
+    TelemetryPolicy,
+    count_local_artifacts_bounded,
+    local_run_proof,
+)
 from spl.daemon_client import (
+    DAEMON_API_TOKEN_ENV,
     clear_daemon_endpoint,
     daemon_url,
     generate_daemon_api_token,
     write_daemon_endpoint,
 )
-from spl.daemon.worker_runtime_marker import WORKER_RUNTIME_MARKER_FILE
+from spl.daemon.worker_runtime_marker import WORKER_MANIFEST_HANDOFF_FILE, WORKER_RUNTIME_MARKER_FILE
 
 LOCAL_RUN_TEXT_ARTIFACT_MAX_BYTES = 256 * 1024
+LOCAL_RUN_TEXT_ARTIFACT_MAX_COUNT = 100
+# Leave room for the run envelope, telemetry summary, and redaction expansion.
+# The final wire-size fitter remains authoritative.
+LOCAL_RUN_TEXT_ARTIFACT_COLLECTION_MAX_BYTES = min(
+    192 * 1024,
+    SYNC_EVENT_PAYLOAD_BUDGET,
+)
+RUN_RETENTION_CLEANUP_RETRY_SECONDS = 30.0
 LOCAL_RUN_TEXT_ARTIFACT_EXTENSIONS = {
     ".csv",
     ".htm",
@@ -154,6 +198,7 @@ DEFAULT_PORT_SCAN_LIMIT = 100
 DEFAULT_INLINE_REMOTE_ARTIFACT_MAX_BYTES = int(
     os.environ.get("SPL_DAEMON_INLINE_REMOTE_ARTIFACT_MAX_BYTES", str(5 * 1024 * 1024))
 )
+_RESULT_NOT_PROVIDED = object()
 DEFAULT_INLINE_REMOTE_ARTIFACT_TOTAL_MAX_BYTES = int(
     os.environ.get(
         "SPL_DAEMON_INLINE_REMOTE_ARTIFACT_TOTAL_MAX_BYTES",
@@ -177,10 +222,6 @@ SERVER_CHANNEL_LEASE_METHODS = frozenset(
         "sync",
     }
 )
-SYNC_EVENT_BATCH_LIMIT = 50
-SYNC_EVENT_SCAN_PAGE_LIMIT = 200
-SYNC_EVENT_MAX_BYTES = 256 * 1024
-SYNC_BATCH_MAX_BYTES = 512 * 1024
 SYNC_REQUEST_TIMEOUT_SECONDS = 15.0
 LOGGER = logging.getLogger(__name__)
 
@@ -201,6 +242,15 @@ HeartbeatServiceFactory = Callable[
     [RegistryStore, Callable[..., dict[str, Any]]],
     HeartbeatsProtocol,
 ]
+RemoteSignatureCacheUpdate = tuple[dict[str, Any], dict[str, Any], str, str | None]
+
+
+class _ServerRunSuperseded(RuntimeError):
+    """Stop reporting for one remote run attempt rejected by claim fencing."""
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        super().__init__(f"remote run attempt was superseded: {run_id}")
 
 
 def _default_environment_manager_factory(
@@ -222,17 +272,23 @@ def _default_docker_pool_factory(
     docker_environment_manager: DockerEnvironmentManagerProtocol,
     *,
     daemon_base_url: str,
+    enabled: bool,
     pool_size: int,
     idle_timeout_seconds: float,
     prewarm: bool,
+    daemon_identity: DaemonInstanceIdentity | None,
+    daemon_home_lock: DaemonHomeLock | None,
 ) -> DockerPoolRunnerProtocol:
     return DockerPool(
         store,
         docker_environment_manager,
         daemon_base_url=daemon_base_url,
+        enabled=enabled,
         pool_size=pool_size,
         idle_timeout_seconds=idle_timeout_seconds,
         prewarm=prewarm,
+        identity=daemon_identity,
+        startup_cleanup_authority=daemon_home_lock,
     )
 
 
@@ -300,6 +356,11 @@ class _ChannelObservedServerClient:
             try:
                 result = target(*args, **kwargs)
             except ServerClientError as exc:
+                if is_stale_run_claim_error(exc):
+                    # Claim rejection proves the authenticated channel is live;
+                    # it invalidates only this worker attempt, not the lease.
+                    self._success()
+                    raise
                 lease_rejected = (
                     name in SERVER_CHANNEL_LEASE_METHODS and exc.status_code in SERVER_CHANNEL_LEASE_REJECTION_STATUSES
                 )
@@ -327,9 +388,12 @@ class DaemonRuntime:
         env_build_timeout_seconds: float | None = None,
         env_stale_lock_seconds: float | None = None,
         daemon_base_url: str = "http://127.0.0.1:8765",
+        docker_pool_enabled: bool = False,
         docker_pool_size: int = 0,
         docker_idle_timeout_seconds: float = 300.0,
         docker_prewarm: bool = False,
+        telemetry: TelemetryLevel = DEFAULT_TELEMETRY_LEVEL,
+        telemetry_sensitive_fields: tuple[str, ...] | list[str] = (),
         environment_manager: EnvironmentManagerProtocol | None = None,
         docker_environment_manager: DockerEnvironmentManagerProtocol | None = None,
         docker_pool: DockerPoolRunnerProtocol | None = None,
@@ -337,6 +401,8 @@ class DaemonRuntime:
         sync_visibility: SyncVisibilityProtocol | None = None,
         server_connections: ServerConnectionsProtocol | None = None,
         heartbeat_service: HeartbeatsProtocol | None = None,
+        daemon_identity: DaemonInstanceIdentity | None = None,
+        daemon_home_lock: DaemonHomeLock | None = None,
         server_client_factory: ServerClientFactoryProtocol = (_default_server_client_factory),
         environment_manager_factory: EnvironmentManagerFactory = (_default_environment_manager_factory),
         docker_environment_manager_factory: DockerEnvironmentManagerFactory = (
@@ -351,6 +417,23 @@ class DaemonRuntime:
         heartbeat_service_factory: HeartbeatServiceFactory = (_default_heartbeat_service_factory),
     ):
         self.store = store
+        self.daemon_identity = daemon_identity
+        self.callback_capabilities = CallbackCapabilityAuthority(self._callback_run_status)
+        self.telemetry_policy = TelemetryPolicy(
+            telemetry,
+            tuple(telemetry_sensitive_fields),
+        )
+        telemetry_log_level = (
+            logging.INFO if self.telemetry_policy.level == DEFAULT_TELEMETRY_LEVEL else logging.WARNING
+        )
+        LOGGER.log(
+            telemetry_log_level,
+            "daemon telemetry level=%s raw_values_mirrored=%s redaction=%s",
+            self.telemetry_policy.level,
+            self.telemetry_policy.level == "full",
+            "best_effort",
+            extra={"spl_event": "daemon_telemetry_policy"},
+        )
         self.auto_build_envs = auto_build_envs
         self.daemon_base_url = daemon_base_url.rstrip("/")
         self.server_client_factory = server_client_factory
@@ -370,9 +453,12 @@ class DaemonRuntime:
             store,
             self.docker_environment_manager,
             daemon_base_url=self.daemon_base_url,
+            enabled=docker_pool_enabled,
             pool_size=docker_pool_size,
             idle_timeout_seconds=docker_idle_timeout_seconds,
             prewarm=docker_prewarm,
+            daemon_identity=daemon_identity,
+            daemon_home_lock=daemon_home_lock,
         )
         backend_services = RuntimeBackendServices(
             environment_manager=self.environment_manager,
@@ -389,17 +475,149 @@ class DaemonRuntime:
         self._server_channel_half_open: set[str] = set()
         self._server_channel_probe_events: dict[str, threading.Event] = {}
         self._server_channel_last_probe_result: dict[str, dict[str, Any]] = {}
+        self._server_attempt_lock = threading.Lock()
+        self._superseded_server_attempts: set[tuple[str, str | None]] = set()
         self._run_threads_lock = threading.Lock()
         self._run_threads: list[threading.Thread] = []
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
+        self._retention_condition = threading.Condition()
+        self._retention_deadlines: dict[str, float] = {}
+        self._retention_scheduler_stopped = False
+        self._retention_scheduler = threading.Thread(
+            target=self._run_retention_scheduler,
+            name="spl-run-retention-scheduler",
+            daemon=True,
+        )
+        self._retention_scheduler_started = False
         self.server_connections = server_connections or server_connection_manager_factory(store, server_client_factory)
         self.heartbeat_service = heartbeat_service or heartbeat_service_factory(
             store,
             self.sync_once,
         )
+        self._normalize_persisted_run_telemetry()
         self.docker_pool.cleanup_stale_containers()
+        self.sweep_run_retention()
         self.restore_server_heartbeat()
+
+    def _callback_run_status(self, run_id: str) -> str | None:
+        """Return authoritative local status for callback authentication."""
+
+        try:
+            return str(self.store.get_run(run_id)["status"])
+        except KeyError:
+            return None
+
+    def telemetry_status(self) -> dict[str, Any]:
+        """Return the active nonsecret central telemetry policy summary."""
+
+        return self.telemetry_policy.status()
+
+    def _normalize_persisted_run_telemetry(self) -> None:
+        """Apply the active privacy policy before any restored sync can run."""
+
+        expired = self.store.sync_events.expire_sync_event_payloads()
+        rewritten = 0
+        compacted = 0
+        quarantined = 0
+        for event in self.store.sync_events.list_run_sync_events():
+            event_id = str(event["id"])
+            kind = str(event["kind"])
+            payload = event.get("payload")
+            proof = local_run_proof(kind, payload)
+            if event.get("status") == "sent":
+                self.store.mark_sync_event_sent(event_id)
+                compacted += 1
+                continue
+            if proof is None:
+                raw_run = payload.get("run") if isinstance(payload, dict) else None
+                raw_id = raw_run.get("id") if isinstance(raw_run, dict) else None
+                try:
+                    safe_id = validate_name(raw_id) if isinstance(raw_id, str) else "unknown"
+                except ValueError:
+                    safe_id = "unknown"
+                raw_status = raw_run.get("status") if isinstance(raw_run, dict) else None
+                known_statuses = m_manifest.ACTIVE_RUN_STATUSES | m_manifest.TERMINAL_RUN_STATUSES
+                safe_status = str(raw_status) if raw_status in known_statuses else "unknown"
+                safe_payload = {
+                    "run": {
+                        "id": safe_id,
+                        "object_name": "unknown",
+                        "object_display_name": "unknown",
+                        "local_object_name": "unknown",
+                        "status": safe_status,
+                        "telemetry_level": "metadata",
+                        "telemetry": {
+                            "level": "metadata",
+                            "redaction": "best_effort",
+                            "availability": {
+                                "input": False,
+                                "result": False,
+                                "streams": False,
+                                "artifact_bodies": False,
+                            },
+                        },
+                        "source_result_present": False,
+                        "input_mirrored": False,
+                        "result_mirrored": False,
+                        "streams_mirrored": False,
+                        "artifact_bodies_mirrored": False,
+                    }
+                }
+                self.store.sync_events.rewrite_run_sync_event(
+                    event_id,
+                    safe_payload,
+                    local_run_id=None,
+                )
+                rewritten += 1
+                continue
+            local_run_id, local_status = proof
+            if kind == "run_update":
+                normalized = dict(payload) if isinstance(payload, dict) else {}
+                detail = normalized.get("payload")
+                normalized_detail = dict(detail) if isinstance(detail, dict) else {}
+                normalized_detail["local_run"] = {
+                    "id": local_run_id,
+                    "status": local_status,
+                }
+                normalized["payload"] = normalized_detail
+                self.store.sync_events.rewrite_run_sync_event(
+                    event_id,
+                    normalized,
+                    local_run_id=local_run_id,
+                )
+                rewritten += 1
+                continue
+            try:
+                state = self.store.get_run(local_run_id)
+            except KeyError:
+                self.store.sync_events.rewrite_run_sync_event(
+                    event_id,
+                    {"run": {"id": local_run_id, "status": local_status}},
+                    local_run_id=None,
+                )
+                self.store.mark_sync_event_failed(
+                    event_id,
+                    "local run no longer exists; telemetry payload was scrubbed",
+                    retryable=False,
+                )
+                quarantined += 1
+                continue
+            self.store.sync_events.rewrite_run_sync_event(
+                event_id,
+                {"run": self._local_run_sync_payload(state)},
+                local_run_id=local_run_id,
+            )
+            rewritten += 1
+        if expired or rewritten or compacted or quarantined:
+            LOGGER.info(
+                "normalized persisted run telemetry expired=%d rewritten=%d compacted=%d quarantined=%d",
+                expired,
+                rewritten,
+                compacted,
+                quarantined,
+                extra={"spl_event": "run_telemetry_queue_normalized"},
+            )
 
     def _server_client(
         self,
@@ -777,6 +995,7 @@ class DaemonRuntime:
             "oldest_event": queue["oldest_event"],
             "last_error": queue["last_error"],
             "heartbeat": self.heartbeat_service.status(connection.get("id")),
+            "telemetry": self.telemetry_status(),
         }
 
     def prune_sync_events(
@@ -819,6 +1038,16 @@ class DaemonRuntime:
             "then retry client.pull(...)."
         )
 
+    @staticmethod
+    def _claim_fencing_capabilities(
+        capabilities: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Advertise the daemon's worker-claim protocol without trusting input."""
+
+        advertised = dict(capabilities or {})
+        advertised[RUN_CLAIM_FENCING_CAPABILITY] = RUN_CLAIM_FENCING_VERSION
+        return advertised
+
     def connect_server(
         self,
         *,
@@ -838,7 +1067,7 @@ class DaemonRuntime:
             user_token=user_token,
             machine_id=machine_id,
             display_name=display_name,
-            capabilities=capabilities,
+            capabilities=self._claim_fencing_capabilities(capabilities),
             heartbeat_interval_seconds=heartbeat_interval_seconds,
         )
         if not result.get("reused") and result.get("connection") is not None:
@@ -968,6 +1197,7 @@ class DaemonRuntime:
             payload["create_library"] = True
         if library_display_name:
             payload["library_display_name"] = str(library_display_name)
+        payload["revive_removed"] = True
         return self.store.enqueue_sync_event("object_version", payload)
 
     def _object_sync_payload_for_version(
@@ -1254,7 +1484,9 @@ class DaemonRuntime:
             version["version_id"],
             include_yaml=True,
         )
-        return self.store.enqueue_object_version_sync_once(self._object_sync_payload_for_version(full_version))
+        payload = self._object_sync_payload_for_version(full_version)
+        payload["revive_removed"] = False
+        return self.store.enqueue_object_version_sync_once(payload)
 
     def _record_object_reconcile_conflict(
         self,
@@ -1323,7 +1555,7 @@ class DaemonRuntime:
         )
         manifest = {"format_version": 1, "items": items}
         snapshot_hash = hashlib.sha256(
-            json.dumps(
+            m_json_contract.dumps(
                 manifest,
                 ensure_ascii=False,
                 sort_keys=True,
@@ -1352,7 +1584,6 @@ class DaemonRuntime:
             "kind": "machine_library_snapshot",
             "payload": {
                 "format_version": 1,
-                "generated_at": utc_now(),
                 "snapshot_hash": snapshot_hash,
                 "items": items,
             },
@@ -1371,11 +1602,35 @@ class DaemonRuntime:
         if kwargs.get("owner_id") is not None:
             kwargs["owner_id"] = self.resolve_user_ref(str(kwargs["owner_id"]))
         self._adopt_server_object_identity_for_publish(name, kwargs)
+        cache_updates: list[RemoteSignatureCacheUpdate] = []
+        resolved_signatures: dict[str, dict[str, Any]] = {}
+
+        def resolve_for_registration(ref: dict[str, Any]) -> dict[str, Any]:
+            normalized = self._normalize_remote_ref(ref)
+            cache_key = json.dumps(normalized, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            if cache_key not in resolved_signatures:
+                resolved_signatures[cache_key] = self._resolve_remote_signature(
+                    normalized,
+                    force=False,
+                    cache_updates=cache_updates,
+                )
+            return resolved_signatures[cache_key]
+
+        def write_signature_cache() -> None:
+            for ref, signature, status, error in cache_updates:
+                self.store.save_remote_signature_in_current_transaction(
+                    ref,
+                    signature,
+                    status=status,
+                    error=error,
+                )
+
         return self.store.register_object(
             name,
             entrypoint,
             env,
-            remote_signature_resolver=self.resolve_remote_signature,
+            remote_signature_resolver=resolve_for_registration,
+            remote_signature_cache_writer=write_signature_cache,
             **kwargs,
         )
 
@@ -1475,6 +1730,19 @@ class DaemonRuntime:
         import can proceed without repeatedly asking the server.
         """
 
+        return self._resolve_remote_signature(
+            ref,
+            force=force,
+            cache_updates=None,
+        )
+
+    def _resolve_remote_signature(
+        self,
+        ref: dict[str, Any],
+        *,
+        force: bool,
+        cache_updates: list[RemoteSignatureCacheUpdate] | None,
+    ) -> dict[str, Any]:
         normalized = self._normalize_remote_ref(ref)
         cache_ref = self._remote_signature_cache_ref(normalized)
         cached = self.store.get_remote_signature(cache_ref) if cache_ref.get("owner_id") else None
@@ -1512,19 +1780,51 @@ class DaemonRuntime:
                 "library": self._server_record_library(signature) or normalized.get("library"),
             }
             cache_ref = {**normalized, "owner_id": canonical_owner_id}
-            self.store.save_remote_signature(cache_ref, signature)
+            self._record_remote_signature_cache_update(
+                cache_updates,
+                cache_ref,
+                signature,
+                status="resolved",
+                error=None,
+            )
             return signature
         except Exception as exc:
             if isinstance(exc, ServerClientError) and self._is_server_connectivity_error(exc):
                 self._mark_server_channel_failure(credentials, error=exc)
             if cache_ref.get("owner_id"):
-                self.store.mark_remote_signature_unavailable(cache_ref, repr(exc))
+                unavailable_signature = dict(cached["signature"]) if cached is not None else {}
+                self._record_remote_signature_cache_update(
+                    cache_updates,
+                    cache_ref,
+                    unavailable_signature,
+                    status="unavailable",
+                    error=repr(exc),
+                )
             if cached is not None and cached.get("signature"):
                 signature = dict(cached["signature"])
                 signature["cache_status"] = "stale"
                 signature["cache_error"] = repr(exc)
                 return signature
             raise
+
+    def _record_remote_signature_cache_update(
+        self,
+        cache_updates: list[RemoteSignatureCacheUpdate] | None,
+        ref: dict[str, Any],
+        signature: dict[str, Any],
+        *,
+        status: str,
+        error: str | None,
+    ) -> None:
+        if cache_updates is None:
+            self.store.save_remote_signature(
+                ref,
+                signature,
+                status=status,
+                error=error,
+            )
+            return
+        cache_updates.append((dict(ref), dict(signature), status, error))
 
     def remote_signature_cache_record(self, ref: dict[str, Any]) -> dict[str, Any] | None:
         """Return the owner-concrete remote signature cache row for diagnostics."""
@@ -1718,6 +2018,12 @@ class DaemonRuntime:
     ) -> dict[str, Any]:
         """Create a server-side run through the idempotent direct route."""
 
+        validate_timeout_seconds(
+            timeout_seconds,
+            name="timeout_seconds",
+            domain=TimeoutDomain.NON_NEGATIVE,
+            allow_none=True,
+        )
         object_name, function = split_object_function_ref(object_name, function)
         credentials = self._require_live_server_channel_credentials()
         resolved_offline_policy = offline_policy or (
@@ -2258,6 +2564,10 @@ class DaemonRuntime:
                 "jobs": [],
                 "sync": self.sync_visibility.summary(),
             }
+        credentials = {
+            **credentials,
+            "capabilities": self._claim_fencing_capabilities(credentials.get("capabilities")),
+        }
 
         if probe_server_channel and credentials.get("status") == "needs_reconnect":
             credentials = self._reconnect_server_credentials(credentials)
@@ -2362,6 +2672,8 @@ class DaemonRuntime:
 
                 if not events and sent_request:
                     break
+                claim_id = self._sync_batch_claim_id(events)
+                wire_events = [self._sync_event_for_wire(event) for event in events]
                 try:
                     if batches:
                         credentials = self._renew_server_lease(server, credentials)
@@ -2369,9 +2681,53 @@ class DaemonRuntime:
                         connection_id=credentials["remote_connection_id"],
                         machine_id=credentials["machine_id"],
                         heartbeat_interval_seconds=self._safe_heartbeat_interval(credentials),
-                        events=events,
+                        events=wire_events,
+                        capabilities=self._claim_fencing_capabilities(credentials.get("capabilities")),
+                        claim_id=claim_id,
                     )
                 except ServerClientError as exc:
+                    collision_event = (
+                        next(
+                            (event for event in events if str(event.get("id")) == exc.event_id),
+                            None,
+                        )
+                        if is_sync_event_identity_collision_error(exc)
+                        else None
+                    )
+                    if collision_event is not None:
+                        sent_request = True
+                        batches += 1
+                        self._mark_server_channel_success(credentials)
+                        assert exc.event_id is not None
+                        if exc.event_id in pending_ids:
+                            self.store.mark_sync_event_failed(
+                                exc.event_id,
+                                exc.message,
+                                retryable=False,
+                            )
+                        event_results.append(
+                            {
+                                "event_id": exc.event_id,
+                                "kind": collision_event.get("kind"),
+                                "status": "error",
+                                "error": exc.message,
+                                "code": exc.code,
+                            }
+                        )
+                        # A batch-level 409 has no receipts for its other
+                        # items. They stay pending and are exact-replayed on
+                        # the next sync; attempted_ids prevents a hot loop.
+                        continue
+                    if is_stale_run_claim_error(exc):
+                        sent_request = True
+                        batches += 1
+                        self._mark_server_channel_success(credentials)
+                        event_results.extend(
+                            self._reject_stale_sync_events(
+                                events,
+                            )
+                        )
+                        continue
                     if self._is_server_connectivity_error(exc):
                         self._mark_server_channel_failure(credentials, error=exc)
                     if sent_request:
@@ -2458,6 +2814,7 @@ class DaemonRuntime:
 
         for job in jobs:
             self.accept_server_job(job, credentials["id"])
+        self.sweep_run_retention()
         response = {
             "connection": self._remote_connection_snapshot(credentials),
             "event_results": event_results,
@@ -2489,7 +2846,7 @@ class DaemonRuntime:
             remote = server.connect_machine(
                 machine_id=credentials["machine_id"],
                 display_name=credentials.get("display_name"),
-                capabilities=credentials.get("capabilities") or {},
+                capabilities=self._claim_fencing_capabilities(credentials.get("capabilities")),
                 heartbeat_interval_seconds=self._safe_heartbeat_interval(credentials),
             )
         except Exception as exc:
@@ -2571,11 +2928,12 @@ class DaemonRuntime:
                 )
                 wire_event = {"id": event["id"], "kind": event["kind"], "payload": event["payload"]}
                 try:
+                    event_attempt = self._sync_event_claim_attempt(wire_event)
                     event_bytes = self._sync_event_wire_bytes(wire_event)
                 except (TypeError, ValueError) as exc:
                     self.store.mark_sync_event_failed(
                         event_id,
-                        f"sync event is not JSON serializable: {exc}",
+                        f"sync event cannot be sent safely: {exc}",
                         retryable=False,
                     )
                     attempted_ids.add(event_id)
@@ -2588,6 +2946,10 @@ class DaemonRuntime:
                     )
                     attempted_ids.add(event_id)
                     continue
+                if batch:
+                    batch_attempt = self._sync_event_claim_attempt(batch[0])
+                    if event_attempt != batch_attempt and (event_attempt is not None or batch_attempt is not None):
+                        return batch, held_count, held_owner_ids, adopted
                 if batch and batch_bytes + event_bytes + 1 > SYNC_BATCH_MAX_BYTES:
                     return batch, held_count, held_owner_ids, adopted
                 batch.append(wire_event)
@@ -2606,6 +2968,11 @@ class DaemonRuntime:
         batch_bytes = 2
         while events and len(batch) < SYNC_EVENT_BATCH_LIMIT:
             event = events[0]
+            event_attempt = self._sync_event_claim_attempt(event)
+            if batch:
+                batch_attempt = self._sync_event_claim_attempt(batch[0])
+                if event_attempt != batch_attempt and (event_attempt is not None or batch_attempt is not None):
+                    break
             event_bytes = self._sync_event_wire_bytes(event)
             if event_bytes > SYNC_EVENT_MAX_BYTES:
                 raise ValueError(
@@ -2619,7 +2986,158 @@ class DaemonRuntime:
 
     @staticmethod
     def _sync_event_wire_bytes(event: dict[str, Any]) -> int:
-        return len(json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        wire_event = DaemonRuntime._sync_event_for_wire(event)
+        return len(
+            m_json_contract.dumps(
+                wire_event,
+                ensure_ascii=False,
+                sort_keys=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
+    @staticmethod
+    def _sync_event_for_wire(event: dict[str, Any]) -> dict[str, Any]:
+        """Return an event envelope without daemon-private claim metadata."""
+
+        wire_event = {
+            "id": event["id"],
+            "kind": event["kind"],
+            "payload": dict(event.get("payload") or {}),
+        }
+        wire_event["payload"].pop(RUN_CLAIM_PRIVATE_FIELD, None)
+        return wire_event
+
+    @staticmethod
+    def _sync_event_claim_id(event: dict[str, Any]) -> str | None:
+        """Read and validate a claim kept only in the daemon-private envelope."""
+
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        claim_id = payload.get(RUN_CLAIM_PRIVATE_FIELD)
+        if claim_id is None:
+            return None
+        if event.get("kind") != "run_update":
+            raise ValueError("private run claim metadata is only valid for run_update events")
+        if not isinstance(claim_id, str) or not claim_id.strip():
+            raise ValueError("private run claim metadata must be a non-empty string")
+        return claim_id
+
+    @classmethod
+    def _sync_event_claim_attempt(
+        cls,
+        event: dict[str, Any],
+    ) -> tuple[str, str] | None:
+        """Return the complete identity of one fenced run-update attempt."""
+
+        claim_id = cls._sync_event_claim_id(event)
+        if claim_id is None:
+            return None
+        payload = event.get("payload")
+        if not isinstance(payload, dict):  # pragma: no cover - claim validation above.
+            raise ValueError("claimed run update must have an object payload")
+        run_id = payload.get("run_id")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("claimed run update must identify a non-empty run_id")
+        return run_id, claim_id
+
+    @classmethod
+    def _sync_batch_claim_id(cls, events: list[dict[str, Any]]) -> str | None:
+        """Return the one claim shared by a homogeneous sync batch."""
+
+        attempts = {cls._sync_event_claim_attempt(event) for event in events}
+        attempts.discard(None)
+        if len(attempts) > 1:
+            raise RuntimeError("sync batch contains multiple private run attempts")
+        attempt = next(iter(attempts), None)
+        if attempt is not None and any(cls._sync_event_claim_attempt(event) != attempt for event in events):
+            raise RuntimeError("claimed sync batch contains an unfenced event")
+        return attempt[1] if attempt is not None else None
+
+    def _reject_stale_sync_events(
+        self,
+        events: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Make stale worker events terminal without failing the server channel."""
+
+        results: list[dict[str, Any]] = []
+        rejected_attempts: set[tuple[str, str | None]] = set()
+        for event in events:
+            event_id = str(event["id"])
+            payload = event.get("payload") or {}
+            run_id = str(payload.get("run_id") or "")
+            claim_id = self._sync_event_claim_id(event)
+            attempt = (run_id, claim_id)
+            if run_id and attempt not in rejected_attempts:
+                self._mark_server_attempt_superseded(run_id, claim_id)
+                rejected_attempts.add(attempt)
+            results.append(
+                {
+                    "event_id": event_id,
+                    "kind": event.get("kind"),
+                    "status": "error",
+                    "code": STALE_RUN_CLAIM_ERROR_CODE,
+                    "error": "run was reclaimed by a newer attempt",
+                }
+            )
+        return results
+
+    def _mark_server_attempt_superseded(
+        self,
+        run_id: str,
+        claim_id: str | None,
+    ) -> None:
+        """Remember a stale attempt and log only its non-secret run identity."""
+
+        key = (run_id, claim_id)
+        with self._server_attempt_lock:
+            first_rejection = key not in self._superseded_server_attempts
+            self._superseded_server_attempts.add(key)
+        if first_rejection:
+            LOGGER.warning(
+                "remote run attempt was superseded; further reports are suppressed for run %s",
+                run_id,
+                extra={
+                    "spl_event": "remote_run_attempt_superseded",
+                    "run_id": run_id,
+                },
+            )
+        self._suppress_queued_server_attempt_events(run_id, claim_id)
+
+    def _suppress_queued_server_attempt_events(
+        self,
+        run_id: str,
+        claim_id: str | None,
+    ) -> None:
+        """Make every queued report for one known-stale attempt nonretryable."""
+
+        error = "remote run was reclaimed by a newer attempt; stale update will not be retried"
+        for event in self.store.list_pending_sync_events(limit=None):
+            if event.get("kind") != "run_update":
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("run_id") != run_id:
+                continue
+            if payload.get(RUN_CLAIM_PRIVATE_FIELD) != claim_id:
+                continue
+            self.store.mark_sync_event_failed(
+                str(event["id"]),
+                error,
+                retryable=False,
+            )
+
+    def _server_attempt_is_superseded(
+        self,
+        run_id: str,
+        claim_id: str | None,
+    ) -> bool:
+        """Return whether central claim fencing rejected this exact attempt."""
+
+        with self._server_attempt_lock:
+            return (run_id, claim_id) in self._superseded_server_attempts
 
     def _sync_events_for_owner(
         self,
@@ -2689,6 +3207,17 @@ class DaemonRuntime:
         )
         thread.start()
 
+    @staticmethod
+    def _job_claim_id(job: dict[str, Any]) -> str | None:
+        """Return a negotiated top-level claim without accepting malformed data."""
+
+        claim_id = job.get("claim_id")
+        if claim_id is None:
+            return None
+        if not isinstance(claim_id, str) or not claim_id.strip():
+            raise ValueError("server job claim_id must be a non-empty string when provided")
+        return claim_id
+
     def _execute_server_job(self, job: dict[str, Any], connection_id: str) -> None:
         """Execute one server-assigned job locally and sync the result back."""
 
@@ -2696,14 +3225,29 @@ class DaemonRuntime:
         version = job["object_version"]
         run_id = run["id"]
         local_name = version["name"]
+        local_run: dict[str, Any] | None = None
+        try:
+            claim_id = self._job_claim_id(job)
+        except ValueError:
+            LOGGER.error(
+                "server job was refused because its claim metadata is invalid for run %s",
+                run_id,
+                extra={
+                    "spl_event": "remote_run_invalid_claim",
+                    "run_id": run_id,
+                },
+            )
+            return
 
         try:
-            self._send_server_run_update(
+            if not self._send_server_run_update(
                 connection_id,
                 run_id=run_id,
                 status="fetching_object",
                 message="registering object bundle in local daemon",
-            )
+                claim_id=claim_id,
+            ):
+                return
             self._ensure_server_object_envs([version])
             object_record = self.register_object(
                 local_name,
@@ -2721,7 +3265,13 @@ class DaemonRuntime:
                 source_object_name=version["name"],
                 runtime_config=version.get("runtime_config"),
             )
-            self._send_server_run_update(connection_id, run_id=run_id, status="running")
+            if not self._send_server_run_update(
+                connection_id,
+                run_id=run_id,
+                status="running",
+                claim_id=claim_id,
+            ):
+                return
             function = (
                 run.get("entrypoint")
                 if run.get("entrypoint") and run.get("entrypoint") != version["entrypoint"]
@@ -2737,54 +3287,126 @@ class DaemonRuntime:
                 function=function,
                 source="local",
                 report_local_run=False,
+                keep="on_failure",
             )
             credentials = self.store.get_server_connection_credentials(connection_id)
             progress_interval = max(
                 1.0,
                 min(float(credentials["heartbeat_interval_seconds"]), 60.0),
             )
-            final_state = self._wait_local_run(
-                local_run["id"],
-                timeout_seconds=run.get("timeout_seconds"),
-                progress_callback=lambda: self._send_server_run_update(
+
+            def report_progress() -> None:
+                if not self._send_server_run_update(
                     connection_id,
                     run_id=run_id,
                     status="running",
                     message="remote run lease renewed",
-                ),
+                    claim_id=claim_id,
+                ):
+                    raise _ServerRunSuperseded(run_id)
+
+            final_state = self._wait_local_run(
+                local_run["id"],
+                timeout_seconds=run.get("timeout_seconds"),
+                progress_callback=report_progress,
                 progress_interval_seconds=progress_interval,
             )
             if final_state["status"] != "succeeded":
-                self._send_server_run_update(
+                queued = self._send_server_run_update(
                     connection_id,
                     run_id=run_id,
                     status="failed",
                     error=final_state.get("error") or "local run failed",
-                    payload={"local_run": final_state},
+                    payload={"local_run": self._local_run_delivery_proof(final_state)},
+                    claim_id=claim_id,
+                )
+                self._mark_remote_local_terminal_queued(
+                    final_state,
+                    queued=queued,
+                    effective_status="failed",
+                    outcome_reason="local-execution-failed",
                 )
                 return
 
-            result = self.store.get_run(final_state["id"]).get("result")
+            completed_state = self.store.get_run(final_state["id"])
+            if not completed_state.get("result_present"):
+                raise RuntimeError("local run succeeded without committing a result value")
+            result = completed_state["result"]
             artifacts = self._prepare_remote_run_artifacts(
                 connection_id,
                 run_id,
                 final_state,
+                claim_id=claim_id,
             )
-            self._send_server_run_update(
+            queued = self._send_server_run_update(
                 connection_id,
                 run_id=run_id,
                 status="succeeded",
                 result=result,
-                payload={"local_run": final_state},
+                payload={"local_run": self._local_run_delivery_proof(final_state)},
                 artifacts=artifacts,
+                claim_id=claim_id,
             )
+            self._mark_remote_local_terminal_queued(
+                final_state,
+                queued=queued,
+                effective_status="succeeded",
+                outcome_reason="server-handoff-succeeded",
+            )
+        except _ServerRunSuperseded:
+            return
         except Exception as exc:
-            self._send_server_run_update(
+            if self._server_attempt_is_superseded(run_id, claim_id):
+                return
+            local_state = None
+            if local_run is not None:
+                try:
+                    local_state = self.store.get_run(str(local_run["id"]))
+                except KeyError:
+                    local_state = None
+            queued = self._send_server_run_update(
                 connection_id,
                 run_id=run_id,
                 status="failed",
                 error=repr(exc),
+                payload={"local_run": self._local_run_delivery_proof(local_state)} if local_state is not None else None,
+                claim_id=claim_id,
             )
+            if local_state is not None:
+                local_status = str(local_state.get("status"))
+                self._mark_remote_local_terminal_queued(
+                    local_state,
+                    queued=queued,
+                    effective_status="failed" if local_status == "succeeded" else local_status,
+                    outcome_reason=(
+                        "server-handoff-failed" if local_status == "succeeded" else "local-execution-failed"
+                    ),
+                )
+
+    def _mark_remote_local_terminal_queued(
+        self,
+        local_state: dict[str, Any],
+        *,
+        queued: bool,
+        effective_status: str,
+        outcome_reason: str,
+    ) -> None:
+        """Release a server-job run only after its terminal update is durable."""
+
+        if not queued or str(local_state.get("status")) not in m_manifest.TERMINAL_RUN_STATUSES:
+            return
+        local_run_id = str(local_state["id"])
+        if not local_state.get("retention_enforced"):
+            persisted = self.store.get_run(local_run_id)
+            if not persisted.get("retention_enforced"):
+                return
+        self.store.runs.mark_retention_terminal_queued(
+            local_run_id,
+            sync_required=True,
+            effective_status=effective_status,
+            outcome_reason=outcome_reason,
+        )
+        self.store.enforce_run_retention(local_run_id)
 
     def _send_server_run_update(
         self,
@@ -2792,31 +3414,38 @@ class DaemonRuntime:
         *,
         run_id: str,
         status: str,
-        result: Any = None,
+        result: Any = _RESULT_NOT_PROVIDED,
         error: str | None = None,
         message: str | None = None,
         payload: dict[str, Any] | None = None,
         artifacts: list[dict[str, Any]] | None = None,
-    ) -> None:
+        claim_id: str | None = None,
+    ) -> bool:
+        """Queue one remote-run mutation unless its attempt was superseded."""
+
+        if claim_id is not None and (not isinstance(claim_id, str) or not claim_id.strip()):
+            raise ValueError("claim_id must be a non-empty string when provided")
         credentials = self.store.get_server_connection_credentials(connection_id)
-        event_payload = {
+        event_payload: dict[str, Any] = {
             "run_id": run_id,
             "status": status,
-            "result": result,
             "error": error,
             "message": message,
             "payload": payload or {},
             "artifacts": artifacts or [],
         }
+        if result is not _RESULT_NOT_PROVIDED:
+            event_payload["result"] = result
         if credentials.get("owner_id"):
             event_payload["owner_id"] = credentials["owner_id"]
-        event: dict[str, Any] = {
-            "id": uuid4().hex,
-            "kind": "run_update",
-            "payload": event_payload,
-        }
-        self.store.enqueue_sync_event(event["kind"], event["payload"])
+        if claim_id is not None:
+            event_payload[RUN_CLAIM_PRIVATE_FIELD] = claim_id
+        with self._server_attempt_lock:
+            if (run_id, claim_id) in self._superseded_server_attempts:
+                return False
+            self.store.enqueue_sync_event("run_update", event_payload)
         self._kick_server_sync(connection_id)
+        return True
 
     def _wait_local_run(
         self,
@@ -2826,6 +3455,12 @@ class DaemonRuntime:
         progress_callback: Callable[[], None] | None = None,
         progress_interval_seconds: float = 60.0,
     ) -> dict[str, Any]:
+        validate_timeout_seconds(
+            timeout_seconds,
+            name="timeout_seconds",
+            domain=TimeoutDomain.NON_NEGATIVE,
+            allow_none=True,
+        )
         started = time.monotonic()
         next_progress = started + progress_interval_seconds
         while True:
@@ -2846,6 +3481,12 @@ class DaemonRuntime:
         *,
         timeout_seconds: float | None,
     ) -> dict[str, Any]:
+        validate_timeout_seconds(
+            timeout_seconds,
+            name="timeout_seconds",
+            domain=TimeoutDomain.NON_NEGATIVE,
+            allow_none=True,
+        )
         credentials = self._require_live_server_channel_credentials()
         server = self._server_client_for_credentials(
             credentials,
@@ -2869,6 +3510,12 @@ class DaemonRuntime:
     ) -> dict[str, Any]:
         """Execute a NodeRemote through the central server and return its result."""
 
+        validate_timeout_seconds(
+            timeout_seconds,
+            name="timeout_seconds",
+            domain=TimeoutDomain.NON_NEGATIVE,
+            allow_none=True,
+        )
         ref = self._normalize_remote_ref(node)
         signature = self.resolve_remote_signature(ref)
         target_machine = (
@@ -2999,12 +3646,24 @@ class DaemonRuntime:
                 )
         return encoded
 
+    @staticmethod
+    def _local_run_delivery_proof(state: dict[str, Any]) -> dict[str, str]:
+        """Return the only local-run fields required by durable handoff proof."""
+
+        return {"id": str(state["id"]), "status": str(state["status"])}
+
     def _prepare_remote_run_artifacts(
         self,
         connection_id: str,
         run_id: str,
         run_state: dict[str, Any],
+        *,
+        claim_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        """Prepare result artifacts without publishing from a stale attempt."""
+
+        if self._server_attempt_is_superseded(run_id, claim_id):
+            raise _ServerRunSuperseded(run_id)
         artifacts_dir = Path(run_state["artifacts_dir"])
         if not artifacts_dir.exists():
             return []
@@ -3017,6 +3676,8 @@ class DaemonRuntime:
         prepared: list[dict[str, Any]] = []
         inline_bytes = 0
         for path in sorted(artifacts_dir.iterdir()):
+            if self._server_attempt_is_superseded(run_id, claim_id):
+                raise _ServerRunSuperseded(run_id)
             if not path.is_file():
                 continue
             metadata = self._artifact_file_metadata(path)
@@ -3035,7 +3696,21 @@ class DaemonRuntime:
                 )
                 continue
 
-            uploaded = server.upload_artifact(run_id, path.name, path)
+            try:
+                if claim_id is None:
+                    uploaded = server.upload_artifact(run_id, path.name, path)
+                else:
+                    uploaded = server.upload_artifact(
+                        run_id,
+                        path.name,
+                        path,
+                        claim_id=claim_id,
+                    )
+            except ServerClientError as exc:
+                if not is_stale_run_claim_error(exc):
+                    raise
+                self._mark_server_attempt_superseded(run_id, claim_id)
+                raise _ServerRunSuperseded(run_id) from exc
             self._assert_uploaded_artifact_matches(metadata, uploaded)
             prepared.append(
                 {
@@ -3113,12 +3788,18 @@ class DaemonRuntime:
         source: str = "auto",
         report_local_run: bool = True,
         runtimes: dict[str, str] | None = None,
-        keep: Any = "on_failure",
+        keep: Any = True,
     ) -> dict[str, Any]:
         """Create a run and execute it in a background worker thread."""
 
         if source not in {"auto", "local"}:
             raise ValueError("source must be 'auto' or 'local'")
+        validate_timeout_seconds(
+            timeout_seconds,
+            name="timeout_seconds",
+            domain=TimeoutDomain.NON_NEGATIVE,
+            allow_none=True,
+        )
 
         object_name, function = split_object_function_ref(object_name, function)
         server_owner_ref = object_owner_id
@@ -3148,6 +3829,7 @@ class DaemonRuntime:
                 library=library,
                 runtimes=runtimes,
                 keep=keep,
+                report_local_run=report_local_run,
             )
         except KeyError as exc:
             can_import = source == "auto" and resolved_version_id is None and "object is not registered" in str(exc)
@@ -3179,6 +3861,7 @@ class DaemonRuntime:
                 library=library,
                 runtimes=runtimes,
                 keep=keep,
+                report_local_run=report_local_run,
             )
         try:
             state = self._prepare_node_runtime_environments_for_run(state, report_local_run=report_local_run)
@@ -3202,17 +3885,33 @@ class DaemonRuntime:
         timeout_seconds: float | None = None,
         adapters: dict[str, Any] | None = None,
         runtimes: dict[str, str] | None = None,
-        keep: Any = "on_failure",
+        keep: Any = True,
         report_local_run: bool = True,
     ) -> dict[str, Any]:
         """Create a child run that resumes one retained daemon pipeline run."""
 
+        if m_manifest.normalize_keep(keep) is False:
+            raise ValueError(
+                "keep=False is incompatible with resume because the child run would discard the state needed "
+                "for another resume; use keep=True (keep='on_failure' retains the child only if it fails)"
+            )
+        validate_timeout_seconds(
+            timeout_seconds,
+            name="timeout_seconds",
+            domain=TimeoutDomain.NON_NEGATIVE,
+            allow_none=True,
+        )
         parent = self.store.get_run(validate_name(run_id))
         if str(parent.get("status")) not in {"failed", "succeeded"}:
             raise RuntimeError(
                 "resume requires a terminal retained run; current status is `{}`".format(parent.get("status"))
             )
         parent_run_dir = Path(str(parent["run_dir"]))
+        if not parent.get("run_dir") or not parent_run_dir.is_dir():
+            raise RuntimeError(
+                "resume requires retained run files, but run `{}` was removed by its keep policy; "
+                "launch the parent with keep=True".format(parent["id"])
+            )
         parent_manifest_path = self._worker_manifest_path(parent_run_dir)
         if parent_manifest_path is not None:
             parent_manifest_dir = parent_manifest_path.parent
@@ -3268,6 +3967,7 @@ class DaemonRuntime:
             keep=keep,
             parent_run_id=parent["id"],
             resume=resume_payload,
+            report_local_run=report_local_run,
         )
         state = self._stage_object_docker_resume_parent(
             state,
@@ -3306,13 +4006,15 @@ class DaemonRuntime:
         report_local_run: bool,
         error: str,
     ) -> dict[str, Any]:
-        return self._update_local_run(
-            state["id"],
+        run_id = str(state["id"])
+        final_state = self._update_local_run_terminal(
+            run_id,
             report_local_run=report_local_run,
             status="failed",
             finished_at=utc_now(),
             error=error,
         )
+        return final_state if final_state is not None else self.store.get_run(run_id)
 
     def _stage_object_docker_resume_parent(
         self,
@@ -3377,7 +4079,7 @@ class DaemonRuntime:
         )
 
     def _load_optional_pipeline_entrypoint(self, object_record: dict[str, Any], entrypoint: str) -> Pipeline | None:
-        namespace: dict[str, Any] = {}
+        namespace = self._pipeline_import_namespace()
         with NamedTemporaryFile("w", encoding="utf-8", suffix=".yaml") as handle:
             handle.write(str(object_record["yaml"]))
             handle.flush()
@@ -3479,7 +4181,7 @@ class DaemonRuntime:
             stderr_path=str(stderr_path),
         )
 
-        timeout = self._read_timeout(input_path)
+        timeout: float | None = None
         workdir = Path(object_record.get("workdir") or str(run_dir))
         workdir.mkdir(parents=True, exist_ok=True)
         generated_modules_dir = self.store.home / "generated-modules"
@@ -3505,6 +4207,7 @@ class DaemonRuntime:
         )
 
         try:
+            timeout = self._read_timeout(input_path)
             backend = self.runtime_backends.backend_for(object_record)
             environment_status = backend.status_for_object(object_record)
             if environment_status.get("spec_hash"):
@@ -3520,8 +4223,24 @@ class DaemonRuntime:
                 worker_runtime = read_worker_runtime_marker(worker_runtime_marker_path)
                 self._log_worker_runtime(object_record, worker_runtime)
                 env = os.environ.copy()
+                env.pop(DAEMON_API_TOKEN_ENV, None)
+                env.pop(CALLBACK_CAPABILITY_ENV, None)
+                worker_identity_env = getattr(self.docker_pool, "worker_identity_env", None)
+                if callable(worker_identity_env):
+                    env.update(worker_identity_env(run_id))
                 if worker_runtime is not None and worker_runtime.get("worker_runtime") == LEGACY_WORKER_RUNTIME:
                     env["PYTHONPATH"] = self._worker_pythonpath(env)
+                remote_nodes = [
+                    node
+                    for node in object_record.get("pipeline_nodes") or []
+                    if isinstance(node, dict) and node.get("kind") == "remote"
+                ]
+                if remote_nodes:
+                    env[CALLBACK_CAPABILITY_ENV] = self.callback_capabilities.mint(
+                        run_id,
+                        remote_nodes,
+                        ttl_seconds=callback_capability_ttl_seconds(timeout),
+                    )
                 self._log_interpreter_substitution(object_record, environment_record)
                 self._update_local_run(
                     run_id,
@@ -3533,15 +4252,37 @@ class DaemonRuntime:
                     runtime_build_hash=environment_record["spec_hash"],
                     **backend.run_state_fields(),
                 )
-                completed = subprocess.run(
-                    command,
-                    cwd=workdir,
-                    env=env,
-                    text=True,
-                    capture_output=True,
-                    timeout=timeout,
-                    check=False,
-                )
+                try:
+                    try:
+                        completed = run_process_tree(
+                            command,
+                            cwd=workdir,
+                            env=env,
+                            timeout=timeout,
+                        )
+                    except subprocess.TimeoutExpired:
+                        self.callback_capabilities.revoke_run(run_id)
+                        try:
+                            backend.handle_timeout(ctx)
+                        except Exception:
+                            LOGGER.exception(
+                                "runtime backend failed to quarantine timed-out run %s",
+                                run_id,
+                                extra={"spl_event": "run_timeout_quarantine_failed", "run_id": run_id},
+                            )
+                        quarantine_run = getattr(self.docker_pool, "quarantine_run_containers", None)
+                        if callable(quarantine_run):
+                            try:
+                                quarantine_run(run_id)
+                            except Exception:
+                                LOGGER.exception(
+                                    "Docker cleanup failed for timed-out run %s",
+                                    run_id,
+                                    extra={"spl_event": "run_timeout_docker_cleanup_failed", "run_id": run_id},
+                                )
+                        raise
+                finally:
+                    env.pop(CALLBACK_CAPABILITY_ENV, None)
                 stdout_path.write_text(completed.stdout, encoding="utf-8")
                 stderr_path.write_text(completed.stderr, encoding="utf-8")
                 after_run = backend.after_run(ctx)
@@ -3646,6 +4387,9 @@ class DaemonRuntime:
             self._update_local_run_terminal(run_id, report_local_run=report_local_run, **error_changes)
 
     def _worker_manifest_path(self, run_dir: Path) -> Path | None:
+        handoff = run_dir / WORKER_MANIFEST_HANDOFF_FILE
+        if handoff.is_file():
+            return handoff
         state_dir = run_dir / "pipeline-state"
         if not state_dir.exists():
             return None
@@ -3683,12 +4427,22 @@ class DaemonRuntime:
         return payload
 
     def _load_pipeline_entrypoint(self, object_yaml_path: Path, entrypoint: str) -> Pipeline:
-        namespace: dict[str, Any] = {}
+        namespace = self._pipeline_import_namespace()
         spl_import_from_file(object_yaml_path, namespace)
         target = namespace.get(entrypoint)
         if not isinstance(target, Pipeline):
             raise RuntimeError("daemon resume is supported only for registered pipelines")
         return target
+
+    @staticmethod
+    def _pipeline_import_namespace() -> dict[str, Any]:
+        """Seed names omitted by the current ``DNodeRemote`` unparser."""
+
+        from uuid import UUID
+
+        from spl.core.entities.node_remote import NodeRemote
+
+        return {"NodeRemote": NodeRemote, "UUID": UUID}
 
     def _update_local_run(
         self,
@@ -3702,6 +4456,118 @@ class DaemonRuntime:
             self.enqueue_local_run_update(state)
         return state
 
+    def renew_run_delivery(self, run_id: str) -> dict[str, Any]:
+        """Renew the bounded compatibility lease before serving run data."""
+
+        state = self.store.renew_run_delivery(
+            validate_name(run_id),
+            lease_seconds=DEFAULT_RUN_DELIVERY_LEASE_SECONDS,
+        )
+        self._schedule_run_retention(state)
+        return state
+
+    def acknowledge_run_delivery(self, run_id: str) -> dict[str, Any]:
+        """Record client consumption and immediately retry safe cleanup."""
+
+        result = self.store.acknowledge_run_delivery(validate_name(run_id))
+        self._cancel_run_retention_deadline(validate_name(run_id))
+        return result
+
+    def _schedule_run_retention(self, state: dict[str, Any]) -> None:
+        """Schedule expiry cleanup for one transient local delivery lease."""
+
+        stored_effective_status = state.get("retention_effective_status")
+        decision_status = str(state["status"] if stored_effective_status is None else stored_effective_status)
+        if (
+            not state.get("retention_enforced")
+            or not state.get("retention_delivery_required")
+            or state.get("retention_delivery_acked")
+            or m_manifest.retention_disposition(
+                state["keep"],
+                decision_status,
+            )
+            != "remove"
+        ):
+            return
+        raw_deadline = state.get("retention_delivery_expires_at")
+        if not raw_deadline:
+            return
+        try:
+            deadline = datetime.fromisoformat(str(raw_deadline))
+        except ValueError:
+            LOGGER.error(
+                "invalid run delivery lease deadline for %s: %r",
+                state.get("id"),
+                raw_deadline,
+            )
+            return
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
+        run_id = validate_name(str(state["id"]))
+        with self._retention_condition:
+            if self._retention_scheduler_stopped:
+                return
+            self._retention_deadlines[run_id] = deadline.timestamp()
+            if not self._retention_scheduler_started:
+                self._retention_scheduler_started = True
+                self._retention_scheduler.start()
+            self._retention_condition.notify_all()
+
+    def _cancel_run_retention_deadline(self, run_id: str) -> None:
+        with self._retention_condition:
+            self._retention_deadlines.pop(run_id, None)
+            self._retention_condition.notify_all()
+
+    def _schedule_run_retention_retry(self, run_id: str) -> None:
+        """Retry a transient filesystem cleanup failure without a busy loop."""
+
+        with self._retention_condition:
+            if self._retention_scheduler_stopped:
+                return
+            self._retention_deadlines[run_id] = time.time() + RUN_RETENTION_CLEANUP_RETRY_SECONDS
+            if not self._retention_scheduler_started:
+                self._retention_scheduler_started = True
+                self._retention_scheduler.start()
+            self._retention_condition.notify_all()
+
+    def _run_retention_scheduler(self) -> None:
+        """Enforce all delivery deadlines from one bounded scheduler thread."""
+
+        while True:
+            due: list[str] = []
+            with self._retention_condition:
+                while not self._retention_scheduler_stopped:
+                    if not self._retention_deadlines:
+                        self._retention_condition.wait()
+                        continue
+                    now = time.time()
+                    next_deadline = min(self._retention_deadlines.values())
+                    delay = next_deadline - now
+                    if delay > 0:
+                        self._retention_condition.wait(timeout=delay)
+                        continue
+                    due = [run_id for run_id, deadline in self._retention_deadlines.items() if deadline <= now]
+                    for run_id in due:
+                        self._retention_deadlines.pop(run_id, None)
+                    break
+                else:
+                    return
+
+            for run_id in due:
+                try:
+                    outcome = self.store.enforce_run_retention(run_id)
+                    if outcome.get("reason") == "consumer-delivery-pending":
+                        self._schedule_run_retention(self.store.get_run(run_id))
+                except (KeyError, OSError, RuntimeError, ValueError) as exc:
+                    LOGGER.error(
+                        "run retention scheduler skipped %s: %s",
+                        run_id,
+                        exc,
+                        extra={"spl_event": "run_retention_cleanup_failed", "run_id": run_id},
+                    )
+                    if isinstance(exc, OSError):
+                        self._schedule_run_retention_retry(run_id)
+
     def _update_local_run_terminal(
         self,
         run_id: str,
@@ -3710,16 +4576,85 @@ class DaemonRuntime:
         **changes: Any,
     ) -> dict[str, Any] | None:
         try:
-            return self._update_local_run(
+            self._update_local_run(
                 run_id,
                 report_local_run=report_local_run,
                 **changes,
             )
+            if report_local_run:
+                sync_state = self.store.sync_events.run_sync_state(run_id)
+                if sync_state["terminal_queued"]:
+                    self.store.runs.mark_retention_terminal_queued(run_id, sync_required=True)
+                elif self.store.current_server_connection_credentials() is None:
+                    self.store.runs.mark_retention_terminal_queued(run_id, sync_required=False)
+            else:
+                self.store.runs.set_retention_sync_required(run_id, required=True)
+            outcome = self.store.enforce_run_retention(run_id)
+            if outcome.get("reason") == "consumer-delivery-pending":
+                self._schedule_run_retention(self.store.get_run(run_id))
+            return self.store.get_run(run_id)
         except RuntimeError as exc:
             if str(exc) != "store is closed":
                 raise
             LOGGER.warning("run state write skipped: store closed during shutdown")
             return None
+        finally:
+            self.callback_capabilities.revoke_run(run_id)
+
+    def sweep_run_retention(self) -> dict[str, Any]:
+        """Recover and enforce safe terminal run cleanup after a restart or sync."""
+
+        results: list[dict[str, Any]] = []
+        for state in self.store.list_runs():
+            if not state.get("retention_enforced"):
+                continue
+            stored_effective_status = state.get("retention_effective_status")
+            decision_status = str(state["status"] if stored_effective_status is None else stored_effective_status)
+            if (
+                m_manifest.retention_disposition(
+                    state["keep"],
+                    decision_status,
+                )
+                != "remove"
+            ):
+                continue
+            try:
+                if not state.get("retention_terminal_queued"):
+                    sync_state = self.store.sync_events.run_sync_state(str(state["id"]))
+                    if sync_state["terminal_queued"]:
+                        self.store.runs.mark_retention_terminal_queued(
+                            str(state["id"]),
+                            sync_required=True,
+                        )
+                    elif state.get("retention_report_mode") == "local":
+                        if self.store.current_server_connection_credentials() is None:
+                            self.store.runs.mark_retention_terminal_queued(
+                                str(state["id"]),
+                                sync_required=False,
+                            )
+                        else:
+                            self.enqueue_local_run_update(state)
+                            recovered = self.store.sync_events.run_sync_state(str(state["id"]))
+                            if recovered["terminal_queued"]:
+                                self.store.runs.mark_retention_terminal_queued(
+                                    str(state["id"]),
+                                    sync_required=True,
+                                )
+                outcome = self.store.enforce_run_retention(str(state["id"]))
+                results.append(outcome)
+                if outcome.get("reason") == "consumer-delivery-pending":
+                    self._schedule_run_retention(self.store.get_run(str(state["id"])))
+            except (OSError, RuntimeError, ValueError) as exc:
+                LOGGER.error(
+                    "run retention sweep skipped %s: %s",
+                    state.get("id"),
+                    exc,
+                    extra={"spl_event": "run_retention_cleanup_failed", "run_id": state.get("id")},
+                )
+                if isinstance(exc, OSError):
+                    self._schedule_run_retention_retry(validate_name(str(state["id"])))
+                results.append({"id": state.get("id"), "removed": False, "reason": repr(exc)})
+        return {"count": len(results), "runs": results}
 
     def _log_interpreter_substitution(
         self,
@@ -3743,23 +4678,24 @@ class DaemonRuntime:
         }
         LOGGER.info(
             "interpreter_substitution %s",
-            json.dumps(payload, sort_keys=True),
+            m_json_contract.dumps(payload, ensure_ascii=True, sort_keys=True, separators=None),
             extra={
                 "spl_event": "interpreter_substitution",
                 "interpreter_substitution": payload,
             },
         )
 
-    def enqueue_local_run_update(self, state: dict[str, Any]) -> None:
+    def enqueue_local_run_update(self, state: dict[str, Any]) -> dict[str, Any] | None:
         """Queue a local-only run status for central-server observability."""
 
         if self.store.current_server_connection_credentials() is None:
-            return
-        self.store.enqueue_sync_event(
+            return None
+        event = self.store.enqueue_sync_event(
             "local_run_update",
             {"run": self._local_run_sync_payload(state)},
         )
         self._kick_server_sync()
+        return event
 
     def _kick_server_sync(self, connection_id: str | None = None) -> None:
         credentials = (
@@ -3799,36 +4735,33 @@ class DaemonRuntime:
 
     def _local_run_sync_payload(self, state: dict[str, Any]) -> dict[str, Any]:
         object_label = self._local_run_object_label(state)
-        return {
-            "id": state["id"],
-            "object_name": object_label["display_name"],
-            "object_display_name": object_label["display_name"],
-            "local_object_name": object_label["local_name"],
-            "object_id": state.get("object_id"),
-            "object_version_id": state.get("object_version_id"),
-            "object_version": state.get("object_version"),
-            "owner_id": object_label.get("owner_id"),
-            "remote_object_id": object_label.get("remote_object_id"),
-            "remote_version_id": object_label.get("remote_version_id"),
-            "entrypoint": state.get("entrypoint"),
-            "env": state.get("env"),
-            "runtime_backend": state.get("runtime_backend"),
-            "worker_runtime": state.get("worker_runtime"),
-            "worker_runtime_reason": state.get("worker_runtime_reason"),
-            "runtime_build_hash": state.get("runtime_build_hash"),
-            "resolved_runtime": state.get("resolved_runtime"),
-            "interpreter_substitution": state.get("interpreter_substitution"),
-            "image_tag": state.get("image_tag"),
-            "container_id": state.get("container_id"),
-            "status": state.get("status"),
-            "input": state.get("input") or {},
-            "result": state.get("result"),
-            "error": state.get("error"),
-            "started_at": state.get("started_at"),
-            "finished_at": state.get("finished_at"),
-            "created_at": state.get("created_at"),
-            "artifacts": self._local_run_text_artifacts(state),
-        }
+        full_artifacts: list[dict[str, Any]] | None = None
+        preflight_omissions: tuple[str, ...] = ()
+        if self.telemetry_policy.level == "full":
+            full_artifacts, preflight_omissions = self._collect_local_run_text_artifacts(state)
+        artifact_count, artifact_scan_truncated, artifact_directory_available = count_local_artifacts_bounded(state)
+        artifact_count_truncated = artifact_scan_truncated or not artifact_directory_available
+        if artifact_scan_truncated:
+            preflight_omissions = tuple(dict.fromkeys((*preflight_omissions, "artifact_scan_limit")))
+        if not artifact_directory_available:
+            preflight_omissions = tuple(dict.fromkeys((*preflight_omissions, "artifact_directory_unavailable")))
+        return self.telemetry_policy.build_local_run_payload(
+            state,
+            object_label,
+            full_artifacts=full_artifacts,
+            artifact_count=artifact_count,
+            artifact_count_truncated=artifact_count_truncated,
+            preflight_omissions=preflight_omissions,
+        )
+
+    @staticmethod
+    def _local_result_present(state: dict[str, Any]) -> bool:
+        """Return explicit result presence, with one-release legacy fallback."""
+
+        result_present = state.get("result_present")
+        if isinstance(result_present, bool):
+            return result_present
+        return state.get("result") is not None
 
     def _local_run_object_label(self, state: dict[str, Any]) -> dict[str, Any]:
         local_name = state.get("object") or "local_object"
@@ -3856,72 +4789,275 @@ class DaemonRuntime:
         return label
 
     def _local_run_text_artifacts(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        artifacts, _ = self._collect_local_run_text_artifacts(state)
+        return artifacts
+
+    def _collect_local_run_text_artifacts(
+        self,
+        state: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], tuple[str, ...]]:
         artifacts: list[dict[str, Any]] = []
-        if state.get("result") is not None:
-            artifacts.append(
-                self._text_artifact_payload(
+        omissions: list[str] = []
+        remaining_bytes = LOCAL_RUN_TEXT_ARTIFACT_COLLECTION_MAX_BYTES
+
+        def omit(reason: str) -> None:
+            if reason not in omissions:
+                omissions.append(reason)
+
+        def add_text(name: str, value: Any, *, kind: str, content_type: str) -> None:
+            nonlocal remaining_bytes
+            if not isinstance(value, str) or not value:
+                return
+            if len(artifacts) >= LOCAL_RUN_TEXT_ARTIFACT_MAX_COUNT or remaining_bytes <= 0:
+                omit("artifact_collection_limit")
+                return
+            payload = self._bounded_text_artifact_payload(
+                name,
+                value,
+                kind=kind,
+                content_type=content_type,
+                max_content_bytes=min(
+                    LOCAL_RUN_TEXT_ARTIFACT_MAX_BYTES,
+                    remaining_bytes,
+                ),
+            )
+            artifacts.append(payload)
+            remaining_bytes -= len(payload["content_text"].encode("utf-8"))
+            if payload["truncated"]:
+                omit("artifact_content_limit")
+
+        if self._local_result_present(state):
+            if state.get("result_unreadable") is True and isinstance(state.get("result_json"), str):
+                add_text(
                     "result.json",
-                    json.dumps(
-                        state["result"],
-                        ensure_ascii=False,
-                        indent=2,
-                        sort_keys=True,
-                    ),
+                    state["result_json"],
                     kind="result",
                     content_type="application/json",
                 )
-            )
-        if state.get("stdout"):
-            artifacts.append(
-                self._text_artifact_payload(
-                    "stdout.txt",
-                    state["stdout"],
-                    kind="stdout",
-                    content_type="text/plain; charset=utf-8",
+            elif len(artifacts) >= LOCAL_RUN_TEXT_ARTIFACT_MAX_COUNT or remaining_bytes <= 0:
+                omit("artifact_collection_limit")
+            else:
+                result_text = self._bounded_json_text(
+                    state.get("result"),
+                    min(LOCAL_RUN_TEXT_ARTIFACT_MAX_BYTES, remaining_bytes),
                 )
+                if result_text is None:
+                    # The top-level full-telemetry result remains independently
+                    # gated. Avoid materializing an oversized duplicate artifact.
+                    omit("result_artifact_limit")
+                else:
+                    payload = self._text_artifact_payload(
+                        "result.json",
+                        result_text,
+                        kind="result",
+                        content_type="application/json",
+                    )
+                    artifacts.append(payload)
+                    remaining_bytes -= len(result_text.encode("utf-8"))
+        if state.get("stdout"):
+            add_text(
+                "stdout.txt",
+                state["stdout"],
+                kind="stdout",
+                content_type="text/plain; charset=utf-8",
             )
         if state.get("stderr"):
-            artifacts.append(
-                self._text_artifact_payload(
-                    "stderr.txt",
-                    state["stderr"],
-                    kind="stderr",
-                    content_type="text/plain; charset=utf-8",
-                )
+            add_text(
+                "stderr.txt",
+                state["stderr"],
+                kind="stderr",
+                content_type="text/plain; charset=utf-8",
             )
 
-        artifacts_dir = Path(state["artifacts_dir"])
-        if artifacts_dir.exists():
-            for path in sorted(artifacts_dir.iterdir()):
-                if not path.is_file() or path.suffix.lower() not in LOCAL_RUN_TEXT_ARTIFACT_EXTENSIONS:
-                    continue
-                payload = self._file_text_artifact_payload(path)
-                if payload is not None:
-                    artifacts.append(payload)
-        return artifacts
+        raw_artifacts_dir = state.get("artifacts_dir")
+        if not isinstance(raw_artifacts_dir, str) or not raw_artifacts_dir:
+            return artifacts, tuple(omissions)
+        artifacts_dir = Path(raw_artifacts_dir)
+        directory = ArtifactDirectory.open(artifacts_dir)
+        if directory is None:
+            omit("artifact_directory_unavailable")
+            return artifacts, tuple(omissions)
+        directory_artifact_start = len(artifacts)
+        directory_remaining_start = remaining_bytes
+        with directory:
+            try:
+                for index, entry in enumerate(directory.iter_entries()):
+                    if index >= LOCAL_ARTIFACT_SCAN_MAX_ENTRIES:
+                        omit("artifact_scan_limit")
+                        break
+                    entry_path = Path(entry.name)
+                    if entry_path.suffix.lower() not in LOCAL_RUN_TEXT_ARTIFACT_EXTENSIONS:
+                        continue
+                    if not directory.entry_is_regular(entry):
+                        omit("unsafe_artifact_entry")
+                        continue
+                    if len(artifacts) >= LOCAL_RUN_TEXT_ARTIFACT_MAX_COUNT or remaining_bytes <= 0:
+                        omit("artifact_collection_limit")
+                        break
+                    file_payload = self._file_text_artifact_payload(
+                        artifacts_dir / entry.name,
+                        directory=directory,
+                        max_content_bytes=min(
+                            LOCAL_RUN_TEXT_ARTIFACT_MAX_BYTES,
+                            remaining_bytes,
+                        ),
+                    )
+                    if file_payload is None:
+                        omit("artifact_read_error")
+                        continue
+                    artifacts.append(file_payload)
+                    remaining_bytes -= len(file_payload["content_text"].encode("utf-8"))
+                    if file_payload["truncated"]:
+                        omit("artifact_content_limit")
+            except (OSError, TypeError, NotImplementedError):
+                omit("artifact_directory_unavailable")
+            if not directory.verify_root():
+                del artifacts[directory_artifact_start:]
+                remaining_bytes = directory_remaining_start
+                omit("artifact_directory_unavailable")
+        return artifacts, tuple(omissions)
 
-    def _file_text_artifact_payload(self, path: Path) -> dict[str, Any] | None:
-        try:
-            data = path.read_bytes()
-        except OSError:
+    def _file_text_artifact_payload(
+        self,
+        path: Path,
+        *,
+        directory: ArtifactDirectory | None = None,
+        max_content_bytes: int = LOCAL_RUN_TEXT_ARTIFACT_MAX_BYTES,
+    ) -> dict[str, Any] | None:
+        if max_content_bytes < 0:
+            raise ValueError("max_content_bytes must be nonnegative")
+        owned_directory: ArtifactDirectory | None = None
+        if directory is None:
+            owned_directory = ArtifactDirectory.open(path.parent)
+            directory = owned_directory
+        if directory is None:
             return None
+        try:
+            file_read = directory.read_regular(path.name, max_content_bytes)
+        finally:
+            if owned_directory is not None:
+                owned_directory.close()
+        if file_read is None:
+            return None
+        data = file_read.data
         content_type = self._artifact_content_type(path)
-        truncated = len(data) > LOCAL_RUN_TEXT_ARTIFACT_MAX_BYTES
-        text = data[:LOCAL_RUN_TEXT_ARTIFACT_MAX_BYTES].decode(
+        size = file_read.size
+        truncated = size > max_content_bytes or len(data) > max_content_bytes
+        decoded = data[:max_content_bytes].decode(
             "utf-8",
             errors="replace",
         )
+        text = self._utf8_prefix(decoded, max_content_bytes)
+        truncated = truncated or text != decoded
         try:
             return self._text_artifact_payload(
                 f"artifact.{path.name}",
                 text,
                 kind="artifact",
                 content_type=content_type,
-                size=len(data),
+                size=size,
                 truncated=truncated,
             )
         except ValueError:
             return None
+
+    def _bounded_text_artifact_payload(
+        self,
+        name: str,
+        content_text: str,
+        *,
+        kind: str,
+        content_type: str,
+        max_content_bytes: int,
+    ) -> dict[str, Any]:
+        bounded, size, truncated = self._bounded_utf8_artifact_text(
+            content_text,
+            max_content_bytes,
+        )
+        return self._text_artifact_payload(
+            name,
+            bounded,
+            kind=kind,
+            content_type=content_type,
+            size=size,
+            truncated=truncated,
+        )
+
+    @staticmethod
+    def _bounded_json_text(value: Any, max_bytes: int) -> str | None:
+        """Serialize a JSON value only when it fits, without building an oversized copy."""
+
+        try:
+            if not m_json_contract.compact_json_fits(value, max_bytes):
+                return None
+            return m_json_contract.dumps(value, ensure_ascii=False, sort_keys=False)
+        except (RecursionError, ValueError):
+            return None
+
+    @staticmethod
+    def _bounded_utf8_artifact_text(
+        value: str,
+        max_bytes: int,
+    ) -> tuple[str, int, bool]:
+        """Return bounded text, its exact-or-lower-bound size, and size honesty.
+
+        A value that fits is measured exactly. Once the byte cap is crossed,
+        the returned size is ``max_bytes + 1``: a truthful lower bound that
+        avoids traversing an arbitrarily large tail. The boolean explicitly
+        marks that lower-bound measurement.
+        """
+
+        if max_bytes < 0:
+            raise ValueError("max_bytes must be nonnegative")
+        total_characters = len(value)
+        if total_characters == 0:
+            return "", 0, False
+        chunks: list[str] = []
+        remaining = max_bytes
+        consumed_characters = 0
+        while consumed_characters < total_characters:
+            if remaining == 0:
+                return "".join(chunks), max_bytes + 1, True
+            # A Unicode code point occupies at least one UTF-8 byte, so looking
+            # at remaining + 1 characters is sufficient to prove overflow.
+            character_count = min(8192, remaining + 1)
+            chunk = value[
+                consumed_characters : min(
+                    total_characters,
+                    consumed_characters + character_count,
+                )
+            ]
+            try:
+                encoded = chunk.encode("utf-8")
+            except UnicodeEncodeError:
+                chunk = "".join("\ufffd" if 0xD800 <= ord(character) <= 0xDFFF else character for character in chunk)
+                encoded = chunk.encode("utf-8")
+            if len(encoded) > remaining:
+                chunks.append(encoded[:remaining].decode("utf-8", errors="ignore"))
+                return "".join(chunks), max_bytes + 1, True
+            chunks.append(chunk)
+            consumed_characters += len(chunk)
+            remaining -= len(encoded)
+        return "".join(chunks), max_bytes - remaining, False
+
+    @staticmethod
+    def _utf8_prefix(value: str, max_bytes: int) -> str:
+        if max_bytes <= 0:
+            return ""
+        chunks: list[str] = []
+        remaining = max_bytes
+        for offset in range(0, len(value), 8192):
+            chunk = value[offset : offset + 8192]
+            encoded = chunk.encode("utf-8")
+            if len(encoded) <= remaining:
+                chunks.append(chunk)
+                remaining -= len(encoded)
+                if remaining == 0:
+                    break
+                continue
+            chunks.append(encoded[:remaining].decode("utf-8", errors="ignore"))
+            break
+        return "".join(chunks)
 
     def _text_artifact_payload(
         self,
@@ -3944,8 +5080,10 @@ class DaemonRuntime:
         }
         if content_type == "application/json" and not truncated:
             try:
-                payload["content_json"] = json.loads(content_text)
-            except json.JSONDecodeError:
+                content_json = json.loads(content_text)
+                m_json_contract.validate_json_value(content_json)
+                payload["content_json"] = content_json
+            except (json.JSONDecodeError, ValueError):
                 pass
         return payload
 
@@ -3989,7 +5127,7 @@ class DaemonRuntime:
         }
         LOGGER.info(
             "worker_runtime %s",
-            json.dumps(payload, sort_keys=True),
+            m_json_contract.dumps(payload, ensure_ascii=True, sort_keys=True, separators=None),
             extra={
                 "spl_event": "worker_runtime",
                 "worker_runtime": payload,
@@ -4001,6 +5139,13 @@ class DaemonRuntime:
             if self._shutdown_complete:
                 return
             self._shutdown_complete = True
+        self.callback_capabilities.clear()
+        with self._retention_condition:
+            self._retention_scheduler_stopped = True
+            self._retention_deadlines.clear()
+            self._retention_condition.notify_all()
+        if self._retention_scheduler.is_alive():
+            self._retention_scheduler.join(timeout=5.0)
         self.heartbeat_service.shutdown()
         self._join_run_threads(timeout_seconds=30.0)
         self.docker_pool.shutdown()
@@ -4028,10 +5173,12 @@ class DaemonRuntime:
         """Read an optional run timeout from the stored input payload."""
 
         payload = json.loads(input_path.read_text(encoding="utf-8"))
-        timeout = payload.get("timeout_seconds")
-        if timeout is None:
-            return None
-        return float(timeout)
+        return validate_timeout_seconds(
+            payload.get("timeout_seconds"),
+            name="timeout_seconds",
+            domain=TimeoutDomain.NON_NEGATIVE,
+            allow_none=True,
+        )
 
     def _subprocess_text(self, value: str | bytes | None) -> str:
         """Normalize TimeoutExpired stdout/stderr values."""
@@ -4065,9 +5212,12 @@ def create_app(
     env_build_timeout_seconds: float | None = None,
     env_stale_lock_seconds: float | None = None,
     daemon_base_url: str = "http://127.0.0.1:8765",
+    docker_pool_enabled: bool = False,
     docker_pool_size: int = 0,
     docker_idle_timeout_seconds: float = 300.0,
     docker_prewarm: bool = False,
+    telemetry: TelemetryLevel = DEFAULT_TELEMETRY_LEVEL,
+    telemetry_sensitive_fields: tuple[str, ...] | list[str] = (),
     api_token: str | None = None,
     environment_manager: EnvironmentManagerProtocol | None = None,
     docker_environment_manager: DockerEnvironmentManagerProtocol | None = None,
@@ -4075,6 +5225,8 @@ def create_app(
     runtime_backends: RuntimeBackendRegistry | None = None,
     sync_visibility: SyncVisibilityProtocol | None = None,
     server_client_factory: ServerClientFactoryProtocol = _default_server_client_factory,
+    daemon_identity: DaemonInstanceIdentity | None = None,
+    daemon_home_lock: DaemonHomeLock | None = None,
 ) -> Any:
     """Create a Quart application bound to one registry store."""
 
@@ -4088,15 +5240,20 @@ def create_app(
         env_build_timeout_seconds=env_build_timeout_seconds,
         env_stale_lock_seconds=env_stale_lock_seconds,
         daemon_base_url=daemon_base_url,
+        docker_pool_enabled=docker_pool_enabled,
         docker_pool_size=docker_pool_size,
         docker_idle_timeout_seconds=docker_idle_timeout_seconds,
         docker_prewarm=docker_prewarm,
+        telemetry=telemetry,
+        telemetry_sensitive_fields=telemetry_sensitive_fields,
         environment_manager=environment_manager,
         docker_environment_manager=docker_environment_manager,
         docker_pool=docker_pool,
         runtime_backends=runtime_backends,
         sync_visibility=sync_visibility,
         server_client_factory=server_client_factory,
+        daemon_identity=daemon_identity,
+        daemon_home_lock=daemon_home_lock,
     )
     app.runtime = runtime
 
@@ -4105,6 +5262,7 @@ def create_app(
         response_cls=Response,
         request=request,
         local_api_token=local_api_token,
+        callback_capabilities=runtime.callback_capabilities,
     )
     app.before_request(context.require_local_api_auth)
 
@@ -4192,9 +5350,12 @@ def serve(
     auto_build_envs: bool = True,
     env_build_timeout_seconds: float | None = None,
     env_stale_lock_seconds: float | None = None,
+    docker_pool_enabled: bool = False,
     docker_pool_size: int = 0,
     docker_idle_timeout_seconds: float = 300.0,
     docker_prewarm: bool = False,
+    telemetry: TelemetryLevel = DEFAULT_TELEMETRY_LEVEL,
+    telemetry_sensitive_fields: tuple[str, ...] | list[str] = (),
     environment_manager: EnvironmentManagerProtocol | None = None,
     docker_environment_manager: DockerEnvironmentManagerProtocol | None = None,
     docker_pool: DockerPoolRunnerProtocol | None = None,
@@ -4204,10 +5365,13 @@ def serve(
 ) -> None:
     """Run the local daemon until interrupted."""
 
-    store = RegistryStore(home)
-    base_url: str | None = None
+    home_lock = DaemonHomeLock(home)
+    daemon_identity = home_lock.acquire()
+    store: RegistryStore | None = None
+    published_base_url: str | None = None
     app: Any | None = None
     try:
+        store = RegistryStore(home_lock.home)
         selected_port = select_daemon_port(
             host,
             port,
@@ -4216,6 +5380,29 @@ def serve(
         )
         client_host = _client_host_for_bind_host(host)
         api_token = generate_daemon_api_token()
+        base_url = daemon_url(client_host, selected_port)
+        app = create_app(
+            store,
+            auto_build_envs=auto_build_envs,
+            env_build_timeout_seconds=env_build_timeout_seconds,
+            env_stale_lock_seconds=env_stale_lock_seconds,
+            daemon_base_url=base_url,
+            docker_pool_enabled=docker_pool_enabled,
+            docker_pool_size=docker_pool_size,
+            docker_idle_timeout_seconds=docker_idle_timeout_seconds,
+            docker_prewarm=docker_prewarm,
+            telemetry=telemetry,
+            telemetry_sensitive_fields=telemetry_sensitive_fields,
+            api_token=api_token,
+            environment_manager=environment_manager,
+            docker_environment_manager=docker_environment_manager,
+            docker_pool=docker_pool,
+            runtime_backends=runtime_backends,
+            sync_visibility=sync_visibility,
+            server_client_factory=server_client_factory,
+            daemon_identity=daemon_identity,
+            daemon_home_lock=home_lock,
+        )
         endpoint = write_daemon_endpoint(
             store.home,
             bind_host=host,
@@ -4224,38 +5411,29 @@ def serve(
             api_token=api_token,
             updated_at=utc_now(),
         )
-        base_url = str(endpoint["base_url"])
-        app = create_app(
-            store,
-            auto_build_envs=auto_build_envs,
-            env_build_timeout_seconds=env_build_timeout_seconds,
-            env_stale_lock_seconds=env_stale_lock_seconds,
-            daemon_base_url=base_url,
-            docker_pool_size=docker_pool_size,
-            docker_idle_timeout_seconds=docker_idle_timeout_seconds,
-            docker_prewarm=docker_prewarm,
-            api_token=api_token,
-            environment_manager=environment_manager,
-            docker_environment_manager=docker_environment_manager,
-            docker_pool=docker_pool,
-            runtime_backends=runtime_backends,
-            sync_visibility=sync_visibility,
-            server_client_factory=server_client_factory,
-        )
+        published_base_url = str(endpoint["base_url"])
         if selected_port != port:
             print(f"SPL daemon port {port} is busy; using {selected_port} instead")
         print(f"SPL daemon listening on {daemon_url(host, selected_port)}")
-        print(f"SPL daemon client endpoint: {base_url}")
+        print(f"SPL daemon client endpoint: {published_base_url}")
         print(f"SPL daemon home: {store.home}")
         app.run(host=host, port=selected_port)
     except KeyboardInterrupt:
         print("\nSPL daemon stopped")
     finally:
-        if base_url is not None:
-            clear_daemon_endpoint(store.home, base_url=base_url)
-        if app is not None:
+        try:
+            if published_base_url is not None:
+                clear_daemon_endpoint(home_lock.home, base_url=published_base_url)
+        finally:
             try:
-                app.runtime.shutdown()
-            except Exception:
-                pass
-        store.close()
+                if app is not None:
+                    try:
+                        app.runtime.shutdown()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    if store is not None:
+                        store.close()
+                finally:
+                    home_lock.release()

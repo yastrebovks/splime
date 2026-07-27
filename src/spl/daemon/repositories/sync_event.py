@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+from spl.core.manifest import TERMINAL_RUN_STATUSES
 from spl.daemon.storage_base import (
     DEFAULT_OBJECT_OWNER_ID,
     RepositoryBase,
@@ -14,6 +15,12 @@ from spl.daemon.storage_base import (
     json_loads,
     utc_now,
     validate_name,
+)
+from spl.daemon.telemetry import (
+    SYNC_EVENT_MAX_BYTES,
+    TELEMETRY_PAYLOAD_TTL_SECONDS,
+    event_wire_size,
+    local_run_proof,
 )
 
 
@@ -26,15 +33,39 @@ class SyncEventRepository(RepositoryBase):
         kind = validate_name(kind)
         event_id = uuid4().hex
         now = utc_now()
+        wire_bytes = event_wire_size(event_id, kind, payload)
+        if wire_bytes > SYNC_EVENT_MAX_BYTES:
+            raise ValueError(
+                "sync event exceeds the {} byte limit ({} bytes); reduce the payload before retrying".format(
+                    SYNC_EVENT_MAX_BYTES,
+                    wire_bytes,
+                )
+            )
+        proof = local_run_proof(kind, payload)
+        local_run_id = self._existing_local_run_id(proof[0] if proof is not None else None)
+        payload_expires_at = (
+            (datetime.now(UTC) + timedelta(seconds=TELEMETRY_PAYLOAD_TTL_SECONDS)).isoformat()
+            if local_run_id is not None
+            else None
+        )
         with self._lock, self._conn:
             self._conn.execute(
                 """
                 INSERT INTO sync_events(
-                    id, kind, payload_json, status, attempts, created_at, updated_at
+                    id, kind, payload_json, status, attempts, created_at, updated_at,
+                    local_run_id, payload_expires_at
                 )
-                VALUES(?, ?, ?, 'pending', 0, ?, ?)
+                VALUES(?, ?, ?, 'pending', 0, ?, ?, ?, ?)
                 """,
-                (event_id, kind, json_dumps(payload), now, now),
+                (
+                    event_id,
+                    kind,
+                    json_dumps(payload),
+                    now,
+                    now,
+                    local_run_id,
+                    payload_expires_at,
+                ),
             )
         return self.get_sync_event(event_id)
 
@@ -55,6 +86,7 @@ class SyncEventRepository(RepositoryBase):
         *,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
+        self.expire_sync_event_payloads()
         if offset < 0:
             raise ValueError("offset must be non-negative")
         limit_clause = "" if limit is None else "LIMIT ?"
@@ -128,13 +160,24 @@ class SyncEventRepository(RepositoryBase):
         event_id = validate_name(event_id)
         now = utc_now()
         with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT kind, payload_json FROM sync_events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"sync event is not found: {event_id}")
+            kind = str(row["kind"])
+            payload = json_loads(row["payload_json"], {})
+            compact = self._compact_sent_run_payload(kind, payload)
+            stored_payload = json_dumps(compact if compact is not None else payload)
             cursor = self._conn.execute(
                 """
                 UPDATE sync_events
-                SET status = 'sent', sent_at = ?, updated_at = ?, error = NULL
+                SET status = 'sent', sent_at = ?, updated_at = ?, error = NULL,
+                    payload_json = ?
                 WHERE id = ?
                 """,
-                (now, now, event_id),
+                (now, now, stored_payload, event_id),
             )
         if cursor.rowcount == 0:
             raise KeyError(f"sync event is not found: {event_id}")
@@ -166,6 +209,76 @@ class SyncEventRepository(RepositoryBase):
             raise KeyError(f"sync event is not found: {event_id}")
         return self.get_sync_event(event_id)
 
+    def run_sync_state(self, local_run_id: str) -> dict[str, Any]:
+        """Return durable terminal proof and unsent-event state for one local run."""
+
+        local_run_id = validate_name(local_run_id)
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, kind, payload_json, status
+                FROM sync_events
+                WHERE kind IN ('local_run_update', 'run_update')
+                ORDER BY created_at, id
+                """
+            ).fetchall()
+        matched = []
+        terminal_queued = False
+        for row in rows:
+            proof = local_run_proof(str(row["kind"]), json_loads(row["payload_json"], {}))
+            if proof is None or proof[0] != local_run_id:
+                continue
+            matched.append(row)
+            terminal_queued = terminal_queued or proof[1] in TERMINAL_RUN_STATUSES
+        return {
+            "terminal_queued": terminal_queued,
+            "unsent": any(str(row["status"]) != "sent" for row in matched),
+            "event_ids": [str(row["id"]) for row in matched],
+        }
+
+    def scrub_sent_run_events(self, local_run_id: str) -> int:
+        """Replace sent run payloads with minimal local id/status delivery proof."""
+
+        local_run_id = validate_name(local_run_id)
+        now = utc_now()
+        updates: list[tuple[str, str, str]] = []
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                """
+                SELECT id, kind, payload_json
+                FROM sync_events
+                WHERE status = 'sent' AND kind IN ('local_run_update', 'run_update')
+                ORDER BY created_at, id
+                """
+            ).fetchall()
+            for row in rows:
+                kind = str(row["kind"])
+                payload = json_loads(row["payload_json"], {})
+                proof = local_run_proof(kind, payload)
+                if proof is None or proof[0] != local_run_id:
+                    continue
+                local_id, local_status = proof
+                compact: dict[str, Any]
+                if kind == "local_run_update":
+                    compact = {"run": {"id": local_id, "status": local_status}}
+                else:
+                    compact = {
+                        "run_id": payload.get("run_id"),
+                        "status": payload.get("status"),
+                        "payload": {"local_run": {"id": local_id, "status": local_status}},
+                    }
+                updates.append((json_dumps(compact), now, str(row["id"])))
+            if updates:
+                self._conn.executemany(
+                    "UPDATE sync_events SET payload_json = ?, updated_at = ? WHERE id = ?",
+                    updates,
+                )
+        return len(updates)
+
+    @staticmethod
+    def _local_run_proof(kind: str, payload: Any) -> tuple[str, str] | None:
+        return local_run_proof(kind, payload)
+
     def _sync_event_row(self, row: sqlite3.Row) -> dict[str, Any]:
         status = row["status"]
         attempts = int(row["attempts"] or 0)
@@ -180,11 +293,115 @@ class SyncEventRepository(RepositoryBase):
             "updated_at": row["updated_at"],
             "sent_at": row["sent_at"],
             "error": row["error"],
+            "local_run_id": row["local_run_id"],
+            "payload_expires_at": row["payload_expires_at"],
             "retry": {
                 "will_retry": will_retry,
                 "next_attempt": attempts + 1 if will_retry else None,
                 "last_error": row["error"],
             },
+        }
+
+    def list_run_sync_events(self) -> list[dict[str, Any]]:
+        """Return run-related events for startup privacy normalization."""
+
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM sync_events
+                WHERE kind IN ('local_run_update', 'run_update')
+                ORDER BY created_at, id
+                """
+            ).fetchall()
+        return [self._sync_event_row(row) for row in rows]
+
+    def rewrite_run_sync_event(
+        self,
+        event_id: str,
+        payload: dict[str, Any],
+        *,
+        local_run_id: str | None,
+    ) -> dict[str, Any]:
+        """Replace one legacy run payload with its current privacy projection."""
+
+        event_id = validate_name(event_id)
+        normalized_run_id = self._existing_local_run_id(local_run_id)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT kind, created_at, payload_expires_at FROM sync_events WHERE id = ?",
+                (event_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"sync event is not found: {event_id}")
+        wire_bytes = event_wire_size(event_id, str(row["kind"]), payload)
+        if wire_bytes > SYNC_EVENT_MAX_BYTES:
+            raise ValueError(
+                "rewritten sync event exceeds the {} byte limit ({} bytes)".format(
+                    SYNC_EVENT_MAX_BYTES,
+                    wire_bytes,
+                )
+            )
+        expires_at = None
+        if normalized_run_id is not None:
+            expires_at = row["payload_expires_at"]
+            if expires_at is None:
+                try:
+                    created_at = datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))
+                except ValueError:
+                    created_at = datetime.now(UTC)
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=UTC)
+                expires_at = (created_at + timedelta(seconds=TELEMETRY_PAYLOAD_TTL_SECONDS)).isoformat()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                UPDATE sync_events
+                SET payload_json = ?, local_run_id = ?, payload_expires_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (json_dumps(payload), normalized_run_id, expires_at, utc_now(), event_id),
+            )
+        return self.get_sync_event(event_id)
+
+    def expire_sync_event_payloads(self, *, now: datetime | None = None) -> int:
+        """Delete expired telemetry and acknowledged run-delivery payloads."""
+
+        cutoff = (now or datetime.now(UTC)).isoformat()
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                """
+                DELETE FROM sync_events
+                WHERE payload_expires_at IS NOT NULL
+                  AND payload_expires_at <= ?
+                  AND (kind = 'local_run_update' OR status = 'sent')
+                """,
+                (cutoff,),
+            )
+        return int(cursor.rowcount)
+
+    def _existing_local_run_id(self, value: str | None) -> str | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            run_id = validate_name(value)
+        except ValueError:
+            return None
+        with self._lock:
+            row = self._conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone()
+        return run_id if row is not None else None
+
+    @staticmethod
+    def _compact_sent_run_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+        proof = local_run_proof(kind, payload)
+        if proof is None:
+            return None
+        local_id, local_status = proof
+        if kind == "local_run_update":
+            return {"run": {"id": local_id, "status": local_status}}
+        return {
+            "run_id": payload.get("run_id"),
+            "status": payload.get("status"),
+            "payload": {"local_run": {"id": local_id, "status": local_status}},
         }
 
     def sync_event_status_summary(self) -> dict[str, Any]:

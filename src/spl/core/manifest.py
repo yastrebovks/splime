@@ -16,29 +16,25 @@ from typing import Any, Literal, TypeAlias, cast
 
 from spl.core.entities.adapter import JSON_ADAPTER_KEY
 from spl.core.entities.artifact import ArtifactRef
+from spl.core.entities.pipeline import AdapterResolutionSource
 from spl.core.fingerprint import FINGERPRINT_FORMAT_VERSION, inline_value_sha256
+from spl.core.json_contract import dumps as json_dumps
+from spl.core.json_contract import validate_json_value
+from spl.core.redaction import (
+    SENSITIVE_KEY_FRAGMENTS,
+    is_sensitive_key,
+    value_looks_sensitive,
+)
 
 RUN_MANIFEST_SCHEMA_VERSION = 1
 RUN_MANIFEST_FILENAME = "manifest.json"
 DEFAULT_ON_FAILURE_TTL_SECONDS = 7 * 24 * 60 * 60
 TERMINAL_RUN_STATUSES = frozenset({"succeeded", "failed", "cancelled", "interrupted", "stale"})
 ACTIVE_RUN_STATUSES = frozenset({"queued", "starting", "preparing_environment", "running", "fetching_object"})
-SENSITIVE_INLINE_KEY_FRAGMENTS = frozenset(
-    {
-        "password",
-        "passwd",
-        "secret",
-        "token",
-        "credential",
-        "authorization",
-        "api_key",
-        "apikey",
-        "access_key",
-        "private_key",
-    }
-)
+SENSITIVE_INLINE_KEY_FRAGMENTS = SENSITIVE_KEY_FRAGMENTS
 
 KeepPolicy: TypeAlias = bool | Literal["on_failure"]
+RetentionDisposition: TypeAlias = Literal["active", "retain", "remove"]
 
 
 def utc_now() -> str:
@@ -98,14 +94,21 @@ def keep_json_value(value: KeepPolicy) -> bool | str:
     return value
 
 
+def retention_disposition(keep: KeepPolicy, status: str) -> RetentionDisposition:
+    """Return the one authoritative disk-retention decision for a run state."""
+
+    keep = normalize_keep(keep)
+    if status not in TERMINAL_RUN_STATUSES:
+        return "active"
+    if keep is True or (keep == "on_failure" and status != "succeeded"):
+        return "retain"
+    return "remove"
+
+
 def should_retain_terminal(keep: KeepPolicy, status: str) -> bool:
     """Return whether a terminal run state must stay on disk."""
 
-    if keep is True:
-        return True
-    if keep is False:
-        return False
-    return status != "succeeded"
+    return retention_disposition(keep, status) == "retain"
 
 
 def default_runs_home() -> Path:
@@ -147,7 +150,7 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     _chmod_dir_owner_only(path.parent)
     tmp_path = path.with_name(".{}.{}.tmp".format(path.name, uuid.uuid4().hex))
     try:
-        _write_text_owner_only(tmp_path, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        _write_text_owner_only(tmp_path, json_dumps(payload, indent=2, separators=None))
         tmp_path.replace(path)
         _chmod_file_owner_only(path)
     finally:
@@ -200,8 +203,34 @@ def manifest_summary(manifest: Mapping[str, Any], *, run_dir: Path | None = None
     }
 
 
+_ADAPTER_SOURCE_LEVEL_PRECEDENCE = {source.value: rank for rank, source in enumerate(AdapterResolutionSource)}
+
+
+def _dominant_adapter_source_level(save_level: Any, load_level: Any) -> Any:
+    """Return the higher-precedence source level across the two adapter halves.
+
+    Save and load halves resolve independently (for example, a resume may
+    override only the load half at run level).  The summary must surface the
+    highest-precedence half instead of letting the save half mask a
+    ``run-override`` on the load half.
+    """
+
+    candidates = [level for level in (save_level, load_level) if level]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda level: _ADAPTER_SOURCE_LEVEL_PRECEDENCE.get(str(level), -1),
+    )
+
+
 def edge_adapter_summary(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Return compact edge adapter and tag records from a manifest."""
+    """Return compact edge adapter and tag records from a manifest.
+
+    Each row carries the per-half resolution levels (``save_level`` and
+    ``load_level``) plus ``source_level``, the higher-precedence level of the
+    two halves.
+    """
 
     edges = manifest.get("edges")
     nodes = manifest.get("nodes")
@@ -230,6 +259,8 @@ def edge_adapter_summary(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
         target_node_id = str(target.get("node_id") or "")
         source_port = str(source.get("port") or "")
         target_port = str(target.get("port") or "")
+        save_level = save_adapter.get("source")
+        load_level = load_adapter.get("source")
         rows.append(
             {
                 "source": _endpoint_label(node_labels, source_node_id, source_port),
@@ -241,7 +272,9 @@ def edge_adapter_summary(manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "tag": artifact_record.get("tag"),
                 "save": _adapter_name(save_adapter),
                 "load": _adapter_name(load_adapter),
-                "source_level": save_adapter.get("source") or load_adapter.get("source"),
+                "save_level": save_level,
+                "load_level": load_level,
+                "source_level": _dominant_adapter_source_level(save_level, load_level),
             }
         )
     return sorted(rows, key=lambda item: (item["source"], item["target"]))
@@ -591,13 +624,12 @@ def build_initial_manifest(
 def retention_record(keep: KeepPolicy, status: str) -> dict[str, Any]:
     """Return the retention block for a manifest state."""
 
+    disposition = retention_disposition(keep, status)
     if keep is True:
         return {"class": "keep", "expires_at": None}
     if keep is False:
         return {"class": "transient", "expires_at": None}
-    if status == "succeeded":
-        return {"class": "on_failure", "expires_at": None}
-    if status in {"failed", "cancelled", "interrupted"}:
+    if disposition == "retain":
         return {"class": "on_failure", "expires_at": utc_after(DEFAULT_ON_FAILURE_TTL_SECONDS)}
     return {"class": "on_failure", "expires_at": None}
 
@@ -677,10 +709,15 @@ def edge_record(
     }
 
 
-def edge_adapter_record(adapter: Mapping[str, Any]) -> dict[str, Any]:
-    """Return save/load adapter blocks for a runtime adapter."""
+def edge_adapter_record(
+    save_adapter: Mapping[str, Any], load_adapter: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Return independently resolved save/load adapter blocks for one edge."""
 
-    return {"save": dict(adapter), "load": dict(adapter)}
+    return {
+        "save": dict(save_adapter),
+        "load": dict(save_adapter if load_adapter is None else load_adapter),
+    }
 
 
 def artifact_ref_record(ref: ArtifactRef, *, run_dir: Path | None = None) -> dict[str, Any]:
@@ -709,6 +746,7 @@ def artifact_record(ref: ArtifactRef, *, run_dir: Path | None = None) -> dict[st
 def json_record(value: Any) -> dict[str, Any]:
     """Return an inline JSON-native value record."""
 
+    validate_json_value(value)
     return {
         "kind": "json",
         "tag": "json",
@@ -838,7 +876,7 @@ class RunManifestWriter:
             != key
         ]
         edges.append(dict(edge))
-        self.data["edges"] = sorted(edges, key=lambda item: json.dumps(item, sort_keys=True))
+        self.data["edges"] = sorted(edges, key=lambda item: json_dumps(item, ensure_ascii=True, separators=None))
         self.write()
 
     def finish(self, *, status: str, error: str | None = None) -> None:
@@ -885,7 +923,7 @@ def _sanitize_inline_value(value: Any, *, preview_limit: int, key_path: tuple[st
     if isinstance(value, dict):
         if value.get("kind") == "json" and "value" in value:
             raw = value["value"]
-            text = json.dumps(raw, ensure_ascii=False, sort_keys=True)
+            text = json_dumps(raw, separators=None)
             result = {
                 key: _sanitize_inline_value(item, preview_limit=preview_limit, key_path=(*key_path, str(key)))
                 for key, item in value.items()
@@ -909,20 +947,11 @@ def _sanitize_inline_value(value: Any, *, preview_limit: int, key_path: tuple[st
 
 
 def _inline_value_looks_sensitive(value: Any, key_path: tuple[str, ...]) -> bool:
-    if any(_is_sensitive_key(key) for key in key_path):
-        return True
-    if isinstance(value, Mapping):
-        return any(
-            _is_sensitive_key(str(key)) or _inline_value_looks_sensitive(item, ()) for key, item in value.items()
-        )
-    if isinstance(value, list):
-        return any(_inline_value_looks_sensitive(item, ()) for item in value)
-    return False
+    return value_looks_sensitive(value, key_path)
 
 
 def _is_sensitive_key(key: str) -> bool:
-    normalized = key.casefold().replace("-", "_").replace(".", "_")
-    return any(fragment in normalized for fragment in SENSITIVE_INLINE_KEY_FRAGMENTS)
+    return is_sensitive_key(key)
 
 
 def _sanitize_plain_sensitive_value(
@@ -932,7 +961,7 @@ def _sanitize_plain_sensitive_value(
     key_path: tuple[str, ...] = (),
 ) -> Any:
     if _inline_value_looks_sensitive(value, key_path):
-        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        text = json_dumps(value, separators=None)
         if any(_is_sensitive_key(key) for key in key_path):
             return {
                 "value_preview": "<omitted>",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any, Callable, cast
@@ -50,6 +51,7 @@ class ObjectRepository(RepositoryBase):
         source_object_name: str | None = None,
         remote_name: str | None = None,
         remote_signature_resolver: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        remote_signature_cache_writer: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Register a new immutable version of a function or pipeline."""
 
@@ -74,20 +76,25 @@ class ObjectRepository(RepositoryBase):
 
         if (yaml_text is None) == (yaml_path is None):
             raise ValueError("provide exactly one of yaml_text or yaml_path")
+        metadata_source: Path | None = None
         if yaml_text is None:
             source_path = Path(str(yaml_path)).expanduser().absolute()
             if not source_path.exists():
                 raise ValueError(f"SPL YAML file is not found: {source_path}")
             yaml_text = source_path.read_text(encoding="utf-8")
+            metadata_source = source_path
 
         try:
-            from spl.daemon.metadata import extract_metadata
+            from spl.daemon.metadata import extract_object_ir_metadata, load_object_ir, validate_object_ir
 
-            metadata = extract_metadata(
+            object_ir = load_object_ir(
                 yaml_text,
                 entrypoint,
                 remote_signature_resolver=remote_signature_resolver,
+                runtime_config=normalized_runtime_config,
+                source=metadata_source,
             )
+            metadata = extract_object_ir_metadata(object_ir)
         except ModuleNotFoundError as exc:
             if exc.name == "yaml":
                 raise ValueError("PyYAML is required to register SPL/YAML objects") from exc
@@ -125,6 +132,17 @@ class ObjectRepository(RepositoryBase):
         publish_fork_warning: dict[str, Any] | None = None
 
         with self._lock, self._conn:
+            # The pure validator is deliberately repeated under the same
+            # transaction that owns every aggregate INSERT. It cannot observe
+            # repository state, so this is deterministic and ensures no future
+            # caller can move persistence ahead of the registration boundary.
+            validate_object_ir(object_ir)
+            if remote_signature_cache_writer is not None:
+                # Remote resolution is staged in memory. Flush it only after
+                # complete validation and inside this aggregate transaction so
+                # any later registration failure rolls cache and object rows
+                # back together.
+                remote_signature_cache_writer()
             if remote_version_id is not None:
                 existing_remote = self._conn.execute(
                     """
@@ -382,11 +400,70 @@ class ObjectRepository(RepositoryBase):
             object_row["name"] if object_row is not None else name,
             next_version,
         )
-        yaml_cache_path.parent.mkdir(parents=True, exist_ok=True)
-        yaml_cache_path.write_text(yaml_text, encoding="utf-8")
+        try:
+            self._write_object_yaml_cache(yaml_cache_path, yaml_text)
+        except Exception as exc:
+            # This compatibility cache is not registry state. The SQLite YAML
+            # is authoritative and workers materialize it per run, so a cache
+            # failure -- including an unsupported platform primitive -- must
+            # not turn a committed registration into a reported failure that
+            # callers retry as though nothing was stored.
+            LOGGER.warning(
+                "object YAML compatibility cache was not written for %s: %s",
+                version_id,
+                exc,
+                extra={
+                    "spl_event": "object_yaml_cache_write_failed",
+                    "object_version_id": version_id,
+                    "cache_path": str(yaml_cache_path),
+                    "error": repr(exc),
+                },
+            )
 
         record = self.get_object_version(version_id, include_yaml=False)
         return self._with_publish_fork_warning(record, publish_fork_warning)
+
+    def _write_object_yaml_cache(self, path: Path, yaml_text: str) -> None:
+        """Atomically write display-only YAML without following parent symlinks."""
+
+        relative = path.relative_to(self.objects_dir)
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        directory_fd = os.open(self.objects_dir, directory_flags)
+        temporary_name = f".{relative.name}.{uuid4().hex}.tmp"
+        try:
+            for part in relative.parent.parts:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=directory_fd)
+                except FileExistsError:
+                    pass
+                next_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+                os.close(directory_fd)
+                directory_fd = next_fd
+            file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            file_fd = os.open(temporary_name, file_flags, 0o600, dir_fd=directory_fd)
+            try:
+                with os.fdopen(file_fd, "w", encoding="utf-8") as stream:
+                    stream.write(yaml_text)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except BaseException:
+                try:
+                    os.unlink(temporary_name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+                raise
+            os.replace(
+                temporary_name,
+                relative.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+        finally:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+            os.close(directory_fd)
 
     @staticmethod
     def _warn_remote_version_id_collision(

@@ -59,45 +59,86 @@ class LibraryRepository(RepositoryBase):
         key = self.remote_signature_key_for(normalized)
         now = utc_now()
         with self._lock, self._conn:
-            existing = self._conn.execute(
-                "SELECT created_at FROM remote_signatures WHERE id = ?",
-                (key,),
-            ).fetchone()
-            created_at = existing["created_at"] if existing is not None else now
-            self._conn.execute(
-                """
-                INSERT INTO remote_signatures(
-                    id, server_url, owner_id, library, object_name, version, version_id,
-                    signature_json, status, error, fetched_at, created_at, updated_at
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    signature_json = excluded.signature_json,
-                    status = excluded.status,
-                    error = excluded.error,
-                    fetched_at = excluded.fetched_at,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    key,
-                    normalized["server_url"],
-                    normalized.get("owner_id"),
-                    normalized.get("library"),
-                    normalized["object_name"],
-                    normalized.get("version"),
-                    normalized.get("version_id"),
-                    json_dumps(signature),
-                    status,
-                    error,
-                    now if status == "resolved" else None,
-                    created_at,
-                    now,
-                ),
+            self._write_remote_signature_locked(
+                normalized,
+                key,
+                signature,
+                status=status,
+                error=error,
+                now=now,
             )
         record = self.get_remote_signature(normalized)
         if record is None:
             raise KeyError(f"remote signature is not found: {key}")
         return record
+
+    def save_remote_signature_in_current_transaction(
+        self,
+        ref: dict[str, Any],
+        signature: dict[str, Any],
+        *,
+        status: str = "resolved",
+        error: str | None = None,
+    ) -> None:
+        """Write through the caller-owned shared SQLite transaction."""
+
+        normalized = self._normalize_remote_signature_ref(ref)
+        key = self.remote_signature_key_for(normalized)
+        with self._lock:
+            self._write_remote_signature_locked(
+                normalized,
+                key,
+                signature,
+                status=status,
+                error=error,
+                now=utc_now(),
+            )
+
+    def _write_remote_signature_locked(
+        self,
+        normalized: dict[str, Any],
+        key: str,
+        signature: dict[str, Any],
+        *,
+        status: str,
+        error: str | None,
+        now: str,
+    ) -> None:
+        existing = self._conn.execute(
+            "SELECT created_at FROM remote_signatures WHERE id = ?",
+            (key,),
+        ).fetchone()
+        created_at = existing["created_at"] if existing is not None else now
+        self._conn.execute(
+            """
+            INSERT INTO remote_signatures(
+                id, server_url, owner_id, library, object_name, version, version_id,
+                signature_json, status, error, fetched_at, created_at, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                signature_json = excluded.signature_json,
+                status = excluded.status,
+                error = excluded.error,
+                fetched_at = excluded.fetched_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                key,
+                normalized["server_url"],
+                normalized.get("owner_id"),
+                normalized.get("library"),
+                normalized["object_name"],
+                normalized.get("version"),
+                normalized.get("version_id"),
+                json_dumps(signature),
+                status,
+                error,
+                now if status == "resolved" else None,
+                created_at,
+                now,
+            ),
+        )
 
     def mark_remote_signature_unavailable(
         self,

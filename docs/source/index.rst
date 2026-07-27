@@ -10,6 +10,7 @@ reused across projects and executed locally or remotely.
 
    cookbook
    owners-libraries-handles
+   daemon-security-telemetry
 
 .. toctree::
    :maxdepth: 2

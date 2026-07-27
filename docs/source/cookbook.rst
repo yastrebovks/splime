@@ -1,8 +1,9 @@
 Cookbook
 ========
 
-splime is offline-first: everything on this page runs with just the local
-daemon — no account, no tokens, no network. The same scenario is enforced
+splime is offline-first: except for the explicitly connected shared-library
+recipe at the end, everything on this page runs with just the local daemon —
+no account, no tokens, no network. The offline scenario is enforced
 mechanically by ``tests/core/test_cookbook_smoke.py`` (``just smoke``).
 
 Setup
@@ -10,7 +11,7 @@ Setup
 
 .. code-block:: bash
 
-   pip install splime
+   python3.13 -m pip install "splime==0.4.5"
    spl-daemon serve        # local daemon on http://127.0.0.1:8765
 
 One import is enough:
@@ -194,16 +195,44 @@ those are local cleanup operations and do not delete anything from the server.
 Retained runs and retention
 ---------------------------
 
-Failed local ``Deployment`` runs are retained by default with
-``keep='on_failure'`` so a later resume can inspect the manifest and artifacts.
-Successful default runs still clean up. ``keep=True`` keeps successful and
-failed runs until explicit prune. ``on_failure`` retained state expires after
-seven days by default; ``spl-daemon run-prune`` removes expired inactive runs,
-and accepts ``--dry-run``, ``--status``, ``--older-than-seconds`` and an
-optional run id. Use ``--local`` to manage ``$SPL_RUNS_HOME`` retained
-``Deployment`` runs instead of daemon runs. ``run-show`` previews inline values
-by default; pass ``--full-inline`` only when the full local data should be
-printed.
+Local ``Deployment`` runs default to ``keep='on_failure'``: failures retain the
+manifest and artifacts for seven days, while successful state is removed.
+``keep=True`` retains successful and failed runs until explicit prune.
+
+Daemon runs started through ``SPLClient`` deliberately keep their historical
+default of ``keep=True``. Before 0.4.5 the worker accidentally forced that
+observed behavior even when another value was supplied, so changing the default
+would silently delete existing callers' data. Explicit policies now work:
+
+* ``keep=True`` retains successful and failed daemon runs;
+* ``keep=False`` removes terminal run files after manifest persistence, required
+  sync, and client delivery; and
+* ``keep='on_failure'`` removes successful run files but retains failed files
+  with the seven-day expiry.
+
+Transient run delivery has a bounded 15-minute compatibility lease. A current
+client's ``call()``/``RemoteRun.collect()`` fetches the result and every
+requested artifact before acknowledging delivery, after which cleanup can run
+immediately. Result and artifact reads renew the lease but do not acknowledge
+it. An older asynchronous client that does not know the acknowledgment endpoint
+therefore has 15 minutes after terminal completion (renewed by those reads) to
+consume the data; the single daemon retention scheduler removes it after the
+lease expires. If an artifact download fails, no acknowledgment is sent and the
+lease remains available for retry. The compact run record survives cleanup with
+status, error, timing, and manifest summary, but inputs, result payload, logs,
+runtime details, and artifact paths do not.
+
+Transient delivery is one acknowledgment lifecycle. Use ``keep=True`` when
+multiple independent consumers need to fetch the same run at unrelated times.
+A removed run cannot be resumed. ``resume(..., keep=False)`` is rejected;
+``keep='on_failure'`` permits another resume only when that child fails and is
+retained, so use ``keep=True`` for a reliably resumable chain.
+
+``spl-daemon run-prune`` removes expired inactive runs and accepts
+``--dry-run``, ``--status``, ``--older-than-seconds`` and an optional run id.
+Use ``--local`` to manage ``$SPL_RUNS_HOME`` retained ``Deployment`` runs
+instead of daemon runs. ``run-show`` previews inline values by default; pass
+``--full-inline`` only when the full local data should be printed.
 
 Retained state is pipeline data. It may include artifact files, manifest
 metadata, inline JSON inputs and outputs, and keyword arguments such as values
@@ -351,34 +380,47 @@ the pipeline, not on the reusable node object:
    pipeline = pipeline.with_node_runtime('heavy_step', 'venv-subprocess')
    Deployment(pipeline).run(runtimes={'heavy_step': 'native'})
 
-Choose the smallest runtime that gives the isolation you need:
+Native and ``venv-subprocess`` runtimes execute trusted code under the
+conductor's OS identity (the daemon user for daemon-managed runs). A virtual
+environment separates dependencies and a subprocess separates execution, but
+neither is an OS sandbox. Scoped callback capabilities limit the authority
+intentionally passed over the worker protocol; they do not protect against
+arbitrary same-UID file reads. Docker or a deliberately separate OS identity
+is required when code must not read same-UID daemon files.
+
+Choose a runtime for its dependency, process, and trust boundary:
 
 .. list-table::
    :header-rows: 1
    :widths: 14 28 34 34
 
    * - Runtime
-     - Isolation
+     - Execution and trust boundary
      - Requirements and image owner
      - Limits
    * - ``native``
-     - Runs in the conductor process.
+     - Runs trusted code in the conductor process under the conductor's OS
+       identity (the daemon user for daemon-managed runs).
      - No extra tools and no image.
      - Supports the full in-process Python path. ``node_timeout_seconds`` does
        not apply.
    * - ``venv-subprocess``
-     - Runs a function node in a separate SPL-free Python process.
+     - Runs trusted code in a separate SPL-free Python process with the same
+       UID and filesystem permissions as its conductor (the daemon for
+       daemon-managed runs).
      - Uses the current interpreter or daemon-provided node environment.
-       No Docker image.
+       No Docker image. This is dependency isolation, not an OS sandbox.
      - Function nodes only; inputs must be JSON-native; honors
        ``node_timeout_seconds``.
    * - ``docker``
-     - Runs a function node in a Docker container with only the SPL-free runner
-       work directory mounted.
+     - Uses the configured container process/filesystem boundary with only the
+       SPL-free runner work directory mounted.
      - Needs the Docker CLI and a responsive Docker daemon. Daemon runs use the
        object environment image; local ``Deployment`` needs an explicit
        ``runtime_config.docker.image``. Missing explicit images are pulled, if
-       possible, by the host Docker daemon before the node runs.
+       possible, by the host Docker daemon before the node runs. Its protection
+       depends on configured mounts and network options and on Docker host
+       trust.
      - Function nodes only; inputs must be JSON-native; honors
        ``node_timeout_seconds`` and kills the container on timeout. No SPL
        package, no ``PYTHONPATH`` injection, and no nested Docker inside an
@@ -416,14 +458,17 @@ images in 0.4.x, so they must pass an explicit image:
        ).run(output="double")
        assert result == 42
 
-Docker node containers default to ``--network none`` for isolation. If an
+Docker node containers default to ``--network none`` as a network-control
+layer. If an
 explicit image needs network access while the node function runs, set
 ``runtime_config={"docker": {"image": "...", "network": "enabled"}}``. Pulling a
 missing image is done by the host Docker daemon and does not depend on the
 node container's ``network`` setting.
 
 Set ``runtime_config={"node_timeout_seconds": 10}`` on ``Deployment`` to bound
-non-native per-node subprocess runtimes. ``native`` runs in the conductor
+non-native per-node subprocess runtimes. A configured bound must be a positive
+finite number; ``NaN`` and infinities fail before a subprocess or container is
+created. ``None`` leaves the bound disabled. ``native`` runs in the conductor
 process and intentionally has no per-node timeout.
 
 ``venv-subprocess`` and ``docker`` both receive inputs through ``input.json``,

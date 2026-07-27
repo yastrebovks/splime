@@ -27,6 +27,10 @@ def _make_other_text() -> str:
     return "other"
 
 
+def _make_dynamic_text() -> Any:
+    return "dynamic"
+
+
 def _save_text(path: str, obj: str) -> None:
     del path, obj
 
@@ -166,3 +170,18 @@ def test_doctor_adapter_tag_check_ignores_warning_dedupe() -> None:
     assert len(_adapter_warnings(captured)) == 2
     assert result.status == WARN
     assert "2 total mismatches" in result.detail
+
+
+def test_unknown_runtime_source_type_still_reports_determinable_tag_mismatch() -> None:
+    lift_any = cast(Any, lift)
+    producer = lift_any(_make_dynamic_text).alias("producer")
+    pipeline = lift_any(_consume_text).bind(value=producer.as_format("csv")).alias("consumer").render("dynamic")
+    adapter = _mismatched_adapter("csv", _CsvLoadTsvAdapter)
+    pipeline = replace(pipeline, adapters={adapter.key: adapter})
+
+    issues = find_pipeline_adapter_compatibility_issues(pipeline)
+
+    assert len(issues) == 1
+    assert issues[0].edge == "producer.default -> consumer.value"
+    assert issues[0].save_tag == "csv"
+    assert issues[0].accepted_tags == ("tsv",)

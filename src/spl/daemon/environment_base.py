@@ -12,6 +12,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator, Protocol
 
+from spl._process import run_process_tree
+from spl._timeout import TimeoutDomain, validate_timeout_seconds
 from spl.daemon.store import RegistryStore, utc_now
 
 ABSENT = "absent"
@@ -67,12 +69,22 @@ class BaseEnvironmentManager(ABC):
         stale_lock_seconds: float = DEFAULT_STALE_LOCK_SECONDS,
     ):
         self.store = store
-        self.build_timeout_seconds = float(build_timeout_seconds)
-        self.stale_lock_seconds = float(stale_lock_seconds)
-        if self.build_timeout_seconds <= 0:
-            raise ValueError("build_timeout_seconds must be positive")
-        if self.stale_lock_seconds <= 0:
-            raise ValueError("stale_lock_seconds must be positive")
+        normalized_build_timeout = validate_timeout_seconds(
+            build_timeout_seconds,
+            name="build_timeout_seconds",
+            domain=TimeoutDomain.POSITIVE,
+            allow_none=False,
+        )
+        normalized_stale_lock = validate_timeout_seconds(
+            stale_lock_seconds,
+            name="stale_lock_seconds",
+            domain=TimeoutDomain.POSITIVE,
+            allow_none=False,
+        )
+        assert normalized_build_timeout is not None
+        assert normalized_stale_lock is not None
+        self.build_timeout_seconds = normalized_build_timeout
+        self.stale_lock_seconds = normalized_stale_lock
         self._lock = threading.RLock()
         self._conditions: dict[str, threading.Condition] = {}
         self._active_builds: set[str] = set()
@@ -377,13 +389,11 @@ class BaseEnvironmentManager(ABC):
         log.write("\n$ " + " ".join(command) + "\n")
         log.flush()
         try:
-            completed = subprocess.run(
+            completed = run_process_tree(
                 command,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True,
+                stdout_target=log,
+                stderr_target=subprocess.STDOUT,
                 timeout=self.build_timeout_seconds,
-                check=False,
             )
         except subprocess.TimeoutExpired as exc:
             raise EnvironmentBuildError(self._command_timeout_message(command)) from exc

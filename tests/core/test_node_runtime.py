@@ -25,6 +25,7 @@ from spl.core.entities.pipeline import DPipeline, Pipeline
 from spl.core.ir.parse import ir_parse
 from spl.core.ir.utils import SPLSafeLoader
 from spl.daemon.canonical import _canonical_spl_documents
+from spl.daemon.runtime_config import normalize_runtime_config
 from spl.daemon.spl_free_generator import filter_spl_runtime_scaffolding
 
 
@@ -424,7 +425,7 @@ def test_docker_node_runtime_builds_spl_free_docker_command(tmp_path: Path, monk
         (context.work_dir / "result.json").write_text('{"result": 42}', encoding="utf-8")
         return subprocess.CompletedProcess(command, 0, stdout="node stdout\n", stderr="")
 
-    monkeypatch.setattr(m_node_runtime.subprocess, "run", fake_run)
+    monkeypatch.setattr(m_node_runtime, "run_process_tree", fake_run)
 
     assert runtime.execute(context, environment) == {DEFAULT_PORT: 42}
     assert runtime.execute(context, environment) == {DEFAULT_PORT: 42}
@@ -457,6 +458,42 @@ def test_docker_node_runtime_builds_spl_free_docker_command(tmp_path: Path, monk
     assert (context.work_dir / "stderr.txt").read_text(encoding="utf-8") == ""
 
 
+def test_daemon_worker_docker_node_name_and_labels_include_instance_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SPL_DAEMON_INSTANCE_ID", "daemon-01")
+    monkeypatch.setenv("SPL_DAEMON_HOME_HASH", "home-hash")
+    monkeypatch.setenv("SPL_DAEMON_GENERATION", "7")
+    monkeypatch.setenv("SPL_DAEMON_RUN_ID", "run-123")
+    runtime = m_node_runtime.DockerNodeRuntime()
+    context = _docker_runtime_context(
+        tmp_path,
+        runtime_config={"docker": {"image": "python:3.13-slim", "network": "none"}},
+    )
+    environment = runtime.prepare(context)
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        (context.work_dir / "result.json").write_text('{"result": 42}', encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(m_node_runtime, "run_process_tree", fake_run)
+
+    assert runtime.execute(context, environment) == {DEFAULT_PORT: 42}
+
+    [command] = commands
+    container_name = command[command.index("--name") + 1]
+    assert container_name.startswith("spl-node-daemon-0-run-123-")
+    labels = [command[index + 1] for index, item in enumerate(command) if item == "--label"]
+    assert "com.splime.instance=daemon-01" in labels
+    assert "com.splime.home=home-hash" in labels
+    assert "com.splime.generation=7" in labels
+    assert "com.splime.run=run-123" in labels
+    assert "com.splime.kind=node" in labels
+
+
 def test_docker_node_runtime_timeout_kills_container(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = m_node_runtime.DockerNodeRuntime()
     context = _docker_runtime_context(
@@ -469,19 +506,25 @@ def test_docker_node_runtime_timeout_kills_container(tmp_path: Path, monkeypatch
     environment = runtime.prepare(context)
     commands: list[list[str]] = []
 
-    def fake_run(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+    def fake_worker_run(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
         commands.append(command)
-        if command[:2] == ["docker", "kill"]:
-            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        (context.work_dir / "container.cid").write_text("immutable-container-id\n", encoding="utf-8")
         raise subprocess.TimeoutExpired(command, 0.25, output="started\n", stderr="")
 
-    monkeypatch.setattr(m_node_runtime.subprocess, "run", fake_run)
+    def fake_docker_cleanup(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(m_node_runtime, "run_process_tree", fake_worker_run)
+    monkeypatch.setattr(m_node_runtime.subprocess, "run", fake_docker_cleanup)
 
     with pytest.raises(RuntimeError, match=r"node runtime `docker` timed out after 0.25s for node `double`"):
         runtime.execute(context, environment)
 
-    run_command, kill_command = commands
-    assert kill_command == ["docker", "kill", run_command[run_command.index("--name") + 1]]
+    run_command, kill_command, remove_command = commands
+    assert run_command[run_command.index("--name") + 1].startswith("spl-node-run-123-")
+    assert kill_command == ["docker", "kill", "immutable-container-id"]
+    assert remove_command == ["docker", "rm", "-f", "immutable-container-id"]
     assert (context.work_dir / "stdout.txt").read_text(encoding="utf-8") == "started\n"
     assert (context.work_dir / "stderr.txt").read_text(encoding="utf-8") == ""
 
@@ -634,9 +677,69 @@ def test_docker_node_runtime_timeout_removes_container(tmp_path: Path, monkeypat
     assert not marker_path.exists()
 
 
-@pytest.mark.parametrize("timeout_value", ["1", 0, -1, True])
+@pytest.mark.parametrize(
+    "timeout_value",
+    ["1", 0, -1, True, float("nan"), float("inf"), float("-inf")],
+    ids=["string", "zero", "negative", "boolean", "nan", "positive-infinity", "negative-infinity"],
+)
 def test_node_timeout_runtime_config_is_validated_early(timeout_value: Any) -> None:
     deployment = Deployment(_runtime_pipeline(), runtime_config={"node_timeout_seconds": timeout_value})
 
     with pytest.raises(ValueError, match=r"node_timeout_seconds"):
         deployment.run()
+
+
+@pytest.mark.parametrize(
+    ("timeout_value", "expected"),
+    [(None, None), (1, 1.0), (1.25, 1.25)],
+)
+def test_node_timeout_runtime_config_preserves_valid_values(
+    timeout_value: float | None,
+    expected: float | None,
+) -> None:
+    assert m_node_runtime.node_timeout_seconds({"node_timeout_seconds": timeout_value}) == expected
+
+
+@pytest.mark.parametrize(
+    "timeout_value",
+    ["1", 0, -1, True, float("nan"), float("inf"), float("-inf")],
+    ids=["string", "zero", "negative", "boolean", "nan", "positive-infinity", "negative-infinity"],
+)
+def test_daemon_runtime_config_rejects_invalid_node_timeout(timeout_value: Any) -> None:
+    with pytest.raises(ValueError, match=r'runtime_config\["node_timeout_seconds"\]'):
+        normalize_runtime_config({"node_timeout_seconds": timeout_value})
+
+
+@pytest.mark.parametrize(
+    "timeout_value",
+    [float("nan"), float("inf"), float("-inf")],
+    ids=["nan", "positive-infinity", "negative-infinity"],
+)
+def test_docker_node_timeout_is_rejected_before_container_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    timeout_value: float,
+) -> None:
+    runtime = m_node_runtime.DockerNodeRuntime()
+    context = _docker_runtime_context(
+        tmp_path,
+        runtime_config={
+            "docker": {"image": "python:3.13-slim", "network": "none"},
+            "node_timeout_seconds": timeout_value,
+        },
+    )
+    environment = runtime.prepare(context)
+    process_called = False
+
+    def forbidden_run_process_tree(*args: Any, **kwargs: Any) -> Any:
+        nonlocal process_called
+        del args, kwargs
+        process_called = True
+        pytest.fail("docker run must not be called for a non-finite timeout")
+
+    monkeypatch.setattr(m_node_runtime, "run_process_tree", forbidden_run_process_tree)
+
+    with pytest.raises(ValueError, match=r"node_timeout_seconds"):
+        runtime.execute(context, environment)
+
+    assert process_called is False

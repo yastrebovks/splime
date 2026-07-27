@@ -561,6 +561,18 @@ def test_daemon_client_register_env_omits_python_payload_when_omitted(
     ]
 
 
+def test_daemon_cli_reports_installed_distribution_version(capsys) -> None:
+    import importlib.metadata
+
+    import spl.daemon.cli as cli_module
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_module.main(["--version"])
+
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out.strip() == (f"spl-daemon {importlib.metadata.version('splime')}")
+
+
 def test_run_management_cli_commands(monkeypatch, capsys) -> None:
     import spl.daemon.cli as cli_module
 
@@ -2384,6 +2396,8 @@ def test_run_management_routes_list_show_prune_and_delete(tmp_path) -> None:
                 "tag": "json",
                 "save": "json",
                 "load": "json",
+                "save_level": "port-default",
+                "load_level": "port-default",
                 "source_level": "port-default",
             }
         ]
@@ -2495,6 +2509,37 @@ def test_sol_008_real_false_body_executes_and_true_query_previews(tmp_path) -> N
         assert executed_body["dry_run"] is False
         with pytest.raises(KeyError):
             store.get_run(executed["id"])
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_delete_dry_run_previews_pending_sync_protection_instead_of_conflict(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        run = _create_failed_run(store, "pending_sync_preview")
+        store.enqueue_sync_event(
+            "local_run_update",
+            {"run": {"id": run["id"], "status": "failed"}},
+        )
+        app = create_app(store, auto_build_envs=False)
+
+        preview_status, preview = _delete_json_from_app(
+            app,
+            f"/runs/{run['id']}?dry_run=true",
+        )
+        delete_status, deleted = _delete_json_from_app(app, f"/runs/{run['id']}")
+
+        assert preview_status == 200
+        assert preview["dry_run"] is True
+        assert preview["count"] == 0
+        assert preview["candidates"] == []
+        assert [item["id"] for item in preview["skipped_pending_sync"]] == [run["id"]]
+        assert delete_status == 409
+        assert deleted == {"error": f"run has pending sync and cannot be pruned: {run['id']}"}
+        assert store.get_run(run["id"])["status"] == "failed"
+        assert Path(run["run_dir"]).exists()
     finally:
         _shutdown_app(app)
         store.close()

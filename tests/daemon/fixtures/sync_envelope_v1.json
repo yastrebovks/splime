@@ -1,0 +1,42 @@
+{
+  "contract": "spl.sync-envelope-canonical-json",
+  "schema_version": 1,
+  "vectors": [
+    {
+      "name": "key_order_a",
+      "kind": "object_version",
+      "payload": {"z": 3, "a": {"second": 2, "first": 1}},
+      "canonical_hex": "7b226b696e64223a226f626a6563745f76657273696f6e222c227061796c6f6164223a7b2261223a7b226669727374223a312c227365636f6e64223a327d2c227a223a337d2c22736368656d615f76657273696f6e223a317d0a",
+      "sha256": "0837449c937f6b0c17767be72a86e7320379bda928e54f493cd6261e980b6e05"
+    },
+    {
+      "name": "key_order_b",
+      "kind": "object_version",
+      "payload": {"a": {"first": 1, "second": 2}, "z": 3},
+      "canonical_hex": "7b226b696e64223a226f626a6563745f76657273696f6e222c227061796c6f6164223a7b2261223a7b226669727374223a312c227365636f6e64223a327d2c227a223a337d2c22736368656d615f76657273696f6e223a317d0a",
+      "sha256": "0837449c937f6b0c17767be72a86e7320379bda928e54f493cd6261e980b6e05"
+    },
+    {
+      "name": "unicode_newlines",
+      "kind": "object_version",
+      "payload": {"message": "Καλημέρα 🌍", "line": "a\r\nb\rc"},
+      "canonical_hex": "7b226b696e64223a226f626a6563745f76657273696f6e222c227061796c6f6164223a7b226c696e65223a22615c6e625c6e63222c226d657373616765223a22ce9aceb1cebbceb7cebcceadcf81ceb120f09f8c8d227d2c22736368656d615f76657273696f6e223a317d0a",
+      "sha256": "dcb38fbcab44b1bd6b1fb67aaf10bd5cbd81e0dd9736acaf62071dd90d0edbce"
+    },
+    {
+      "name": "null_false_empty",
+      "kind": "run_update",
+      "payload": {
+        "empty_list": [],
+        "empty_object": {},
+        "empty_string": "",
+        "false": false,
+        "null": null
+      },
+      "canonical_hex": "7b226b696e64223a2272756e5f757064617465222c227061796c6f6164223a7b22656d7074795f6c697374223a5b5d2c22656d7074795f6f626a656374223a7b7d2c22656d7074795f737472696e67223a22222c2266616c7365223a66616c73652c226e756c6c223a6e756c6c7d2c22736368656d615f76657273696f6e223a317d0a",
+      "sha256": "3114a507d162cfc83eef24c4d2d57830297d6c4dd7e0f22efd0f99218c9c6bbf"
+    }
+  ],
+  "reject_nonfinite": ["nan", "positive_infinity", "negative_infinity"]
+}
+

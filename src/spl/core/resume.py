@@ -182,6 +182,114 @@ def manifest_output_record(parent_manifest: Mapping[str, Any], node: Node, port_
     return dict(record)
 
 
+def manifest_frozen_save_adapter_record(
+    parent_manifest: Mapping[str, Any],
+    *,
+    source_node: Node,
+    source_port: str,
+    target_node: Node,
+    target_port: str,
+) -> dict[str, Any]:
+    """Return the save provenance for bytes reused by one frozen edge.
+
+    Current manifests store independent ``save`` and ``load`` blocks. Older
+    manifests stored one adapter block directly on the edge. A failed parent
+    may not have reached edge recording after it materialized the source, so
+    the source node's output-adapter block is the final compatibility fallback.
+    """
+
+    edge = _manifest_edge_record(
+        parent_manifest,
+        source_node=source_node,
+        source_port=source_port,
+        target_node=target_node,
+        target_port=target_port,
+    )
+    if edge is not None:
+        record = _save_record_from_edge_adapter(edge.get("adapter"))
+        if record is not None:
+            return record
+
+    node_record = manifest_node_record(parent_manifest, source_node)
+    adapters = None if node_record is None else node_record.get("adapters")
+    if isinstance(adapters, Mapping):
+        record = _normalize_manifest_adapter_record(adapters.get(source_port))
+        if record is not None:
+            return record
+
+    source_label = node_label(node_record, source_node)
+    raise ResumeValidationError(
+        "cannot preserve frozen artifact provenance for `{}.{}` -> `{}.{}` because the parent manifest "
+        "has no usable save adapter record; recalculate the producer with from_='{}' or retain a manifest "
+        "that records its output adapter".format(
+            source_label,
+            source_port,
+            node_label(manifest_node_record(parent_manifest, target_node), target_node),
+            target_port,
+            source_label,
+        )
+    )
+
+
+def _manifest_edge_record(
+    parent_manifest: Mapping[str, Any],
+    *,
+    source_node: Node,
+    source_port: str,
+    target_node: Node,
+    target_port: str,
+) -> Mapping[str, Any] | None:
+    edges = parent_manifest.get("edges")
+    if not isinstance(edges, list):
+        return None
+    source_id = str(source_node.uuid)
+    target_id = str(target_node.uuid)
+    for edge in edges:
+        if not isinstance(edge, Mapping):
+            continue
+        source = edge.get("source")
+        target = edge.get("target")
+        if not isinstance(source, Mapping) or not isinstance(target, Mapping):
+            continue
+        if (
+            str(source.get("node_id")) == source_id
+            and source.get("port") == source_port
+            and str(target.get("node_id")) == target_id
+            and target.get("port") == target_port
+        ):
+            return edge
+    return None
+
+
+def _save_record_from_edge_adapter(adapter: Any) -> dict[str, Any] | None:
+    if not isinstance(adapter, Mapping):
+        return None
+    save = adapter.get("save")
+    if isinstance(save, Mapping):
+        return _normalize_manifest_adapter_record(save)
+    # v1 compatibility: the edge adapter was one adapter_record used for both
+    # halves, before role-separated save/load blocks were additive.
+    return _normalize_manifest_adapter_record(adapter)
+
+
+def _normalize_manifest_adapter_record(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    identity = value.get("identity")
+    source = value.get("source")
+    if isinstance(identity, Mapping) and isinstance(source, str) and source:
+        record = dict(value)
+        record["identity"] = dict(identity)
+        return record
+
+    # Also tolerate the oldest direct-identity edge shape when it carries its
+    # resolution source beside the identity fields.
+    if isinstance(value.get("key"), str) and isinstance(source, str) and source:
+        identity_value = {key: item for key, item in value.items() if key != "source"}
+        return m_manifest.adapter_record(identity_value, source)
+    return None
+
+
 def artifact_ref_from_record(record: Mapping[str, Any], parent_run_dir: Path) -> ArtifactRef:
     """Build an ArtifactRef from a manifest artifact record."""
 

@@ -6,6 +6,7 @@ import argparse
 import importlib.metadata
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -19,6 +20,7 @@ from typing import Any
 ARTIFACTS_KEY = "__spl_artifacts__"
 RESULT_KEY = "__spl_result__"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+JSON_SCALARS = frozenset({type(None), bool, int, float, str})
 
 
 def validate_name(name: str) -> str:
@@ -40,10 +42,11 @@ def read_json(path: Path) -> Any:
 def write_json(path: Path, value: Any) -> None:
     """Write a UTF-8 JSON file with stable formatting."""
 
+    payload = _json_dumps(value, ensure_ascii=False, indent=2, sort_keys=True, separators=None)
     _ensure_private_dir(path.parent)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+        handle.write(payload)
     _chmod_owner_file(path)
 
 
@@ -81,20 +84,96 @@ def validate_environment(distributions: list[dict[str, str]]) -> None:
         raise RuntimeError("worker environment does not match SPL metadata: " + "; ".join(mismatches))
 
 
-def to_jsonable(value: Any) -> Any:
+def to_jsonable(value: Any, *, path: str = "$") -> Any:
     """Convert common Python containers into JSON-compatible values."""
 
-    if value is None or isinstance(value, str | int | float | bool):
+    if type(value) in JSON_SCALARS:
+        _validate_json_value(value, path=path)
         return value
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, Mapping):
-        return {str(key): to_jsonable(item) for key, item in value.items()}
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                _validate_json_value({key: None}, path=path)
+                raise AssertionError("JSON key validation unexpectedly accepted a non-string key")
+            result[key] = to_jsonable(item, path=_json_child_path(path, key))
+        return result
     if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
-        return [to_jsonable(item) for item in value]
+        return [to_jsonable(item, path="{}[{}]".format(path, index)) for index, item in enumerate(value)]
     if isinstance(value, set):
-        return [to_jsonable(item) for item in sorted(value, key=repr)]
+        return [
+            to_jsonable(item, path="{}[{}]".format(path, index)) for index, item in enumerate(sorted(value, key=repr))
+        ]
     raise TypeError("result is not JSON serializable; return JSON-like data or declare artifacts")
+
+
+def _json_dumps(
+    value: Any,
+    *,
+    ensure_ascii: bool = False,
+    indent: int | str | None = None,
+    sort_keys: bool = True,
+    separators: tuple[str, str] | None = (",", ":"),
+) -> str:
+    """Mirror the packaged JSON contract inside this stdlib-only runner."""
+
+    _validate_json_value(value)
+    return json.dumps(
+        value,
+        ensure_ascii=ensure_ascii,
+        indent=indent,
+        sort_keys=sort_keys,
+        separators=separators,
+        allow_nan=False,
+    )
+
+
+def _validate_json_value(value: Any, *, path: str = "$", active_ids: set[int] | None = None) -> None:
+    active_ids = set() if active_ids is None else active_ids
+    value_type = type(value)
+    if value_type in JSON_SCALARS:
+        if value_type is float and not math.isfinite(value):
+            raise ValueError("invalid splime JSON value at {}: non-finite floats are not permitted".format(path))
+        if value_type is str:
+            _validate_unicode_scalar_string(value, path=path, role="string")
+        return
+    if value_type not in {list, dict}:
+        raise ValueError(
+            "invalid splime JSON value at {}: unsupported value type `{}`".format(path, value_type.__name__)
+        )
+
+    container_id = id(value)
+    if container_id in active_ids:
+        raise ValueError("invalid splime JSON value at {}: circular container reference is not permitted".format(path))
+    active_ids.add(container_id)
+    try:
+        if value_type is list:
+            for index, item in enumerate(value):
+                _validate_json_value(item, path="{}[{}]".format(path, index), active_ids=active_ids)
+            return
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ValueError("invalid splime JSON value at {}: object key {!r} is not a string".format(path, key))
+            _validate_unicode_scalar_string(key, path=path, role="object key")
+            _validate_json_value(item, path=_json_child_path(path, key), active_ids=active_ids)
+    finally:
+        active_ids.remove(container_id)
+
+
+def _json_child_path(path: str, key: str) -> str:
+    return "{}[{}]".format(path, json.dumps(key, ensure_ascii=False, allow_nan=False))
+
+
+def _validate_unicode_scalar_string(value: str, *, path: str, role: str) -> None:
+    for index, character in enumerate(value):
+        code_point = ord(character)
+        if 0xD800 <= code_point <= 0xDFFF:
+            raise ValueError(
+                "invalid splime JSON value at {}: {} contains Unicode surrogate U+{:04X} at character {}; "
+                "use Unicode scalar values".format(path, role, code_point, index)
+            )
 
 
 def copy_artifact(source: Path, target: Path) -> None:

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import tempfile
 import typing
 import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from types import UnionType
 from typing import Any
 
 import yaml
@@ -17,10 +17,13 @@ from spl.core.entities.adapter import (
     BUILTIN_JSON_ADAPTER,
     JSON_ADAPTER_FORMAT,
     JSON_NATIVE_TYPES,
+    Adapter,
+    BuiltInJsonAdapter,
     DAdapter,
     DLoadAdapter,
     DSaveAdapter,
     RuntimeAdapter,
+    SaveAdapter,
     adapter_identity,
 )
 from spl.core.entities.function import DFunction
@@ -35,8 +38,14 @@ from spl.core.entities.node import (
     OutputPort,
 )
 from spl.core.entities.node_function import DNodeFunction, NodeFunction
-from spl.core.entities.pipeline import AdapterResolution, Pipeline
+from spl.core.entities.pipeline import (
+    AdapterResolutionSource,
+    LoadAdapterResolution,
+    Pipeline,
+    SaveAdapterResolution,
+)
 from spl.core.ir.utils import SPLSafeLoader
+from spl.core.json_contract import dumps as json_dumps
 
 
 class AdapterCompatibilityWarning(UserWarning):
@@ -102,10 +111,34 @@ class AdapterProbeReport:
 
 
 @dataclass(frozen=True)
+class StaticAdapterResolution:
+    """Adapter keys statically selected for one serialized formatted edge."""
+
+    save_adapter: str | None
+    load_adapter: str | None
+    save_candidates: tuple[str, ...] = ()
+    load_candidates: tuple[str, ...] = ()
+    save_deferred: bool = False
+    load_deferred: bool = False
+
+    @property
+    def save_ambiguous(self) -> bool:
+        """Return whether more than one save half could serve the edge."""
+
+        return not self.save_deferred and self.save_adapter is None and len(self.save_candidates) > 1
+
+    @property
+    def load_ambiguous(self) -> bool:
+        """Return whether more than one load half could serve the edge."""
+
+        return not self.load_deferred and self.load_adapter is None and len(self.load_candidates) > 1
+
+
+@dataclass(frozen=True)
 class _RuntimeEdgeBinding:
     edge: str
-    save: AdapterResolution
-    load: AdapterResolution
+    save: SaveAdapterResolution
+    load: LoadAdapterResolution
 
 
 @dataclass(frozen=True)
@@ -113,6 +146,7 @@ class _StaticHalf:
     key: str
     tag: str | None
     accepted_tags: tuple[str, ...] | None
+    legacy_pair: bool = False
 
 
 _BUILTIN_TYPES: dict[str, type[Any]] = {
@@ -124,10 +158,25 @@ _BUILTIN_TYPES: dict[str, type[Any]] = {
     "builtins.float": float,
     "bool": bool,
     "builtins.bool": bool,
+    "None": type(None),
+    "NoneType": type(None),
+    "builtins.NoneType": type(None),
     "dict": dict,
     "builtins.dict": dict,
     "list": list,
     "builtins.list": list,
+    "Dict": dict,
+    "typing.Dict": dict,
+    "List": list,
+    "typing.List": list,
+    "set": set,
+    "builtins.set": set,
+    "Set": set,
+    "typing.Set": set,
+    "tuple": tuple,
+    "builtins.tuple": tuple,
+    "Tuple": tuple,
+    "typing.Tuple": tuple,
 }
 _AdapterCompatibilityIssueKey = tuple[str, str, tuple[str, ...], str, str]
 _WARNED_PIPELINE_ISSUES: set[_AdapterCompatibilityIssueKey] = set()
@@ -203,6 +252,117 @@ def warn_yaml_adapter_compatibility(yaml_text: str, entrypoint: str) -> None:
         warnings.warn(issue.warning_message, AdapterCompatibilityWarning, stacklevel=3)
 
 
+def resolve_yaml_edge_adapters(
+    adapters: list[Any],
+    *,
+    source_type: str | None,
+    target_type: str | None,
+    adapter_format: str,
+) -> StaticAdapterResolution:
+    """Resolve both adapter halves for an explicitly formatted serialized edge."""
+
+    save_halves, load_halves = _static_adapter_halves(adapters)
+    normalized_source_type = _normalize_static_type_name(source_type)
+    normalized_target_type = _normalize_static_type_name(target_type)
+    save_candidates = _static_save_candidates(save_halves, normalized_source_type, adapter_format)
+    save = _sole_static_half(save_candidates)
+    save_deferred = (
+        save is None and bool(save_candidates) and (normalized_source_type is None or "." not in normalized_source_type)
+    )
+
+    paired_load = _legacy_paired_load(save, load_halves)
+    load_deferred = False
+    if normalized_target_type is None and paired_load is not None:
+        # A legacy DAdapter is one logical save/load pair. Preserve its
+        # historical source-selected behavior for untyped/Any consumers.
+        load_candidates = [paired_load]
+    elif normalized_target_type is None and save_deferred:
+        candidate_pairs = [_legacy_paired_load(candidate, load_halves) for candidate in save_candidates]
+        if all(pair is not None for pair in candidate_pairs):
+            # Runtime selects the save half from type(value). If every possible
+            # save is a full legacy pair, that same selection also determines
+            # the load half without a target annotation.
+            load_candidates = [typing.cast(_StaticHalf, pair) for pair in candidate_pairs]
+            load_deferred = True
+        else:
+            load_candidates = _static_load_candidates(load_halves, normalized_target_type, adapter_format)
+    else:
+        load_candidates = _static_load_candidates(load_halves, normalized_target_type, adapter_format)
+    load = _sole_static_half(load_candidates)
+    if load_deferred:
+        load = None
+    return StaticAdapterResolution(
+        save_adapter=None if save is None else save.key,
+        load_adapter=None if load is None else load.key,
+        save_candidates=_static_candidate_keys(save_candidates),
+        load_candidates=_static_candidate_keys(load_candidates),
+        save_deferred=save_deferred,
+        load_deferred=load_deferred,
+    )
+
+
+def _static_save_candidates(halves: list[_StaticHalf], type_name: str | None, adapter_format: str) -> list[_StaticHalf]:
+    candidates = (
+        _matching_static_halves(halves, type_name, adapter_format)
+        if type_name is not None
+        else _static_halves_by_format(halves, adapter_format)
+    )
+    if candidates or adapter_format != JSON_ADAPTER_FORMAT:
+        return candidates
+    return [
+        _StaticHalf(
+            key=BUILTIN_JSON_ADAPTER.key,
+            tag=BUILTIN_JSON_ADAPTER.tag,
+            accepted_tags=None,
+            legacy_pair=True,
+        )
+    ]
+
+
+def _static_load_candidates(halves: list[_StaticHalf], type_name: str | None, adapter_format: str) -> list[_StaticHalf]:
+    candidates = (
+        _matching_static_halves(halves, type_name, adapter_format)
+        if type_name is not None
+        else _static_halves_by_format(halves, adapter_format)
+    )
+    if candidates or adapter_format != JSON_ADAPTER_FORMAT:
+        return candidates
+    return [
+        _StaticHalf(
+            key=BUILTIN_JSON_ADAPTER.key,
+            tag=None,
+            accepted_tags=tuple(sorted(BUILTIN_JSON_ADAPTER.accepted_tags)),
+            legacy_pair=True,
+        )
+    ]
+
+
+def _static_halves_by_format(halves: list[_StaticHalf], adapter_format: str) -> list[_StaticHalf]:
+    return [half for half in halves if _format_from_key(half.key) == adapter_format]
+
+
+def _sole_static_half(candidates: list[_StaticHalf]) -> _StaticHalf | None:
+    unique = {candidate.key: candidate for candidate in candidates}
+    return next(iter(unique.values())) if len(unique) == 1 else None
+
+
+def _static_candidate_keys(candidates: list[_StaticHalf]) -> tuple[str, ...]:
+    return tuple(sorted({candidate.key for candidate in candidates}))
+
+
+def _legacy_paired_load(save: _StaticHalf | None, load_halves: list[_StaticHalf]) -> _StaticHalf | None:
+    if save is None or not save.legacy_pair:
+        return None
+    if save.key == BUILTIN_JSON_ADAPTER.key:
+        return _StaticHalf(
+            key=BUILTIN_JSON_ADAPTER.key,
+            tag=None,
+            accepted_tags=tuple(sorted(BUILTIN_JSON_ADAPTER.accepted_tags)),
+            legacy_pair=True,
+        )
+    return next((half for half in load_halves if half.legacy_pair and half.key == save.key), None)
+
+
 def probe_pipeline_adapters(pipeline: Pipeline) -> AdapterProbeReport:
     """Run local save/load probes for adapters with an ``example`` callable."""
 
@@ -211,7 +371,7 @@ def probe_pipeline_adapters(pipeline: Pipeline) -> AdapterProbeReport:
     failures: list[AdapterProbeFailure] = []
     seen: set[str] = set()
     for adapter in _iter_runtime_edge_adapters(pipeline):
-        identity = json.dumps(adapter_identity(adapter), sort_keys=True)
+        identity = json_dumps(adapter_identity(adapter), ensure_ascii=True, separators=None)
         if identity in seen:
             continue
         seen.add(identity)
@@ -242,8 +402,9 @@ def _probe_adapter(adapter: RuntimeAdapter, example: Any) -> None:
 
 def _iter_runtime_edge_adapters(pipeline: Pipeline) -> Iterable[RuntimeAdapter]:
     for binding in _iter_runtime_edge_bindings(pipeline):
-        yield binding.save.adapter
-        yield binding.load.adapter
+        for adapter in (binding.save.adapter, binding.load.adapter):
+            if isinstance(adapter, Adapter | BuiltInJsonAdapter):
+                yield adapter
 
 
 def _iter_runtime_edge_bindings(pipeline: Pipeline) -> Iterable[_RuntimeEdgeBinding]:
@@ -254,10 +415,28 @@ def _iter_runtime_edge_bindings(pipeline: Pipeline) -> Iterable[_RuntimeEdgeBind
             continue
         source_type = _runtime_port_type(source_ref.node, source_ref.port, is_output=True)
         target_type = _runtime_port_type(target_ref.node, target_ref.port, is_output=False)
-        if source_type is None or target_type is None:
+        if isinstance(source_type, type):
+            save = pipeline.resolve_save_adapter_binding(py_type=source_type, format=adapter_format)
+        else:
+            save = _representative_runtime_save_by_format(pipeline, adapter_format)
+        if save is None:
             continue
-        save = pipeline.resolve_adapter_binding(py_type=source_type, format=adapter_format)
-        load = pipeline.resolve_adapter_binding(py_type=target_type, format=adapter_format)
+        if isinstance(target_type, type):
+            load = pipeline.resolve_load_adapter_binding(py_type=target_type, format=adapter_format)
+        elif isinstance(target_type, str):
+            load = pipeline.resolve_load_adapter_binding_by_type_name(
+                type_name=target_type,
+                format=adapter_format,
+            )
+        elif isinstance(save.adapter, Adapter | BuiltInJsonAdapter):
+            load = LoadAdapterResolution(save.adapter, save.source)
+        elif adapter_format is not None:
+            try:
+                load = pipeline.resolve_load_adapter_binding_by_format(format=adapter_format)
+            except ValueError:
+                load = None
+        else:
+            load = None
         if save is None or load is None:
             continue
         yield _RuntimeEdgeBinding(
@@ -265,6 +444,22 @@ def _iter_runtime_edge_bindings(pipeline: Pipeline) -> Iterable[_RuntimeEdgeBind
             save=save,
             load=load,
         )
+
+
+def _representative_runtime_save_by_format(
+    pipeline: Pipeline, adapter_format: str | None
+) -> SaveAdapterResolution | None:
+    if adapter_format is None:
+        return None
+    registered: dict[str, SaveAdapter] = {**pipeline.adapters, **pipeline.save_adapters}
+    candidates: list[SaveAdapter] = [
+        adapter for key, adapter in sorted(registered.items()) if _format_from_key(key) == adapter_format
+    ]
+    if not candidates and adapter_format == JSON_ADAPTER_FORMAT:
+        candidates = [BUILTIN_JSON_ADAPTER]
+    if not candidates:
+        return None
+    return SaveAdapterResolution(candidates[0], AdapterResolutionSource.EDGE)
 
 
 def _runtime_source_ref_and_format(raw_source: Any) -> tuple[NodeOutputRef | None, str | None]:
@@ -275,21 +470,45 @@ def _runtime_source_ref_and_format(raw_source: Any) -> tuple[NodeOutputRef | Non
     return None, None
 
 
-def _runtime_port_type(node: Node, port: InputPort | OutputPort, *, is_output: bool) -> type[Any] | None:
+def _runtime_port_type(node: Node, port: InputPort | OutputPort, *, is_output: bool) -> type[Any] | str | None:
     if isinstance(node, NodeFunction):
-        annotation = node.func.__annotations__.get("return" if is_output else port.name)
-        annotation = _unwrap_annotated(annotation)
-        if isinstance(annotation, type):
-            return annotation
+        try:
+            annotation = typing.get_type_hints(node.func, include_extras=True).get("return" if is_output else port.name)
+        except (NameError, TypeError):
+            annotation = node.func.__annotations__.get("return" if is_output else port.name)
+        normalized = _normalize_runtime_annotation(annotation)
+        if normalized is not None:
+            return normalized
     if port.typ_ is not None:
-        return _BUILTIN_TYPES.get(port.typ_)
+        type_name = _normalize_static_type_name(port.typ_)
+        if type_name is not None:
+            return _BUILTIN_TYPES.get(type_name, type_name)
     return None
 
 
-def _unwrap_annotated(annotation: Any) -> Any:
-    if typing.get_origin(annotation) is typing.Annotated:
-        return typing.get_args(annotation)[0]
-    return annotation
+def _normalize_runtime_annotation(annotation: Any) -> type[Any] | str | None:
+    if annotation is None:
+        return None
+    if isinstance(annotation, str):
+        type_name = _normalize_static_type_name(annotation)
+        if type_name is None:
+            return None
+        return _BUILTIN_TYPES.get(type_name, type_name)
+    while typing.get_origin(annotation) is typing.Annotated:
+        annotation = typing.get_args(annotation)[0]
+    if annotation is Any:
+        return None
+    origin = typing.get_origin(annotation)
+    if origin in {typing.Union, UnionType}:
+        concrete = [item for item in typing.get_args(annotation) if item is not type(None)]
+        if len(concrete) != 1:
+            return None
+        return _normalize_runtime_annotation(concrete[0])
+    if isinstance(origin, type):
+        return origin
+    if isinstance(annotation, type):
+        return annotation
+    return None
 
 
 def _alias_by_node(pipeline: Pipeline) -> dict[Node, str]:
@@ -346,10 +565,22 @@ def _find_dpipeline_adapter_compatibility_issues(
             continue
         source_type = _static_port_type(node_functions, source_ref.uuid, source_ref.port, is_output=True)
         target_type = _static_port_type(node_functions, target_ref.uuid, target_ref.port, is_output=False)
-        if source_type is None or target_type is None:
+        if adapter_format is not None:
+            resolution = resolve_yaml_edge_adapters(
+                pipeline.adapters,
+                source_type=source_type,
+                target_type=target_type,
+                adapter_format=adapter_format,
+            )
+            save = _static_half_by_key(save_halves, resolution.save_adapter, role="save")
+            load = _static_half_by_key(load_halves, resolution.load_adapter, role="load")
+            if save is None and resolution.save_deferred and resolution.save_candidates:
+                save = _static_half_by_key(save_halves, resolution.save_candidates[0], role="save")
+        elif source_type is not None and target_type is not None:
+            save = _resolve_static_save(save_halves, source_type, adapter_format)
+            load = _resolve_static_load(load_halves, target_type, adapter_format)
+        else:
             continue
-        save = _resolve_static_save(save_halves, source_type, adapter_format)
-        load = _resolve_static_load(load_halves, target_type, adapter_format)
         if save is None or load is None or save.tag is None or load.accepted_tags is None:
             continue
         if save.tag not in load.accepted_tags:
@@ -365,6 +596,22 @@ def _find_dpipeline_adapter_compatibility_issues(
     return tuple(issues)
 
 
+def _static_half_by_key(halves: list[_StaticHalf], key: str | None, *, role: str) -> _StaticHalf | None:
+    if key is None:
+        return None
+    match = next((half for half in halves if half.key == key), None)
+    if match is not None:
+        return match
+    if key != BUILTIN_JSON_ADAPTER.key:
+        return None
+    return _StaticHalf(
+        key=key,
+        tag=BUILTIN_JSON_ADAPTER.tag if role == "save" else None,
+        accepted_tags=(None if role == "save" else tuple(sorted(BUILTIN_JSON_ADAPTER.accepted_tags))),
+        legacy_pair=True,
+    )
+
+
 def _static_adapter_halves(adapters: list[Any]) -> tuple[list[_StaticHalf], list[_StaticHalf]]:
     save_halves: list[_StaticHalf] = []
     load_halves: list[_StaticHalf] = []
@@ -375,6 +622,7 @@ def _static_adapter_halves(adapters: list[Any]) -> tuple[list[_StaticHalf], list
                 key=adapter.key,
                 tag=adapter_format,
                 accepted_tags=(adapter_format,),
+                legacy_pair=True,
             )
             save_halves.append(half)
             load_halves.append(half)
@@ -407,25 +655,41 @@ def _static_port_type(
 
 
 def _resolve_static_save(halves: list[_StaticHalf], type_name: str, adapter_format: str | None) -> _StaticHalf | None:
-    if _is_json_native_type_name(type_name) and adapter_format in {None, JSON_ADAPTER_FORMAT}:
+    normalized_type = _normalize_static_type_name(type_name)
+    if normalized_type is None:
+        return None
+    candidates = _matching_static_halves(halves, normalized_type, adapter_format)
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates:
+        return None
+    if _is_json_native_type_name(normalized_type) and adapter_format in {None, JSON_ADAPTER_FORMAT}:
         return _StaticHalf(
             key=BUILTIN_JSON_ADAPTER.key,
             tag=BUILTIN_JSON_ADAPTER.tag,
             accepted_tags=None,
+            legacy_pair=True,
         )
-    candidates = _matching_static_halves(halves, type_name, adapter_format)
-    return candidates[0] if len(candidates) == 1 else None
+    return None
 
 
 def _resolve_static_load(halves: list[_StaticHalf], type_name: str, adapter_format: str | None) -> _StaticHalf | None:
-    if _is_json_native_type_name(type_name) and adapter_format in {None, JSON_ADAPTER_FORMAT}:
+    normalized_type = _normalize_static_type_name(type_name)
+    if normalized_type is None:
+        return None
+    candidates = _matching_static_halves(halves, normalized_type, adapter_format)
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates:
+        return None
+    if _is_json_native_type_name(normalized_type) and adapter_format in {None, JSON_ADAPTER_FORMAT}:
         return _StaticHalf(
             key=BUILTIN_JSON_ADAPTER.key,
             tag=None,
             accepted_tags=tuple(sorted(BUILTIN_JSON_ADAPTER.accepted_tags)),
+            legacy_pair=True,
         )
-    candidates = _matching_static_halves(halves, type_name, adapter_format)
-    return candidates[0] if len(candidates) == 1 else None
+    return None
 
 
 def _matching_static_halves(halves: list[_StaticHalf], type_name: str, adapter_format: str | None) -> list[_StaticHalf]:
@@ -439,12 +703,31 @@ def _matching_static_halves(halves: list[_StaticHalf], type_name: str, adapter_f
 
 def _key_matches_type(key: str, type_name: str) -> bool:
     key_type, _, _ = key.rpartition("@")
-    return key_type == type_name or key_type.endswith(".{}".format(type_name))
+    return key_type == type_name or ("." not in type_name and key_type.endswith(".{}".format(type_name)))
 
 
 def _format_from_key(key: str) -> str:
     _, _, adapter_format = key.rpartition("@")
     return adapter_format
+
+
+def _normalize_static_type_name(type_name: str | None) -> str | None:
+    """Return a concrete outer type name, or None for unavailable/union types."""
+
+    if type_name is None:
+        return None
+    normalized = type_name.strip()
+    if not normalized or normalized in {"Any", "typing.Any"}:
+        return None
+    if "|" in normalized:
+        return None
+    outer = normalized.partition("[")[0].strip()
+    if outer in {"Annotated", "typing.Annotated", "Optional", "typing.Optional", "Union", "typing.Union"}:
+        return None
+    concrete = _BUILTIN_TYPES.get(outer)
+    if concrete is not None:
+        return "{}.{}".format(concrete.__module__, concrete.__qualname__)
+    return outer
 
 
 def _is_json_native_type_name(type_name: str | None) -> bool:

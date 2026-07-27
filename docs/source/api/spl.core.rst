@@ -22,6 +22,15 @@ spl.core.\_common module
    :show-inheritance:
    :undoc-members:
 
+spl.core.\_graph module
+-----------------------
+
+.. automodule:: spl.core._graph
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.core.adapter\_compat module
 -------------------------------
 
@@ -40,6 +49,15 @@ spl.core.fingerprint module
    :show-inheritance:
    :undoc-members:
 
+spl.core.json\_contract module
+------------------------------
+
+.. automodule:: spl.core.json_contract
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.core.manifest module
 ------------------------
 
@@ -53,6 +71,15 @@ spl.core.node\_runtime module
 -----------------------------
 
 .. automodule:: spl.core.node_runtime
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.core.redaction module
+-------------------------
+
+.. automodule:: spl.core.redaction
    :members:
    :private-members:
    :show-inheritance:

@@ -141,14 +141,15 @@ def test_sync_backlog_is_bounded_by_count_bytes_and_timeout(tmp_path: Path) -> N
         store.close()
 
 
-def test_oversized_sync_event_is_terminal_failed_and_does_not_block_queue(tmp_path: Path) -> None:
+def test_oversized_sync_event_is_rejected_before_persistence_and_does_not_block_queue(tmp_path: Path) -> None:
     _BatchServer.reset()
     store, runtime, _ = _runtime(tmp_path)
     try:
-        poison = store.enqueue_sync_event(
-            "local_run_update",
-            {"owner_id": "owner-a", "run": {"id": "poison", "stdout": "x" * (600 * 1_024)}},
-        )
+        with pytest.raises(ValueError, match="sync event exceeds"):
+            store.enqueue_sync_event(
+                "local_run_update",
+                {"owner_id": "owner-a", "run": {"id": "poison", "stdout": "x" * (600 * 1_024)}},
+            )
         healthy = store.enqueue_sync_event(
             "local_run_update",
             {"owner_id": "owner-a", "run": {"id": "healthy", "stdout": "ok"}},
@@ -156,11 +157,13 @@ def test_oversized_sync_event_is_terminal_failed_and_does_not_block_queue(tmp_pa
 
         runtime.sync_once()
 
-        poisoned = store.get_sync_event(poison["id"])
-        assert poisoned["status"] == "failed"
-        assert poisoned["retry"]["will_retry"] is False
-        assert "exceeds" in poisoned["error"]
         assert store.get_sync_event(healthy["id"])["status"] == "sent"
+        with store._lock:  # noqa: SLF001 - queue-admission invariant.
+            ids = {
+                row["id"]
+                for row in store._conn.execute("SELECT id FROM sync_events").fetchall()  # noqa: SLF001
+            }
+        assert ids == {healthy["id"]}
     finally:
         runtime.shutdown()
         store.close()
@@ -197,7 +200,9 @@ def test_unserializable_sync_event_is_terminal_failed_and_does_not_block_queue(
         poisoned = store.get_sync_event(poison["id"])
         assert poisoned["status"] == "failed"
         assert poisoned["retry"]["will_retry"] is False
-        assert "not JSON serializable" in poisoned["error"]
+        assert 'invalid splime JSON value at $["payload"]["not_json"]' in poisoned["error"]
+        assert "builtins.set" in poisoned["error"]
+        assert "is not supported" in poisoned["error"]
         assert store.get_sync_event(healthy["id"])["status"] == "sent"
     finally:
         runtime.shutdown()

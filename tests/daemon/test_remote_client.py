@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from io import BytesIO
 from typing import Any
+from urllib.error import HTTPError
 
 import pytest
 
@@ -67,48 +69,47 @@ def test_server_client_uses_user_bearer_for_library_admin_calls() -> None:
     }
 
 
-def test_streaming_file_request_uses_bundled_ca_context(tmp_path, monkeypatch) -> None:
-    sentinel_context = object()
+def test_server_client_surfaces_actionable_redirect_error(monkeypatch) -> None:
+    def refuse_redirect(request: Any, **kwargs: Any) -> None:
+        del kwargs
+        raise HTTPError(
+            request.full_url,
+            302,
+            "HTTP 302 redirect refused: configure the client with the final HTTPS endpoint instead",
+            {},
+            BytesIO(),
+        )
+
+    monkeypatch.setattr(remote_client, "urlopen_verified", refuse_redirect)
+
+    with pytest.raises(remote_client.ServerClientError, match="final HTTPS endpoint"):
+        ServerClient("https://splime.io/api", "machine-token").list_machines()
+
+
+def test_streaming_file_request_uses_shared_transport_without_buffering(tmp_path, monkeypatch) -> None:
     calls: dict[str, Any] = {}
 
     class FakeResponse:
-        status = 200
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
 
         def read(self) -> bytes:
             return b'{"ok": true}'
 
-    class FakeHTTPSConnection:
-        def __init__(self, host, port=None, *, timeout=None, context=None):
-            calls["init"] = {
-                "host": host,
-                "port": port,
-                "timeout": timeout,
-                "context": context,
-            }
-
-        def putrequest(self, method, path):
-            calls["request"] = (method, path)
-
-        def putheader(self, name, value):
-            calls.setdefault("headers", []).append((name, value))
-
-        def endheaders(self):
-            calls["ended"] = True
-
-        def send(self, chunk):
-            calls.setdefault("chunks", []).append(chunk)
-
-        def getresponse(self):
-            return FakeResponse()
-
-        def close(self):
-            calls["closed"] = True
+    def fake_open(request: Any, *, timeout: float | None) -> FakeResponse:
+        calls["request"] = request
+        calls["timeout"] = timeout
+        calls["chunks"] = list(request.data)
+        return FakeResponse()
 
     upload = tmp_path / "payload.bin"
-    upload.write_bytes(b"payload")
+    payload = b"a" * (1024 * 1024 + 7)
+    upload.write_bytes(payload)
 
-    monkeypatch.setattr(remote_client, "verified_https_context", lambda: sentinel_context)
-    monkeypatch.setattr(remote_client.http.client, "HTTPSConnection", FakeHTTPSConnection)
+    monkeypatch.setattr(remote_client, "urlopen_verified", fake_open)
 
     result = ServerClient("https://splime.io/api", "machine-token")._streaming_file_request(
         "PUT",
@@ -117,11 +118,14 @@ def test_streaming_file_request_uses_bundled_ca_context(tmp_path, monkeypatch) -
     )
 
     assert result == {"ok": True}
-    assert calls["init"]["context"] is sentinel_context
-    assert calls["init"]["host"] == "splime.io"
-    assert calls["request"] == ("PUT", "/api/artifacts/run-1/payload.bin")
-    assert calls["chunks"] == [b"payload"]
-    assert calls["closed"] is True
+    assert calls["request"].full_url == "https://splime.io/api/artifacts/run-1/payload.bin"
+    assert calls["request"].get_method() == "PUT"
+    assert calls["timeout"] == remote_client.DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS
+    assert [len(chunk) for chunk in calls["chunks"]] == [1024 * 1024, 7]
+    assert b"".join(calls["chunks"]) == payload
+    headers = {name.casefold(): value for name, value in calls["request"].header_items()}
+    assert headers["authorization"] == "Bearer machine-token"
+    assert headers["content-length"] == str(len(payload))
 
 
 def test_owner_and_handle_reads_use_exact_additive_central_paths(monkeypatch) -> None:

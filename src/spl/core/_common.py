@@ -1,29 +1,36 @@
 import inspect
 import json
+import logging
 import os
 import shutil
 import tempfile
+import typing
 import warnings
 import weakref
+from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
-from itertools import groupby
 from operator import itemgetter
 from pathlib import Path
-from types import FunctionType
+from types import FunctionType, UnionType
 from typing import Any, cast, overload
 
 from spl.core import manifest as m_manifest
 from spl.core import node_runtime as m_node_runtime
 from spl.core import resume as m_resume
+from spl.core._graph import node_input_ref_sort_key
 from spl.core.entities.adapter import (
     BUILTIN_JSON_ADAPTER,
     JSON_NATIVE_TYPES,
+    Adapter,
+    BuiltInJsonAdapter,
     LoadAdapter,
     RuntimeAdapter,
     SaveAdapter,
-    adapter_identity,
+    load_adapter_identity,
+    save_adapter_identity,
 )
 from spl.core.entities.artifact import ArtifactRef, compute_sha256
 from spl.core.entities.node import (
@@ -37,15 +44,110 @@ from spl.core.entities.node import (
 )
 from spl.core.entities.node_function import NodeFunction
 from spl.core.entities.node_remote import NodeRemote
-from spl.core.entities.pipeline import AdapterResolution, AdapterResolutionSource, Pipeline
+from spl.core.entities.pipeline import (
+    AdapterResolution,
+    AdapterResolutionSource,
+    LoadAdapterResolution,
+    Pipeline,
+    SaveAdapterResolution,
+)
 from spl.core.entities.scalar import Scalar
 from spl.core.fingerprint import canonical_json_bytes, node_fingerprint
+from spl.core.json_contract import validate_json_value
 
 _JSON_NATIVE_TYPES = JSON_NATIVE_TYPES
+LOGGER = logging.getLogger(__name__)
 RunAdapterOverrideKey = tuple[str, str]
 RunAdapterOverrides = Mapping[RunAdapterOverrideKey, RuntimeAdapter]
 _NormalizedRunAdapterOverrides = dict[tuple[Node, str], RuntimeAdapter]
 RunRuntimeOverrides = m_node_runtime.RunRuntimeOverrides
+_OutputMaterializationRequest = tuple[NodeOutputRef, str | None, RuntimeAdapter | None, Node, InputPort]
+
+_BUILTIN_PORT_TYPES: dict[str, type[Any]] = {
+    "str": str,
+    "builtins.str": str,
+    "int": int,
+    "builtins.int": int,
+    "float": float,
+    "builtins.float": float,
+    "bool": bool,
+    "builtins.bool": bool,
+    "None": type(None),
+    "NoneType": type(None),
+    "builtins.NoneType": type(None),
+    "dict": dict,
+    "builtins.dict": dict,
+    "list": list,
+    "builtins.list": list,
+    "Dict": dict,
+    "typing.Dict": dict,
+    "List": list,
+    "typing.List": list,
+    "set": set,
+    "builtins.set": set,
+    "Set": set,
+    "typing.Set": set,
+    "tuple": tuple,
+    "builtins.tuple": tuple,
+    "Tuple": tuple,
+    "typing.Tuple": tuple,
+}
+
+
+class _SourceOutputCommitError(RuntimeError):
+    """Failure while saving or recording one producing-node output."""
+
+
+def _runtime_input_type_hint(node: Node, port: InputPort) -> type[Any] | str | None:
+    if isinstance(node, NodeFunction):
+        try:
+            annotation = typing.get_type_hints(node.func, include_extras=True).get(port.name)
+        except (NameError, TypeError):
+            annotation = node.func.__annotations__.get(port.name)
+        while typing.get_origin(annotation) is typing.Annotated:
+            annotation = typing.get_args(annotation)[0]
+        if annotation is Any:
+            annotation = None
+        origin = typing.get_origin(annotation)
+        if origin in {typing.Union, UnionType}:
+            concrete = [item for item in typing.get_args(annotation) if item is not type(None)]
+            annotation = concrete[0] if len(concrete) == 1 else None
+            if annotation is Any:
+                annotation = None
+            origin = typing.get_origin(annotation)
+        if isinstance(origin, type):
+            return origin
+        if isinstance(annotation, type):
+            return annotation
+    if port.typ_ is not None:
+        type_name = _normalize_port_type_name(port.typ_)
+        if type_name is not None:
+            return _BUILTIN_PORT_TYPES.get(type_name, type_name)
+    return None
+
+
+def _normalize_port_type_name(type_name: str) -> str | None:
+    normalized = type_name.strip()
+    if not normalized or normalized in {"Any", "typing.Any"} or "|" in normalized:
+        return None
+    outer = normalized.partition("[")[0].strip()
+    if outer in {"Annotated", "typing.Annotated", "Optional", "typing.Optional", "Union", "typing.Union"}:
+        return None
+    concrete = _BUILTIN_PORT_TYPES.get(outer)
+    if concrete is not None:
+        return "{}.{}".format(concrete.__module__, concrete.__qualname__)
+    return outer
+
+
+def _accumulate_pipeline_dependencies(pipeline: Pipeline) -> dict[Node, dict[InputPort, Any]]:
+    deps: defaultdict[Node, dict[InputPort, Any]] = defaultdict(dict)
+    linked_inputs: set[NodeInputRef] = set()
+    for node_input_ref, value in sorted(pipeline.links, key=lambda link: node_input_ref_sort_key(link[0])):
+        if node_input_ref in linked_inputs:
+            raise ValueError("pipeline input `{}` is linked more than once".format(node_input_ref))
+        linked_inputs.add(node_input_ref)
+        deps[node_input_ref.node][node_input_ref.port] = value
+    return dict(deps)
 
 
 def _normalize_run_adapter_override_key(key: Any) -> RunAdapterOverrideKey:
@@ -422,7 +524,20 @@ class Deployment:
 
         if self._pipeline is None:
             raise RuntimeError("resume requires a local pipeline")
-        parent_run_dir, parent_manifest = m_resume.load_retained_manifest(run_id)
+        if m_manifest.normalize_keep(keep) is False:
+            raise ValueError(
+                "keep=False is incompatible with resume because the child run would discard the state needed "
+                "for another resume; use keep=True (keep='on_failure' retains the child only if it fails)"
+            )
+        try:
+            parent_run_dir, parent_manifest = m_resume.load_retained_manifest(run_id)
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "cannot resume run `{}` because its retained files are unavailable; transient keep=False and "
+                "successful keep='on_failure' runs are intentionally removed, so launch the parent with keep=True".format(
+                    run_id
+                )
+            ) from exc
         if parent_manifest.get("status") not in {"failed", "succeeded"}:
             raise RuntimeError(
                 "resume requires a terminal retained run; current status is `{}`".format(parent_manifest.get("status"))
@@ -524,15 +639,14 @@ class Run:
             or self._runtime_config.get("node_runtime") is not None
             or any(m_node_runtime.RUNTIME_TAG_NAME in node_tags for node_tags in pipeline.tags.values())
         )
-        self._deps: dict[Node, dict[Any, Any]] = {
-            k: dict(map(itemgetter(slice(1, None)), vs))
-            for k, vs in groupby(
-                sorted([(x.node, x.port, y) for (x, y) in pipeline.links], key=lambda x: hash(x[0])), itemgetter(0)
-            )
-        }
+        self._deps = _accumulate_pipeline_dependencies(pipeline)
         self._results: dict[Node, dict[str, Any]] = dict()
+        self._visiting_nodes: list[Node] = []
+        self._visiting_node_set: set[Node] = set()
         self._artifact_refs: dict[tuple[Node, str, str], ArtifactRef] = dict()
-        self._adapter_resolutions: dict[tuple[Node, str], AdapterResolution] = dict()
+        self._adapter_resolutions: dict[tuple[Node, str], SaveAdapterResolution | AdapterResolution] = dict()
+        self._load_adapter_resolutions: dict[tuple[Node, str, Node, str], LoadAdapterResolution] = dict()
+        self._frozen_save_adapter_records: dict[tuple[Node, str, Node, str], dict[str, Any]] = dict()
         self._node_inputs: dict[Node, dict[str, Any]] = dict()
         self._node_adapters: dict[Node, dict[str, Any]] = dict()
         self._node_runtimes: dict[Node, dict[str, Any]] = dict()
@@ -563,6 +677,14 @@ class Run:
         if self._manifest_writer is None:
             return None
         return self._manifest_writer.path
+
+    @property
+    def manifest_snapshot(self) -> dict[str, Any] | None:
+        """Return an in-memory manifest copy, including deferred transient runs."""
+
+        if self._manifest_writer is None:
+            return None
+        return deepcopy(self._manifest_writer.data)
 
     @overload
     def resume(
@@ -607,6 +729,11 @@ class Run:
         only its load half.
         """
 
+        if m_manifest.normalize_keep(keep) is False:
+            raise ValueError(
+                "keep=False is incompatible with resume because the child run would discard the state needed "
+                "for another resume; use keep=True (keep='on_failure' retains the child only if it fails)"
+            )
         parent_run_dir, parent_manifest = self._parent_manifest()
         merged_kwargs = dict(self._kwargs)
         if kwargs is not None:
@@ -641,17 +768,133 @@ class Run:
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
-        self.close()
+        try:
+            self.close()
+        except BaseException as close_exc:
+            if exc is not None:
+                raise close_exc from exc
+            raise
 
     def close(self) -> None:
-        if not self._closed:
-            if self._manifest_writer is not None and self._terminal_status is None:
-                self._finish_manifest(status="succeeded")
-            if self._artifacts_finalizer is not None:
-                self._artifacts_finalizer()
-            if self._run_dir_finalizer is not None and not self._should_retain_terminal():
-                self._run_dir_finalizer()
-            self._closed = True
+        if self._closed:
+            return
+        discovered_error: RuntimeError | None = None
+        if self._terminal_status is None and self._manifest_writer is None:
+            self._ensure_manifest_writer()
+        if self._manifest_writer is not None and self._terminal_status is None:
+            discovered_error = self._finish_unfinished_manifest()
+        if self._artifacts_finalizer is not None:
+            self._artifacts_finalizer()
+        if self._run_dir_finalizer is not None and not self._should_retain_terminal():
+            self._run_dir_finalizer()
+        self._closed = True
+        if discovered_error is not None:
+            raise discovered_error
+
+    def _finish_unfinished_manifest(self) -> RuntimeError | None:
+        writer = self._manifest_writer
+        if writer is None:
+            return None
+        nodes = writer.data.get("nodes")
+        node_records = nodes if isinstance(nodes, Mapping) else {}
+        if self._all_node_records_are_complete(node_records):
+            self._finish_manifest(status="succeeded")
+            return None
+        recorded_error = self._recorded_node_failure(node_records)
+        if recorded_error is not None:
+            LOGGER.error(
+                "run `%s` reached a failed node but its terminal run status was missing; recording failure: %s",
+                self._run_id,
+                recorded_error,
+            )
+            for node in self._pipeline.nodes:
+                record = node_records.get(self._node_id(node))
+                if self._node_record_is_complete(record) or (
+                    isinstance(record, Mapping) and record.get("status") in {"failed", "upstream-failed"}
+                ):
+                    continue
+                self._write_node_manifest(
+                    node,
+                    status="failed",
+                    outputs={},
+                    error="run finalization followed another node failure: {}".format(recorded_error),
+                    compute_fingerprint=False,
+                )
+            self._finish_manifest(status="failed", error=recorded_error)
+            return RuntimeError(
+                "run `{}` had a failed node but no terminal run status; the recorded failure was preserved: {}".format(
+                    self._run_id,
+                    recorded_error,
+                )
+            )
+
+        error = self._incomplete_close_error(node_records)
+        LOGGER.error("%s", error)
+        for node in self._pipeline.nodes:
+            node_id = self._node_id(node)
+            record = node_records.get(node_id)
+            if self._node_record_is_complete(record):
+                continue
+            self._write_node_manifest(
+                node,
+                status="failed",
+                outputs={},
+                error=error,
+                compute_fingerprint=False,
+            )
+        self._finish_manifest(status="failed", error=error)
+        return RuntimeError(error)
+
+    def _all_node_records_are_complete(self, node_records: Mapping[Any, Any]) -> bool:
+        expected_node_ids = {self._node_id(node) for node in self._pipeline.nodes}
+        return set(node_records) == expected_node_ids and all(
+            self._node_record_is_complete(node_records[node_id]) for node_id in expected_node_ids
+        )
+
+    def _node_record_is_complete(self, record: Any) -> bool:
+        if not isinstance(record, Mapping) or record.get("status") not in {"succeeded", "frozen"}:
+            return False
+        node_id = record.get("id")
+        node = next((item for item in self._pipeline.nodes if self._node_id(item) == node_id), None)
+        if node is None:
+            return False
+        outputs = record.get("outputs")
+        return isinstance(outputs, Mapping) and set(outputs) == {port.name for port in node.outputs}
+
+    def _recorded_node_failure(self, node_records: Mapping[Any, Any]) -> str | None:
+        for node_id, record in sorted(node_records.items(), key=lambda item: str(item[0])):
+            if not isinstance(record, Mapping) or record.get("status") not in {"failed", "upstream-failed"}:
+                continue
+            error = record.get("error")
+            if isinstance(error, str) and error:
+                return error
+            return "node `{}` ended with status `{}` without an error detail".format(
+                record.get("alias") or node_id,
+                record.get("status"),
+            )
+        return None
+
+    def _incomplete_close_error(self, node_records: Mapping[Any, Any]) -> str:
+        incomplete = []
+        expected_nodes = {self._node_id(node): node for node in self._pipeline.nodes}
+        for node_id, node in sorted(expected_nodes.items()):
+            record = node_records.get(node_id)
+            if self._node_record_is_complete(record):
+                continue
+            status = record.get("status") if isinstance(record, Mapping) else "missing"
+            alias = record.get("alias") if isinstance(record, Mapping) else self._node_alias(node)
+            incomplete.append("{} ({})".format(alias or node_id, status))
+        for node_id, record in sorted(node_records.items(), key=lambda item: str(item[0])):
+            if node_id in expected_nodes:
+                continue
+            status = record.get("status") if isinstance(record, Mapping) else "invalid"
+            alias = record.get("alias") if isinstance(record, Mapping) else None
+            incomplete.append("{} ({}, unknown node)".format(alias or node_id, status))
+        detail = ", ".join(incomplete) if incomplete else "no terminal node records"
+        return (
+            "run `{}` closed before node finalization completed; non-terminal or inconsistent nodes: {}. "
+            "The run is recorded as failed; re-run it and inspect this manifest if the problem repeats."
+        ).format(self._run_id, detail)
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -678,10 +921,8 @@ class Run:
         return self._run_dir
 
     def _ensure_manifest_writer(self) -> m_manifest.RunManifestWriter | None:
-        if self._keep is False:
-            return None
         if self._manifest_writer is None:
-            if self._keep == "on_failure":
+            if self._keep is False or self._keep == "on_failure":
                 self._manifest_writer = m_manifest.RunManifestWriter.create_deferred(
                     run_id=self._run_id,
                     keep=self._keep,
@@ -707,11 +948,12 @@ class Run:
             return
         if self._terminal_status is not None:
             return
-        self._terminal_status = status
-        if self._should_retain_terminal():
+        should_retain = m_manifest.should_retain_terminal(self._keep, status)
+        if should_retain:
             writer.materialize(self._ensure_run_dir())
         writer.finish(status=status, error=error)
-        if self._should_retain_terminal() and self._run_dir_finalizer is not None:
+        self._terminal_status = status
+        if should_retain and self._run_dir_finalizer is not None:
             self._run_dir_finalizer.detach()
 
     def _should_retain_terminal(self) -> bool:
@@ -726,6 +968,7 @@ class Run:
             # ADR 002 keeps this pre-resolution shortcut: implicit JSON-native values and the resolved built-in
             # json adapter both return the original object without files, but avoiding resolver work keeps this
             # hot path fast.
+            validate_json_value(value)
             return value
 
         return self._round_trip_resolved(value, source_ref, adapter_format, run_override=None)
@@ -758,18 +1001,181 @@ class Run:
         if source_ref is not None:
             self._adapter_resolutions[(source_ref.node, source_ref.port.name)] = resolution
         if adapter is BUILTIN_JSON_ADAPTER and type(value) in _JSON_NATIVE_TYPES:
+            validate_json_value(value)
             return value
 
         self._ensure_open()
         if source_ref is None:
             ref = encode(value, adapter, self._get_artifacts_dir())
         else:
-            cache_key = (source_ref.node, source_ref.port.name, adapter.key)
-            if cache_key not in self._artifact_refs:
-                self._artifact_refs[cache_key] = encode(value, adapter, self._get_artifacts_dir())
-            ref = self._artifact_refs[cache_key]
-            self._record_materialized_output(source_ref, ref, resolution)
+            try:
+                ref = self._materialize_source_output(value, source_ref, resolution)
+            except _SourceOutputCommitError as exc:
+                self._finalize_lazy_source_output_failure(source_ref, exc)
+                raise
         return decode(ref, adapter)
+
+    def _resolve_edge_adapter_bindings(
+        self,
+        value: Any,
+        source_ref: NodeOutputRef,
+        target_node: Node,
+        target_port: InputPort,
+        adapter_format: str | None,
+        run_override: RuntimeAdapter | None,
+    ) -> tuple[SaveAdapterResolution | None, LoadAdapterResolution | None]:
+        save = self._pipeline.resolve_save_adapter_binding(
+            py_type=type(value), format=adapter_format, run_override=run_override
+        )
+        target_type = _runtime_input_type_hint(target_node, target_port)
+        load: LoadAdapterResolution | None
+        if run_override is not None:
+            load = LoadAdapterResolution(run_override, AdapterResolutionSource.RUN_OVERRIDE)
+        elif isinstance(target_type, type):
+            load = self._pipeline.resolve_load_adapter_binding(
+                py_type=target_type,
+                format=adapter_format,
+            )
+        elif isinstance(target_type, str):
+            load = self._pipeline.resolve_load_adapter_binding_by_type_name(
+                type_name=target_type,
+                format=adapter_format,
+            )
+        elif save is not None and isinstance(save.adapter, Adapter | BuiltInJsonAdapter):
+            load = LoadAdapterResolution(save.adapter, save.source)
+        elif adapter_format is not None:
+            load = self._pipeline.resolve_load_adapter_binding_by_format(format=adapter_format)
+        elif save is not None:
+            load_adapter = self._pipeline.resolve_load_adapter(key=save.adapter.key)
+            load = (
+                None if load_adapter is None else LoadAdapterResolution(load_adapter, AdapterResolutionSource.PIPELINE)
+            )
+        else:
+            load = None
+
+        if adapter_format is None and save is None and load is None:
+            return None, None
+        if save is None:
+            raise ValueError(
+                "pipeline adapter is not found for save python type ({}) and format `{}`".format(
+                    type(value), adapter_format or "<default>"
+                )
+            )
+        if target_type is None and load is None:
+            label = self._node_alias(target_node) or self._node_name(target_node)
+            raise ValueError(
+                "pipeline load adapter cannot be resolved for {}.{} because its Python input type is unknown".format(
+                    label, target_port.name
+                )
+            )
+        if load is None:
+            raise ValueError(
+                "pipeline adapter is not found for load python type ({}) and format `{}`".format(
+                    target_type, adapter_format or "<default>"
+                )
+            )
+
+        self._adapter_resolutions[(source_ref.node, source_ref.port.name)] = save
+        self._load_adapter_resolutions[(source_ref.node, source_ref.port.name, target_node, target_port.name)] = load
+        return save, load
+
+    def _round_trip_edge(
+        self,
+        value: Any,
+        source_ref: NodeOutputRef,
+        target_node: Node,
+        target_port: InputPort,
+        adapter_format: str | None,
+        run_override: RuntimeAdapter | None,
+    ) -> Any:
+        save, load = self._resolve_edge_adapter_bindings(
+            value,
+            source_ref,
+            target_node,
+            target_port,
+            adapter_format,
+            run_override,
+        )
+        if save is None or load is None:
+            return value
+        if (
+            save.adapter is BUILTIN_JSON_ADAPTER
+            and load.adapter is BUILTIN_JSON_ADAPTER
+            and type(value) in _JSON_NATIVE_TYPES
+        ):
+            validate_json_value(value)
+            return value
+
+        self._ensure_open()
+        try:
+            ref = self._materialize_source_output(value, source_ref, save)
+        except _SourceOutputCommitError as exc:
+            self._finalize_lazy_source_output_failure(source_ref, exc)
+            raise
+        return decode(ref, load.adapter)
+
+    def _materialize_source_output(
+        self,
+        value: Any,
+        source_ref: NodeOutputRef,
+        resolution: SaveAdapterResolution | AdapterResolution,
+    ) -> ArtifactRef:
+        adapter = resolution.adapter
+        cache_key = (source_ref.node, source_ref.port.name, adapter.key)
+        if cache_key not in self._artifact_refs:
+            try:
+                self._artifact_refs[cache_key] = encode(value, adapter, self._get_artifacts_dir())
+            except Exception as exc:
+                raise self._source_output_commit_error(
+                    source_ref,
+                    stage="adapter save/materialization",
+                    exc=exc,
+                ) from exc
+        ref = self._artifact_refs[cache_key]
+        try:
+            self._record_materialized_output(source_ref, ref, resolution)
+        except Exception as exc:
+            raise self._source_output_commit_error(
+                source_ref,
+                stage="output manifest persistence",
+                exc=exc,
+            ) from exc
+        return ref
+
+    def _source_output_commit_error(
+        self,
+        source_ref: NodeOutputRef,
+        *,
+        stage: str,
+        exc: Exception,
+    ) -> _SourceOutputCommitError:
+        label = self._node_alias(source_ref.node) or self._node_name(source_ref.node)
+        return _SourceOutputCommitError(
+            "output commit failed for node `{}` port `{}` during {}: {}".format(
+                label,
+                source_ref.port.name,
+                stage,
+                repr(exc),
+            )
+        )
+
+    def _finalize_lazy_source_output_failure(
+        self,
+        source_ref: NodeOutputRef,
+        exc: _SourceOutputCommitError,
+    ) -> None:
+        error = repr(exc)
+        try:
+            self._write_node_manifest(
+                source_ref.node,
+                status="failed",
+                outputs={},
+                error=error,
+                compute_fingerprint=False,
+            )
+            self._finish_manifest(status="failed", error=error)
+        except BaseException as finalization_exc:
+            raise finalization_exc from exc
 
     def _adapter_override_for(self, source_ref: NodeOutputRef | None) -> RuntimeAdapter | None:
         if source_ref is None:
@@ -812,13 +1218,16 @@ class Run:
         return self._resume_plan is not None and node not in self._resume_plan.recalculated_nodes
 
     def _record_materialized_output(
-        self, source_ref: NodeOutputRef, ref: ArtifactRef, resolution: AdapterResolution
+        self,
+        source_ref: NodeOutputRef,
+        ref: ArtifactRef,
+        resolution: SaveAdapterResolution | AdapterResolution,
     ) -> None:
         if self._manifest_writer is None:
             return
         output_record = m_manifest.artifact_record(ref, run_dir=self._run_dir)
         self._set_node_output(source_ref.node, source_ref.port.name, output_record)
-        adapter_record = m_manifest.adapter_record(adapter_identity(resolution.adapter), str(resolution.source))
+        adapter_record = m_manifest.adapter_record(save_adapter_identity(resolution.adapter), str(resolution.source))
         self._set_node_adapter(source_ref.node, source_ref.port.name, adapter_record)
         self._write_node_manifest(source_ref.node, status=self._node_status(source_ref.node))
 
@@ -852,14 +1261,91 @@ class Run:
             result[port.name] = self._value_from_frozen_record(record, NodeOutputRef(node, port), None)
         return result
 
-    def _get_frozen_edge_input(self, source_ref: NodeOutputRef, adapter_format: str | None) -> Any:
+    def _get_frozen_edge_input(
+        self,
+        source_ref: NodeOutputRef,
+        adapter_format: str | None,
+        target_node: Node,
+        target_port: InputPort,
+    ) -> Any:
         self._ensure_frozen_node_manifest(source_ref.node)
         if self._resume_plan is None:
             raise RuntimeError("frozen edge input requested outside resume")
         record = m_resume.manifest_output_record(
             self._resume_plan.parent_manifest, source_ref.node, source_ref.port.name
         )
-        return self._value_from_frozen_record(record, source_ref, adapter_format)
+        if record.get("kind") == "json":
+            return self._round_trip_edge(
+                record.get("value"),
+                source_ref,
+                target_node,
+                target_port,
+                adapter_format,
+                self._adapter_override_for(source_ref),
+            )
+        if record.get("kind") != "artifact":
+            label = self._node_alias(source_ref.node) or self._node_id(source_ref.node)
+            raise m_resume.ResumeValidationError(
+                "{}:{} cannot be frozen from output kind `{}`; recalculate with from_='{}'".format(
+                    label, source_ref.port.name, record.get("kind"), label
+                )
+            )
+
+        ref = m_resume.artifact_ref_from_record(record, self._resume_plan.parent_run_dir)
+        parent_save_record = m_resume.manifest_frozen_save_adapter_record(
+            self._resume_plan.parent_manifest,
+            source_node=source_ref.node,
+            source_port=source_ref.port.name,
+            target_node=target_node,
+            target_port=target_port.name,
+        )
+        parent_save_identity = parent_save_record.get("identity")
+        parent_save_key = parent_save_identity.get("key") if isinstance(parent_save_identity, Mapping) else None
+        if parent_save_key != ref.key:
+            raise m_resume.ResumeValidationError(
+                "cannot restore frozen artifact `{}` because its ref key `{}` does not match the parent save "
+                "adapter provenance key `{}`".format(ref.uri, ref.key, parent_save_key or "<missing>")
+            )
+        run_override = self._adapter_override_for(source_ref)
+        target_type = _runtime_input_type_hint(target_node, target_port)
+        load: LoadAdapterResolution | None
+        if run_override is not None:
+            load = LoadAdapterResolution(run_override, AdapterResolutionSource.RUN_OVERRIDE)
+        elif isinstance(target_type, type):
+            load = self._pipeline.resolve_load_adapter_binding(
+                py_type=target_type,
+                format=adapter_format,
+            )
+        elif isinstance(target_type, str):
+            load = self._pipeline.resolve_load_adapter_binding_by_type_name(
+                type_name=target_type,
+                format=adapter_format,
+            )
+        elif ref.key == BUILTIN_JSON_ADAPTER.key:
+            source = (
+                AdapterResolutionSource.EDGE if adapter_format is not None else AdapterResolutionSource.PORT_DEFAULT
+            )
+            load = LoadAdapterResolution(BUILTIN_JSON_ADAPTER, source)
+        elif ref.key in self._pipeline.adapters:
+            source = AdapterResolutionSource.EDGE if adapter_format is not None else AdapterResolutionSource.PIPELINE
+            load = LoadAdapterResolution(self._pipeline.adapters[ref.key], source)
+        elif adapter_format is not None:
+            load = self._pipeline.resolve_load_adapter_binding_by_format(format=adapter_format)
+        else:
+            load_adapter = self._pipeline.resolve_load_adapter(key=ref.key)
+            load = (
+                None if load_adapter is None else LoadAdapterResolution(load_adapter, AdapterResolutionSource.PIPELINE)
+            )
+        if load is None:
+            raise m_resume.ResumeValidationError(
+                "cannot restore frozen artifact `{}` because no load adapter is registered for {} and format `{}`".format(
+                    ref.uri, target_type, adapter_format or "<default>"
+                )
+            )
+        edge_key = (source_ref.node, source_ref.port.name, target_node, target_port.name)
+        self._frozen_save_adapter_records[edge_key] = parent_save_record
+        self._load_adapter_resolutions[edge_key] = load
+        return decode(ref, load.adapter)
 
     def _value_from_frozen_record(
         self, record: Mapping[str, Any], source_ref: NodeOutputRef, adapter_format: str | None
@@ -878,18 +1364,17 @@ class Run:
             raise RuntimeError("artifact restore requested outside resume")
         ref = m_resume.artifact_ref_from_record(record, self._resume_plan.parent_run_dir)
         resolution = self._resolution_for_frozen_artifact(ref, source_ref, adapter_format)
-        self._adapter_resolutions[(source_ref.node, source_ref.port.name)] = resolution
         return decode(ref, resolution.adapter)
 
     def _resolution_for_frozen_artifact(
         self, ref: ArtifactRef, source_ref: NodeOutputRef, adapter_format: str | None
-    ) -> AdapterResolution:
+    ) -> LoadAdapterResolution:
         run_override = self._adapter_override_for(source_ref)
         if run_override is not None:
-            return AdapterResolution(run_override, AdapterResolutionSource.RUN_OVERRIDE)
+            return LoadAdapterResolution(run_override, AdapterResolutionSource.RUN_OVERRIDE)
         if ref.key == BUILTIN_JSON_ADAPTER.key:
-            return AdapterResolution(BUILTIN_JSON_ADAPTER, AdapterResolutionSource.PORT_DEFAULT)
-        adapter = self._pipeline.resolve_adapter(key=ref.key)
+            return LoadAdapterResolution(BUILTIN_JSON_ADAPTER, AdapterResolutionSource.PORT_DEFAULT)
+        adapter = self._pipeline.resolve_load_adapter(key=ref.key)
         if adapter is None:
             label = self._node_alias(source_ref.node) or self._node_id(source_ref.node)
             raise m_resume.ResumeValidationError(
@@ -897,82 +1382,150 @@ class Run:
                 "recalculate with from_='{}'".format(label, source_ref.port.name, ref.uri, ref.key, label)
             )
         source = AdapterResolutionSource.EDGE if adapter_format is not None else AdapterResolutionSource.PIPELINE
-        return AdapterResolution(adapter, source)
+        return LoadAdapterResolution(adapter, source)
 
-    def _get_input(self, x: Any) -> Any:
+    def _get_input(self, x: Any, target_node: Node, target_port: InputPort) -> Any:
         match x:
             case Scalar():
                 return self._round_trip_artifact(x.value)
 
             case NodeOutputRef():
                 if self._is_frozen_node(x.node):
-                    return self._get_frozen_edge_input(x, None)
-                value = (self._get_result(x.node))[x.port.name]
-                if (run_override := self._adapter_override_for(x)) is not None:
-                    return self._round_trip_artifact_override(value, x, None, run_override)
-                return self._round_trip_artifact(value, x)
+                    return self._get_frozen_edge_input(x, None, target_node, target_port)
+                run_override = self._adapter_override_for(x)
+                value = (
+                    self._get_result(
+                        x.node,
+                        output_request=(x, None, run_override, target_node, target_port),
+                    )
+                )[x.port.name]
+                return self._round_trip_edge(value, x, target_node, target_port, None, run_override)
 
             case FormattedOutputRef():
                 if self._is_frozen_node(x.out_ref.node):
-                    return self._get_frozen_edge_input(x.out_ref, x.format)
-                value = (self._get_result(x.out_ref.node))[x.out_ref.port.name]
-                if (run_override := self._adapter_override_for(x.out_ref)) is not None:
-                    return self._round_trip_artifact_override(value, x.out_ref, x.format, run_override)
-                return self._round_trip_artifact(value, source_ref=x.out_ref, adapter_format=x.format)
+                    return self._get_frozen_edge_input(x.out_ref, x.format, target_node, target_port)
+                run_override = self._adapter_override_for(x.out_ref)
+                value = (
+                    self._get_result(
+                        x.out_ref.node,
+                        output_request=(x.out_ref, x.format, run_override, target_node, target_port),
+                    )
+                )[x.out_ref.port.name]
+                return self._round_trip_edge(
+                    value,
+                    x.out_ref,
+                    target_node,
+                    target_port,
+                    x.format,
+                    run_override,
+                )
 
             case _:
                 raise ValueError(x)
 
-    def _get_result(self, node: Node) -> dict[str, Any]:
-        if node not in self._results:
-            self._ensure_open()
-            self._ensure_manifest_writer()
-            if self._is_frozen_node(node):
-                self._results[node] = self._restore_frozen_result(node)
-                return self._results[node]
-            kwargs: dict[InputPort, Any] = {}
-            input_records: dict[str, Any] = {}
-            input_value_ref: Any = None
-            try:
-                for port in node.inputs:
-                    input_value_ref = None
-                    if port.name not in self._kwargs:
-                        continue
-                    value = self._round_trip_artifact(self._kwargs[port.name])
+    def _get_result(
+        self,
+        node: Node,
+        *,
+        output_request: _OutputMaterializationRequest | None = None,
+    ) -> dict[str, Any]:
+        if node in self._results:
+            if output_request is not None:
+                try:
+                    self._materialize_requested_output_artifact(node, self._results[node], output_request)
+                except _SourceOutputCommitError as exc:
+                    self._finalize_lazy_source_output_failure(output_request[0], exc)
+                    raise
+            return self._results[node]
+        if node in self._visiting_node_set:
+            cycle_start = self._visiting_nodes.index(node)
+            cycle = [*self._visiting_nodes[cycle_start:], node]
+            labels = [self._node_alias(item) or self._node_id(item) for item in cycle]
+            raise RuntimeError("splime pipeline execution cycle detected: {}".format(" → ".join(labels)))
+
+        self._visiting_nodes.append(node)
+        self._visiting_node_set.add(node)
+        try:
+            return self._get_uncached_result(node, output_request=output_request)
+        finally:
+            completed = self._visiting_nodes.pop()
+            self._visiting_node_set.remove(completed)
+
+    def _get_uncached_result(
+        self,
+        node: Node,
+        *,
+        output_request: _OutputMaterializationRequest | None,
+    ) -> dict[str, Any]:
+        self._ensure_open()
+        self._ensure_manifest_writer()
+        if self._is_frozen_node(node):
+            self._results[node] = self._restore_frozen_result(node)
+            return self._results[node]
+        kwargs: dict[InputPort, Any] = {}
+        input_records: dict[str, Any] = {}
+        input_value_ref: Any = None
+        try:
+            for port in node.inputs:
+                input_value_ref = None
+                if port.name not in self._kwargs:
+                    continue
+                value = self._round_trip_artifact(self._kwargs[port.name])
+                kwargs[port] = value
+                if self._manifest_writer is not None:
+                    input_records[port.name] = self._value_record(value)
+
+            if node in self._deps:
+                for port, value_ref in self._deps[node].items():
+                    input_value_ref = value_ref
+                    value = self._get_input(value_ref, node, port)
                     kwargs[port] = value
                     if self._manifest_writer is not None:
-                        input_records[port.name] = self._value_record(value)
-
-                if node in self._deps:
-                    for port, value_ref in self._deps[node].items():
-                        input_value_ref = value_ref
-                        value = self._get_input(value_ref)
-                        kwargs[port] = value
-                        if self._manifest_writer is not None:
-                            input_records[port.name] = self._record_link_input(node, port, value_ref, value)
-            except BaseException as exc:
-                error = self._upstream_failure_error(input_value_ref, exc)
-                status = "upstream-failed" if error is not None else "failed"
-                self._write_node_manifest(node, status=status, inputs=input_records, error=error or repr(exc))
-                self._finish_manifest(status="failed", error=error or repr(exc))
-                raise
-
+                        input_records[port.name] = self._record_link_input(node, port, value_ref, value)
+        except BaseException as exc:
+            error = self._upstream_failure_error(input_value_ref, exc)
+            status = "upstream-failed" if error is not None else "failed"
             try:
-                self._node_inputs[node] = input_records
-                result = self._execute_node_with_runtime(node, kwargs, input_records)
-            except BaseException as exc:
-                error = repr(exc)
-                self._write_node_manifest(node, status="failed", inputs=input_records, error=error)
-                self._finish_manifest(status="failed", error=error)
-                raise
+                self._write_node_manifest(
+                    node,
+                    status=status,
+                    inputs=input_records,
+                    outputs={},
+                    error=error or repr(exc),
+                    compute_fingerprint=False,
+                )
+                self._finish_manifest(status="failed", error=error or repr(exc))
+            except BaseException as finalization_exc:
+                raise finalization_exc from exc
+            raise
 
-            self._results[node] = result
+        try:
+            self._node_inputs[node] = input_records
+            result = self._execute_node_with_runtime(node, kwargs, input_records)
+            output_records = self._output_records(node, result, output_request=output_request)
             self._write_node_manifest(
                 node,
                 status="succeeded",
                 inputs=input_records,
-                outputs=self._output_records(node, result),
+                outputs=output_records,
             )
+        except BaseException as exc:
+            error = repr(exc)
+            try:
+                self._write_node_manifest(
+                    node,
+                    status="failed",
+                    inputs=input_records,
+                    outputs={},
+                    error=error,
+                    compute_fingerprint=False,
+                )
+                self._finish_manifest(status="failed", error=error)
+            except BaseException as finalization_exc:
+                raise finalization_exc from exc
+            raise
+
+        self._results[node] = result
         return self._results[node]
 
     def _upstream_failure_error(self, value_ref: Any, exc: BaseException) -> str | None:
@@ -1042,8 +1595,11 @@ class Run:
     def __getitem__(self, node: Node) -> dict[str, Any]:
         try:
             return self._get_result(node)
-        except BaseException:
-            self.close()
+        except BaseException as exc:
+            try:
+                self.close()
+            except BaseException as close_exc:
+                raise close_exc from exc
             raise
 
     def value(self, alias: str | None = None, port: str = DEFAULT_PORT) -> Any:
@@ -1065,22 +1621,23 @@ class Run:
         if source_ref is None:
             return self._value_record(value)
 
-        adapter_format = value_ref.format if isinstance(value_ref, FormattedOutputRef) else None
-        run_override = self._adapter_override_for(source_ref)
-        resolution = self._adapter_resolutions.get((source_ref.node, source_ref.port.name))
-        if resolution is None:
-            resolution = self._pipeline.resolve_adapter_binding(
-                py_type=type(value), format=adapter_format, run_override=run_override
-            )
-            if resolution is not None:
-                self._adapter_resolutions[(source_ref.node, source_ref.port.name)] = resolution
-
         record = self._edge_value_record(source_ref, value)
-        adapter_record = None
-        if resolution is not None:
-            adapter_record = m_manifest.adapter_record(adapter_identity(resolution.adapter), str(resolution.source))
-            self._set_node_adapter(source_ref.node, source_ref.port.name, adapter_record)
-            self._set_node_adapter(target_node, target_port.name, adapter_record)
+        edge_key = (source_ref.node, source_ref.port.name, target_node, target_port.name)
+        save_resolution = self._adapter_resolutions.get((source_ref.node, source_ref.port.name))
+        load_resolution = self._load_adapter_resolutions.get(edge_key)
+        save_record = self._frozen_save_adapter_records.get(edge_key)
+        load_record = None
+        if save_record is None and save_resolution is not None:
+            save_record = m_manifest.adapter_record(
+                save_adapter_identity(save_resolution.adapter), str(save_resolution.source)
+            )
+        if save_record is not None:
+            self._set_node_adapter(source_ref.node, source_ref.port.name, save_record)
+        if load_resolution is not None:
+            load_record = m_manifest.adapter_record(
+                load_adapter_identity(load_resolution.adapter), str(load_resolution.source)
+            )
+            self._set_node_adapter(target_node, target_port.name, load_record)
 
         writer = self._manifest_writer
         if writer is not None:
@@ -1091,7 +1648,11 @@ class Run:
                     target_node_id=self._node_id(target_node),
                     target_port=target_port.name,
                     artifact=record,
-                    adapter=None if adapter_record is None else m_manifest.edge_adapter_record(adapter_record),
+                    adapter=(
+                        None
+                        if save_record is None or load_record is None
+                        else m_manifest.edge_adapter_record(save_record, load_record)
+                    ),
                 )
             )
             self._write_node_manifest(source_ref.node, status=self._node_status(source_ref.node))
@@ -1136,14 +1697,78 @@ class Run:
         if writer is not None and self._node_id(node) in writer.data["nodes"]:
             writer.set_node_output(self._node_id(node), port_name, record)
 
-    def _output_records(self, node: Node, result: dict[str, Any]) -> dict[str, Any]:
+    def _output_records(
+        self,
+        node: Node,
+        result: dict[str, Any],
+        *,
+        output_request: _OutputMaterializationRequest | None = None,
+    ) -> dict[str, Any]:
+        expected_ports = {port.name for port in node.outputs}
+        actual_ports = set(result)
+        if actual_ports != expected_ports:
+            missing = sorted(expected_ports - actual_ports)
+            unexpected = sorted(actual_ports - expected_ports)
+            details = []
+            if missing:
+                details.append("missing port(s): {}".format(", ".join(missing)))
+            if unexpected:
+                details.append("unexpected port(s): {}".format(", ".join(unexpected)))
+            label = self._node_alias(node) or self._node_name(node)
+            raise ValueError(
+                "invalid output mapping from node `{}`: {}; return exactly the declared output ports".format(
+                    label, "; ".join(details)
+                )
+            )
+        if output_request is not None:
+            self._materialize_requested_output_artifact(node, result, output_request)
         outputs = {}
         for port_name, value in result.items():
             ref = self._artifact_ref_for_output(node, port_name)
-            outputs[port_name] = (
-                m_manifest.artifact_record(ref, run_dir=self._run_dir) if ref is not None else self._value_record(value)
-            )
+            if ref is not None:
+                outputs[port_name] = m_manifest.artifact_record(ref, run_dir=self._run_dir)
+                continue
+            if type(value) in _JSON_NATIVE_TYPES:
+                try:
+                    validate_json_value(value)
+                except ValueError as exc:
+                    label = self._node_alias(node) or self._node_name(node)
+                    raise ValueError(
+                        "invalid JSON output from node `{}` port `{}`: {}. Return a valid JSON value "
+                        "or materialize this output with an adapter.".format(label, port_name, exc)
+                    ) from exc
+            outputs[port_name] = self._value_record(value)
         return outputs
+
+    def _materialize_requested_output_artifact(
+        self,
+        node: Node,
+        result: Mapping[str, Any],
+        request: _OutputMaterializationRequest,
+    ) -> None:
+        source_ref, adapter_format, run_override, target_node, target_port = request
+        if source_ref.node != node:
+            raise RuntimeError("output materialization request does not belong to the producing node")
+        value = result[source_ref.port.name]
+        save, load = self._resolve_edge_adapter_bindings(
+            value,
+            source_ref,
+            target_node,
+            target_port,
+            adapter_format,
+            run_override,
+        )
+        if save is None or load is None:
+            return
+        if (
+            save.adapter is BUILTIN_JSON_ADAPTER
+            and load.adapter is BUILTIN_JSON_ADAPTER
+            and type(value) in _JSON_NATIVE_TYPES
+        ):
+            validate_json_value(value)
+            return
+        self._ensure_open()
+        self._materialize_source_output(value, source_ref, save)
 
     def _artifact_ref_for_output(self, node: Node, port_name: str) -> ArtifactRef | None:
         refs = [
@@ -1165,6 +1790,7 @@ class Run:
         outputs: Mapping[str, Any] | None = None,
         runtime: Mapping[str, Any] | None = None,
         error: str | None = None,
+        compute_fingerprint: bool = True,
     ) -> None:
         writer = self._manifest_writer
         if writer is None:
@@ -1177,6 +1803,13 @@ class Run:
         runtime_record = dict(
             runtime if runtime is not None else self._node_runtimes.get(node, existing.get("runtime", {}))
         )
+        fingerprint_sha256: str | None
+        if compute_fingerprint:
+            fingerprint_sha256 = self._node_fingerprint(node, merged_inputs, adapters)
+        else:
+            existing_fingerprint = existing.get("fingerprint")
+            existing_sha256 = existing_fingerprint.get("sha256") if isinstance(existing_fingerprint, Mapping) else None
+            fingerprint_sha256 = existing_sha256 if isinstance(existing_sha256, str) else None
         writer.set_node(
             m_manifest.node_record(
                 node_id=node_id,
@@ -1184,7 +1817,7 @@ class Run:
                 kind=self._node_kind(node),
                 name=self._node_name(node),
                 status=status,
-                fingerprint_sha256=self._node_fingerprint(node, merged_inputs, adapters),
+                fingerprint_sha256=fingerprint_sha256,
                 inputs=merged_inputs,
                 outputs=merged_outputs,
                 adapters=adapters,

@@ -49,6 +49,24 @@ spl.\_owner\_ref module
    :show-inheritance:
    :undoc-members:
 
+spl.\_process module
+--------------------
+
+.. automodule:: spl._process
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.\_timeout module
+--------------------
+
+.. automodule:: spl._timeout
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.\_views module
 ------------------
 

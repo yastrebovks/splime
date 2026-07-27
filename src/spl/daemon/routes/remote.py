@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from http import HTTPStatus
 from typing import Any
 
 from spl.daemon.routes._helpers import RouteContext, RouteRegistrar
@@ -46,11 +47,24 @@ def register_remote_routes(
     @route_errors
     async def run_remote_node() -> Any:
         body = await context.read_json_body()
-        return json_response(
-            await context.run_blocking(
-                runtime.run_remote_node,
-                body["node"],
-                kwargs=body.get("kwargs") or {},
-                timeout_seconds=body.get("timeout_seconds"),
+        node = body["node"]
+        principal = context.callback_principal()
+        if principal is not None and not runtime.callback_capabilities.authorizes_node(principal, node):
+            return json_response(
+                {
+                    "error": (
+                        "worker callback capability does not authorize this remote node; "
+                        "run the registered node from its original parent run"
+                    )
+                },
+                HTTPStatus.FORBIDDEN,
             )
+        result = await context.run_blocking(
+            runtime.run_remote_node,
+            node,
+            kwargs=body.get("kwargs") or {},
+            timeout_seconds=body.get("timeout_seconds"),
         )
+        if principal is not None:
+            return json_response({"value": result.get("value")})
+        return json_response(result)

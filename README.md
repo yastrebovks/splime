@@ -21,11 +21,14 @@ redeploying.
 ## Requirements
 
 - Python **3.13+**
+- POSIX for local daemon environment builds and timeout-safe worker execution
+  in 0.4.5 (Windows Job Object support is not yet implemented; Windows
+  client-only use is unaffected)
 
 ## Install
 
 ```bash
-pip install splime
+python3.13 -m pip install "splime==0.4.5"
 ```
 
 The distribution is named `splime`; the Python import package is `spl`.
@@ -64,7 +67,7 @@ it by name and get back the value (plus logs and any artifacts).
 
 The same `call` becomes a remote run when you point it at a library, an owner, or a
 target machine. This requires a connected splime server and a private worker; the local
-daemon builds an isolated environment on the worker before executing.
+daemon builds the declared dependency environment on the worker before executing.
 
 ```python
 client = SPLClient(user_token="…", machine_token="…")   # connect the daemon to your server
@@ -102,9 +105,37 @@ splime runs code that you publish on purpose, on machines you control. It is bui
 
 - **explicit ownership** of every published object,
 - **scoped access** grants per library (read metadata, read objects, execute),
-- **private worker boundaries** — the server coordinates, your own workers execute,
-- **isolated environments** built by the daemon before a run,
+- **private worker topology** — the server coordinates, your own workers execute,
+- **dependency environments** built by the daemon before a run,
+- **metadata-only central telemetry by default** — local inputs, results,
+  error details, streams, and artifact bodies stay on the machine; diagnostic
+  adds only redacted/truncated error and stdout/stderr text, while full also
+  opts in to redacted inputs, results, and supported text artifacts,
 - an **auditable run history**.
+
+Credentialed central-server traffic requires a direct HTTPS endpoint and never
+follows redirects. Loopback HTTP remains available for local development; the
+only other plaintext path is the exact Docker callback carrying only a scoped
+run capability.
+
+Native and `venv-subprocess` runtimes execute trusted code under the
+conductor's OS identity—the daemon user for daemon-managed runs. A virtual
+environment separates dependencies and a subprocess separates execution, but
+neither is an OS sandbox. Docker or a deliberately separate OS identity is
+required when code must not read same-UID daemon files. Docker provides the
+configured process/filesystem boundary, subject to its mounts and network
+options and to trust in the Docker daemon and host.
+
+Scoped callback capabilities limit the authority intentionally passed over the
+worker protocol. They do not protect against arbitrary same-UID file reads and
+do not turn a native or virtual-environment worker into a sandbox.
+
+Docker object runs use one container per run by default and mount only that
+run's writable directory. Warm pooling is explicitly opt-in with
+`spl-daemon serve --docker-pool-enabled --docker-pool-size N`; pooled
+containers share all runs for that daemon and are suitable only for
+single-tenant, mutually trusting workloads. One process also exclusively locks
+each daemon home before opening its database or publishing its endpoint.
 
 ## How it fits together
 

@@ -12,11 +12,15 @@ is enough for the MVP workflow:
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
+from spl.core import json_contract as m_json_contract
+from spl.daemon.docker_pool import DOCKER_POOL_TRUST_WARNING
 from spl.daemon_client import (
     DEFAULT_DAEMON_PORT,
     DEFAULT_SERVER_URL,
@@ -24,12 +28,18 @@ from spl.daemon_client import (
     Client,
     RunProgressPrinter,
 )
+from spl.daemon.telemetry import (
+    DEFAULT_TELEMETRY_LEVEL,
+    TELEMETRY_LEVELS,
+    normalize_telemetry_level,
+    parse_sensitive_fields_env,
+)
 
 
 def print_json(value: Any) -> None:
     """Print a JSON value for shell-friendly output."""
 
-    print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+    print(m_json_contract.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, separators=None))
 
 
 def parse_json_arg(value: str, expected_type: type) -> Any:
@@ -82,7 +92,12 @@ def read_runtime_config(
 def build_parser() -> argparse.ArgumentParser:
     """Create the top-level CLI parser."""
 
-    parser = argparse.ArgumentParser(prog="python -m spl.daemon")
+    parser = argparse.ArgumentParser(prog="spl-daemon")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {importlib.metadata.version('splime')}",
+    )
     parser.add_argument(
         "--url",
         default=None,
@@ -139,10 +154,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="seconds before an abandoned venv build lock may be reused",
     )
     serve.add_argument(
+        "--docker-pool-enabled",
+        action="store_true",
+        help=DOCKER_POOL_TRUST_WARNING,
+    )
+    serve.add_argument(
         "--docker-pool-size",
         type=int,
         default=0,
-        help="maximum warm Docker containers to keep; 0 disables the pool",
+        help="maximum warm Docker containers to keep when --docker-pool-enabled is set",
     )
     serve.add_argument(
         "--docker-idle-timeout",
@@ -154,6 +174,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--docker-prewarm",
         action="store_true",
         help="after Docker object registration, build the image and warm a pooled container",
+    )
+    serve.add_argument(
+        "--telemetry",
+        choices=TELEMETRY_LEVELS,
+        type=normalize_telemetry_level,
+        default=normalize_telemetry_level(os.environ.get("SPL_DAEMON_TELEMETRY", DEFAULT_TELEMETRY_LEVEL)),
+        help="central observability level; metadata is the privacy-preserving default",
+    )
+    serve.add_argument(
+        "--telemetry-sensitive-field",
+        action="append",
+        default=list(parse_sensitive_fields_env(os.environ.get("SPL_DAEMON_TELEMETRY_SENSITIVE_FIELDS"))),
+        metavar="JSON_POINTER",
+        help="redact a JSON Pointer and repeated values from diagnostic/full telemetry; repeat as needed",
     )
 
     subparsers.add_parser("health", help="show daemon health details")
@@ -531,9 +565,12 @@ def main(argv: list[str] | None = None) -> int:
                 auto_build_envs=args.auto_build_envs,
                 env_build_timeout_seconds=args.env_build_timeout,
                 env_stale_lock_seconds=args.env_stale_lock_timeout,
+                docker_pool_enabled=args.docker_pool_enabled,
                 docker_pool_size=args.docker_pool_size,
                 docker_idle_timeout_seconds=args.docker_idle_timeout,
                 docker_prewarm=args.docker_prewarm,
+                telemetry=args.telemetry,
+                telemetry_sensitive_fields=args.telemetry_sensitive_field,
             )
             return 0
         except Exception as exc:

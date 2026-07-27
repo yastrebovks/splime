@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import hashlib
-import http.client
 import json
 import socket
 import ssl
 import time
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, BinaryIO, Iterator, Literal, cast
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, urlencode
 from urllib.request import Request
 
 from spl._http import (
@@ -19,8 +18,8 @@ from spl._http import (
     DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS,
     DEFAULT_HTTP_TIMEOUT_SECONDS,
     urlopen_verified,
-    verified_https_context,
 )
+from spl.core import json_contract as m_json_contract
 
 DEFAULT_SERVER_URL = "https://splime.io/api"
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60.0
@@ -32,16 +31,43 @@ LIBRARY_DELETE_UNSUPPORTED_MESSAGE = (
 SERVER_GET_RETRY_DELAY_SECONDS = 0.5
 SERVER_MAX_TRANSPORT_ATTEMPTS = 3
 TRANSIENT_SERVER_STATUS_CODES = frozenset({502, 503, 504})
+RUN_CLAIM_FENCING_CAPABILITY = "run_claim_fencing"
+RUN_CLAIM_FENCING_VERSION = 1
+RUN_CLAIM_HEADER = "X-Spl-Claim"
+RUN_CLAIM_PRIVATE_FIELD = "_spl_claim_id"
+STALE_RUN_CLAIM_ERROR_CODE = "stale_run_claim"
+SYNC_EVENT_IDENTITY_COLLISION_ERROR_CODE = "sync_event_identity_collision"
 FailurePhase = Literal["connection", "post_send", "application"]
 
 
 class ServerClientError(RuntimeError):
     """Raised when the central daemon server returns an error response."""
 
-    def __init__(self, status_code: int, message: str):
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        *,
+        code: str | None = None,
+        event_id: str | None = None,
+    ) -> None:
         self.status_code = status_code
         self.message = message
+        self.code = code
+        self.event_id = event_id
         super().__init__(f"{status_code}: {message}")
+
+
+def is_stale_run_claim_error(exc: ServerClientError) -> bool:
+    """Return whether the server rejected a superseded worker attempt."""
+
+    return exc.status_code == 409 and exc.code == STALE_RUN_CLAIM_ERROR_CODE
+
+
+def is_sync_event_identity_collision_error(exc: ServerClientError) -> bool:
+    """Return whether one exact queued event identity collided at the server."""
+
+    return exc.status_code == 409 and exc.code == SYNC_EVENT_IDENTITY_COLLISION_ERROR_CODE and bool(exc.event_id)
 
 
 def _as_json_dict(value: Any) -> dict[str, Any]:
@@ -50,6 +76,74 @@ def _as_json_dict(value: Any) -> dict[str, Any]:
 
 def _as_json_list(value: Any) -> list[dict[str, Any]]:
     return cast(list[dict[str, Any]], value)
+
+
+def _error_response(
+    raw: str,
+    *,
+    http_error: HTTPError | None = None,
+) -> tuple[str, str | None, str | None]:
+    """Return safe structured fields from one JSON error response."""
+
+    if http_error is not None and 300 <= http_error.code < 400:
+        return str(http_error.reason), None, None
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw, None, None
+    if not isinstance(payload, dict):
+        return raw, None, None
+
+    error = payload.get("error", raw)
+    code = payload.get("code")
+    event_id = payload.get("event_id")
+    if isinstance(error, dict):
+        nested_code = error.get("code")
+        if code is None and isinstance(nested_code, str):
+            code = nested_code
+        nested_event_id = error.get("event_id")
+        if event_id is None and isinstance(nested_event_id, str):
+            event_id = nested_event_id
+        error = error.get("message") or error.get("error") or raw
+    return (
+        str(error),
+        str(code) if isinstance(code, str) else None,
+        str(event_id) if isinstance(event_id, str) else None,
+    )
+
+
+def _claim_headers(claim_id: str | None) -> dict[str, str]:
+    """Build the optional claim header without exposing it in a JSON body."""
+
+    if claim_id is None:
+        return {}
+    if not isinstance(claim_id, str) or not claim_id.strip():
+        raise ValueError("claim_id must be a non-empty string when provided")
+    return {RUN_CLAIM_HEADER: claim_id}
+
+
+def _sync_events_for_wire(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copy sync events while removing daemon-private claim metadata."""
+
+    wire_events: list[dict[str, Any]] = []
+    for event in events:
+        wire_event = dict(event)
+        wire_event.pop(RUN_CLAIM_PRIVATE_FIELD, None)
+        payload = wire_event.get("payload")
+        if isinstance(payload, dict):
+            wire_payload = dict(payload)
+            wire_payload.pop(RUN_CLAIM_PRIVATE_FIELD, None)
+            wire_event["payload"] = wire_payload
+        wire_events.append(wire_event)
+    return wire_events
+
+
+def _file_chunks(source: BinaryIO) -> Iterator[bytes]:
+    """Yield bounded chunks without loading an artifact fully into memory."""
+
+    while chunk := source.read(1024 * 1024):
+        yield chunk
 
 
 def _exception_chain(exc: BaseException) -> list[BaseException]:
@@ -159,7 +253,12 @@ class ServerClient:
         headers = self._headers(auth=auth)
         headers.update(extra_headers or {})
         if payload is not None:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            body = m_json_contract.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=False,
+                separators=None,
+            ).encode("utf-8")
             headers["Content-Type"] = "application/json; charset=utf-8"
 
         request = Request(
@@ -179,10 +278,7 @@ class ServerClient:
                     raw = response.read().decode("utf-8")
             except HTTPError as exc:
                 raw = exc.read().decode("utf-8")
-                try:
-                    message = json.loads(raw).get("error", raw)
-                except json.JSONDecodeError:
-                    message = raw
+                message, error_code, event_id = _error_response(raw, http_error=exc)
                 message = f"central SPL daemon server returned {exc.code} at {self.base_url}{path}: {message}"
                 phase = _failure_phase(exc)
                 if (
@@ -195,7 +291,12 @@ class ServerClient:
                     post_send_retried = True
                     time.sleep(SERVER_GET_RETRY_DELAY_SECONDS)
                     continue
-                raise ServerClientError(exc.code, message) from exc
+                raise ServerClientError(
+                    exc.code,
+                    message,
+                    code=error_code,
+                    event_id=event_id,
+                ) from exc
             except URLError as exc:
                 message = f"central SPL daemon server is not reachable at {self.base_url}: {exc.reason}"
                 phase = _failure_phase(exc)
@@ -259,12 +360,14 @@ class ServerClient:
                 return cast(bytes, response.read())
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")
-            try:
-                message = json.loads(raw).get("error", raw)
-            except json.JSONDecodeError:
-                message = raw
+            message, error_code, event_id = _error_response(raw, http_error=exc)
             message = f"central SPL daemon server returned {exc.code} at {self.base_url}{path}: {message}"
-            raise ServerClientError(exc.code, message) from exc
+            raise ServerClientError(
+                exc.code,
+                message,
+                code=error_code,
+                event_id=event_id,
+            ) from exc
         except URLError as exc:
             raise ServerClientError(
                 502,
@@ -279,55 +382,41 @@ class ServerClient:
         *,
         headers: dict[str, str] | None = None,
     ) -> Any:
-        url = urlparse(self.base_url)
-        if url.scheme not in {"http", "https"}:
-            raise ServerClientError(400, f"unsupported server URL scheme: {url.scheme}")
-        host = url.hostname
-        if not host:
-            raise ServerClientError(400, f"invalid server URL: {self.base_url}")
-        connection: http.client.HTTPConnection
-        if url.scheme == "https":
-            connection = http.client.HTTPSConnection(
-                host,
-                url.port,
-                timeout=DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS,
-                context=verified_https_context(),
-            )
-        else:
-            connection = http.client.HTTPConnection(host, url.port, timeout=DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS)
-        request_path = f"{url.path.rstrip('/')}{path}"
         request_headers = {
             **self._headers(),
             "Content-Length": str(file_path.stat().st_size),
         }
         request_headers.update(headers or {})
-        try:
-            connection.putrequest(method, request_path)
-            for name, value in request_headers.items():
-                connection.putheader(name, value)
-            connection.endheaders()
-            with file_path.open("rb") as source:
-                while chunk := source.read(1024 * 1024):
-                    connection.send(chunk)
-            response = connection.getresponse()
-            raw_bytes = response.read()
-        except OSError as exc:
-            raise ServerClientError(
-                502,
-                (f"central SPL daemon server is not reachable at {self.base_url}: {exc}"),
+        with file_path.open("rb") as source:
+            request = Request(
+                f"{self.base_url}{path}",
+                data=_file_chunks(source),
+                headers=request_headers,
+                method=method,
             )
-        finally:
-            connection.close()
-        raw = raw_bytes.decode("utf-8")
-        if response.status >= 400:
             try:
-                message = json.loads(raw).get("error", raw)
-            except json.JSONDecodeError:
-                message = raw
-            raise ServerClientError(
-                response.status,
-                (f"central SPL daemon server returned {response.status} at {self.base_url}{path}: {message}"),
-            )
+                with urlopen_verified(request, timeout=DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS) as response:
+                    raw = response.read().decode("utf-8")
+            except HTTPError as exc:
+                raw = exc.read().decode("utf-8")
+                message, error_code, event_id = _error_response(raw, http_error=exc)
+                raise ServerClientError(
+                    exc.code,
+                    (f"central SPL daemon server returned {exc.code} at {self.base_url}{path}: {message}"),
+                    code=error_code,
+                    event_id=event_id,
+                ) from exc
+            except URLError as exc:
+                raise ServerClientError(
+                    502,
+                    (f"central SPL daemon server is not reachable at {self.base_url}: {exc.reason}"),
+                ) from exc
+            except OSError as exc:
+                raise ServerClientError(
+                    502,
+                    (f"central SPL daemon server is not reachable at {self.base_url}: {exc}"),
+                ) from exc
+
         if not raw:
             return None
         return json.loads(raw)
@@ -633,7 +722,10 @@ class ServerClient:
         heartbeat_interval_seconds: float,
         events: list[dict[str, Any]],
         capabilities: dict[str, Any] | None = None,
+        claim_id: str | None = None,
     ) -> dict[str, Any]:
+        """Send one sync batch with an optional worker-attempt capability."""
+
         return _as_json_dict(
             self._json_request(
                 "POST",
@@ -643,8 +735,9 @@ class ServerClient:
                     "machine_id": machine_id,
                     "heartbeat_interval_seconds": heartbeat_interval_seconds,
                     "capabilities": capabilities or {},
-                    "events": events,
+                    "events": _sync_events_for_wire(events),
                 },
+                extra_headers=_claim_headers(claim_id),
                 allow_transport_retries=False,
             )
         )
@@ -675,7 +768,16 @@ class ServerClient:
     def list_artifacts(self, run_id: str) -> list[dict[str, Any]]:
         return _as_json_list(self._json_request("GET", f"/remote-runs/{quote(run_id)}/artifacts"))
 
-    def upload_artifact(self, run_id: str, name: str, path: str | Path) -> dict[str, Any]:
+    def upload_artifact(
+        self,
+        run_id: str,
+        name: str,
+        path: str | Path,
+        *,
+        claim_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload an artifact under an optional worker-attempt capability."""
+
         artifact_path = Path(path)
         return _as_json_dict(
             self._streaming_file_request(
@@ -686,6 +788,7 @@ class ServerClient:
                     "Content-Type": "application/octet-stream",
                     "X-SPL-Artifact-Sha256": _file_sha256(artifact_path),
                     "X-SPL-Artifact-Size": str(artifact_path.stat().st_size),
+                    **_claim_headers(claim_id),
                 },
             )
         )

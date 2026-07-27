@@ -9,11 +9,12 @@ the frontend app.
 from __future__ import annotations
 
 import html
-import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
+
+from spl.core import json_contract as m_json_contract
 
 NODE_WIDTH = 292
 PORT_ROW_HEIGHT = 28
@@ -472,11 +473,7 @@ def _link_sort_key(item: tuple[Any, Any]) -> tuple[str, str, str]:
 
 
 def _json_safe_value(value: Any) -> Any:
-    try:
-        json.dumps(value)
-    except TypeError:
-        return repr(value)
-    return value
+    return value if m_json_contract.is_json_value(value) else repr(value)
 
 
 def _ensure_list(value: Any) -> list[Any]:
@@ -749,8 +746,8 @@ def _format_scalar_value(value: Any) -> str:
     if isinstance(value, str):
         return value
     try:
-        return json.dumps(value, ensure_ascii=False)
-    except TypeError:
+        return m_json_contract.dumps(value, ensure_ascii=False, sort_keys=False, separators=None)
+    except (TypeError, ValueError):
         return repr(value)
 
 
@@ -759,7 +756,7 @@ def _escape(value: Any) -> str:
 
 
 def _json_for_script(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False).replace("</", "<\\/")
+    return m_json_contract.dumps(value, ensure_ascii=False, sort_keys=False, separators=None).replace("</", "<\\/")
 
 
 def _render_outliner(model: dict[str, Any], selected_node_id: str) -> str:
@@ -1271,7 +1268,7 @@ def _widget_css(dom_id: str, height: int) -> str:
 
 
 def _widget_js(dom_id: str) -> str:
-    safe_dom_id = json.dumps(dom_id)
+    safe_dom_id = m_json_contract.dumps(dom_id, ensure_ascii=True, sort_keys=False, separators=None)
     return f"""
 (function () {{
   const root = document.getElementById({safe_dom_id});

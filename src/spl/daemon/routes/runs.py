@@ -95,7 +95,7 @@ def register_run_routes(
                 library=body.get("library"),
                 source=body.get("source", "auto"),
                 runtimes=runtimes,
-                keep=body.get("keep", "on_failure"),
+                keep=body.get("keep", True),
             ),
             HTTPStatus.ACCEPTED,
         )
@@ -158,7 +158,7 @@ def register_run_routes(
                 timeout_seconds=body.get("timeout_seconds"),
                 adapters=adapters,
                 runtimes=runtimes,
-                keep=body.get("keep", "on_failure"),
+                keep=body.get("keep", True),
             ),
             HTTPStatus.ACCEPTED,
         )
@@ -176,14 +176,22 @@ def register_run_routes(
     @app.get("/runs/<run_id>/result")
     @route_errors
     async def get_result(run_id: str) -> Any:
-        state = runtime.store.get_run(validate_name(run_id))
+        run_id = validate_name(run_id)
+        runtime.renew_run_delivery(run_id)
+        state = runtime.store.get_run(run_id)
         if state.get("result") is not None:
             return json_response(state["result"])
 
-        result_path = Path(state["result_path"])
-        if not result_path.exists():
+        raw_result_path = state.get("result_path")
+        result_path = Path(str(raw_result_path)) if raw_result_path else None
+        if result_path is None or not result_path.is_file():
             return json_response(
                 {"error": "result is not available", "status": state["status"]},
                 HTTPStatus.CONFLICT,
             )
         return json_response(json.loads(result_path.read_text(encoding="utf-8")))
+
+    @app.post("/runs/<run_id>/delivery-ack")
+    @route_errors
+    async def acknowledge_delivery(run_id: str) -> Any:
+        return json_response(runtime.acknowledge_run_delivery(validate_name(run_id)))

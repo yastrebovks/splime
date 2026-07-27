@@ -19,19 +19,21 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
+from spl._process import run_process_tree
+from spl._timeout import TimeoutDomain, validate_timeout_seconds
 from spl.core.entities.function import DFunction
 from spl.core.entities.node import InputPort, Node, OutputPort
 from spl.core.entities.node_function import NodeFunction
 from spl.core.entities.pipeline import Pipeline
 from spl.core.fingerprint import canonical_json_bytes
 from spl.core.ir.parse import _branch, ir_parse
+from spl.core.json_contract import dumps as json_dumps
 
 NATIVE_NODE_RUNTIME = "native"
 VENV_SUBPROCESS_NODE_RUNTIME = "venv-subprocess"
 DOCKER_NODE_RUNTIME = "docker"
 RUNTIME_TAG_NAME = "runtime"
 NODE_TIMEOUT_SECONDS_KEY = "node_timeout_seconds"
-_NODE_TIMEOUT_SECONDS_ERROR = 'runtime_config["{}"] must be a positive number or None'.format(NODE_TIMEOUT_SECONDS_KEY)
 _SPL_NODE_CONTAINER_WORKDIR = "/spl-node"
 _SPL_OBJECT_RUNTIME_BACKEND_ENV = "SPL_OBJECT_RUNTIME_BACKEND"
 _SPL_OBJECT_DOCKER_WORKER_ENV = "SPL_OBJECT_DOCKER_WORKER"
@@ -248,6 +250,7 @@ class DockerNodeRuntime:
             container_name,
             "--cidfile",
             str(cidfile_path),
+            *_docker_label_args(),
             "-v",
             "{}:{}".format(invocation.work_dir.resolve(), _SPL_NODE_CONTAINER_WORKDIR),
             "-w",
@@ -275,7 +278,9 @@ class DockerNodeRuntime:
             command,
             runtime_name=self.name,
             failure_target="node `{}`".format(context.node_label),
-            timeout_cleanup=lambda: _kill_docker_container(container_name),
+            timeout_cleanup=lambda: _kill_docker_container(
+                _docker_cleanup_target(cidfile_path, fallback=container_name)
+            ),
         )
 
 
@@ -365,15 +370,12 @@ def validate_node_runtime_config(runtime_config: Mapping[str, Any] | None) -> di
 def node_timeout_seconds(runtime_config: Mapping[str, Any]) -> float | None:
     """Return the configured non-native node runtime timeout in seconds."""
 
-    value = runtime_config.get(NODE_TIMEOUT_SECONDS_KEY)
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(_NODE_TIMEOUT_SECONDS_ERROR)
-    timeout_seconds = float(value)
-    if timeout_seconds <= 0:
-        raise ValueError(_NODE_TIMEOUT_SECONDS_ERROR)
-    return timeout_seconds
+    return validate_timeout_seconds(
+        runtime_config.get(NODE_TIMEOUT_SECONDS_KEY),
+        name='runtime_config["{}"]'.format(NODE_TIMEOUT_SECONDS_KEY),
+        domain=TimeoutDomain.POSITIVE,
+        allow_none=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -438,13 +440,10 @@ def _run_spl_free_invocation(
 ) -> dict[str, Any]:
     timeout_seconds = node_timeout_seconds(context.runtime_config)
     try:
-        completed = subprocess.run(
+        completed = run_process_tree(
             command,
             cwd=invocation.work_dir,
             env=_subprocess_env_without_project_pythonpath(),
-            text=True,
-            capture_output=True,
-            check=False,
             timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired as exc:
@@ -561,6 +560,12 @@ def _docker_network_args(runtime_config: dict[str, Any]) -> list[str]:
     return docker_node_network_args(runtime_config)
 
 
+def _docker_label_args() -> list[str]:
+    from spl.daemon.docker_pool import worker_container_label_args_from_env
+
+    return worker_container_label_args_from_env(kind="node")
+
+
 def _docker_hardening_args(runtime_config: dict[str, Any]) -> list[str]:
     from spl.daemon.docker_pool import docker_hardening_args
 
@@ -584,7 +589,16 @@ def _docker_container_name(context: NodeRuntimeContext) -> str:
     run_part = parent.parent.name if parent.name == "node-runtimes" else parent.name
     run_token = _docker_name_token(run_part)[:32]
     uuid_token = str(context.node.uuid).replace("-", "")[:8]
-    container_name = "spl-node-{}-{}-{}".format(run_token, uuid_token, uuid4().hex[:6])
+    random_token = uuid4().hex[:6]
+    instance_value = os.environ.get("SPL_DAEMON_INSTANCE_ID")
+    if instance_value:
+        instance_token = _docker_name_token(instance_value)[:8]
+        suffix = "{}-{}".format(uuid_token, random_token)
+        prefix = "spl-node-{}-".format(instance_token)
+        run_token = run_token[: max(1, 63 - len(prefix) - len(suffix) - 1)]
+        container_name = "{}{}-{}".format(prefix, run_token, suffix)
+    else:
+        container_name = "spl-node-{}-{}-{}".format(run_token, uuid_token, random_token)
     if len(container_name) > 63:
         raise RuntimeError("docker node container name exceeds Docker's 63-character limit")
     return container_name
@@ -599,25 +613,82 @@ def _docker_name_token(value: str) -> str:
     return token
 
 
-def _kill_docker_container(container_name: str) -> None:
+def _docker_cleanup_target(cidfile_path: Path, *, fallback: str) -> str:
+    try:
+        container_id = cidfile_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return fallback
+    return container_id or fallback
+
+
+def _kill_docker_container(container_target: str) -> None:
+    if not _docker_cleanup_target_is_owned(container_target):
+        LOGGER.warning(
+            "refusing to remove timed-out Docker node container `%s`: ownership labels differ", container_target
+        )
+        return
+    kill_error: str | None = None
     try:
         completed = subprocess.run(
-            ["docker", "kill", container_name],
+            ["docker", "kill", container_target],
             text=True,
             capture_output=True,
             timeout=15,
             check=False,
         )
     except Exception as exc:
-        LOGGER.warning("failed to kill timed-out Docker node container `%s`: %s", container_name, exc)
+        kill_error = str(exc)
+    else:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        if completed.returncode != 0 and "No such container" not in detail:
+            kill_error = detail or str(completed.returncode)
+    if kill_error is not None:
+        LOGGER.warning("docker kill `%s` failed: %s", container_target, kill_error)
+
+    try:
+        removed = subprocess.run(
+            ["docker", "rm", "-f", container_target],
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except Exception as exc:
+        LOGGER.warning("failed to remove timed-out Docker node container `%s`: %s", container_target, exc)
         return
-    if completed.returncode == 0:
-        return
-    detail = (completed.stderr or completed.stdout or "").strip()
-    if "No such container" in detail:
-        LOGGER.debug("timed-out Docker node container `%s` was already absent", container_name)
-        return
-    LOGGER.warning("docker kill `%s` failed: %s", container_name, detail or completed.returncode)
+    detail = (removed.stderr or removed.stdout or "").strip()
+    if removed.returncode != 0 and "No such container" not in detail:
+        LOGGER.warning("docker rm `%s` failed: %s", container_target, detail or removed.returncode)
+
+
+def _docker_cleanup_target_is_owned(container_target: str) -> bool:
+    from spl.daemon.docker_pool import worker_container_labels_from_env
+
+    expected = worker_container_labels_from_env(kind="node")
+    if not expected:
+        return True
+    try:
+        inspected = subprocess.run(
+            ["docker", "inspect", "--format", "{{json .Config.Labels}}", container_target],
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except Exception as exc:
+        LOGGER.warning("failed to inspect timed-out Docker node container `%s`: %s", container_target, exc)
+        return False
+    if inspected.returncode != 0:
+        detail = (inspected.stderr or inspected.stdout or "").strip()
+        if "No such" in detail:
+            return True
+        LOGGER.warning("docker inspect `%s` failed: %s", container_target, detail or inspected.returncode)
+        return False
+    try:
+        labels = json.loads(inspected.stdout or "{}")
+    except json.JSONDecodeError:
+        return False
+    return isinstance(labels, dict) and all(labels.get(key) == value for key, value in expected.items())
 
 
 def _spl_free_runner_args(
@@ -656,7 +727,7 @@ def _subprocess_input_json(
     kwargs = []
     for port, value in sorted(context.inputs.items(), key=lambda item: item[0].name):
         try:
-            encoded_value = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            encoded_value = json_dumps(value, separators=None)
         except (TypeError, ValueError) as exc:
             raise RuntimeError(
                 "node `{}` port `{}` cannot run with {} in 0.4.0 because input value type `{}` "
@@ -664,7 +735,7 @@ def _subprocess_input_json(
                 "node (cookbook: Converter Nodes For Adapter Tags), or wait for artifact-file input transport "
                 "(0.4.x).".format(context.node_label, port.name, runtime_name, _type_name(value), exc)
             ) from exc
-        kwargs.append("{}:{}".format(json.dumps(port.name, ensure_ascii=False), encoded_value))
+        kwargs.append("{}:{}".format(json_dumps(port.name, sort_keys=False, separators=None), encoded_value))
     return '{{"args":[],"kwargs":{{{}}}}}'.format(",".join(kwargs))
 
 
@@ -806,7 +877,7 @@ def _copy_spl_free_runner(runner_path: Path) -> None:
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    path.write_text(json_dumps(value, indent=2, separators=None), encoding="utf-8")
 
 
 def _subprocess_env_without_project_pythonpath() -> dict[str, str]:

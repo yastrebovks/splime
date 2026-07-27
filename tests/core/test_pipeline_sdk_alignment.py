@@ -158,7 +158,7 @@ def test_resume_warns_for_resume_only_reserved_free_input_name(tmp_path, monkeyp
         assert parent.value("echo") == "parent"
 
     with pytest.warns(UserWarning, match=r"`from_`"):
-        parent.resume(from_="echo", keep=False)
+        parent.resume(from_="echo", keep=True)
 
 
 def test_deployment_rejects_multi_output_nodes() -> None:
@@ -457,6 +457,35 @@ def test_node_remote_locate_is_canonical_factory(monkeypatch) -> None:
             "target_machine": "tractor-gpu",
         }
     ]
+
+
+def test_node_remote_locate_uses_configured_client_daemon(tmp_path, monkeypatch) -> None:
+    calls = []
+    client = SPLClient(daemon_port=9876, daemon_home=tmp_path)
+
+    def resolve_remote_signature(ref):
+        calls.append(ref)
+        return {
+            "signature": {
+                "inputs": [{"name": "value", "type": "int"}],
+                "outputs": [{"name": "default", "type": "int"}],
+            }
+        }
+
+    monkeypatch.setattr(client._daemon, "resolve_remote_signature", resolve_remote_signature)
+
+    class FailingDefaultClient:
+        def __init__(self):
+            raise AssertionError("the default daemon client must not be constructed")
+
+    monkeypatch.setattr(daemon_client, "Client", FailingDefaultClient)
+
+    node = NodeRemote.locate(name="remote_score", client=client)
+
+    assert client._daemon.base_url == "http://127.0.0.1:9876"
+    assert node.inputs == [InputPort("value", "int", None)]
+    assert node.outputs == [OutputPort("default", "int")]
+    assert calls == [{"url": "", "name": "remote_score", "version": "latest"}]
 
 
 def test_node_remote_keeps_explicit_legacy_constructor(monkeypatch) -> None:

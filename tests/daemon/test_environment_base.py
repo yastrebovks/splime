@@ -125,6 +125,38 @@ def test_base_constructor_validates_timeouts(store: RegistryStore) -> None:
         HelperEnvironmentManager(store, stale_lock_seconds=0)
 
 
+@pytest.mark.parametrize(
+    "timeout_value",
+    [True, "30", float("nan"), float("inf"), float("-inf")],
+    ids=["boolean", "string", "nan", "positive-infinity", "negative-infinity"],
+)
+@pytest.mark.parametrize("field_name", ["build_timeout_seconds", "stale_lock_seconds"])
+def test_base_constructor_rejects_invalid_timeout_domains(
+    store: RegistryStore,
+    field_name: str,
+    timeout_value: Any,
+) -> None:
+    kwargs = {field_name: timeout_value}
+
+    with pytest.raises(ValueError, match=field_name):
+        HelperEnvironmentManager(store, **kwargs)
+
+
+@pytest.mark.parametrize("timeout_value", [1, 1.25])
+def test_base_constructor_preserves_positive_finite_timeouts(
+    store: RegistryStore,
+    timeout_value: float,
+) -> None:
+    manager = HelperEnvironmentManager(
+        store,
+        build_timeout_seconds=timeout_value,
+        stale_lock_seconds=timeout_value,
+    )
+
+    assert manager.build_timeout_seconds == float(timeout_value)
+    assert manager.stale_lock_seconds == float(timeout_value)
+
+
 def test_base_normalizes_distributions_deterministically(
     store: RegistryStore,
 ) -> None:

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import builtins
 import re
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from html import escape
@@ -735,6 +736,30 @@ class RemoteRun:
                 )
         return downloaded
 
+    def _acknowledge_transient_delivery(self) -> None:
+        """Best-effort additive handshake after terminal data is consumed."""
+
+        if self.server_side:
+            return
+        try:
+            self._client._daemon.acknowledge_run_delivery(self.id)
+        except ClientError as exc:
+            if exc.status_code in {404, 405}:
+                # A 0.4.5 client can still collect from a 0.4.4 daemon.  That
+                # daemon does not enforce transient cleanup, so no data is at risk.
+                return
+            warnings.warn(
+                f"run {self.id!r} was delivered, but its retention acknowledgment failed: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"run {self.id!r} was delivered, but its retention acknowledgment failed: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
     def collect(
         self,
         *,
@@ -753,18 +778,25 @@ class RemoteRun:
             timeout_seconds=timeout_seconds,
             progress=progress,
         )
-        if final_state["status"] != "succeeded":
+        status = str(final_state["status"])
+        transient = m_manifest.retention_disposition(final_state.get("keep", True), status) == "remove"
+        if status != "succeeded":
             error = final_state.get("error") or "run returned no error message"
+            if transient:
+                self._acknowledge_transient_delivery()
             raise RuntimeError(f"{self.mode} run {self.id!r} ended as {final_state.get('status')!r}: {error}")
 
         payload = self.result()
         downloaded = self.download_artifacts(artifacts_dir) if artifacts_dir is not None else {}
-        return RemoteResult(
+        result = RemoteResult(
             run=final_state,
             payload=payload,
             mode=self.mode,
             downloaded_artifacts=downloaded,
         )
+        if transient:
+            self._acknowledge_transient_delivery()
+        return result
 
 
 class _LibraryAdmin:

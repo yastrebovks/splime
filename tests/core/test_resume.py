@@ -53,6 +53,11 @@ def _mutating_save_resume_box(path: str, obj: ResumeBox) -> None:
     Path(path).write_text("changed:{}".format(obj.value), encoding="utf-8")
 
 
+def _save_resume_box_must_not_run(path: str, obj: ResumeBox) -> None:
+    del path, obj
+    raise AssertionError("frozen artifact must not call a save override")
+
+
 def _bad_load_resume_box(path: str) -> ResumeBox:
     raise RuntimeError("bad load for {}".format(Path(path).read_text(encoding="utf-8")))
 
@@ -85,6 +90,16 @@ def _good_box_adapter_with_mutating_save() -> Adapter:
         load=_good_load_resume_box,
         py_type=ResumeBox,
         format="box",
+    )
+
+
+def _unregistered_alt_box_adapter(save: Any) -> Adapter:
+    return Adapter(
+        key=make_key(ResumeBox, "altbox"),
+        save=save,
+        load=_good_load_resume_box,
+        py_type=ResumeBox,
+        format="altbox",
     )
 
 
@@ -226,8 +241,64 @@ def test_resume_pair_override_ignores_save_half_for_frozen_producer(
     assert child_output["ref"]["sha256"] == parent_output["ref"]["sha256"]
     assert child_output["ref"]["size"] == parent_output["ref"]["size"]
     assert child_output["ref"]["sha256"] == hashlib.sha256(parent_bytes).hexdigest()
-    assert child_manifest["edges"][0]["adapter"]["save"]["identity"]["save"].endswith("_mutating_save_resume_box")
+    assert child_manifest["edges"][0]["adapter"]["save"]["identity"]["save"].endswith("_save_resume_box")
+    assert child_manifest["edges"][0]["adapter"]["save"]["source"] == "pipeline"
     assert child_manifest["edges"][0]["adapter"]["load"]["identity"]["load"].endswith("_good_load_resume_box")
+    assert child_manifest["edges"][0]["adapter"]["load"]["source"] == "run-override"
+
+
+def test_frozen_edge_preserves_unregistered_parent_save_override_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SPL_RUNS_HOME", str(tmp_path / "runs"))
+    _reset_calls("producer", "consumer")
+    pipeline = _resume_box_pipeline()
+    parent_adapter = _unregistered_alt_box_adapter(_mutating_save_resume_box)
+    parent = Deployment(pipeline).run(
+        adapters={("producer", DEFAULT_PORT): parent_adapter},
+        keep=True,
+    )
+    with parent:
+        assert parent.value("consumer") == "box:changed:seed"
+
+    parent_manifest = _read_manifest(parent)
+    parent_edge = parent_manifest["edges"][0]
+    parent_output = _node_by_alias(parent_manifest, "producer")["outputs"][DEFAULT_PORT]
+    assert parent_edge["adapter"]["save"]["identity"]["key"] == make_key(ResumeBox, "altbox")
+    assert parent_edge["adapter"]["save"]["source"] == "run-override"
+    legacy_manifest = cast(dict[str, Any], json.loads(json.dumps(parent_manifest)))
+    legacy_manifest["edges"][0]["adapter"] = parent_edge["adapter"]["save"]
+    assert (
+        m_resume.manifest_frozen_save_adapter_record(
+            legacy_manifest,
+            source_node=pipeline.get_node_by_alias("producer"),
+            source_port=DEFAULT_PORT,
+            target_node=pipeline.get_node_by_alias("consumer"),
+            target_port="box",
+        )
+        == parent_edge["adapter"]["save"]
+    )
+
+    child_adapter = _unregistered_alt_box_adapter(_save_resume_box_must_not_run)
+    child = parent.resume(
+        from_="consumer",
+        adapters={("producer", DEFAULT_PORT): child_adapter},
+        keep=True,
+    )
+    with child:
+        assert child.value("consumer") == "box:changed:seed"
+
+    child_manifest = _read_manifest(child)
+    child_edge = child_manifest["edges"][0]
+    child_output = _node_by_alias(child_manifest, "producer")["outputs"][DEFAULT_PORT]
+    assert _calls == {"producer": 1, "consumer": 2}
+    assert _node_by_alias(child_manifest, "producer")["status"] == "frozen"
+    assert child_output["ref"]["sha256"] == parent_output["ref"]["sha256"]
+    assert child_output["ref"]["size"] == parent_output["ref"]["size"]
+    assert child_edge["adapter"]["save"] == parent_edge["adapter"]["save"]
+    assert child_edge["adapter"]["load"]["identity"]["load"].endswith("_good_load_resume_box")
+    assert child_edge["adapter"]["load"]["source"] == "run-override"
 
 
 def test_resume_kwargs_recalculates_consumers_and_descendants_only(

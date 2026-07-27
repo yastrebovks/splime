@@ -86,11 +86,45 @@ jobs:
               sys.exit(1)
           PY
 
-      - name: Build sdist and wheel
-        run: python -m build --sdist --wheel
+      - name: Build sdist and wheel deterministically
+        env:
+          SOURCE_DATE_EPOCH: "1784073600"
+        run: |
+          python tools/build_release_artifacts.py --out-dir dist
+          python tools/build_release_artifacts.py --out-dir dist-repeat
+
+      - name: Verify the build is reproducible
+        run: |
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          first = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in Path("dist").iterdir()}
+          second = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in Path("dist-repeat").iterdir()}
+          if first != second:
+              raise SystemExit(f"non-reproducible release build: first={first!r} second={second!r}")
+          PY
 
       - name: Check package metadata
         run: python -m twine check dist/*
+
+      - name: Verify filenames and SHA-256 against release manifest
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(Path("release-manifest.json").read_text(encoding="utf-8"))
+          expected = {item["filename"]: item["sha256"] for item in manifest["python"]["artifacts"]}
+          actual = {
+              path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in Path("dist").iterdir()
+              if path.is_file()
+          }
+          if actual != expected:
+              raise SystemExit(f"release artifact drift: expected={expected!r} actual={actual!r}")
+          PY
 
       - name: Upload distributions
         uses: actions/upload-artifact@v4
@@ -99,10 +133,46 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  install-test:
+    name: Install released wheel (${{ matrix.os }})
+    needs:
+      - build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install the exact built wheel
+        shell: bash
+        run: |
+          python -m venv release-smoke
+          if [ -x release-smoke/Scripts/python.exe ]; then
+            PYTHON=release-smoke/Scripts/python.exe
+          else
+            PYTHON=release-smoke/bin/python
+          fi
+          "$PYTHON" -m pip install --upgrade pip
+          "$PYTHON" -m pip install dist/splime-0.4.5-py3-none-any.whl
+          "$PYTHON" -c "from spl import SPLClient; print(SPLClient)"
+          "$PYTHON" -m spl.daemon --version
+
   publish-testpypi:
     name: Publish to TestPyPI
     needs:
-      - build
+      - install-test
     runs-on: ubuntu-latest
     if: github.event_name != 'workflow_dispatch' || inputs.target == 'testpypi'
     environment:
@@ -129,7 +199,7 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     needs:
-      - build
+      - install-test
     runs-on: ubuntu-latest
     if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
     environment:

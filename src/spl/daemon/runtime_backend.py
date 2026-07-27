@@ -150,6 +150,11 @@ class VenvBackend:
     def after_run(self, ctx: RunContext) -> dict[str, Any]:
         return {}
 
+    def handle_timeout(self, ctx: RunContext) -> None:
+        """Leave no backend-specific resources after a venv worker timeout."""
+
+        del ctx
+
     def process_result(
         self,
         ctx: RunContext,
@@ -181,6 +186,7 @@ class DockerBackend:
         self._container_name: str | None = None
         self._cleanup_container = False
         self._container_id: str | None = None
+        self._run_id: str | None = None
 
     def __enter__(self) -> DockerBackend:
         return self
@@ -195,7 +201,11 @@ class DockerBackend:
             self._pool_context.__exit__(exc_type, exc, traceback)
             self._pool_context = None
         if self._container_name is not None and self._cleanup_container:
-            self.docker_pool.remove_container(self._container_name)
+            self.docker_pool.remove_owned_container(
+                self._container_id or self._container_name,
+                kind="run",
+                run_id=self._run_id,
+            )
 
     def status_for_object(self, object_record: dict[str, Any]) -> dict[str, Any]:
         return self.environment_manager.status_for_object(object_record)
@@ -219,6 +229,7 @@ class DockerBackend:
     def build_command(self, ctx: RunContext) -> list[str]:
         environment_record = self._ready_record()
         runtime_config = ctx.object_record.get("runtime_config") or {"mode": "venv"}
+        self._run_id = ctx.run_id
         write_worker_runtime_marker(
             WorkerRuntimePlan(
                 runtime=LEGACY_WORKER_RUNTIME,
@@ -242,9 +253,14 @@ class DockerBackend:
                 run_id=ctx.run_id,
                 container_name=self._container_name,
                 runtime_config=runtime_config,
+                lease=self._pool_record,
             )
 
-        self._container_name = self._docker_container_name(ctx.run_id)
+        fallback_name = self._docker_container_name(ctx.run_id)
+        run_container_name = getattr(self.docker_pool, "run_container_name", None)
+        self._container_name = (
+            run_container_name(ctx.run_id, fallback=fallback_name) if callable(run_container_name) else fallback_name
+        )
         self._cleanup_container = True
         return self.docker_pool.worker_command(
             object_record=ctx.object_record,
@@ -278,7 +294,26 @@ class DockerBackend:
     def after_run(self, ctx: RunContext) -> dict[str, Any]:
         if not self._cleanup_container:
             return {}
-        return {"container_id": self._read_docker_container_id(ctx.run_dir)}
+        self._container_id = self._read_docker_container_id(ctx.run_dir)
+        return {"container_id": self._container_id}
+
+    def handle_timeout(self, ctx: RunContext) -> None:
+        """Quarantine a timed-out Docker container before releasing its lease."""
+
+        if self._pool_record is not None:
+            self.docker_pool.quarantine_container(self._pool_record)
+            self._pool_record = None
+            return
+        if self._container_name is not None and self._cleanup_container:
+            self._container_id = self._read_docker_container_id(ctx.run_dir)
+            target = self._container_id or self._container_name
+            exact_absent = self.docker_pool.quarantine_owned_container(
+                target,
+                kind="run",
+                run_id=ctx.run_id,
+            )
+            run_absent = self.docker_pool.quarantine_run_containers(ctx.run_id)
+            self._cleanup_container = not (exact_absent and run_absent)
 
     def process_result(
         self,

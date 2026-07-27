@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, TypeAlias, TypeVar
+
+from spl.core.json_contract import dumps as json_dumps
+from spl.core.json_contract import validate_json_value
 
 FINGERPRINT_FORMAT_VERSION = 1
 
@@ -92,19 +94,14 @@ def canonical_json_bytes(value: Any) -> bytes:
     """Return stable JSON bytes for JSON-native inline values."""
 
     normalized = _normalize_plain(value)
-    text = json.dumps(
-        normalized,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
+    text = json_dumps(normalized)
     return "{}\n".format(text).encode("utf-8")
 
 
 def inline_value_sha256(value: Any) -> str:
     """Return the SHA-256 digest used for JSON-native inline values."""
 
+    validate_json_value(value)
     return _sha256(canonical_json_bytes(value))
 
 
@@ -173,7 +170,7 @@ def _validate_sha256(value: str) -> None:
 
 def _normalize_plain(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return {str(key): _normalize_plain(item) for key, item in sorted(value.items(), key=lambda item: str(item[0]))}
+        return {key: _normalize_plain(item) for key, item in sorted(value.items(), key=lambda item: str(item[0]))}
     if isinstance(value, tuple | list):
         return [_normalize_plain(item) for item in value]
     if isinstance(value, Path):
@@ -188,13 +185,7 @@ def _sorted_canonical(values: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _canonical_sort_key(value: Any) -> str:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
+    return json_dumps(value)
 
 
 def _sha256(value: bytes) -> str:

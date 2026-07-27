@@ -433,6 +433,21 @@ class RegistryStore:
             error=error,
         )
 
+    def save_remote_signature_in_current_transaction(
+        self,
+        ref: dict[str, Any],
+        signature: dict[str, Any],
+        *,
+        status: str = "resolved",
+        error: str | None = None,
+    ) -> None:
+        self.libraries.save_remote_signature_in_current_transaction(
+            ref,
+            signature,
+            status=status,
+            error=error,
+        )
+
     def mark_remote_signature_unavailable(
         self,
         ref: dict[str, Any],
@@ -462,6 +477,7 @@ class RegistryStore:
         source_object_name: str | None = None,
         remote_name: str | None = None,
         remote_signature_resolver: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        remote_signature_cache_writer: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         return self.objects.register_object(
             name,
@@ -483,6 +499,7 @@ class RegistryStore:
             source_object_name=source_object_name,
             remote_name=remote_name,
             remote_signature_resolver=remote_signature_resolver,
+            remote_signature_cache_writer=remote_signature_cache_writer,
         )
 
     def list_objects(self) -> dict[str, Any]:
@@ -640,9 +657,10 @@ class RegistryStore:
         owner_id: str | None = None,
         library: str | None = None,
         runtimes: dict[str, str] | None = None,
-        keep: KeepPolicy = "on_failure",
+        keep: KeepPolicy = True,
         parent_run_id: str | None = None,
         resume: dict[str, Any] | None = None,
+        report_local_run: bool = True,
     ) -> dict[str, Any]:
         return self.runs.create_run(
             object_name,
@@ -659,6 +677,7 @@ class RegistryStore:
             keep=keep,
             parent_run_id=parent_run_id,
             resume=resume,
+            report_local_run=report_local_run,
         )
 
     def update_run(self, run_id: str, **changes: Any) -> dict[str, Any]:
@@ -673,11 +692,49 @@ class RegistryStore:
     def show_run(self, run_id: str, *, include_inline_values: bool = False) -> dict[str, Any]:
         return self.runs.show_run(run_id, include_inline_values=include_inline_values)
 
+    def enforce_run_retention(self, run_id: str) -> dict[str, Any]:
+        """Enforce one terminal run policy after all outbound events are sent."""
+
+        with self._storage._lock:
+            sync_state = self.sync_events.run_sync_state(run_id)
+            if not sync_state["unsent"]:
+                self.sync_events.scrub_sent_run_events(run_id)
+            return self.runs.enforce_run_retention(
+                run_id,
+                blocked_by_sync=bool(sync_state["unsent"]),
+            )
+
+    def renew_run_delivery(self, run_id: str, *, lease_seconds: float) -> dict[str, Any]:
+        """Renew the compatibility delivery lease for one terminal local run."""
+
+        return self.runs.renew_run_delivery(run_id, lease_seconds=lease_seconds)
+
+    def acknowledge_run_delivery(self, run_id: str) -> dict[str, Any]:
+        """Acknowledge client delivery, then enforce retention atomically."""
+
+        with self._storage._lock:
+            state = self.runs.acknowledge_run_delivery(run_id)
+            outcome = self.enforce_run_retention(run_id)
+        return {
+            "id": state["id"],
+            "acknowledged": bool(state["retention_delivery_acked"]),
+            "retention": outcome,
+        }
+
     def run_tag_stats(self) -> dict[str, Any]:
         return self.runs.tag_stats()
 
     def delete_run(self, run_id: str, *, dry_run: bool = False) -> dict[str, Any]:
-        return self.runs.delete_run(run_id, dry_run=dry_run)
+        result = self.prune_runs(run_id=run_id, dry_run=dry_run)
+        if result["count"] == 0:
+            if result["skipped_active"]:
+                raise RuntimeError("run is active and cannot be pruned: {}".format(run_id))
+            if result["skipped_pending_sync"]:
+                if dry_run:
+                    return result
+                raise RuntimeError("run has pending sync and cannot be pruned: {}".format(run_id))
+            raise KeyError("run is not found: {}".format(run_id))
+        return result
 
     def prune_runs(
         self,
@@ -687,9 +744,16 @@ class RegistryStore:
         older_than_seconds: float | None = None,
         dry_run: bool = False,
     ) -> dict[str, Any]:
-        return self.runs.prune_runs(
-            run_id=run_id,
-            statuses=statuses,
-            older_than_seconds=older_than_seconds,
-            dry_run=dry_run,
-        )
+        with self._storage._lock:
+            protected_run_ids = {
+                str(state["id"])
+                for state in self.runs.list_runs()
+                if self.sync_events.run_sync_state(str(state["id"]))["unsent"]
+            }
+            return self.runs.prune_runs(
+                run_id=run_id,
+                statuses=statuses,
+                older_than_seconds=older_than_seconds,
+                dry_run=dry_run,
+                protected_run_ids=protected_run_ids,
+            )

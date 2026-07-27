@@ -69,17 +69,22 @@ from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from typing import Any, Literal, cast, overload
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from urllib.request import Request
 
+from spl._http import urlopen_verified
+from spl.core import json_contract as m_json_contract
+from spl.core import manifest as m_manifest
 from spl.core import node_runtime as m_node_runtime
 from spl.core.entities.adapter import Adapter
 from spl.core.entities.distribution import DDistribution
+from spl.daemon.callback_capability import CALLBACK_CAPABILITY_ENV
 from spl.daemon.store import validate_name
+from spl.daemon.worker_runtime_marker import WORKER_MANIFEST_HANDOFF_FILE
 
 ARTIFACTS_KEY = "__spl_artifacts__"
 ARTIFACT_REF_KEY = "__spl_artifact_ref__"
 RESULT_KEY = "__spl_result__"
-_JSON_SCALAR_TYPES = (str, int, float, bool)
 _ARTIFACT_NAME_TOKEN_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 DEFAULT_REMOTE_NODE_HTTP_TIMEOUT_SECONDS: float | None = None
 
@@ -93,10 +98,11 @@ def read_json(path: Path) -> Any:
 def write_json(path: Path, value: Any) -> None:
     """Write a UTF-8 JSON file with stable formatting."""
 
+    payload = m_json_contract.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, separators=None)
     _ensure_private_dir(path.parent)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+        handle.write(payload)
     _chmod_owner_file(path)
 
 
@@ -122,12 +128,16 @@ class RemoteNodeClient:
         self,
         daemon_url: str,
         *,
+        callback_capability: str | None = None,
         timeout_seconds: float | None = None,
     ):
         self.daemon_url = daemon_url.rstrip("/")
+        self.callback_capability = callback_capability
         self.timeout_seconds = timeout_seconds
 
     def run_node(self, node: Any, kwargs: dict[str, Any]) -> Any:
+        if not self.callback_capability:
+            raise RuntimeError("remote node callback capability is missing; start this pipeline through the SPL daemon")
         node_payload: dict[str, Any] = {
             "uuid": str(node.uuid),
             "url": node.url,
@@ -150,29 +160,45 @@ class RemoteNodeClient:
             node_payload["library"] = library
         request = Request(
             f"{self.daemon_url}/remote-nodes/run",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            data=m_json_contract.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=False,
+                separators=None,
+            ).encode("utf-8"),
             headers={
                 "Accept": "application/json",
+                "Authorization": f"Bearer {self.callback_capability}",
                 "Content-Type": "application/json; charset=utf-8",
             },
             method="POST",
         )
         try:
             # /remote-nodes/run is a blocking call: the daemon polls the
-            # server-side run until the node reaches a terminal state.  urllib
-            # exposes one socket timeout for both connect and read, so an
-            # unbounded run must not inherit the short control-plane default.
+            # server-side run until the node reaches a terminal state.  The
+            # shared helper keeps its bounded connect timeout while allowing
+            # the response read to remain unbounded when no run timeout exists.
             timeout = (
                 self.timeout_seconds if self.timeout_seconds is not None else DEFAULT_REMOTE_NODE_HTTP_TIMEOUT_SECONDS
             )
-            with urlopen(request, timeout=timeout) as response:  # noqa: S310 - local daemon URL.
+            daemon_target = urlparse(self.daemon_url)
+            with urlopen_verified(
+                request,
+                timeout=timeout,
+                allow_docker_callback_http=(
+                    daemon_target.scheme.casefold() == "http" and daemon_target.hostname == "host.docker.internal"
+                ),
+            ) as response:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             raw = exc.read().decode("utf-8")
-            try:
-                message = json.loads(raw).get("error", raw)
-            except json.JSONDecodeError:
-                message = raw
+            if 300 <= exc.code < 400:
+                message = str(exc.reason)
+            else:
+                try:
+                    message = json.loads(raw).get("error", raw)
+                except json.JSONDecodeError:
+                    message = raw
             raise RuntimeError(f"remote node call failed: {message}") from exc
         except URLError as exc:
             raise RuntimeError(f"local daemon is not reachable for remote node call: {exc.reason}") from exc
@@ -238,7 +264,7 @@ def validate_environment(distributions: list[dict[str, str]]) -> None:
         raise RuntimeError("worker environment does not match SPL metadata: " + "; ".join(mismatches))
 
 
-def to_jsonable(value: Any) -> Any:
+def to_jsonable(value: Any, *, path: str = "$") -> Any:
     """Convert common Python containers into JSON-compatible values.
 
     The function is intentionally strict for unknown objects.  A daemon that
@@ -247,16 +273,25 @@ def to_jsonable(value: Any) -> Any:
     a display string.
     """
 
-    if value is None or isinstance(value, str | int | float | bool):
+    if type(value) in m_json_contract.JSON_SCALARS:
+        m_json_contract.validate_json_value(value, path=path)
         return value
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, Mapping):
-        return {str(key): to_jsonable(item) for key, item in value.items()}
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                m_json_contract.validate_json_value({key: None}, path=path)
+                raise AssertionError("JSON key validation unexpectedly accepted a non-string key")
+            result[key] = to_jsonable(item, path=_json_child_path(path, key))
+        return result
     if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
-        return [to_jsonable(item) for item in value]
+        return [to_jsonable(item, path="{}[{}]".format(path, index)) for index, item in enumerate(value)]
     if isinstance(value, set):
-        return [to_jsonable(item) for item in sorted(value, key=repr)]
+        return [
+            to_jsonable(item, path="{}[{}]".format(path, index)) for index, item in enumerate(sorted(value, key=repr))
+        ]
     raise TypeError("result is not JSON serializable; return JSON-like data or declare artifacts")
 
 
@@ -334,6 +369,20 @@ def _result_path(parts: Sequence[str]) -> str:
     return ".".join(parts)
 
 
+def _json_child_path(path: str, key: str) -> str:
+    return "{}[{}]".format(
+        path,
+        m_json_contract.dumps(key, ensure_ascii=False, sort_keys=False),
+    )
+
+
+def _json_path(parts: Sequence[str]) -> str:
+    path = "$"
+    for part in parts:
+        path = _json_child_path(path, part)
+    return path
+
+
 def _artifact_name_token(value: str) -> str:
     token = _ARTIFACT_NAME_TOKEN_PATTERN.sub("_", str(value)).strip("._-")
     return token or "value"
@@ -374,16 +423,23 @@ class PipelineResultNormalizer:
         self._used_artifact_names: set[str] = set()
 
     def normalize(self, value: Any, path: tuple[str, ...] = ("result",)) -> Any:
-        if value is None or isinstance(value, _JSON_SCALAR_TYPES):
+        if type(value) in m_json_contract.JSON_SCALARS:
+            m_json_contract.validate_json_value(value, path=_json_path(path))
             return value
         if isinstance(value, Path):
             return str(value)
         if isinstance(value, Mapping):
             if ARTIFACTS_KEY in value:
-                result = self._result_from_explicit_artifact_mapping(value)
+                explicit_result = self._result_from_explicit_artifact_mapping(value)
                 self._copy_declared_artifacts(value[ARTIFACTS_KEY])
-                return self.normalize(result, path)
-            return {str(key): self.normalize(item, (*path, str(key))) for key, item in value.items()}
+                return self.normalize(explicit_result, path)
+            normalized_mapping: dict[str, Any] = {}
+            for key, item in value.items():
+                if type(key) is not str:
+                    m_json_contract.validate_json_value({key: None}, path=_json_path(path))
+                    raise AssertionError("JSON key validation unexpectedly accepted a non-string key")
+                normalized_mapping[key] = self.normalize(item, (*path, key))
+            return normalized_mapping
         if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
             return [self.normalize(item, (*path, str(index))) for index, item in enumerate(value)]
         if isinstance(value, set):
@@ -490,6 +546,7 @@ def run_pipeline(
     output: str | None,
     *,
     daemon_url: str,
+    callback_capability: str | None = None,
     timeout_seconds: float | None,
     artifacts_dir: Path,
     namespace: Mapping[str, Any] | None = None,
@@ -498,6 +555,7 @@ def run_pipeline(
     node_runtime_environments: Mapping[str, Any] | None = None,
     runtimes: dict[str, str] | None = None,
     resume: Mapping[str, Any] | None = None,
+    keep: m_manifest.KeepPolicy = True,
     include_manifest: Literal[False] = False,
 ) -> tuple[Any, dict[str, str]]: ...
 
@@ -509,6 +567,7 @@ def run_pipeline(
     output: str | None,
     *,
     daemon_url: str,
+    callback_capability: str | None = None,
     timeout_seconds: float | None,
     artifacts_dir: Path,
     namespace: Mapping[str, Any] | None = None,
@@ -517,6 +576,7 @@ def run_pipeline(
     node_runtime_environments: Mapping[str, Any] | None = None,
     runtimes: dict[str, str] | None = None,
     resume: Mapping[str, Any] | None = None,
+    keep: m_manifest.KeepPolicy = True,
     include_manifest: Literal[True],
 ) -> tuple[Any, dict[str, str], dict[str, Any] | None]: ...
 
@@ -527,6 +587,7 @@ def run_pipeline(
     output: str | None,
     *,
     daemon_url: str,
+    callback_capability: str | None = None,
     timeout_seconds: float | None,
     artifacts_dir: Path,
     namespace: Mapping[str, Any] | None = None,
@@ -535,6 +596,7 @@ def run_pipeline(
     node_runtime_environments: Mapping[str, Any] | None = None,
     runtimes: dict[str, str] | None = None,
     resume: Mapping[str, Any] | None = None,
+    keep: m_manifest.KeepPolicy = True,
     include_manifest: bool = False,
 ) -> tuple[Any, dict[str, str]] | tuple[Any, dict[str, str], dict[str, Any] | None]:
     """Run a ``spl.core`` pipeline without changing the existing core files.
@@ -551,7 +613,11 @@ def run_pipeline(
 
     from spl.core._common import Deployment
 
-    client = RemoteNodeClient(daemon_url, timeout_seconds=timeout_seconds)
+    client = RemoteNodeClient(
+        daemon_url,
+        callback_capability=callback_capability,
+        timeout_seconds=timeout_seconds,
+    )
     node_environment_provider = WorkerNodeEnvironmentProvider(node_runtime_environments)
     try:
         deployment = Deployment(
@@ -575,40 +641,46 @@ def run_pipeline(
     previous_runs_home = os.environ.get("SPL_RUNS_HOME")
     os.environ["SPL_RUNS_HOME"] = str(artifacts_dir.parent / "pipeline-state")
     try:
-        if resume is None:
-            run = deployment.run(runtimes=runtimes, keep=True, **kwargs)
-        else:
-            run = deployment.resume(
-                _resume_parent_run_dir(resume, artifacts_dir=artifacts_dir),
-                from_=_resume_from_selection(resume),
-                adapters=_adapter_overrides_from_payload(pipeline, namespace or {}, resume.get("adapters")),
-                runtimes=runtimes,
-                kwargs=_resume_kwargs(resume),
-                keep=True,
-            )
-        with run:
-            if output is not None:
-                result = run[pipeline.get_node_by_alias(output)]
-            elif pipeline.aliases:
-                result = {
-                    alias: run[node]
-                    for alias, node in sorted(
-                        pipeline.aliases.items(),
-                        key=lambda item: item[0],
-                    )
-                }
-            elif len(pipeline.nodes) == 1:
-                [node] = list(pipeline.nodes)
-                result = run[node]
+        try:
+            if resume is None:
+                run = deployment.run(runtimes=runtimes, keep=keep, **kwargs)
             else:
-                raise ValueError("pipeline has multiple nodes and no aliases; pass output or register aliases")
+                run = deployment.resume(
+                    _resume_parent_run_dir(resume, artifacts_dir=artifacts_dir),
+                    from_=_resume_from_selection(resume),
+                    adapters=_adapter_overrides_from_payload(pipeline, namespace or {}, resume.get("adapters")),
+                    runtimes=runtimes,
+                    kwargs=_resume_kwargs(resume),
+                    keep=keep,
+                )
+            with run:
+                if output is not None:
+                    result = run[pipeline.get_node_by_alias(output)]
+                elif pipeline.aliases:
+                    result = {
+                        alias: run[node]
+                        for alias, node in sorted(
+                            pipeline.aliases.items(),
+                            key=lambda item: item[0],
+                        )
+                    }
+                elif len(pipeline.nodes) == 1:
+                    [node] = list(pipeline.nodes)
+                    result = run[node]
+                else:
+                    raise ValueError("pipeline has multiple nodes and no aliases; pass output or register aliases")
+        except BaseException:
+            snapshot = run.manifest_snapshot if "run" in locals() else None
+            if snapshot is not None and run.manifest_path is None:
+                write_json(artifacts_dir.parent / WORKER_MANIFEST_HANDOFF_FILE, snapshot)
+            raise
     finally:
         if previous_runs_home is None:
             os.environ.pop("SPL_RUNS_HOME", None)
         else:
             os.environ["SPL_RUNS_HOME"] = previous_runs_home
 
-    run_manifest = read_json(run.manifest_path) if run.manifest_path is not None else None
+    run_manifest = run.manifest_snapshot
     if output is not None:
         normalized = normalizer.normalize(result, ("result", output))
         if include_manifest:
@@ -767,13 +839,13 @@ def _read_remote_ports(path: Path | None) -> dict[str, dict[str, Any]]:
         return {}
     payload = read_json(path)
     return {
-        str(item["id"]): {
+        str(item.get("node_id") or item["id"]): {
             "inputs": item.get("inputs") or [],
             "outputs": item.get("outputs") or [],
             "remote": item.get("remote") or {},
         }
         for item in payload.get("nodes", [])
-        if item.get("kind") == "remote" and item.get("id")
+        if item.get("kind") == "remote" and (item.get("node_id") or item.get("id"))
     }
 
 
@@ -861,12 +933,14 @@ def execute(
 ) -> dict[str, Any]:
     """Load, call, and persist one function or pipeline result."""
 
+    callback_capability = os.environ.pop(CALLBACK_CAPABILITY_ENV, None)
     payload = read_json(input_path)
     args = payload.get("args", [])
     kwargs = payload.get("kwargs", {})
     output = payload.get("output")
     runtime_config = payload.get("runtime_config")
     runtimes = payload.get("runtimes")
+    keep = m_manifest.normalize_keep(payload.get("keep", True))
 
     runtime_env_spec: list[dict[str, Any]] = []
     if env_spec_path is not None:
@@ -887,6 +961,7 @@ def execute(
             kwargs,
             output,
             daemon_url=daemon_url,
+            callback_capability=callback_capability,
             timeout_seconds=payload.get("timeout_seconds"),
             artifacts_dir=artifacts_dir,
             namespace=namespace,
@@ -899,6 +974,7 @@ def execute(
             ),
             runtimes=runtimes if isinstance(runtimes, dict) else None,
             resume=payload.get("resume") if isinstance(payload.get("resume"), Mapping) else None,
+            keep=keep,
             include_manifest=True,
         )
     elif callable(target):

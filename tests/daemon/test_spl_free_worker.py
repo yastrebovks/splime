@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
 import shlex
@@ -127,6 +128,33 @@ TYPE_HINTS_YAML = """\
 """
 
 
+NULL_RESULT_YAML = """\
+- !DFunction
+  name: null_result
+  inputs: []
+  outputs:
+  - name: default
+    type: object
+  body: |-
+    return None
+"""
+
+
+LARGE_FINITE_RESULT_YAML = """\
+- !DFunction
+  name: large_finite_result
+  inputs: []
+  outputs:
+  - name: default
+    type: dict
+  body: |-
+    return {
+        "large_integer": 123456789012345678901234567890,
+        "integral_float": 1e20,
+    }
+"""
+
+
 class FakeEnvironmentManager:
     def __init__(self, python_path: str):
         self.record = {
@@ -180,6 +208,12 @@ def _python_without_site_packages(tmp_path: Path) -> Path:
     )
     wrapper.chmod(0o755)
     return wrapper
+
+
+def _shared_result_transport_case(case_id: str) -> dict[str, Any]:
+    fixture_path = Path(__file__).resolve().parents[1] / "fixtures" / "json-values-v1.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    return next(case for case in fixture["result_transport_cases"] if case["id"] == case_id)
 
 
 def _run_object(
@@ -386,6 +420,50 @@ def test_functional_node_runs_without_spl_installed_or_pythonpath(tmp_path: Path
     assert final["result"]["result"] == {
         "pythonpath": None,
         "spl_found": False,
+    }
+
+
+def test_function_none_result_round_trips_worker_and_daemon_as_explicit_null(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    transport = _shared_result_transport_case("worker-none")
+
+    final = _run_object(
+        tmp_path,
+        NULL_RESULT_YAML,
+        name="null_result",
+        entrypoint="null_result",
+        isolated_python=True,
+    )
+
+    assert final["status"] == "succeeded", final.get("error")
+    assert final["worker_runtime"] == SPL_FREE_WORKER_RUNTIME
+    assert final["result_present"] is transport["result_present"]
+    assert final["result"] == transport["daemon_result"]
+
+
+def test_large_finite_result_round_trips_spl_free_worker_and_daemon(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+
+    final = _run_object(
+        tmp_path,
+        LARGE_FINITE_RESULT_YAML,
+        name="large_finite_result",
+        entrypoint="large_finite_result",
+        isolated_python=True,
+    )
+
+    assert final["status"] == "succeeded", final.get("error")
+    assert final["worker_runtime"] == SPL_FREE_WORKER_RUNTIME
+    assert final["result_present"] is True
+    assert final["result"]["result"] == {
+        "large_integer": 123456789012345678901234567890,
+        "integral_float": 1e20,
     }
 
 

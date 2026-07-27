@@ -23,6 +23,24 @@ spl.daemon.\_\_main\_\_ module
    :show-inheritance:
    :undoc-members:
 
+spl.daemon.artifact\_access module
+----------------------------------
+
+.. automodule:: spl.daemon.artifact_access
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.callback\_capability module
+--------------------------------------
+
+.. automodule:: spl.daemon.callback_capability
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.daemon.canonical module
 ---------------------------
 
@@ -99,6 +117,15 @@ spl.daemon.heartbeat\_service module
 ------------------------------------
 
 .. automodule:: spl.daemon.heartbeat_service
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.home\_lock module
+----------------------------
+
+.. automodule:: spl.daemon.home_lock
    :members:
    :private-members:
    :show-inheritance:
@@ -243,6 +270,15 @@ spl.daemon.store module
 -----------------------
 
 .. automodule:: spl.daemon.store
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.telemetry module
+---------------------------
+
+.. automodule:: spl.daemon.telemetry
    :members:
    :private-members:
    :show-inheritance:

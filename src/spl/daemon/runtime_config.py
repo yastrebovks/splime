@@ -6,6 +6,8 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+from spl._timeout import TimeoutDomain, validate_timeout_seconds
+
 DEFAULT_RUNTIME_MODE = "venv"
 DEFAULT_DOCKER_PYTHON = "3.13"
 DEFAULT_DOCKER_DISTRO = "trixie"
@@ -100,6 +102,12 @@ def _copy_node_runtime_fields(config: dict[str, Any], raw: dict[str, Any]) -> No
             raise ValueError("node_runtime must be a non-empty string")
         config["node_runtime"] = node_runtime_value
     node_timeout_seconds = raw.get("node_timeout_seconds")
+    validate_timeout_seconds(
+        node_timeout_seconds,
+        name='runtime_config["node_timeout_seconds"]',
+        domain=TimeoutDomain.POSITIVE,
+        allow_none=True,
+    )
     if node_timeout_seconds is not None:
         config["node_timeout_seconds"] = node_timeout_seconds
     docker = raw.get("docker")

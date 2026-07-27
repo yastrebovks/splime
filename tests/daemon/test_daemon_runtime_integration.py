@@ -5,7 +5,9 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import shutil
+import signal
 import subprocess
 import sys
 import stat
@@ -22,8 +24,10 @@ from spl.core import node_runtime as m_node_runtime
 from spl.core.entities.node import DEFAULT_PORT
 from spl.core.entities.node_function import NodeFunction
 from spl.core.ir.utils import spl_export_to_file
+from spl.daemon.callback_capability import CALLBACK_CAPABILITY_ENV
 from spl.daemon.environment import EnvironmentBuildError
 from spl.daemon.heartbeat_service import HeartbeatService
+from spl.daemon.home_lock import DaemonInstanceIdentity
 from spl.daemon.remote_client import ServerClientError
 from spl.daemon.server import DaemonRuntime, create_app
 from spl.daemon.storage_base import json_dumps
@@ -59,6 +63,18 @@ REMOTE_FUNCTION_YAML = """\
   body: |-
     return 1
 """
+
+
+def _docker_test_identity(store: RegistryStore) -> DaemonInstanceIdentity:
+    home_hash = hashlib.sha256(str(store.home.resolve()).encode("utf-8")).hexdigest()
+    return DaemonInstanceIdentity(
+        instance_id=home_hash[:32],
+        home_hash=home_hash,
+        generation=1,
+        previous_generation=None,
+        pid=os.getpid(),
+        started_at=utc_now(),
+    )
 
 
 def _remote_function_yaml(name: str, value: int) -> str:
@@ -103,6 +119,35 @@ def _worker_slow_marker(marker_path: str) -> str:
     time.sleep(1.2)
     Path(marker_path).write_text("finished", encoding="utf-8")
     return "finished"
+
+
+def _worker_sigterm_ignoring_descendant(child_pid_path: str, survived_marker: str) -> str:
+    import signal
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    child_code = """
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8')
+time.sleep(1.5)
+Path(sys.argv[2]).write_text('survived', encoding='utf-8')
+time.sleep(10.0)
+"""
+    subprocess.Popen([sys.executable, "-c", child_code, child_pid_path, survived_marker])
+    deadline = time.monotonic() + 2.0
+    while not Path(child_pid_path).exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    print("tree-ready", flush=True)
+    time.sleep(10.0)
+    return "unexpected"
 
 
 def _worker_final_unadapted_bytes() -> bytes:
@@ -454,6 +499,8 @@ class _CapturingSyncServerClient:
         machine_id: str,
         heartbeat_interval_seconds: float,
         events: list[dict[str, Any]],
+        capabilities: dict[str, Any] | None = None,
+        claim_id: str | None = None,
     ) -> dict[str, Any]:
         self.calls.append(
             {
@@ -461,6 +508,8 @@ class _CapturingSyncServerClient:
                 "machine_id": machine_id,
                 "heartbeat_interval_seconds": heartbeat_interval_seconds,
                 "events": events,
+                "capabilities": capabilities,
+                "claim_id": claim_id,
             }
         )
         return {
@@ -720,10 +769,21 @@ def test_sync_lock_prevents_two_threads_from_sending_the_same_event(tmp_path) ->
         store.close()
 
 
-def test_machine_library_snapshot_event_id_is_stable_for_same_hash(tmp_path) -> None:
+def test_machine_library_snapshot_event_is_stable_for_same_hash(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = RegistryStore(tmp_path)
     runtime = DaemonRuntime(store, heartbeat_service=_NoopHeartbeats())
     try:
+        timestamps = iter(
+            [
+                "2026-07-15T00:00:00+00:00",
+                "2026-07-15T00:00:01+00:00",
+                "2026-07-15T00:00:02+00:00",
+            ]
+        )
+        monkeypatch.setattr(daemon_server, "utc_now", lambda: next(timestamps))
         first = runtime.build_machine_library_snapshot_event(
             snapshot_hash="snapshot-hash-a",
             manifest_items=[],
@@ -737,7 +797,8 @@ def test_machine_library_snapshot_event_id_is_stable_for_same_hash(tmp_path) -> 
             manifest_items=[],
         )
 
-        assert replay["id"] == first["id"]
+        assert replay == first
+        assert "generated_at" not in first["payload"]
         assert changed["id"] != first["id"]
     finally:
         runtime.shutdown()
@@ -912,6 +973,19 @@ def test_run_update_sync_kick_does_not_block_local_run_path(tmp_path) -> None:
         assert len(pending) == 1
         assert pending[0]["kind"] == "run_update"
         assert pending[0]["payload"]["owner_id"] == "owner-a"
+        assert "result" not in pending[0]["payload"]
+
+        runtime._send_server_run_update(
+            connection["id"],
+            run_id="run-null",
+            status="succeeded",
+            result=None,
+        )
+        null_event = next(
+            event for event in store.list_pending_sync_events() if event["payload"]["run_id"] == "run-null"
+        )
+        assert "result" in null_event["payload"]
+        assert null_event["payload"]["result"] is None
     finally:
         BlockingRunUpdateServerClient.release.set()
         if runtime is not None:
@@ -1041,11 +1115,52 @@ def test_local_run_update_payload_includes_object_owner_id(tmp_path) -> None:
             "owned_runner",
             object_version_id=record["version_id"],
         )
-        runtime = DaemonRuntime(store, heartbeat_service=_NoopHeartbeats())
+        runtime = DaemonRuntime(
+            store,
+            heartbeat_service=_NoopHeartbeats(),
+            telemetry="full",
+        )
 
         payload = runtime._local_run_sync_payload(run)  # noqa: SLF001 - I-02 payload identity regression.
 
         assert payload["owner_id"] == "owner-a"
+        assert payload["result_present"] is False
+
+        completed = store.update_run(run["id"], result=None)
+        assert completed["result"] is None
+        assert completed["result_present"] is True
+        completed_payload = runtime._local_run_sync_payload(completed)  # noqa: SLF001 - JSON contract seam.
+        assert completed_payload["result_present"] is True
+        assert completed_payload["result"] is None
+        result_artifact = next(
+            artifact for artifact in completed_payload["artifacts"] if artifact["name"] == "result.json"
+        )
+        assert result_artifact["content_text"] == "null"
+
+        with store._lock, store._conn:  # noqa: SLF001 - seed a malformed legacy result row.
+            store._conn.execute(  # noqa: SLF001 - compatibility boundary assertion.
+                "UPDATE runs SET result_json = ?, input_json = ? WHERE id = ?",
+                ("NaN", '{"args":[9007199254740993]}', run["id"]),
+            )
+        unreadable = store.get_run(run["id"])
+        assert unreadable["result"] is None
+        assert unreadable["result_present"] is True
+        assert unreadable["result_unreadable"] is True
+        assert unreadable["result_json"] == "NaN"
+        assert unreadable["input"] == {"args": [9007199254740993]}
+        assert "input_unreadable" not in unreadable
+        assert "input_json" not in unreadable
+        assert json.loads(json_dumps(unreadable))["input"] == {"args": [9007199254740993]}
+
+        unreadable_payload = runtime._local_run_sync_payload(unreadable)  # noqa: SLF001
+        assert unreadable_payload["result"] is None
+        assert unreadable_payload["result_present"] is True
+        assert unreadable_payload["result_unreadable"] is True
+        assert unreadable_payload["result_json"] == "NaN"
+        unreadable_artifact = next(
+            artifact for artifact in unreadable_payload["artifacts"] if artifact["name"] == "result.json"
+        )
+        assert unreadable_artifact["content_text"] == "NaN"
     finally:
         if runtime is not None:
             runtime.shutdown()
@@ -1315,6 +1430,72 @@ def test_pipeline_node_timeout_runtime_config_reaches_daemon_worker(tmp_path) ->
 
     time.sleep(0.7)
     assert not marker_path.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group contract")
+def test_daemon_run_timeout_kills_sigterm_ignoring_worker_descendant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RegistryStore(tmp_path / "store")
+    runtime: DaemonRuntime | None = None
+    child_pid: int | None = None
+    marker_path = tmp_path / "survived.txt"
+    child_pid_path = tmp_path / "child.pid"
+    quarantined_runs: list[str] = []
+    try:
+        store.register_env("default", sys.executable)
+        runtime = DaemonRuntime(store, auto_build_envs=False)
+        monkeypatch.setattr(runtime.docker_pool, "quarantine_run_containers", quarantined_runs.append)
+        pipeline = lift(_worker_sigterm_ignoring_descendant).alias("slow").render("process_tree_timeout")
+        yaml_path = tmp_path / "process_tree_timeout.yaml"
+        spl_export_to_file(yaml_path, [pipeline])
+        record = runtime.register_object(
+            "process_tree_timeout",
+            "process_tree_timeout",
+            "default",
+            yaml_text=yaml_path.read_text(encoding="utf-8"),
+        )
+        _mark_object_environment_ready(runtime, record)
+
+        started = runtime.start_run(
+            "process_tree_timeout",
+            kwargs={
+                "child_pid_path": str(child_pid_path),
+                "survived_marker": str(marker_path),
+            },
+            output="slow",
+            source="local",
+            report_local_run=False,
+            timeout_seconds=0.4,
+        )
+        final = _wait_for_run(store, started["id"], timeout_seconds=5.0)
+
+        assert final["status"] == "failed"
+        assert final["error"] == "run timed out after 0.4 seconds"
+        assert quarantined_runs == [started["id"]]
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError(f"timed-out worker descendant survived with pid {child_pid}")
+        time.sleep(1.1)
+        assert not marker_path.exists()
+        assert store.get_run(started["id"])["status"] == "failed"
+    finally:
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if runtime is not None:
+            runtime.shutdown()
+        store.close()
 
 
 def test_node_docker_start_run_prepares_image_from_pipeline_tag(tmp_path, monkeypatch) -> None:
@@ -1879,6 +2060,7 @@ def test_docker_runtime_config_is_persisted_and_command_is_constructed(
             lambda: [("daemon", daemon_src), ("framework", framework_src)],
         )
 
+        run_name = runtime.docker_pool.run_container_name("abc123", fallback="splime-run-abc123")
         command = runtime.docker_pool.worker_command(
             object_record=record,
             entrypoint=record["entrypoint"],
@@ -1886,11 +2068,13 @@ def test_docker_runtime_config_is_persisted_and_command_is_constructed(
             run_dir=run_dir,
             workdir=workdir,
             image_tag=build_spec["image_tag"],
-            container_name="splime-run-abc123",
+            container_name=run_name,
             runtime_config=record["runtime_config"],
         )
 
-        assert command[:5] == ["docker", "run", "--rm", "--name", "splime-run-abc123"]
+        assert command[:5] == ["docker", "run", "--rm", "--name", run_name]
+        assert run_name.startswith("splime-run-")
+        assert run_name != "splime-run-abc123"
         assert "--network" in command
         assert command[command.index("--network") + 1] == "none"
         assert "--read-only" in command
@@ -1905,13 +2089,30 @@ def test_docker_runtime_config_is_persisted_and_command_is_constructed(
         assert build_spec["image_tag"] in command
         assert "/opt/splime/src0/spl/daemon/worker.py" in command
         assert f"{run_dir.resolve()}:/work" in command
-        assert f"{workdir.resolve()}:/workspace" in command
+        assert not any(str(workdir.resolve()) in item for item in command)
+        assert "/workspace" not in command
+        assert command[command.index("-w") + 1] == "/work"
         assert "PYTHONPATH=/opt/splime/src0:/opt/splime/src1" in command
         assert "SPL_OBJECT_RUNTIME_BACKEND=docker" in command
         assert "SPL_OBJECT_DOCKER_WORKER=1" in command
         assert "HOME=/tmp" in command
         assert "XDG_CACHE_HOME=/tmp/.cache" in command
         assert "MPLCONFIGDIR=/tmp/.cache/matplotlib" in command
+        assert CALLBACK_CAPABILITY_ENV not in command
+
+        remote_name = runtime.docker_pool.run_container_name("remote123", fallback="splime-run-remote123")
+        remote_command = runtime.docker_pool.worker_command(
+            object_record={**record, "pipeline_nodes": [{"kind": "remote"}]},
+            entrypoint=record["entrypoint"],
+            run_id="remote123",
+            run_dir=run_dir,
+            workdir=workdir,
+            image_tag=build_spec["image_tag"],
+            container_name=remote_name,
+            runtime_config=record["runtime_config"],
+        )
+        assert CALLBACK_CAPABILITY_ENV in remote_command
+        assert not any(item.startswith(f"{CALLBACK_CAPABILITY_ENV}=") for item in remote_command)
     finally:
         store.close()
 
@@ -1974,26 +2175,51 @@ def test_docker_network_uses_bridge_host_gateway_for_remote_nodes(
         store.close()
 
 
-def test_docker_pool_exec_command_uses_runs_mount(tmp_path) -> None:
+def test_docker_pool_exec_command_uses_runs_mount(tmp_path, monkeypatch) -> None:
     store = RegistryStore(tmp_path)
     try:
-        runtime = DaemonRuntime(store, auto_build_envs=False, docker_pool_size=1)
+        runtime = DaemonRuntime(
+            store,
+            auto_build_envs=False,
+            docker_pool_enabled=True,
+            docker_pool_size=1,
+            daemon_identity=_docker_test_identity(store),
+        )
 
+        monkeypatch.setattr(
+            runtime.docker_pool,
+            "start_container",
+            lambda **kwargs: {
+                "key": kwargs["key"],
+                "name": "splime-pool-test",
+                "container_id": "immutable-pool-id",
+                "image_tag": kwargs["image_tag"],
+            },
+        )
+        lease = runtime.docker_pool.ensure_container(
+            object_record={"pipeline_nodes": [{"kind": "remote"}]},
+            image_tag="splime-runtime:demo",
+            runtime_config={"mode": "docker", "network": "auto"},
+        )
         command = runtime.docker_pool.exec_worker_command(
-            object_record={"pipeline_nodes": []},
+            object_record={"pipeline_nodes": [{"kind": "remote"}]},
             entrypoint="artifact_func",
             run_id="abc123",
-            container_name="splime-pool-test",
+            container_name=lease["name"],
             runtime_config={"mode": "docker", "network": "auto"},
+            lease=lease,
         )
 
         assert command[:2] == ["docker", "exec"]
         assert command[command.index("-w") + 1] == "/runs/abc123"
         assert "SPL_OBJECT_RUNTIME_BACKEND=docker" in command
         assert "SPL_OBJECT_DOCKER_WORKER=1" in command
-        assert "splime-pool-test" in command
+        assert CALLBACK_CAPABILITY_ENV in command
+        assert not any(item.startswith(f"{CALLBACK_CAPABILITY_ENV}=") for item in command)
+        assert "immutable-pool-id" in command
         assert "/runs/abc123/object.yaml" in command
         assert "/runs/abc123/result.json" in command
+        runtime.docker_pool.release_container(lease)
     finally:
         store.close()
 
@@ -2001,7 +2227,13 @@ def test_docker_pool_exec_command_uses_runs_mount(tmp_path) -> None:
 def test_docker_pool_key_includes_effective_network(tmp_path, monkeypatch) -> None:
     store = RegistryStore(tmp_path)
     try:
-        runtime = DaemonRuntime(store, auto_build_envs=False, docker_pool_size=1)
+        runtime = DaemonRuntime(
+            store,
+            auto_build_envs=False,
+            docker_pool_enabled=True,
+            docker_pool_size=1,
+            daemon_identity=_docker_test_identity(store),
+        )
         monkeypatch.setattr("spl.daemon.docker_pool.platform.system", lambda: "Linux")
         config = {"mode": "docker", "network": "auto"}
 
@@ -2021,16 +2253,23 @@ def test_docker_pool_key_includes_effective_network(tmp_path, monkeypatch) -> No
         store.close()
 
 
-def test_docker_pool_records_exec_lock(tmp_path, monkeypatch) -> None:
+def test_docker_pool_returns_already_leased_generation(tmp_path, monkeypatch) -> None:
     store = RegistryStore(tmp_path)
     try:
-        runtime = DaemonRuntime(store, auto_build_envs=False, docker_pool_size=1)
+        runtime = DaemonRuntime(
+            store,
+            auto_build_envs=False,
+            docker_pool_enabled=True,
+            docker_pool_size=1,
+            daemon_identity=_docker_test_identity(store),
+        )
         monkeypatch.setattr(
             runtime.docker_pool,
             "start_container",
             lambda **kwargs: {
                 "key": kwargs["key"],
                 "name": "splime-pool-test",
+                "container_id": "immutable-pool-id",
                 "image_tag": kwargs["image_tag"],
             },
         )
@@ -2042,7 +2281,10 @@ def test_docker_pool_records_exec_lock(tmp_path, monkeypatch) -> None:
             runtime_config={"mode": "docker", "network": "auto"},
         )
 
-        assert "exec_lock" in record
+        assert record["in_use"] is True
+        assert record["lease_id"]
+        assert record["container_generation"] == 1
+        runtime.docker_pool.release_container(record)
     finally:
         store.close()
 
@@ -2054,8 +2296,10 @@ def test_docker_pool_idle_eviction_skips_in_use_containers(tmp_path, monkeypatch
         runtime = DaemonRuntime(
             store,
             auto_build_envs=False,
+            docker_pool_enabled=True,
             docker_pool_size=2,
             docker_idle_timeout_seconds=1,
+            daemon_identity=_docker_test_identity(store),
         )
         monkeypatch.setattr(runtime.docker_pool, "remove_container", lambda name: removed.append(name))
         runtime.docker_pool._containers = {
@@ -2084,7 +2328,13 @@ def test_docker_pool_lru_eviction_skips_in_use_containers(tmp_path, monkeypatch)
     store = RegistryStore(tmp_path)
     removed: list[str] = []
     try:
-        runtime = DaemonRuntime(store, auto_build_envs=False, docker_pool_size=1)
+        runtime = DaemonRuntime(
+            store,
+            auto_build_envs=False,
+            docker_pool_enabled=True,
+            docker_pool_size=1,
+            daemon_identity=_docker_test_identity(store),
+        )
         monkeypatch.setattr(runtime.docker_pool, "remove_container", lambda name: removed.append(name))
         runtime.docker_pool._containers = {
             "busy": {
@@ -2196,6 +2446,7 @@ def test_docker_pull_config_updates_build_command(tmp_path, monkeypatch) -> None
         spec = manager.build_spec(record)
         monkeypatch.setattr("spl.daemon.docker_environment.shutil.which", lambda _: "/usr/bin/docker")
         monkeypatch.setattr("spl.daemon.docker_environment.subprocess.run", fake_run)
+        monkeypatch.setattr("spl.daemon.environment_base.run_process_tree", fake_run)
 
         manager._build_environment(spec)
 
@@ -2585,7 +2836,13 @@ def test_docker_runtime_reuses_warm_pool_container(tmp_path) -> None:
     """A pooled run uses `docker exec` into a reusable warm container."""
 
     store = RegistryStore(tmp_path)
-    runtime = DaemonRuntime(store, auto_build_envs=False, docker_pool_size=2)
+    runtime = DaemonRuntime(
+        store,
+        auto_build_envs=False,
+        docker_pool_enabled=True,
+        docker_pool_size=2,
+        daemon_identity=_docker_test_identity(store),
+    )
     try:
         store.register_env("default", sys.executable)
         record = runtime.register_object(

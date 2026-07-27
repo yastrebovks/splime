@@ -62,6 +62,10 @@ class DockerPoolRunnerProtocol(Protocol):
         """Return whether a run can use a warm pooled container."""
         ...
 
+    def worker_identity_env(self, run_id: str) -> dict[str, str]:
+        """Return nonsecret daemon/run identity for nested Docker ownership."""
+        ...
+
     def ensure_container(
         self,
         *,
@@ -80,6 +84,7 @@ class DockerPoolRunnerProtocol(Protocol):
         run_id: str,
         container_name: str,
         runtime_config: dict[str, Any],
+        lease: dict[str, Any] | None = None,
     ) -> list[str]:
         """Build the command for executing inside a pooled container."""
         ...
@@ -103,8 +108,40 @@ class DockerPoolRunnerProtocol(Protocol):
         """Return a context manager marking a pooled container in use."""
         ...
 
+    def quarantine_container(self, record: dict[str, Any]) -> bool:
+        """Retire a lease and report whether physical absence was verified."""
+        ...
+
+    def quarantine_run_containers(self, run_id: str) -> bool:
+        """Remove owned run containers and report verified aggregate absence."""
+        ...
+
+    def quarantine_owned_container(
+        self,
+        target: str,
+        *,
+        kind: str,
+        run_id: str | None = None,
+    ) -> bool:
+        """Remove one exact owned target and report verified absence."""
+        ...
+
+    def run_container_name(self, run_id: str, *, fallback: str) -> str:
+        """Return the owned one-shot container name for ``run_id``."""
+        ...
+
     def remove_container(self, name: str) -> None:
         """Remove a Docker container by name."""
+        ...
+
+    def remove_owned_container(
+        self,
+        target: str,
+        *,
+        kind: str,
+        run_id: str | None = None,
+    ) -> bool:
+        """Remove a container only after its ownership labels match."""
         ...
 
     def prewarm_object(self, object_record: dict[str, Any]) -> None:
@@ -164,6 +201,10 @@ class RuntimeBackendProtocol(Protocol):
 
     def after_run(self, ctx: RunContext) -> dict[str, Any]:
         """Return persisted run fields collected after subprocess completion."""
+        ...
+
+    def handle_timeout(self, ctx: RunContext) -> None:
+        """Quarantine runtime resources before a timed-out backend is released."""
         ...
 
     def process_result(
@@ -359,8 +400,9 @@ class ServerClientProtocol(Protocol):
         heartbeat_interval_seconds: float,
         events: list[dict[str, Any]],
         capabilities: dict[str, Any] | None = None,
+        claim_id: str | None = None,
     ) -> dict[str, Any]:
-        """Send one sync request."""
+        """Send one sync request under an optional worker claim."""
         ...
 
     def create_remote_run(
@@ -380,8 +422,15 @@ class ServerClientProtocol(Protocol):
         """Return remote run artifacts."""
         ...
 
-    def upload_artifact(self, run_id: str, name: str, path: str | Path) -> dict[str, Any]:
-        """Upload a remote run artifact."""
+    def upload_artifact(
+        self,
+        run_id: str,
+        name: str,
+        path: str | Path,
+        *,
+        claim_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload a remote run artifact under an optional worker claim."""
         ...
 
     def artifact_bytes(self, run_id: str, name: str) -> bytes:

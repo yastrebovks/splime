@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 from threading import RLock
 from typing import Any, Protocol
 
+from spl._process import run_process_tree
 from spl.daemon.environment_base import (
     ABSENT,
     CREATING,
@@ -411,12 +411,9 @@ class EnvironmentManager(BaseEnvironmentManager):
 
     def _read_python_version(self, python: str) -> str:
         try:
-            completed = subprocess.run(
+            completed = run_process_tree(
                 [python, "--version"],
-                text=True,
-                capture_output=True,
                 timeout=15,
-                check=False,
             )
         except Exception:
             return "unknown"

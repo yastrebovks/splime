@@ -55,17 +55,28 @@ def register_artifact_routes(
     @app.get("/runs/<run_id>/artifacts")
     @route_errors
     async def list_artifacts(run_id: str) -> Any:
-        state = runtime.store.get_run(validate_name(run_id))
-        artifacts_dir = Path(state["artifacts_dir"])
-        if not artifacts_dir.exists():
+        run_id = validate_name(run_id)
+        runtime.renew_run_delivery(run_id)
+        state = runtime.store.get_run(run_id)
+        raw_artifacts_dir = state.get("artifacts_dir")
+        artifacts_dir = Path(str(raw_artifacts_dir)) if raw_artifacts_dir else None
+        if artifacts_dir is None or not artifacts_dir.is_dir():
             return json_response([])
         return json_response(sorted(path.name for path in artifacts_dir.iterdir()))
 
     @app.get("/runs/<run_id>/artifacts/<artifact_name>")
     @route_errors
     async def get_artifact(run_id: str, artifact_name: str) -> Any:
-        state = runtime.store.get_run(validate_name(run_id))
-        artifact_path = Path(state["artifacts_dir"]) / validate_name(artifact_name)
+        run_id = validate_name(run_id)
+        runtime.renew_run_delivery(run_id)
+        state = runtime.store.get_run(run_id)
+        raw_artifacts_dir = state.get("artifacts_dir")
+        if not raw_artifacts_dir:
+            return json_response(
+                {"error": "artifact is not found"},
+                HTTPStatus.NOT_FOUND,
+            )
+        artifact_path = Path(str(raw_artifacts_dir)) / validate_name(artifact_name)
         if not artifact_path.exists() or not artifact_path.is_file():
             return json_response(
                 {"error": "artifact is not found"},

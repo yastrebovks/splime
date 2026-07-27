@@ -6,7 +6,7 @@ import json
 import re
 import sys
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,6 +21,7 @@ from spl.core.entities.adapter import (
     DAdapter,
     DLoadAdapter,
     DSaveAdapter,
+    SplitLoadAdapter,
     adapter_identity,
     make_key,
 )
@@ -65,6 +66,25 @@ class _TagOnlyLoadAdapter:
 class RuntimeBox:
     value: str
     decoded: bool = False
+
+
+@dataclass(frozen=True)
+class JsonEnvelope:
+    value: str
+
+
+def _make_json_envelope_payload() -> dict[str, str]:
+    return {"value": "json-envelope"}
+
+
+def _load_json_envelope(path: str) -> JsonEnvelope:
+    with open(path, encoding="utf-8") as f:
+        payload = json.load(f)
+    return JsonEnvelope(str(payload["value"]))
+
+
+def _consume_json_envelope(value: JsonEnvelope) -> str:
+    return value.value
 
 
 def _runtime_make_box() -> RuntimeBox:
@@ -126,6 +146,10 @@ def _format_make_value() -> str:
 
 def _format_consume_value(value: str) -> str:
     return value
+
+
+def _format_consume_any(value: Any) -> str:
+    return "{}:{}".format(type(value).__name__, value)
 
 
 def _json_scalar_add(left: int, right: int) -> int:
@@ -402,6 +426,16 @@ def test_adapter_requires_save_and_load_functions() -> None:
         Adapter(key=key, save=_adapter_save, load=cast(Any, "load"), py_type=str, format="txt")
 
 
+@pytest.mark.parametrize("key", ["", "builtins.str", "@txt", "builtins.str@"])
+def test_split_load_adapter_requires_well_formed_key(key: str) -> None:
+    with pytest.raises(ValueError, match="adapter (key|key must be)"):
+        SplitLoadAdapter(
+            key=key,
+            load=_adapter_load,
+            accepted_tags_value=("txt",),
+        )
+
+
 def test_pipeline_merge_rejects_duplicate_adapter_key() -> None:
     left = Pipeline().add_adapter(RuntimeBox, "bytes", save=_runtime_save_box, load=_runtime_load_box)
     right = Pipeline().add_adapter(RuntimeBox, "bytes", save=_runtime_save_box_alt, load=_runtime_load_box)
@@ -611,6 +645,48 @@ def test_explicit_json_edge_uses_builtin_adapter_without_artifact_files() -> Non
     assert run[consumer] == {"default": "hello-format"}
     assert run._artifact_refs == {}
     assert run._artifacts_dir is None
+
+
+def test_any_target_uses_source_selected_legacy_adapter_with_same_format_candidates() -> None:
+    lift_any = cast(Any, lift)
+    deployment = cast(Any, Deployment)
+    producer = lift_any(_format_make_value)
+    pipeline = (
+        lift_any(_format_consume_any)
+        .bind(value=producer.as_format("txt"))
+        .alias("consumer")
+        .render("legacy_any_pipeline")
+        .add_adapter(str, "txt", save=_adapter_save, load=_adapter_load)
+        .add_adapter(int, "txt", save=_adapter_save, load=_adapter_load)
+    )
+
+    with deployment(pipeline).run(keep=False) as run:
+        assert run.value("consumer") == "str:hello-format"
+
+
+def test_builtin_json_save_materializes_for_custom_target_load_half() -> None:
+    lift_any = cast(Any, lift)
+    deployment = cast(Any, Deployment)
+    producer = lift_any(_make_json_envelope_payload)
+    pipeline = (
+        lift_any(_consume_json_envelope)
+        .bind(value=producer.as_format("json"))
+        .alias("consumer")
+        .render("json_envelope_pipeline")
+    )
+    load_adapter = SplitLoadAdapter(
+        key=make_key(JsonEnvelope, "json"),
+        load=_load_json_envelope,
+        accepted_tags_value=("json",),
+    )
+    pipeline = replace(pipeline, load_adapters={load_adapter.key: load_adapter})._validate_consistency()
+    consumer = pipeline.get_node_by_alias("consumer")
+    run = deployment(pipeline).run(keep=False)
+
+    with run:
+        assert run[consumer] == {"default": "json-envelope"}
+        assert len(run._artifact_refs) == 1
+        assert next(iter(run._artifact_refs.values())).tag == "json"
 
 
 def test_builtin_adapter_requires_explicit_artifact_edge() -> None:

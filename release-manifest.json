@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "release_id": "splime-0.4.5",
+  "version": "0.4.5",
+  "source_date_epoch": 1784073600,
+  "packages": {
+    "framework": "0.4.5",
+    "daemon": "0.4.5",
+    "server": "0.4.5",
+    "console": "0.4.5"
+  },
+  "python": {
+    "distribution": "splime",
+    "requires_python": ">=3.13",
+    "project_url": "https://pypi.org/project/splime/0.4.5/",
+    "install_requirement": "splime==0.4.5",
+    "artifacts": [
+      {
+        "filename": "splime-0.4.5-py3-none-any.whl",
+        "sha256": "417122bd3f320f5e1503aa459099673df08ba327e5a75421b2c86efed75a1987"
+      },
+      {
+        "filename": "splime-0.4.5.tar.gz",
+        "sha256": "7e7424d02d92a3624c20dea2d9302da32cd1d175c61aeaea0a7bf18cd8d08934"
+      }
+    ]
+  },
+  "console": {
+    "url": "https://splime.io/app/",
+    "integrity_url": "https://splime.io/app/static-integrity.json?release=splime-0.4.5",
+    "integrity_sha256": "a8b94b356345ad1cee676f7dcf972422f1db45fd6bfe4e3221d91e293f522c7d",
+    "cache_policy": "unhashed assets revalidate; only content-hashed assets are immutable"
+  },
+  "install_page_urls": [
+    "https://splime.io/install.html",
+    "https://pypi.org/project/splime/0.4.5/",
+    "https://raw.githubusercontent.com/yastrebovks/splime/v0.4.5/release-manifest.json"
+  ],
+  "public_artifacts": [
+    {
+      "url": "https://splime.io/downloads/splime-cookbook.ipynb",
+      "sha256": "15ae5b809223426f26b998fd3f5b6aef1bf10e9d0b6e74dfdeef2572405f368d"
+    }
+  ],
+  "manifest_url": "https://raw.githubusercontent.com/yastrebovks/splime/v0.4.5/release-manifest.json",
+  "docker": {
+    "repository": "yastrebovks/spl-daemon",
+    "tag": "0.4.5",
+    "advertised_in_console": false,
+    "verification_url": "https://hub.docker.com/v2/repositories/yastrebovks/spl-daemon/tags/0.4.5",
+    "publication_url": "https://hub.docker.com/r/yastrebovks/spl-daemon/tags?name=0.4.5"
+  },
+  "publication_order": ["pypi", "docker_hub", "landing_and_console"]
+}

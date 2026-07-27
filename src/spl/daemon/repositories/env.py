@@ -5,11 +5,11 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import sqlite3
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, cast
 
+from spl._process import run_process_tree
 from spl.daemon.storage_base import (
     RepositoryBase,
     json_dumps,
@@ -286,12 +286,9 @@ class EnvRepository(RepositoryBase):
         if path in self._python_version_cache:
             return cast(str, self._python_version_cache[path])
         try:
-            completed = subprocess.run(
+            completed = run_process_tree(
                 [path, "--version"],
-                text=True,
-                capture_output=True,
                 timeout=5,
-                check=False,
             )
             version = (completed.stdout or completed.stderr).strip() or "unknown"
         except Exception:

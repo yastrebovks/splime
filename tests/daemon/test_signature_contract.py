@@ -15,9 +15,17 @@ runtime execution resolves a local interpreter by env name/default/daemon.
 
 from __future__ import annotations
 
+import inspect
 import sys
 from pathlib import Path
 
+from spl.daemon.remote_client import (
+    RUN_CLAIM_FENCING_CAPABILITY,
+    RUN_CLAIM_FENCING_VERSION,
+    RUN_CLAIM_HEADER,
+    ServerClient,
+)
+from spl.daemon.runtime_dependencies import ServerClientProtocol
 from spl.daemon.server import DaemonRuntime
 from spl.daemon.run_lifecycle import (
     CANONICAL_RUN_STATUSES,
@@ -104,6 +112,48 @@ EXPECTED_044_ADDITIVE_CONTRACT = {
     ),
 }
 
+# Shared with the server contract. A 0.4.4 daemon omits this field, while a
+# 0.4.5 daemon uses it to distinguish explicit publication from reconciliation.
+EXPECTED_045_OBJECT_SYNC_ADDITIVE_CONTRACT = {
+    "object_sync_fields": ("revive_removed",),
+    "legacy_optional": True,
+}
+
+# Shared with the server contract. Old jobs omit ``claim_id``; fenced daemons
+# advertise version 1 and carry the optional capability only in this header.
+EXPECTED_045_RUN_CLAIM_ADDITIVE_CONTRACT = {
+    "job_field": "claim_id",
+    "request_header": "X-Spl-Claim",
+    "capability": ("run_claim_fencing", 1),
+    "legacy_optional": True,
+}
+
+# Shared with the server contract. A new daemon reports whether JSON null is
+# an explicit result; a 0.4.4 daemon omits the additive presence field.
+EXPECTED_045_RESULT_PRESENCE_ADDITIVE_CONTRACT = {
+    "local_run_field": "result_present",
+    "detail_field": "result_present",
+    "detail_value_field": "result_value",
+    "legacy_unreadable_fields": ("result_unreadable", "result_json"),
+    "legacy_optional": True,
+}
+
+# Shared with the 0.4.5 server contract. A pre-0.4.5 local-run payload may
+# omit every field and is classified as legacy_full rather than metadata.
+EXPECTED_045_TELEMETRY_ADDITIVE_CONTRACT = {
+    "local_run_fields": (
+        "telemetry_level",
+        "telemetry",
+        "source_result_present",
+        "input_mirrored",
+        "result_mirrored",
+        "streams_mirrored",
+        "artifact_bodies_mirrored",
+    ),
+    "legacy_level": "legacy_full",
+    "legacy_optional": True,
+}
+
 EXPECTED_RUN_TRANSITIONS = {
     "local": {
         "queued": ("failed", "starting"),
@@ -178,6 +228,81 @@ def test_044_additive_contract_is_named_and_legacy_payloads_may_omit_it() -> Non
     assert all(field not in legacy_run for field in EXPECTED_044_ADDITIVE_CONTRACT["resolution_envelopes"])
 
 
+def test_045_object_sync_revive_intent_is_additive() -> None:
+    legacy_payload = {"name": "demo_obj", "yaml": REFERENCE_YAML}
+
+    assert EXPECTED_045_OBJECT_SYNC_ADDITIVE_CONTRACT == {
+        "object_sync_fields": ("revive_removed",),
+        "legacy_optional": True,
+    }
+    assert "revive_removed" not in legacy_payload
+
+
+def test_045_run_claim_contract_is_additive_and_keyword_optional() -> None:
+    legacy_job = {"run": {"id": "run-1"}, "object_version": {"id": "version-1"}}
+
+    assert EXPECTED_045_RUN_CLAIM_ADDITIVE_CONTRACT == {
+        "job_field": "claim_id",
+        "request_header": "X-Spl-Claim",
+        "capability": ("run_claim_fencing", 1),
+        "legacy_optional": True,
+    }
+    assert RUN_CLAIM_HEADER == EXPECTED_045_RUN_CLAIM_ADDITIVE_CONTRACT["request_header"]
+    assert (
+        RUN_CLAIM_FENCING_CAPABILITY,
+        RUN_CLAIM_FENCING_VERSION,
+    ) == EXPECTED_045_RUN_CLAIM_ADDITIVE_CONTRACT["capability"]
+    assert DaemonRuntime._job_claim_id(legacy_job) is None  # noqa: SLF001
+    assert DaemonRuntime._job_claim_id({**legacy_job, "claim_id": "claim-1"}) == "claim-1"  # noqa: SLF001
+    for method in (ServerClient.sync, ServerClientProtocol.sync):
+        parameter = inspect.signature(method).parameters["claim_id"]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is None
+    for method in (ServerClient.upload_artifact, ServerClientProtocol.upload_artifact):
+        parameter = inspect.signature(method).parameters["claim_id"]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is None
+
+
+def test_045_result_presence_contract_is_additive() -> None:
+    legacy_run = {"id": "run-1", "result": None}
+    current_run = {**legacy_run, "result_present": True}
+
+    assert EXPECTED_045_RESULT_PRESENCE_ADDITIVE_CONTRACT == {
+        "local_run_field": "result_present",
+        "detail_field": "result_present",
+        "detail_value_field": "result_value",
+        "legacy_unreadable_fields": ("result_unreadable", "result_json"),
+        "legacy_optional": True,
+    }
+    assert "result_present" not in legacy_run
+    assert current_run["result_present"] is True
+
+
+def test_local_run_telemetry_contract_is_additive() -> None:
+    legacy_run = {"id": "run-1", "status": "succeeded"}
+    current_run = {
+        **legacy_run,
+        **dict.fromkeys(EXPECTED_045_TELEMETRY_ADDITIVE_CONTRACT["local_run_fields"]),
+    }
+
+    assert EXPECTED_045_TELEMETRY_ADDITIVE_CONTRACT == {
+        "local_run_fields": (
+            "telemetry_level",
+            "telemetry",
+            "source_result_present",
+            "input_mirrored",
+            "result_mirrored",
+            "streams_mirrored",
+            "artifact_bodies_mirrored",
+        ),
+        "legacy_level": "legacy_full",
+        "legacy_optional": True,
+    }
+    assert all(field not in legacy_run for field in EXPECTED_045_TELEMETRY_ADDITIVE_CONTRACT["local_run_fields"])
+    assert all(field in current_run for field in EXPECTED_045_TELEMETRY_ADDITIVE_CONTRACT["local_run_fields"])
+
+
 class _NoopHeartbeats:
     def restore_server_heartbeat(self) -> None:
         pass
@@ -233,10 +358,12 @@ def test_daemon_signature_matches_shared_contract(tmp_path: Path) -> None:
         "env": sync_event["payload"]["env"],
         "env_python": sync_event["payload"]["env_python"],
         "env_python_version": sync_event["payload"]["env_python_version"],
+        "revive_removed": sync_event["payload"]["revive_removed"],
     } == {
         "env": AUTHOR_ENV,
         "env_python": AUTHOR_ENV_PYTHON,
         "env_python_version": AUTHOR_ENV_PYTHON_VERSION,
+        "revive_removed": True,
     }
 
 

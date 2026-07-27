@@ -5,6 +5,133 @@ All notable changes to the `splime` package are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.4.5] - 2026-07-27
+
+### Changed
+
+- **Docker isolation default:** object Docker runs now use a cold per-run
+  container with only that run directory mounted read-write. Warm pooling
+  requires explicit `docker_pool_enabled`/`--docker-pool-enabled` consent and a
+  positive pool size; enabling it warns that pooled containers share the runs
+  directory and are only for single-tenant, mutually-trusting workloads. On
+  the audit host, 15 already-local hardened Python-image starts measured
+  119.9 ms median and 137.1 ms p95 (about 105.1 ms median above native Python
+  startup); this measurement is host-specific.
+- **Privacy default:** daemon observability now uses ``metadata`` telemetry.
+  Inputs, results, error details, stdout/stderr, and artifact bodies stay local.
+  ``diagnostic`` adds only redacted/truncated errors and stdout/stderr;
+  ``full`` also opts in to redacted inputs, results, and supported text artifact
+  bodies. The active level and withheld-content state are visible in daemon
+  diagnostics and the Console. Historical data already retained by a central
+  server is not erased automatically.
+- Credentialed daemon/server requests, including URLs with username/password
+  userinfo, now require a direct HTTPS endpoint and never follow redirects.
+  Exact loopback HTTP remains available for
+  development with a warning. The only other plaintext exception is the exact
+  Docker-host callback route carrying only a run-scoped capability. Deployments
+  using HTTP or redirects must reconnect with
+  ``spl-daemon server-connect --server-url https://your-server/api`` (or pass
+  the final HTTPS ``server_url=`` to the Python client) before upgrading.
+- Nodes returning `None` now record a JSON `null` instead of an unfreezable value. Their fingerprints change, so the first run after upgrading recomputes them once. Cached/resumable state for other nodes is unaffected.
+- Finite Python integers and floats retain the 0.4.4 JSON acceptance contract,
+  including integers outside JavaScript's safe-integer range. The Console
+  displays received finite numbers without claiming exact representation for
+  every Python integer; a versioned lossless browser-number protocol is
+  deferred to 0.5.0. Non-finite floats and strings containing lone UTF-16
+  surrogates are still rejected before persistence.
+- **Daemon retention default:** omitted `keep` deliberately remains `True` for
+  `SPLClient`/daemon runs. Although the API design also supports
+  `keep=False` and `keep="on_failure"`, older workers accidentally forced
+  every daemon run to `True`; preserving the observed default prevents an
+  upgrade from deleting existing callers' run data. Local `Deployment` runs
+  continue to default to `"on_failure"`.
+- The `allow_unfenced_claims` compatibility setting defaults to `true` in
+  0.4.5 so pre-0.4.5 daemons can finish unfenced work when no fenced claim is
+  active. Every accepted legacy write warns and is audited. The default flips
+  to `false` in 0.5.0; operators should disable it earlier after all daemons
+  advertise claim fencing.
+- Self-hosted servers no longer default to SPLime's Firebase project or API
+  key. Identity providers must be configured for each deployment. The removed
+  Firebase API key was a public client-side realm identifier, not a secret;
+  this corrects a trust boundary, not a leaked secret.
+- `require_approval_exec` was never enforced; the control has been removed.
+  Run approval is not implemented.
+
+### Fixed
+
+- Edge adapter summaries (`run list/show`, run progress, daemon run routes) no
+  longer let the save half mask a higher-precedence load half: `source_level`
+  now reports the dominant half (`run-override` > `edge` > `pipeline` >
+  `port-default`), and each row additionally carries additive `save_level` and
+  `load_level` fields. Previously a resume that overrode only the load half at
+  run level was summarized as `pipeline`.
+- Daemon startup now locks its home before opening SQLite or replacing the
+  endpoint, keeps a stable per-home Docker identity with generation fencing,
+  and refuses a second live daemon with an actionable endpoint/PID message.
+  Docker cleanup is label-scoped and handles attributable unlabeled legacy
+  pools without a global prefix sweep.
+- Docker pool selection and reservation are atomic; eviction cannot remove an
+  in-use lease, stale generations cannot execute against a replacement, and a
+  timed-out lease is quarantined and destroyed instead of being reused.
+  Native POSIX worker timeouts now terminate and reap the complete process
+  group. All finite managed-subprocess timeouts, including environment builds,
+  fail closed on Windows until Job Object support is available; fresh local
+  daemon execution is therefore POSIX-only in this release. Windows lock-file
+  privacy continues to depend on an owner-private inherited home-directory
+  DACL.
+- Real ``NodeRemote`` worker callbacks now authenticate with a short-lived,
+  run- and node-scoped capability. The worker environment and callback protocol
+  receive no daemon master token, registered node identities are compared with
+  exact JSON types, and the callback credential is revoked when the run becomes
+  terminal. Native and ``venv-subprocess`` runtimes execute trusted code under
+  the daemon's OS user and filesystem permissions. The scoped capability limits
+  the normal worker protocol; it does not prevent arbitrary same-UID file reads.
+  Use Docker, subject to reviewed mounts and Docker-host trust, or OS-account
+  isolation for code not trusted with that user's daemon endpoint state.
+- Run telemetry is redacted and bounded before queue persistence. Run-linked
+  queue payloads have a seven-day TTL, compact after acknowledgement, and
+  cascade when their local run is deleted. Full-telemetry artifact collection
+  rejects symlink/reparse entries and enforces pre-materialization component,
+  file, aggregate-body, accepted-count, and total-directory-scan limits. Scan
+  truncation/unavailability is reported as a lower-bound count instead of an
+  exact count; POSIX uses descriptor-relative no-follow access and the portable
+  fallback revalidates directory/file identities around each bounded read.
+  Metadata node/text/stream-size work, synthesized stream collection, explicit
+  pointer handling for contract-unreadable JSON, and repeated-value replacement
+  are bounded as well; truncation and omissions remain explicit.
+- Object registration is now all-or-nothing: every bundled pipeline validates
+  function/import references, ports, links, UUIDs/cycles, and runtime/adapter
+  tags before any aggregate row is written. Valid YAML remains stored
+  byte-for-byte unchanged.
+- Daemon workers now receive the exact stored `keep` policy. `keep=False`
+  removes terminal run files and `keep="on_failure"` removes successful run
+  files only after the manifest and required sync are durable. Failed
+  `"on_failure"` runs retain their seven-day expiry, while a compact run record
+  survives transient-file cleanup.
+- Current clients acknowledge transient delivery only after the result and all
+  requested artifacts are fetched. Older clients receive a bounded 15-minute
+  post-terminal lease, renewed by result/artifact reads, before one daemon
+  scheduler thread performs cleanup. Failed downloads remain unacknowledged for
+  retry. Pending sync, active runs, historical pre-migration rows, and internal
+  server-job artifact handoff remain protected.
+- Transient resume behavior is explicit: `resume(..., keep=False)` is rejected,
+  and already removed parent state reports that it cannot be resumed. Use
+  `keep=True` for a reliably resumable chain.
+- Pre-authentication server rate limits now always reserve a stable effective-
+  peer bucket before credential validation. Rotating invalid `Authorization`
+  values cannot create fresh buckets, and raw credential text is never used as
+  a rate-limit key.
+- Administrator authority, target-state and last-administrator validation, the
+  protected grant/revoke mutation, and its audit event now share one serialized
+  database transaction. A revocation committed by another worker therefore
+  takes effect before any later protected mutation.
+- Non-finite timeout values are rejected at configuration boundaries and again
+  immediately before subprocess or container creation. `NaN` and infinities
+  can no longer leave a spawned child behind when a runtime API rejects the
+  timeout.
+
 ## [0.4.4] - 2026-07-14
 
 ### Added
@@ -420,6 +547,13 @@ here. No breaking API changes.
 - Initial release: turn trusted Python functions into versioned, portable nodes
   reusable across projects and executed locally or remotely.
 
+[Unreleased]: https://github.com/yastrebovks/splime/compare/v0.4.5...HEAD
+[0.4.5]: https://github.com/yastrebovks/splime/compare/v0.4.4...v0.4.5
+[0.4.4]: https://github.com/yastrebovks/splime/compare/v0.4.3...v0.4.4
+[0.4.3]: https://github.com/yastrebovks/splime/compare/v0.4.2...v0.4.3
+[0.4.2]: https://github.com/yastrebovks/splime/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/yastrebovks/splime/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/yastrebovks/splime/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/yastrebovks/splime/compare/v0.2.5...v0.3.0
 [0.2.5]: https://github.com/yastrebovks/splime/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/yastrebovks/splime/compare/v0.2.3...v0.2.4

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 from pathlib import Path
@@ -10,6 +9,7 @@ from typing import Any
 
 import yaml
 
+from spl.core import json_contract as m_json_contract
 from spl.core.entities.adapter import DAdapter, DLoadAdapter, DSaveAdapter
 from spl.core.entities.artifact import DArtifactRef, _default_tag_from_key
 from spl.core.entities.distribution import DDistribution
@@ -33,12 +33,11 @@ def canonicalize(object_def: Mapping[str, Any]) -> bytes:
     """Return stable bytes for an object definition."""
 
     normalized = _normalize_plain(object_def)
-    text = json.dumps(
+    text = m_json_contract.dumps(
         normalized,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
-        allow_nan=False,
     )
     return f"{text}\n".encode("utf-8")
 
@@ -169,7 +168,11 @@ def _canonical_ir(value: Any) -> Any:
             **{field.name: _canonical_ir(getattr(value, field.name)) for field in fields(value)},
         }
     if isinstance(value, Mapping):
-        return {str(key): _canonical_ir(item) for key, item in sorted(value.items(), key=lambda item: str(item[0]))}
+        normalized = {}
+        for key, item in sorted(value.items(), key=lambda item: str(item[0])):
+            _validate_mapping_key(key)
+            normalized[key] = _canonical_ir(item)
+        return normalized
     if isinstance(value, tuple | list):
         return [_canonical_ir(item) for item in value]
     if isinstance(value, Path):
@@ -181,10 +184,11 @@ def _normalize_plain(value: Any, path: tuple[str, ...] = ()) -> Any:
     if is_dataclass(value):
         return _normalize_plain(_canonical_ir(value), path)
     if isinstance(value, Mapping):
-        return {
-            str(key): _normalize_plain(item, (*path, str(key)))
-            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
-        }
+        normalized = {}
+        for key, item in sorted(value.items(), key=lambda item: str(item[0])):
+            _validate_mapping_key(key, path=path)
+            normalized[key] = _normalize_plain(item, (*path, key))
+        return normalized
     if isinstance(value, tuple | list):
         items = [_normalize_plain(item, path) for item in value]
         if path and path[-1] in _UNORDERED_METADATA_LIST_KEYS:
@@ -201,15 +205,21 @@ def _normalize_text(value: str) -> str:
     return value.replace("\r\n", "\n").replace("\r", "\n")
 
 
+def _validate_mapping_key(key: Any, *, path: tuple[str, ...] = ()) -> None:
+    if type(key) is str:
+        return
+    json_path = "$" + "".join("[{}]".format(m_json_contract.dumps(part, sort_keys=False)) for part in path)
+    m_json_contract.validate_json_value({key: None}, path=json_path)
+
+
 def _sorted_canonical(values: Any) -> list[Any]:
     return sorted(values, key=_canonical_sort_key)
 
 
 def _canonical_sort_key(value: Any) -> str:
-    return json.dumps(
+    return m_json_contract.dumps(
         value,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
-        allow_nan=False,
     )

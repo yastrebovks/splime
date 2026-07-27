@@ -242,12 +242,12 @@ def _ir_parse__function_metadata(x: FunctionType, name: str | None = None) -> _b
 
 @ir_unparse.register(lambda x: isinstance(x, DFunction))
 def _ir_unparse__function(x: DFunction, source: Path) -> Generator[ast.stmt]:
-    outputs = cast(list[OutputPort], x.outputs)
+    outputs = x.outputs or []
     yield ast.FunctionDef(
         name=x.name,
         body=ast.parse(x.body).body,
         # TODO: add support for multiple outputs
-        returns=ast.parse(outputs[0].typ_, mode="eval").body if outputs[0].typ_ is not None else None,
+        returns=ast.parse(outputs[0].typ_, mode="eval").body if outputs and outputs[0].typ_ is not None else None,
         args=ast.arguments(
             args=[
                 ast.arg(

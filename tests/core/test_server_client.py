@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 
+import pytest
+
+import spl.server_client as server_client_module
 from spl.server_client import SPLExternalTokenClient, SPLServerClient
 
 
@@ -45,6 +50,23 @@ def test_server_client_uses_bearer_token_headers() -> None:
         "Accept": "application/json",
         "Authorization": "Bearer external-token",
     }
+
+
+def test_direct_server_client_surfaces_actionable_redirect_error(monkeypatch) -> None:
+    def refuse_redirect(request: Any, **kwargs: Any) -> None:
+        del kwargs
+        raise HTTPError(
+            request.full_url,
+            308,
+            "HTTP 308 redirect refused: configure the client with the final HTTPS endpoint instead",
+            {},
+            BytesIO(),
+        )
+
+    monkeypatch.setattr(server_client_module, "urlopen_verified", refuse_redirect)
+
+    with pytest.raises(server_client_module.ServerClientError, match="final HTTPS endpoint"):
+        SPLServerClient("external-token").objects()
 
 
 def test_server_client_signature_uses_owner_library_path() -> None:

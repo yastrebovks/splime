@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from spl.daemon.remote_client import RUN_CLAIM_PRIVATE_FIELD
 from spl.daemon.store import RegistryStore
 
 
@@ -50,10 +51,19 @@ class SyncVisibilityService:
         }
 
     def decorate_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Return diagnostics for an event without private claim material."""
+
         status = event.get("status")
         attempts = int(event.get("attempts") or 0)
+        public_event = dict(event)
+        public_event.pop(RUN_CLAIM_PRIVATE_FIELD, None)
+        payload = public_event.get("payload")
+        if isinstance(payload, dict):
+            public_payload = dict(payload)
+            public_payload.pop(RUN_CLAIM_PRIVATE_FIELD, None)
+            public_event["payload"] = public_payload
         return {
-            **event,
+            **public_event,
             "retry": {
                 "will_retry": status in {"pending", "failed"},
                 "next_attempt": attempts + 1 if status in {"pending", "failed"} else None,

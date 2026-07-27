@@ -64,6 +64,7 @@ def register_diagnostics_routes(
                     "heartbeat": runtime.heartbeat_service.status((connection_state.get("connection") or {}).get("id")),
                 },
                 "sync": sync_summary,
+                "telemetry": runtime.telemetry_status(),
                 "interpreter_substitutions": interpreter_substitutions,
                 "environment_builds": {
                     "by_status": build_statuses,
@@ -98,6 +99,7 @@ def register_diagnostics_routes(
                     "heartbeat": runtime.heartbeat_service.status((connection or {}).get("id")),
                 },
                 "sync": sync_visibility.summary(pending_sync_events),
+                "telemetry": runtime.telemetry_status(),
                 "counts": {
                     "envs": len(envs),
                     "objects": len(objects),

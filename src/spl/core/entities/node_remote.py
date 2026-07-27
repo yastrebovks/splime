@@ -1,7 +1,7 @@
 import ast
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Generator, cast
+from typing import TYPE_CHECKING, Any, Generator, cast
 from uuid import UUID
 
 import yaml
@@ -12,6 +12,9 @@ from spl.core.entities.node import InputPort, Node, OutputPort
 from spl.core.ir.common import DBase
 from spl.core.ir.parse import _branch, ir_parse
 from spl.core.ir.unparse import ir_unparse
+
+if TYPE_CHECKING:
+    import spl
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,7 @@ class NodeRemote(Node):
         owner_id: str | None = None,
         library: str | None = None,
         target_machine: str | None = None,
+        client: "spl.SPLClient | None" = None,
     ) -> None:
 
         if pipeline is not None:
@@ -65,7 +69,13 @@ class NodeRemote(Node):
 
         if inputs is None or outputs is None:
             resolved_inputs, resolved_outputs, resolved_owner_id = _resolve_remote_ports(
-                url=url, name=name, version=version, owner_id=owner_id, library=library, target_machine=target_machine
+                url=url,
+                name=name,
+                version=version,
+                owner_id=owner_id,
+                library=library,
+                target_machine=target_machine,
+                client=client,
             )
             owner_id = resolved_owner_id
             if inputs is None:
@@ -93,6 +103,7 @@ class NodeRemote(Node):
         owner: str | None = None,
         library: str | None = None,
         target_machine: str | None = None,
+        client: "spl.SPLClient | None" = None,
     ) -> "NodeRemote":
         """The single documented way to reference a remote object.
 
@@ -102,7 +113,9 @@ class NodeRemote(Node):
         are resolved through the daemon, the returned canonical owner id
         replaces a handle before serialization. Explicit ``inputs`` and
         ``outputs`` avoid the network round trip and therefore retain the raw
-        owner reference until run time. Since 0.2.0 the
+        owner reference until run time. Pass the configured ``SPLClient`` as
+        ``client`` when the signature must be resolved through a non-default
+        daemon endpoint. Since 0.2.0 the
         convenience ``__init__`` forms (``pipeline=``/``function=`` keywords,
         object name in the positional ``url`` slot) emit
         ``DeprecationWarning``; ``locate`` is the canonical spelling and the
@@ -123,7 +136,13 @@ class NodeRemote(Node):
             raise TypeError("NodeRemote.locate() requires name or pipeline")
 
         return cls(
-            url=url, name=resolved_name, version=version, owner=owner, library=library, target_machine=target_machine
+            url=url,
+            name=resolved_name,
+            version=version,
+            owner=owner,
+            library=library,
+            target_machine=target_machine,
+            client=client,
         )
 
     def __repr__(self) -> str:
@@ -184,13 +203,13 @@ def _resolve_remote_ports(
     owner_id: str | None = None,
     library: str | None = None,
     target_machine: str | None = None,
+    client: "spl.SPLClient | None" = None,
 ) -> tuple[list[InputPort], list[OutputPort], str | None]:
     """Resolve a remote node signature through the local daemon."""
 
     try:
-        from spl.daemon_client import Client
-
-        payload = Client().resolve_remote_signature(
+        resolver = _remote_signature_resolver(client)
+        payload = resolver.resolve_remote_signature(
             _remote_ref(
                 url=url, name=name, version=version, owner_id=owner_id, library=library, target_machine=target_machine
             )
@@ -224,6 +243,19 @@ def _resolve_remote_ports(
         _signature_outputs_to_ports(signature.get("outputs") or []),
         resolved_owner_id,
     )
+
+
+def _remote_signature_resolver(client: "spl.SPLClient | None") -> Any:
+    """Return the daemon transport selected for signature resolution."""
+
+    if client is None:
+        from spl.daemon_client import Client
+
+        return Client()
+    resolver = getattr(client, "_daemon", None)
+    if resolver is None or not callable(getattr(resolver, "resolve_remote_signature", None)):
+        raise TypeError("client must be an SPLClient configured for the target daemon")
+    return resolver
 
 
 def _signature_input_to_port(item: dict[str, Any]) -> InputPort:

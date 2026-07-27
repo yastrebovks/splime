@@ -282,6 +282,7 @@ class _SharedDefaultServer:
         heartbeat_interval_seconds: float,
         events: list[dict[str, Any]],
         capabilities: dict[str, Any] | None = None,
+        claim_id: str | None = None,
     ) -> dict[str, Any]:
         self.calls.append(
             (

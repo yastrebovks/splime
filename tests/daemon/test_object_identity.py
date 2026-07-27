@@ -2232,12 +2232,12 @@ def test_pipeline_decomposition_validation_rejects_bad_links(
                 "distributions": [],
             }
 
-        monkeypatch.setattr(metadata_module, "extract_metadata", invalid_metadata)
+        monkeypatch.setattr(metadata_module, "extract_object_ir_metadata", invalid_metadata)
 
         with pytest.raises(ValueError, match="pipeline link target node"):
             store.register_object(
                 "bad_pipeline",
-                "bad_pipeline",
+                "demo_obj",
                 "default",
                 yaml_text=PIPELINE_YAML,
             )

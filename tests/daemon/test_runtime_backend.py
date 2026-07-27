@@ -64,6 +64,12 @@ class FakeDockerPool:
     def __init__(self, *, can_use: bool):
         self.can_use_value = can_use
         self.removed: list[str] = []
+        self.quarantined: list[dict[str, Any]] = []
+        self.quarantined_runs: list[str] = []
+        self.quarantined_owned: list[tuple[str, str, str | None]] = []
+        self.quarantine_owned_result = True
+        self.quarantine_run_result = True
+        self.quarantine_run_error: Exception | None = None
         self.use_context = FakeUseContext()
 
     def can_use(self, run_dir: Path, workdir: Path) -> bool:
@@ -89,7 +95,9 @@ class FakeDockerPool:
         run_id: str,
         container_name: str,
         runtime_config: dict[str, Any],
+        lease: dict[str, Any] | None = None,
     ) -> list[str]:
+        assert lease is not None
         return ["docker", "exec", container_name, entrypoint, run_id]
 
     def worker_command(
@@ -111,6 +119,37 @@ class FakeDockerPool:
 
     def remove_container(self, name: str) -> None:
         self.removed.append(name)
+
+    def remove_owned_container(
+        self,
+        target: str,
+        *,
+        kind: str,
+        run_id: str | None = None,
+    ) -> bool:
+        del kind, run_id
+        self.removed.append(target)
+        return True
+
+    def quarantine_container(self, record: dict[str, Any]) -> bool:
+        self.quarantined.append(record)
+        return True
+
+    def quarantine_run_containers(self, run_id: str) -> bool:
+        self.quarantined_runs.append(run_id)
+        if self.quarantine_run_error is not None:
+            raise self.quarantine_run_error
+        return self.quarantine_run_result
+
+    def quarantine_owned_container(
+        self,
+        target: str,
+        *,
+        kind: str,
+        run_id: str | None = None,
+    ) -> bool:
+        self.quarantined_owned.append((target, kind, run_id))
+        return self.quarantine_owned_result
 
     def prewarm_object(self, object_record: dict[str, Any]) -> None:
         pass
@@ -325,6 +364,75 @@ def test_docker_backend_writes_legacy_worker_runtime_marker(tmp_path: Path) -> N
         store.close()
 
 
+def test_docker_backend_quarantines_pool_lease_before_timeout_context_exit(tmp_path: Path) -> None:
+    pool = FakeDockerPool(can_use=True)
+    backend = DockerBackend(
+        FakeEnvironmentManager({"spec_hash": "docker-hash", "image_tag": "splime-runtime:demo"}),
+        pool,
+    )
+    ctx = _ctx(tmp_path)
+
+    with backend:
+        backend.ensure_ready(ctx.object_record, wait=False)
+        backend.build_command(ctx)
+        backend.handle_timeout(ctx)
+        assert pool.quarantined == [
+            {
+                "name": "splime-pool-test",
+                "container_id": "warm-container-id",
+            }
+        ]
+        assert pool.use_context.exited is False
+
+    assert pool.use_context.exited is True
+    assert pool.removed == []
+
+
+def test_docker_backend_removes_one_shot_container_on_timeout(tmp_path: Path) -> None:
+    pool = FakeDockerPool(can_use=False)
+    backend = DockerBackend(
+        FakeEnvironmentManager({"spec_hash": "docker-hash", "image_tag": "splime-runtime:demo"}),
+        pool,
+    )
+    ctx = _ctx(tmp_path, run_id="timeout-run")
+
+    with backend:
+        backend.ensure_ready(ctx.object_record, wait=False)
+        backend.build_command(ctx)
+        (ctx.run_dir / "container.cid").write_text("immutable-container-id\n", encoding="utf-8")
+        backend.handle_timeout(ctx)
+        assert pool.quarantined_owned == [("immutable-container-id", "run", "timeout-run")]
+        assert pool.quarantined_runs == ["timeout-run"]
+        assert pool.removed == []
+
+    assert pool.quarantined_runs == ["timeout-run"]
+    assert pool.removed == []
+
+
+def test_docker_backend_keeps_exact_timeout_cleanup_armed_when_query_fails(tmp_path: Path) -> None:
+    pool = FakeDockerPool(can_use=False)
+    pool.quarantine_run_error = RuntimeError("Docker ownership query failed")
+    backend = DockerBackend(
+        FakeEnvironmentManager({"spec_hash": "docker-hash", "image_tag": "splime-runtime:demo"}),
+        pool,
+    )
+    ctx = _ctx(tmp_path, run_id="timeout-run")
+
+    with backend:
+        backend.ensure_ready(ctx.object_record, wait=False)
+        backend.build_command(ctx)
+        (ctx.run_dir / "container.cid").write_text("immutable-container-id\n", encoding="utf-8")
+        try:
+            backend.handle_timeout(ctx)
+        except RuntimeError as exc:
+            assert "ownership query failed" in str(exc)
+        else:  # pragma: no cover - guards the cleanup contract explicitly
+            raise AssertionError("query failure must remain distinguishable")
+
+    assert pool.quarantined_owned == [("immutable-container-id", "run", "timeout-run")]
+    assert pool.removed == ["immutable-container-id"]
+
+
 def test_docker_backend_builds_one_shot_command_and_rewrites_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -353,4 +461,4 @@ def test_docker_backend_builds_one_shot_command_and_rewrites_artifacts(
     assert after_run == {"container_id": "container-id"}
     assert changed is True
     assert payload["artifacts"] == {"artifact.txt": str(ctx.artifacts_dir / "artifact.txt")}
-    assert pool.removed == ["splime-run-abc123"]
+    assert pool.removed == ["container-id"]
