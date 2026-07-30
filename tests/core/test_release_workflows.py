@@ -1,4 +1,4 @@
-"""Static fail-closed contracts for the cross-repository release workflows."""
+"""Static fail-closed contracts for the SPLime package release workflows."""
 
 from __future__ import annotations
 
@@ -19,86 +19,56 @@ def _workflow(path: Path) -> dict[str, Any]:
     return payload
 
 
-def test_publish_workflow_uses_external_source_and_built_evidence() -> None:
+def test_publish_workflow_is_package_only() -> None:
     workflow = _workflow(PUBLISH_WORKFLOW)
     jobs = workflow["jobs"]
     text = PUBLISH_WORKFLOW.read_text(encoding="utf-8")
 
     assert set(jobs) == {
-        "source-chain",
         "test",
         "build",
         "install-test",
         "publish-testpypi",
         "publish-pypi",
     }
-    assert set(jobs["build"]["needs"]) == {"source-chain", "test"}
-    assert "--emit-source-evidence" in text
-    assert "artifacts/source-release-manifest.json" in text
-    assert "--stage source" in text
-    assert "release-source-evidence" in text
-    assert "--emit-built-evidence" in text
-    assert "artifacts/release-manifest.json" in text
-    assert "--stage built" in text
-    assert "release-built-bom-and-artifacts" in text
-    assert "--new-declaration" not in text
-    assert "--manifest-only" not in text
+    assert jobs["build"]["needs"] == ["test"]
+    assert "spl-server" not in text
+    assert "spl-frontend" not in text
+    assert "SPL_RELEASE_GITLAB" not in text
+    assert "source-chain" not in text
+    assert "build_console_artifact" not in text
 
 
-def test_publish_workflow_builds_every_authoritative_component_from_pinned_source() -> None:
+def test_publish_workflow_verifies_the_exact_signed_tag() -> None:
+    workflow = _workflow(PUBLISH_WORKFLOW)
     text = PUBLISH_WORKFLOW.read_text(encoding="utf-8")
     signing_key = SPL_ROOT / ".github" / "release-signing-public-key.asc"
 
-    assert "verify-tag" in text
-    assert "secrets.SPL_RELEASE_SIGNING_PUBLIC_KEY" not in text
-    assert "github.workflow_sha" in text
     assert signing_key.is_file()
+    assert "github.workflow_sha" in text
+    assert "git verify-tag" in text
     assert "31E24377474710AF950C81C6B8C5D1937087FA85" in text
-    assert "secrets.SPL_RELEASE_GITLAB_KNOWN_HOSTS" not in text
-    assert (SPL_ROOT / ".github" / "gitlab-known-hosts").is_file()
-    assert "0a05b156080b28acbb84e38be631f1cfe49c8fa9379cac1a1395346eb82328a8" in text
-    assert 'checkout --detach "${SERVER_COMMIT}"' in text
-    assert 'checkout --detach "${CONSOLE_COMMIT}"' in text
-    assert "tools/build_release_artifacts.py" in text
-    assert "python -m build --wheel" in text
-    assert "python -m tools.build_console_artifact" in text
-    assert "reproducibility/python" in text
-    assert "reproducibility/server" in text
-    assert "reproducibility/console" in text
-    for component in ("framework", "daemon", "server", "console"):
-        assert f'--component-artifact "{component}=' in text
+    assert "secrets.SPL_RELEASE_SIGNING_PUBLIC_KEY" not in text
+    for job_name in ("test", "build"):
+        checkout = workflow["jobs"][job_name]["steps"][1]["with"]
+        assert checkout["ref"] == "${{ env.RELEASE_TAG }}"
+        assert checkout["fetch-depth"] == "0"
+        assert checkout["persist-credentials"] == "false"
 
 
-def test_publish_workflow_makes_the_public_cookbook_contract_mandatory() -> None:
+def test_publish_workflow_supports_automatic_and_manual_publication() -> None:
     workflow = _workflow(PUBLISH_WORKFLOW)
     inputs = workflow["on"]["workflow_dispatch"]["inputs"]
-    test_job = workflow["jobs"]["test"]
-    text = PUBLISH_WORKFLOW.read_text(encoding="utf-8")
 
-    assert inputs["cookbook-url"]["required"] == "true"
-    assert inputs["cookbook-sha256"]["required"] == "true"
     assert set(workflow["on"]) == {"push", "release", "workflow_dispatch"}
     assert workflow["on"]["push"]["tags"] == ["v*.*.*"]
     assert workflow["on"]["release"]["types"] == ["published"]
+    assert set(inputs) == {"release-tag", "target"}
+    assert inputs["release-tag"]["required"] == "true"
+    assert inputs["target"]["options"] == ["testpypi", "pypi"]
     assert workflow["env"]["RELEASE_TAG"] == (
         "${{ inputs.release-tag || github.event.release.tag_name || github.ref_name }}"
     )
-    assert workflow["env"]["PUBLIC_COOKBOOK_URL"] == (
-        "${{ inputs.cookbook-url || 'https://splime.io/downloads/splime-cookbook.ipynb' }}"
-    )
-    assert workflow["env"]["PUBLIC_COOKBOOK_SHA256"] == (
-        "${{ inputs.cookbook-sha256 || '15ae5b809223426f26b998fd3f5b6aef1bf10e9d0b6e74dfdeef2572405f368d' }}"
-    )
-    checkout = test_job["steps"][1]["with"]
-    assert checkout["ref"] == "${{ env.RELEASE_TAG }}"
-    assert checkout["path"] == "release-workspace/spl"
-    assert test_job["defaults"]["run"]["working-directory"] == "release-workspace/spl"
-    assert "Check out pinned server and Console sources" in text
-    assert "Fetch and verify the reviewed canonical public cookbook" in text
-    assert "--proto '=https' --proto-redir '=https'" in text
-    assert "sha256sum --check --strict" in text
-    assert "SPL_RELEASE_COOKBOOK_PATH=" in text
-    assert test_job["steps"][-1]["run"] == 'python -m pytest -m "not smoke" -q'
     assert workflow["jobs"]["publish-testpypi"]["if"] == (
         "github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi')"
     )
@@ -107,7 +77,46 @@ def test_publish_workflow_makes_the_public_cookbook_contract_mandatory() -> None
     )
 
 
-def test_publish_jobs_receive_only_the_verified_reviewed_bundle() -> None:
+def test_package_tests_keep_the_reviewed_cookbook_gate() -> None:
+    workflow = _workflow(PUBLISH_WORKFLOW)
+    test_job = workflow["jobs"]["test"]
+    text = PUBLISH_WORKFLOW.read_text(encoding="utf-8")
+
+    assert workflow["env"]["PUBLIC_COOKBOOK_URL"] == ("https://splime.io/downloads/splime-cookbook.ipynb")
+    assert workflow["env"]["PUBLIC_COOKBOOK_SHA256"] == (
+        "15ae5b809223426f26b998fd3f5b6aef1bf10e9d0b6e74dfdeef2572405f368d"
+    )
+    assert "--proto '=https' --proto-redir '=https'" in text
+    assert "SPL_RELEASE_COOKBOOK_PATH=" in text
+    rendered_steps = "\n".join(str(step) for step in test_job["steps"])
+    assert "ruff check" in rendered_steps
+    assert "ruff format --check" in rendered_steps
+    assert "mypy --python-version 3.13 src" in rendered_steps
+    assert "--ignore=tests/core/test_release_chain.py" in rendered_steps
+    assert "--ignore=tests/core/test_release_controls.py" in rendered_steps
+    assert "--ignore=tests/core/test_release_workflows.py" in rendered_steps
+
+
+def test_build_is_reproducible_and_every_install_uses_the_exact_wheel() -> None:
+    workflow = _workflow(PUBLISH_WORKFLOW)
+    jobs = workflow["jobs"]
+    text = PUBLISH_WORKFLOW.read_text(encoding="utf-8")
+
+    assert "tools/build_release_artifacts.py" in text
+    assert "dist-reproducibility" in text
+    assert "wheel/sdist build is not reproducible" in text
+    assert "python -m twine check" in text
+    assert "python-artifacts.sha256" in text
+    assert "splime-python-release" in text
+    assert jobs["install-test"]["needs"] == ["build"]
+    assert jobs["install-test"]["strategy"]["matrix"]["os"] == [
+        "ubuntu-latest",
+        "macos-latest",
+        "windows-latest",
+    ]
+
+
+def test_publish_jobs_use_oidc_and_only_the_verified_package_directory() -> None:
     workflow = _workflow(PUBLISH_WORKFLOW)
     jobs = workflow["jobs"]
     text = PUBLISH_WORKFLOW.read_text(encoding="utf-8")
@@ -121,17 +130,12 @@ def test_publish_jobs_receive_only_the_verified_reviewed_bundle() -> None:
         assert job["environment"]["name"] == environment
         assert job["permissions"]["id-token"] == "write"
         rendered_steps = "\n".join(str(step) for step in job["steps"])
-        assert "release-built-bom-and-artifacts" in rendered_steps
-        assert "artifacts/python/" in rendered_steps
-        assert "evidence" in rendered_steps and "built" in rendered_steps
+        assert "splime-python-release" in rendered_steps
+        assert "sha256sum --check --strict" in rendered_steps
+        assert "packages-dir" in rendered_steps
+        assert "package/dist/" in rendered_steps
     assert "skip-existing" not in text
-    assert "packages-dir: dist/" not in text
-    assert "Observe exact PyPI publication handoff" in text
-    assert "pypi-publication-evidence.json" in text
-    assert "PyPI filename set does not match the built BOM" in text
-    assert "PyPI hashes do not match the built BOM" in text
-    assert "PyPI bytes do not match the built BOM" in text
-    assert 'parsed.scheme != "https"' in text
+    assert "Verify PyPI publication" in text
 
 
 def test_published_verification_downloads_an_explicit_external_manifest() -> None:

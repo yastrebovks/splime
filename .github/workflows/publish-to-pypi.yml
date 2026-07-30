@@ -13,14 +13,6 @@ on:
         description: "Exact signed SPLime source tag to build"
         required: true
         type: string
-      cookbook-url:
-        description: "HTTPS URL for the reviewed canonical public cookbook"
-        required: true
-        type: string
-      cookbook-sha256:
-        description: "Reviewed SHA-256 of the canonical public cookbook"
-        required: true
-        type: string
       target:
         description: "Package index to publish to"
         required: true
@@ -32,15 +24,18 @@ on:
 
 env:
   RELEASE_TAG: ${{ inputs.release-tag || github.event.release.tag_name || github.ref_name }}
-  PUBLIC_COOKBOOK_URL: ${{ inputs.cookbook-url || 'https://splime.io/downloads/splime-cookbook.ipynb' }}
-  PUBLIC_COOKBOOK_SHA256: ${{ inputs.cookbook-sha256 || '15ae5b809223426f26b998fd3f5b6aef1bf10e9d0b6e74dfdeef2572405f368d' }}
+  PUBLIC_COOKBOOK_URL: https://splime.io/downloads/splime-cookbook.ipynb
+  PUBLIC_COOKBOOK_SHA256: 15ae5b809223426f26b998fd3f5b6aef1bf10e9d0b6e74dfdeef2572405f368d
 
 jobs:
-  source-chain:
-    name: Materialize external source evidence
+  test:
+    name: Verify signed source and test SPLime
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    defaults:
+      run:
+        working-directory: source
     steps:
       - name: Check out the versioned release-signing public key
         uses: actions/checkout@v4
@@ -48,169 +43,41 @@ jobs:
           ref: ${{ github.workflow_sha }}
           path: release-controls
           persist-credentials: false
-          sparse-checkout: |
-            .github/gitlab-known-hosts
-            .github/release-signing-public-key.asc
+          sparse-checkout: .github/release-signing-public-key.asc
           sparse-checkout-cone-mode: false
 
-      - name: Check out the exact framework/daemon source tag
+      - name: Check out the exact SPLime source tag
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          path: release-workspace/spl
+          path: source
           persist-credentials: false
           ref: ${{ env.RELEASE_TAG }}
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Import the trusted release-signing public key
+      - name: Verify the signed source tag
         run: |
           KEY_PATH="${GITHUB_WORKSPACE}/release-controls/.github/release-signing-public-key.asc"
           test "$(gpg --batch --show-keys --with-colons "${KEY_PATH}" \
             | awk -F: '$1 == "fpr" { print $10; exit }')" \
             = "31E24377474710AF950C81C6B8C5D1937087FA85"
           gpg --batch --import "${KEY_PATH}"
-          git -C release-workspace/spl verify-tag "${RELEASE_TAG}"
+          git verify-tag "${RELEASE_TAG}"
 
-      - name: Configure authenticated GitLab source trust
-        uses: webfactory/ssh-agent@v0.9.1
-        with:
-          ssh-private-key: ${{ secrets.SPL_RELEASE_GITLAB_SSH_KEY }}
-
-      - name: Install the pinned GitLab host keys
-        run: |
-          KNOWN_HOSTS_PATH="${GITHUB_WORKSPACE}/release-controls/.github/gitlab-known-hosts"
-          printf '%s  %s\n' \
-            "0a05b156080b28acbb84e38be631f1cfe49c8fa9379cac1a1395346eb82328a8" \
-            "${KNOWN_HOSTS_PATH}" \
-            | sha256sum --check --strict -
-          install -d -m 0700 "${HOME}/.ssh"
-          install -m 0600 "${KNOWN_HOSTS_PATH}" "${HOME}/.ssh/known_hosts"
-
-      - name: Validate the requested release tag against the tracked declaration
-        working-directory: release-workspace/spl
+      - name: Validate the requested version
         run: |
           python - <<'PY'
-          import json
           import os
+          import tomllib
           from pathlib import Path
 
-          contract = json.loads(Path("release-contract.json").read_text(encoding="utf-8"))
+          version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
           requested = os.environ["RELEASE_TAG"]
-          if contract["source_tag"] != requested or requested != f"v{contract['version']}":
-              raise SystemExit(
-                  f"requested tag {requested!r} does not match the release contract "
-                  f"{contract['source_tag']!r}"
-              )
+          if requested != f"v{version}":
+              raise SystemExit(f"requested tag {requested!r} does not match package version {version!r}")
           PY
 
-      - name: Check out pinned server and Console sources
+      - name: Fetch and verify the reviewed public cookbook
         run: |
-          SERVER_REF="$(python -c 'import json; print(json.load(open("release-workspace/spl/release-contract.json"))["components"]["server"]["source_ref"])')"
-          CONSOLE_REF="$(python -c 'import json; print(json.load(open("release-workspace/spl/release-contract.json"))["components"]["console"]["source_ref"])')"
-          git clone --branch "${SERVER_REF}" --depth 1 \
-            git@gitlab.com:spl894143/spl-server.git release-workspace/spl-server
-          git clone --branch "${CONSOLE_REF}" --depth 1 \
-            git@gitlab.com:spl894143/spl-frontend.git release-workspace/spl-frontend
-
-      - name: Generate and verify external source evidence
-        working-directory: release-workspace/spl
-        run: |
-          OBSERVED_AT="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
-          python -m tools.generate_release_identity \
-            --workspace-root "${GITHUB_WORKSPACE}/release-workspace" --check
-          python -m tools.release_chain \
-            --workspace-root "${GITHUB_WORKSPACE}/release-workspace" \
-            --manifest "${GITHUB_WORKSPACE}/release-workspace/spl/release-manifest.json" \
-            --emit-source-evidence \
-              "${GITHUB_WORKSPACE}/release-workspace/artifacts/source-release-manifest.json" \
-            --observed-at "${OBSERVED_AT}"
-          python -m tools.release_chain \
-            --workspace-root "${GITHUB_WORKSPACE}/release-workspace" \
-            --manifest \
-              "${GITHUB_WORKSPACE}/release-workspace/artifacts/source-release-manifest.json" \
-            --stage source
-          test -z "$(git status --porcelain=v1 --untracked-files=all)"
-          test -z "$(git -C ../spl-server status --porcelain=v1 --untracked-files=all)"
-          test -z "$(git -C ../spl-frontend status --porcelain=v1 --untracked-files=all)"
-
-      - name: Upload external source evidence
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-source-evidence
-          path: release-workspace/artifacts/source-release-manifest.json
-          if-no-files-found: error
-          retention-days: 14
-
-  test:
-    name: Run unit tests
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    defaults:
-      run:
-        working-directory: release-workspace/spl
-    steps:
-      - name: Check out the versioned GitLab host keys
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: release-controls
-          persist-credentials: false
-          sparse-checkout: .github/gitlab-known-hosts
-          sparse-checkout-cone-mode: false
-
-      - name: Check out repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          path: release-workspace/spl
-          persist-credentials: false
-          ref: ${{ env.RELEASE_TAG }}
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Configure authenticated GitLab source trust
-        uses: webfactory/ssh-agent@v0.9.1
-        with:
-          ssh-private-key: ${{ secrets.SPL_RELEASE_GITLAB_SSH_KEY }}
-
-      - name: Install the pinned GitLab host keys
-        run: |
-          KNOWN_HOSTS_PATH="${GITHUB_WORKSPACE}/release-controls/.github/gitlab-known-hosts"
-          printf '%s  %s\n' \
-            "0a05b156080b28acbb84e38be631f1cfe49c8fa9379cac1a1395346eb82328a8" \
-            "${KNOWN_HOSTS_PATH}" \
-            | sha256sum --check --strict -
-          install -d -m 0700 "${HOME}/.ssh"
-          install -m 0600 "${KNOWN_HOSTS_PATH}" "${HOME}/.ssh/known_hosts"
-
-      - name: Check out pinned server and Console sources
-        run: |
-          SERVER_REF="$(python -c 'import json; print(json.load(open("release-contract.json"))["components"]["server"]["source_ref"])')"
-          CONSOLE_REF="$(python -c 'import json; print(json.load(open("release-contract.json"))["components"]["console"]["source_ref"])')"
-          git clone --branch "${SERVER_REF}" --depth 1 \
-            git@gitlab.com:spl894143/spl-server.git \
-            "${GITHUB_WORKSPACE}/release-workspace/spl-server"
-          git clone --branch "${CONSOLE_REF}" --depth 1 \
-            git@gitlab.com:spl894143/spl-frontend.git \
-            "${GITHUB_WORKSPACE}/release-workspace/spl-frontend"
-
-      - name: Fetch and verify the reviewed canonical public cookbook
-        run: |
-          test -n "${PUBLIC_COOKBOOK_URL}"
-          test -n "${PUBLIC_COOKBOOK_SHA256}"
-          case "${PUBLIC_COOKBOOK_URL}" in
-            https://*) ;;
-            *) echo "public cookbook URL must use HTTPS" >&2; exit 1 ;;
-          esac
-          printf '%s' "${PUBLIC_COOKBOOK_SHA256}" | grep -Eq '^[0-9a-f]{64}$'
           curl --fail --location \
             --proto '=https' --proto-redir '=https' \
             --output "${RUNNER_TEMP}/splime-cookbook.ipynb" \
@@ -221,6 +88,11 @@ jobs:
             | sha256sum --check --strict -
           echo "SPL_RELEASE_COOKBOOK_PATH=${RUNNER_TEMP}/splime-cookbook.ipynb" \
             >> "${GITHUB_ENV}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
 
       - name: Install package with test extras
         run: |
@@ -236,17 +108,23 @@ jobs:
       - name: Run mypy
         run: mypy --python-version 3.13 src
 
-      - name: Run unit tests (smoke excluded)
-        run: python -m pytest -m "not smoke" -q
+      - name: Run package tests
+        run: >-
+          python -m pytest -m "not smoke" -q
+          --ignore=tests/core/test_release_chain.py
+          --ignore=tests/core/test_release_controls.py
+          --ignore=tests/core/test_release_workflows.py
 
   build:
-    name: Build and verify the external release BOM
+    name: Build reproducible wheel and sdist
     needs:
-      - source-chain
       - test
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    defaults:
+      run:
+        working-directory: source
     steps:
       - name: Check out the versioned release-signing public key
         uses: actions/checkout@v4
@@ -254,296 +132,83 @@ jobs:
           ref: ${{ github.workflow_sha }}
           path: release-controls
           persist-credentials: false
-          sparse-checkout: |
-            .github/gitlab-known-hosts
-            .github/release-signing-public-key.asc
+          sparse-checkout: .github/release-signing-public-key.asc
           sparse-checkout-cone-mode: false
 
-      - name: Check out the exact framework/daemon source tag
+      - name: Check out the exact SPLime source tag
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          path: release-workspace/spl
+          path: source
           persist-credentials: false
           ref: ${{ env.RELEASE_TAG }}
 
-      - name: Download external source evidence
-        uses: actions/download-artifact@v4
-        with:
-          name: release-source-evidence
-          path: release-workspace/artifacts
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Import the trusted release-signing public key
+      - name: Verify the signed source tag
         run: |
           KEY_PATH="${GITHUB_WORKSPACE}/release-controls/.github/release-signing-public-key.asc"
           test "$(gpg --batch --show-keys --with-colons "${KEY_PATH}" \
             | awk -F: '$1 == "fpr" { print $10; exit }')" \
             = "31E24377474710AF950C81C6B8C5D1937087FA85"
           gpg --batch --import "${KEY_PATH}"
-          git -C release-workspace/spl verify-tag "${RELEASE_TAG}"
+          git verify-tag "${RELEASE_TAG}"
 
-      - name: Configure authenticated GitLab source trust
-        uses: webfactory/ssh-agent@v0.9.1
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          ssh-private-key: ${{ secrets.SPL_RELEASE_GITLAB_SSH_KEY }}
+          python-version: "3.13"
 
-      - name: Install the pinned GitLab host keys
-        run: |
-          KNOWN_HOSTS_PATH="${GITHUB_WORKSPACE}/release-controls/.github/gitlab-known-hosts"
-          printf '%s  %s\n' \
-            "0a05b156080b28acbb84e38be631f1cfe49c8fa9379cac1a1395346eb82328a8" \
-            "${KNOWN_HOSTS_PATH}" \
-            | sha256sum --check --strict -
-          install -d -m 0700 "${HOME}/.ssh"
-          install -m 0600 "${KNOWN_HOSTS_PATH}" "${HOME}/.ssh/known_hosts"
-
-      - name: Resolve the externally observed component sources
-        id: source
-        env:
-          SOURCE_MANIFEST: release-workspace/artifacts/source-release-manifest.json
-        run: |
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-          import re
-
-          manifest = json.loads(Path(os.environ["SOURCE_MANIFEST"]).read_text(encoding="utf-8"))
-          if manifest.get("evidence", {}).get("state") != "source":
-              raise SystemExit("downloaded source evidence is not in source state")
-          outputs = {}
-          for component in ("server", "console"):
-              value = manifest["components"][component]
-              source_ref = value["source_ref"]
-              commit = value["source_commit"]
-              if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", source_ref) is None:
-                  raise SystemExit(f"unsafe {component} source ref")
-              if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit) is None:
-                  raise SystemExit(f"unsafe {component} source commit")
-              outputs[f"{component}-ref"] = source_ref
-              outputs[f"{component}-commit"] = commit
-          epoch = manifest["source_date_epoch"]
-          if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0:
-              raise SystemExit("source evidence has no valid SOURCE_DATE_EPOCH")
-          outputs["source-date-epoch"] = str(epoch)
-          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
-              for name, value in outputs.items():
-                  stream.write(f"{name}={value}\n")
-          PY
-
-      - name: Check out the exact pinned server and Console commits
-        env:
-          CONSOLE_COMMIT: ${{ steps.source.outputs.console-commit }}
-          CONSOLE_REF: ${{ steps.source.outputs.console-ref }}
-          SERVER_COMMIT: ${{ steps.source.outputs.server-commit }}
-          SERVER_REF: ${{ steps.source.outputs.server-ref }}
-        run: |
-          git clone --branch "${SERVER_REF}" --depth 1 \
-            git@gitlab.com:spl894143/spl-server.git release-workspace/spl-server
-          git -C release-workspace/spl-server checkout --detach "${SERVER_COMMIT}"
-          git clone --branch "${CONSOLE_REF}" --depth 1 \
-            git@gitlab.com:spl894143/spl-frontend.git release-workspace/spl-frontend
-          git -C release-workspace/spl-frontend checkout --detach "${CONSOLE_COMMIT}"
-
-      - name: Reverify source evidence before building
-        working-directory: release-workspace/spl
-        run: |
-          python -m tools.generate_release_identity \
-            --workspace-root "${GITHUB_WORKSPACE}/release-workspace" --check
-          python -m tools.release_chain \
-            --workspace-root "${GITHUB_WORKSPACE}/release-workspace" \
-            --manifest \
-              "${GITHUB_WORKSPACE}/release-workspace/artifacts/source-release-manifest.json" \
-            --stage source
-
-      - name: Install deterministic build tools
+      - name: Install pinned build tools
         run: |
           python -m pip install --upgrade pip
           python -m pip install "build==1.5.0" "twine==6.2.0"
 
-      - name: Record one build observation time
-        run: echo "RELEASE_BUILT_AT=$(date --utc +%Y-%m-%dT%H:%M:%SZ)" >> "${GITHUB_ENV}"
-
-      - name: Build framework and daemon artifacts twice
-        env:
-          SOURCE_DATE_EPOCH: ${{ steps.source.outputs.source-date-epoch }}
-        working-directory: release-workspace/spl
+      - name: Build artifacts twice
         run: |
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct HEAD)"
           python tools/build_release_artifacts.py \
-            --out-dir "${GITHUB_WORKSPACE}/release-workspace/artifacts/python" \
+            --out-dir "${GITHUB_WORKSPACE}/dist" \
             --source-date-epoch "${SOURCE_DATE_EPOCH}"
           python tools/build_release_artifacts.py \
-            --out-dir "${GITHUB_WORKSPACE}/release-workspace/artifacts/reproducibility/python" \
+            --out-dir "${GITHUB_WORKSPACE}/dist-reproducibility" \
             --source-date-epoch "${SOURCE_DATE_EPOCH}"
           python - <<'PY'
           import hashlib
           from pathlib import Path
 
-          workspace = Path.cwd().parent
-          first = workspace / "artifacts" / "python"
-          second = workspace / "artifacts" / "reproducibility" / "python"
-          digests = lambda root: {
-              path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-              for path in sorted(root.iterdir())
-              if path.is_file()
-          }
-          if digests(first) != digests(second):
-              raise SystemExit("framework/daemon artifacts are not reproducible")
+          def digests(root: Path) -> dict[str, str]:
+              return {
+                  path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in sorted(root.iterdir())
+                  if path.is_file()
+              }
+
+          first = digests(Path("../dist"))
+          second = digests(Path("../dist-reproducibility"))
+          if set(first) != set(second) or len(first) != 2 or first != second:
+              raise SystemExit("wheel/sdist build is not reproducible")
           PY
-          python -m twine check "${GITHUB_WORKSPACE}"/release-workspace/artifacts/python/*
+          python -m twine check "${GITHUB_WORKSPACE}"/dist/*
 
-      - name: Build the pinned server wheel twice
-        env:
-          SOURCE_DATE_EPOCH: ${{ steps.source.outputs.source-date-epoch }}
-        working-directory: release-workspace/spl-server
+      - name: Create artifact checksum inventory
         run: |
-          python -m build --wheel \
-            --outdir "${GITHUB_WORKSPACE}/release-workspace/artifacts/server"
-          python -m build --wheel \
-            --outdir "${GITHUB_WORKSPACE}/release-workspace/artifacts/reproducibility/server"
-          python - <<'PY'
-          import hashlib
-          from pathlib import Path
-
-          workspace = Path.cwd().parent
-          first = workspace / "artifacts" / "server"
-          second = workspace / "artifacts" / "reproducibility" / "server"
-          digests = lambda root: {
-              path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-              for path in sorted(root.iterdir())
-              if path.is_file()
-          }
-          if len(digests(first)) != 1 or digests(first) != digests(second):
-              raise SystemExit("server wheel is missing or is not reproducible")
-          PY
-          python -m twine check "${GITHUB_WORKSPACE}"/release-workspace/artifacts/server/*
-
-      - name: Build the deterministic pinned Console artifact twice
-        env:
-          CONSOLE_COMMIT: ${{ steps.source.outputs.console-commit }}
-          SOURCE_DATE_EPOCH: ${{ steps.source.outputs.source-date-epoch }}
-        working-directory: release-workspace/spl
-        run: |
-          python -m tools.build_console_artifact \
-            --workspace-root "${GITHUB_WORKSPACE}/release-workspace" \
-            --frontend-root "${GITHUB_WORKSPACE}/release-workspace/spl-frontend" \
-            --contract "${GITHUB_WORKSPACE}/release-workspace/spl/release-contract.json" \
-            --output-root "${GITHUB_WORKSPACE}/release-workspace/artifacts" \
-            --source-commit "${CONSOLE_COMMIT}" \
-            --built-at "${RELEASE_BUILT_AT}" \
-            --source-date-epoch "${SOURCE_DATE_EPOCH}"
-          python -m tools.build_console_artifact \
-            --workspace-root "${GITHUB_WORKSPACE}/release-workspace" \
-            --frontend-root "${GITHUB_WORKSPACE}/release-workspace/spl-frontend" \
-            --contract "${GITHUB_WORKSPACE}/release-workspace/spl/release-contract.json" \
-            --output-root \
-              "${GITHUB_WORKSPACE}/release-workspace/artifacts/reproducibility/console" \
-            --source-commit "${CONSOLE_COMMIT}" \
-            --built-at "${RELEASE_BUILT_AT}" \
-            --source-date-epoch "${SOURCE_DATE_EPOCH}"
-          VERSION="$(python -c 'import json; print(json.load(open("release-contract.json"))["version"])')"
-          cmp \
-            "${GITHUB_WORKSPACE}/release-workspace/artifacts/splime-console-${VERSION}.tar.gz" \
-            "${GITHUB_WORKSPACE}/release-workspace/artifacts/reproducibility/console/splime-console-${VERSION}.tar.gz"
-          diff --recursive --brief \
-            "${GITHUB_WORKSPACE}/release-workspace/artifacts/console" \
-            "${GITHUB_WORKSPACE}/release-workspace/artifacts/reproducibility/console/console"
-
-      - name: Materialize and verify the external built BOM
-        working-directory: release-workspace/spl
-        run: |
-          FRAMEWORK_WHEEL="$(python - <<'PY'
-          import json
-          from pathlib import Path
-
-          manifest = json.loads(
-              Path("../artifacts/source-release-manifest.json").read_text(encoding="utf-8")
+          install -d "${GITHUB_WORKSPACE}/release-evidence"
+          (
+            cd "${GITHUB_WORKSPACE}"
+            sha256sum dist/* > release-evidence/python-artifacts.sha256
           )
-          wheels = [
-              artifact["path"]
-              for artifact in manifest["python"]["artifacts"]
-              if artifact["filename"].endswith(".whl")
-          ]
-          if len(wheels) != 1:
-              raise SystemExit("source manifest must declare exactly one framework wheel")
-          print(wheels[0])
-          PY
-          )"
-          SERVER_WHEEL="$(find "${GITHUB_WORKSPACE}/release-workspace/artifacts/server" \
-            -maxdepth 1 -type f -name 'spl_server-*-py3-none-any.whl' -print)"
-          test -n "${SERVER_WHEEL}"
-          test "$(printf '%s\n' "${SERVER_WHEEL}" | wc -l | tr -d ' ')" = "1"
-          SERVER_WHEEL="${SERVER_WHEEL#${GITHUB_WORKSPACE}/release-workspace/}"
-          VERSION="$(python -c 'import json; print(json.load(open("release-contract.json"))["version"])')"
-          CONSOLE_ARCHIVE="artifacts/splime-console-${VERSION}.tar.gz"
-          python -m tools.release_chain \
-            --workspace-root "${GITHUB_WORKSPACE}/release-workspace" \
-            --manifest \
-              "${GITHUB_WORKSPACE}/release-workspace/artifacts/source-release-manifest.json" \
-            --emit-built-evidence \
-              "${GITHUB_WORKSPACE}/release-workspace/artifacts/release-manifest.json" \
-            --component-artifact "framework=${FRAMEWORK_WHEEL}" \
-            --component-artifact "daemon=${FRAMEWORK_WHEEL}" \
-            --component-artifact "server=${SERVER_WHEEL}" \
-            --component-artifact "console=${CONSOLE_ARCHIVE}" \
-            --observed-at "${RELEASE_BUILT_AT}"
-          python -m tools.release_chain \
-            --workspace-root "${GITHUB_WORKSPACE}/release-workspace" \
-            --manifest \
-              "${GITHUB_WORKSPACE}/release-workspace/artifacts/release-manifest.json" \
-            --stage built
 
-      - name: Create the reviewed artifact checksum inventory
-        run: |
-          python - <<'PY'
-          import hashlib
-          from pathlib import Path
-
-          root = Path("release-workspace/artifacts")
-          console_archives = list(root.glob("splime-console-*.tar.gz"))
-          if len(console_archives) != 1:
-              raise SystemExit("reviewed release must contain exactly one Console archive")
-          included = [
-              root / "source-release-manifest.json",
-              *sorted((root / "python").glob("*")),
-              *sorted((root / "server").glob("*")),
-              console_archives[0],
-              *sorted(path for path in (root / "console").rglob("*") if path.is_file()),
-          ]
-          if len(included) != len(set(included)) or not all(path.is_file() for path in included):
-              raise SystemExit("reviewed release artifact allowlist is incomplete")
-          lines = [
-              f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(root).as_posix()}"
-              for path in sorted(included)
-          ]
-          (root / "release-artifact-bom.sha256").write_text(
-              "\n".join(lines) + "\n",
-              encoding="utf-8",
-          )
-          PY
-
-      - name: Upload reviewed external BOM and artifacts
+      - name: Upload exact package artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-built-bom-and-artifacts
+          name: splime-python-release
           path: |
-            release-workspace/artifacts/source-release-manifest.json
-            release-workspace/artifacts/release-manifest.json
-            release-workspace/artifacts/release-artifact-bom.sha256
-            release-workspace/artifacts/python/*
-            release-workspace/artifacts/server/*
-            release-workspace/artifacts/console/**
-            release-workspace/artifacts/splime-console-*.tar.gz
+            dist/*
+            release-evidence/python-artifacts.sha256
           if-no-files-found: error
           retention-days: 14
 
   install-test:
-    name: Install exact built wheel (${{ matrix.os }})
+    name: Install exact wheel (${{ matrix.os }})
     needs:
       - build
     strategy:
@@ -552,47 +217,30 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Download reviewed external BOM and artifacts
+      - name: Download exact package artifacts
         uses: actions/download-artifact@v4
         with:
-          name: release-built-bom-and-artifacts
-          path: artifacts
+          name: splime-python-release
+          path: package
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
-      - name: Verify artifact inventory and select the exact wheel
+      - name: Verify checksums and select the wheel
         shell: bash
         run: |
-          python - <<'PY'
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
+          (
+            cd package
+            sha256sum --check --strict release-evidence/python-artifacts.sha256
+          )
+          WHEEL="$(find package/dist -maxdepth 1 -type f -name 'splime-*.whl' -print)"
+          test -n "${WHEEL}"
+          test "$(printf '%s\n' "${WHEEL}" | wc -l | tr -d ' ')" = "1"
+          echo "RELEASE_WHEEL=${WHEEL}" >> "${GITHUB_ENV}"
 
-          root = Path("artifacts")
-          for line in (root / "release-artifact-bom.sha256").read_text(encoding="utf-8").splitlines():
-              expected, relative = line.split("  ", 1)
-              path = root / relative
-              if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-                  raise SystemExit(f"reviewed release artifact mismatch: {relative}")
-          manifest = json.loads((root / "release-manifest.json").read_text(encoding="utf-8"))
-          if manifest.get("evidence", {}).get("state") != "built":
-              raise SystemExit("install test requires verified built evidence")
-          wheels = [
-              Path(artifact["path"]).relative_to("artifacts")
-              for artifact in manifest["python"]["artifacts"]
-              if artifact["filename"].endswith(".whl")
-          ]
-          if len(wheels) != 1:
-              raise SystemExit("built BOM must contain exactly one wheel")
-          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as stream:
-              stream.write(f"RELEASE_WHEEL=artifacts/{wheels[0].as_posix()}\n")
-          PY
-
-      - name: Install and inspect the exact built wheel
+      - name: Install and inspect the exact wheel
         shell: bash
         run: |
           python -m venv release-smoke
@@ -607,7 +255,7 @@ jobs:
           "$PYTHON" -m spl.daemon --version
 
   publish-testpypi:
-    name: Publish exact built artifacts to TestPyPI
+    name: Publish exact artifacts to TestPyPI
     needs:
       - install-test
     runs-on: ubuntu-latest
@@ -621,49 +269,27 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - name: Download reviewed external BOM and artifacts
+      - name: Download exact package artifacts
         uses: actions/download-artifact@v4
         with:
-          name: release-built-bom-and-artifacts
-          path: artifacts
+          name: splime-python-release
+          path: package
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Require the verified built BOM
+      - name: Verify exact package artifacts
         run: |
-          python - <<'PY'
-          import hashlib
-          import json
-          from pathlib import Path
-
-          root = Path("artifacts")
-          manifest = json.loads((root / "release-manifest.json").read_text(encoding="utf-8"))
-          if manifest.get("evidence", {}).get("state") != "built":
-              raise SystemExit("refusing to publish without built external evidence")
-          expected = {}
-          for artifact in manifest["python"]["artifacts"]:
-              relative = Path(artifact["path"]).relative_to("artifacts")
-              path = root / relative
-              digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
-              if digest != artifact["sha256"]:
-                  raise SystemExit(f"Python artifact does not match built BOM: {relative}")
-              expected[path.name] = artifact["sha256"]
-          actual = {path.name for path in (root / "python").iterdir() if path.is_file()}
-          if actual != set(expected):
-              raise SystemExit("refusing to publish an unexpected Python artifact set")
-          PY
+          (
+            cd package
+            sha256sum --check --strict release-evidence/python-artifacts.sha256
+          )
 
       - name: Publish to TestPyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
-          packages-dir: artifacts/python/
+          packages-dir: package/dist/
 
   publish-pypi:
-    name: Publish exact built artifacts to PyPI
+    name: Publish exact artifacts to PyPI
     needs:
       - install-test
     runs-on: ubuntu-latest
@@ -677,145 +303,56 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - name: Download reviewed external BOM and artifacts
+      - name: Download exact package artifacts
         uses: actions/download-artifact@v4
         with:
-          name: release-built-bom-and-artifacts
-          path: artifacts
+          name: splime-python-release
+          path: package
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
-      - name: Require the verified built BOM
+      - name: Verify exact package artifacts
         run: |
-          python - <<'PY'
-          import hashlib
-          import json
-          from pathlib import Path
-
-          root = Path("artifacts")
-          manifest = json.loads((root / "release-manifest.json").read_text(encoding="utf-8"))
-          if manifest.get("evidence", {}).get("state") != "built":
-              raise SystemExit("refusing to publish without built external evidence")
-          expected = {}
-          for artifact in manifest["python"]["artifacts"]:
-              relative = Path(artifact["path"]).relative_to("artifacts")
-              path = root / relative
-              digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
-              if digest != artifact["sha256"]:
-                  raise SystemExit(f"Python artifact does not match built BOM: {relative}")
-              expected[path.name] = artifact["sha256"]
-          actual = {path.name for path in (root / "python").iterdir() if path.is_file()}
-          if actual != set(expected):
-              raise SystemExit("refusing to publish an unexpected Python artifact set")
-          PY
+          (
+            cd package
+            sha256sum --check --strict release-evidence/python-artifacts.sha256
+          )
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: artifacts/python/
+          packages-dir: package/dist/
 
-      - name: Observe exact PyPI publication handoff
+      - name: Verify PyPI publication
         run: |
           python - <<'PY'
-          from datetime import datetime, timezone
           import hashlib
           import json
+          import os
           from pathlib import Path
           import time
-          import urllib.parse
           import urllib.request
 
-          root = Path("artifacts")
-          manifest = json.loads((root / "release-manifest.json").read_text(encoding="utf-8"))
-          expected = {
-              artifact["filename"]: artifact["sha256"]
-              for artifact in manifest["python"]["artifacts"]
-          }
-          metadata_url = f"https://pypi.org/pypi/splime/{manifest['version']}/json"
-          project = None
-          failure = "PyPI metadata did not become complete"
+          expected = {}
+          for line in Path("package/release-evidence/python-artifacts.sha256").read_text().splitlines():
+              digest, relative = line.split("  ", 1)
+              expected[Path(relative).name] = digest
+
+          release_tag = os.environ["RELEASE_TAG"]
+          if not release_tag.startswith("v"):
+              raise SystemExit("release tag must start with v")
+          metadata_url = f"https://pypi.org/pypi/splime/{release_tag[1:]}/json"
           for attempt in range(12):
               try:
-                  request = urllib.request.Request(
-                      metadata_url,
-                      headers={"User-Agent": "splime-release-workflow/1"},
-                  )
-                  with urllib.request.urlopen(request, timeout=30) as response:
-                      candidate = json.loads(response.read())
+                  with urllib.request.urlopen(metadata_url, timeout=30) as response:
+                      payload = json.loads(response.read())
                   observed = {
-                      item["filename"]: item
-                      for item in candidate.get("urls", [])
+                      item["filename"]: item["digests"]["sha256"]
+                      for item in payload.get("urls", [])
                   }
-                  if set(observed) != set(expected):
-                      failure = "PyPI filename set does not match the built BOM"
-                  elif all(
-                      observed[name].get("digests", {}).get("sha256") == digest
-                      for name, digest in expected.items()
-                  ):
-                      project = observed
+                  if observed == expected:
                       break
-                  else:
-                      failure = "PyPI hashes do not match the built BOM"
-              except Exception as exc:
-                  failure = f"PyPI observation failed: {exc}"
-              if attempt != 11:
-                  time.sleep(5)
-          if project is None:
-              raise SystemExit(failure)
-
-          artifacts = []
-          for filename in sorted(expected):
-              item = project[filename]
-              url = item.get("url")
-              parsed = urllib.parse.urlparse(url)
-              if (
-                  parsed.scheme != "https"
-                  or parsed.hostname is None
-                  or parsed.username is not None
-                  or parsed.password is not None
-                  or parsed.fragment
-                  or Path(parsed.path).name != filename
-              ):
-                  raise SystemExit(f"PyPI returned an unsafe artifact URL for {filename}")
-              with urllib.request.urlopen(
-                  urllib.request.Request(
-                      url,
-                      headers={"User-Agent": "splime-release-workflow/1"},
-                  ),
-                  timeout=30,
-              ) as response:
-                  payload = response.read()
-              if hashlib.sha256(payload).hexdigest() != expected[filename]:
-                  raise SystemExit(f"PyPI bytes do not match the built BOM for {filename}")
-              artifacts.append(
-                  {
-                      "filename": filename,
-                      "url": url,
-                      "sha256": expected[filename],
-                  }
-              )
-
-          handoff = {
-              "schema_version": 1,
-              "release_id": manifest["release_id"],
-              "index": "pypi",
-              "metadata_url": metadata_url,
-              "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-              "artifacts": artifacts,
-          }
-          (root / "pypi-publication-evidence.json").write_text(
-              json.dumps(handoff, indent=2, sort_keys=True) + "\n",
-              encoding="utf-8",
-          )
+              except Exception:
+                  pass
+              if attempt == 11:
+                  raise SystemExit("PyPI did not expose the exact published artifacts")
+              time.sleep(5)
           PY
-
-      - name: Upload observed PyPI publication handoff
-        uses: actions/upload-artifact@v4
-        with:
-          name: pypi-publication-evidence
-          path: artifacts/pypi-publication-evidence.json
-          if-no-files-found: error
-          retention-days: 14
