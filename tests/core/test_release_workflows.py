@@ -59,24 +59,19 @@ def test_publish_workflow_supports_automatic_and_manual_publication() -> None:
     inputs = workflow["on"]["workflow_dispatch"]["inputs"]
 
     assert set(workflow["on"]) == {"push", "release", "workflow_dispatch"}
-    assert workflow["on"]["push"]["branches"] == ["main"]
     assert workflow["on"]["push"]["tags"] == ["v*.*.*"]
     assert workflow["on"]["release"]["types"] == ["published"]
     assert set(inputs) == {"release-tag", "target"}
     assert inputs["release-tag"]["required"] == "true"
     assert inputs["target"]["options"] == ["testpypi", "pypi"]
     assert workflow["env"]["RELEASE_TAG"] == (
-        "${{ (github.event_name == 'push' && github.ref_type == 'branch' && 'v0.4.6') || "
-        "inputs.release-tag || github.event.release.tag_name || github.ref_name }}"
+        "${{ inputs.release-tag || github.event.release.tag_name || github.ref_name }}"
     )
     assert workflow["jobs"]["publish-testpypi"]["if"] == (
-        "(github.event_name == 'push' && github.ref_type == 'tag') || "
-        "(github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi')"
+        "github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi')"
     )
     assert workflow["jobs"]["publish-pypi"]["if"] == (
-        "github.event_name == 'release' || "
-        "(github.event_name == 'push' && github.ref_type == 'branch' && github.ref_name == 'main') || "
-        "(github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')"
+        "github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')"
     )
 
 
