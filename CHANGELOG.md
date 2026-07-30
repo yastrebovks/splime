@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-07-30
+
+### Added
+
+- The integrated daemon can advertise bounded Worker-operation, installed
+  build, telemetry-policy, and terminal execution-manifest evidence to a
+  compatible server. Missing or invalid additive evidence remains unknown;
+  none of these fields proves capacity, compatibility, or readiness.
+- Terminal Run synchronization can include an allowlisted manifest digest and
+  summary plus producer-node evidence derived from exact retained artifact
+  identity. Full manifests remain local.
+- Release tooling now separates tracked declarations, externally resolved
+  source revisions, artifact-side build evidence, and host deployment
+  receipts. No tracked component identity is required to contain its own final
+  Git commit or artifact hash.
+
+### Changed
+
+- Typed archive rejections are terminal for the affected outbound sync event
+  instead of being retried forever. Other retry behavior is unchanged.
+- All new daemon/server fields are additive. Existing YAML/IR, public Python
+  imports and signatures, local object/version/run identities, retained data,
+  and local-only daemon operation remain compatible with 0.4.5.
+- `allow_unfenced_claims` retains its 0.4.x-compatible default of `true`.
+  Changing that default remains deferred to a future major release.
+
 ## [0.4.5] - 2026-07-27
 
 ### Changed
@@ -49,9 +75,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   continue to default to `"on_failure"`.
 - The `allow_unfenced_claims` compatibility setting defaults to `true` in
   0.4.5 so pre-0.4.5 daemons can finish unfenced work when no fenced claim is
-  active. Every accepted legacy write warns and is audited. The default flips
-  to `false` in 0.5.0; operators should disable it earlier after all daemons
-  advertise claim fencing.
+  active. Every accepted legacy write warns and is audited. It remains `true`
+  in 0.4.6; a future major release may flip it after operators have confirmed
+  that every daemon advertises claim fencing.
 - Self-hosted servers no longer default to SPLime's Firebase project or API
   key. Identity providers must be configured for each deployment. The removed
   Firebase API key was a public client-side realm identifier, not a secret;
@@ -547,7 +573,8 @@ here. No breaking API changes.
 - Initial release: turn trusted Python functions into versioned, portable nodes
   reusable across projects and executed locally or remotely.
 
-[Unreleased]: https://github.com/yastrebovks/splime/compare/v0.4.5...HEAD
+[Unreleased]: https://github.com/yastrebovks/splime/compare/v0.4.6...HEAD
+[0.4.6]: https://github.com/yastrebovks/splime/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/yastrebovks/splime/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/yastrebovks/splime/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/yastrebovks/splime/compare/v0.4.2...v0.4.3

@@ -22,8 +22,50 @@ from spl.daemon.remote_client import (
     ServerClient,
     ServerClientError,
 )
-from spl.daemon.server import DaemonRuntime
+from spl.daemon.server import (
+    TELEMETRY_POLICY_CAPABILITY,
+    WORKER_OPERATIONS_CAPABILITY,
+    DaemonRuntime,
+)
 from spl.daemon.store import RegistryStore
+from spl.daemon.telemetry import TelemetryLevel
+
+
+TELEMETRY_POLICY_CASES: tuple[tuple[TelemetryLevel, dict[str, Any]], ...] = (
+    (
+        "metadata",
+        {
+            "level": "metadata",
+            "default": True,
+            "redaction": "best_effort",
+            "sensitive_field_count": 0,
+            "raw_values_mirrored": False,
+            "diagnostic_text_mirrored": False,
+        },
+    ),
+    (
+        "diagnostic",
+        {
+            "level": "diagnostic",
+            "default": False,
+            "redaction": "best_effort",
+            "sensitive_field_count": 0,
+            "raw_values_mirrored": False,
+            "diagnostic_text_mirrored": True,
+        },
+    ),
+    (
+        "full",
+        {
+            "level": "full",
+            "default": False,
+            "redaction": "best_effort",
+            "sensitive_field_count": 0,
+            "raw_values_mirrored": True,
+            "diagnostic_text_mirrored": True,
+        },
+    ),
+)
 
 
 class _NoopHeartbeats:
@@ -66,19 +108,23 @@ def _remote_connection(
 def _connected_runtime(
     tmp_path: Path,
     server_client_factory: Any,
+    *,
+    telemetry: TelemetryLevel = "metadata",
+    capabilities: dict[str, Any] | None = None,
 ) -> tuple[RegistryStore, DaemonRuntime, dict[str, Any]]:
     store = RegistryStore(tmp_path)
     connection = store.save_server_connection(
         server_url="https://splime.io/api",
         token="machine-token-secret",
         user_token="user-token-secret",
-        connection=_remote_connection(),
+        connection=_remote_connection(capabilities=capabilities),
         heartbeat_interval_seconds=60,
     )
     runtime = DaemonRuntime(
         store,
         heartbeat_service=_NoopHeartbeats(),
         server_client_factory=server_client_factory,
+        telemetry=telemetry,
     )
     credentials = store.get_server_connection_credentials(connection["id"])
     runtime._mark_server_channel_success(credentials)  # noqa: SLF001
@@ -521,17 +567,81 @@ def test_connect_advertises_claim_fencing_and_overrides_spoofed_version(
             user_token="user-token-secret",
             machine_id="machine-1",
             display_name="machine-1",
-            capabilities={"python": "3.13", RUN_CLAIM_FENCING_CAPABILITY: 0},
+            capabilities={
+                "python": "3.13",
+                RUN_CLAIM_FENCING_CAPABILITY: 0,
+                TELEMETRY_POLICY_CAPABILITY: {"level": "spoofed"},
+            },
             heartbeat_interval_seconds=60,
         )
 
         assert result["connected"] is True
-        assert _ConnectCaptureServer.connect_capabilities == [
-            {
-                "python": "3.13",
-                RUN_CLAIM_FENCING_CAPABILITY: RUN_CLAIM_FENCING_VERSION,
-            }
-        ]
+        assert len(_ConnectCaptureServer.connect_capabilities) == 1
+        capabilities = _ConnectCaptureServer.connect_capabilities[0]
+        assert capabilities["python"] == "3.13"
+        assert capabilities[RUN_CLAIM_FENCING_CAPABILITY] == RUN_CLAIM_FENCING_VERSION
+        assert capabilities[TELEMETRY_POLICY_CAPABILITY] == TELEMETRY_POLICY_CASES[0][1]
+        assert capabilities[WORKER_OPERATIONS_CAPABILITY]["schema_version"] == 1
+    finally:
+        runtime.shutdown()
+        store.close()
+
+
+@pytest.mark.parametrize(("telemetry", "expected_policy"), TELEMETRY_POLICY_CASES)
+def test_connect_advertises_current_telemetry_policy(
+    tmp_path: Path,
+    telemetry: TelemetryLevel,
+    expected_policy: dict[str, Any],
+) -> None:
+    _ConnectCaptureServer.reset()
+    store = RegistryStore(tmp_path)
+    runtime = DaemonRuntime(
+        store,
+        heartbeat_service=_NoopHeartbeats(),
+        server_client_factory=_ConnectCaptureServer,
+        telemetry=telemetry,
+    )
+    try:
+        runtime.connect_server(
+            server_url="https://splime.io/api",
+            machine_token="machine-token-secret",
+            user_token="user-token-secret",
+            machine_id="machine-1",
+            display_name="machine-1",
+            capabilities={TELEMETRY_POLICY_CAPABILITY: {"level": "spoofed"}},
+            heartbeat_interval_seconds=60,
+        )
+
+        assert _ConnectCaptureServer.connect_capabilities[0][TELEMETRY_POLICY_CAPABILITY] == expected_policy
+    finally:
+        runtime.shutdown()
+        store.close()
+
+
+@pytest.mark.parametrize(("telemetry", "expected_policy"), TELEMETRY_POLICY_CASES)
+def test_sync_advertises_current_telemetry_policy_and_overwrites_stored_spoof(
+    tmp_path: Path,
+    telemetry: TelemetryLevel,
+    expected_policy: dict[str, Any],
+) -> None:
+    _ClaimSyncServer.reset()
+    store, runtime, _ = _connected_runtime(
+        tmp_path,
+        _ClaimSyncServer,
+        telemetry=telemetry,
+        capabilities={
+            "custom": "preserved",
+            RUN_CLAIM_FENCING_CAPABILITY: 0,
+            TELEMETRY_POLICY_CAPABILITY: {"level": "spoofed"},
+        },
+    )
+    try:
+        runtime.sync_once()
+
+        capabilities = _ClaimSyncServer.calls[0]["capabilities"]
+        assert capabilities["custom"] == "preserved"
+        assert capabilities[RUN_CLAIM_FENCING_CAPABILITY] == RUN_CLAIM_FENCING_VERSION
+        assert capabilities[TELEMETRY_POLICY_CAPABILITY] == expected_policy
     finally:
         runtime.shutdown()
         store.close()

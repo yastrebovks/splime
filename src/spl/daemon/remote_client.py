@@ -37,6 +37,12 @@ RUN_CLAIM_HEADER = "X-Spl-Claim"
 RUN_CLAIM_PRIVATE_FIELD = "_spl_claim_id"
 STALE_RUN_CLAIM_ERROR_CODE = "stale_run_claim"
 SYNC_EVENT_IDENTITY_COLLISION_ERROR_CODE = "sync_event_identity_collision"
+PERMANENT_ARCHIVED_SYNC_ERROR_CODES = frozenset(
+    {
+        "library_archived",
+        "resource_archived",
+    }
+)
 FailurePhase = Literal["connection", "post_send", "application"]
 
 
@@ -68,6 +74,12 @@ def is_sync_event_identity_collision_error(exc: ServerClientError) -> bool:
     """Return whether one exact queued event identity collided at the server."""
 
     return exc.status_code == 409 and exc.code == SYNC_EVENT_IDENTITY_COLLISION_ERROR_CODE and bool(exc.event_id)
+
+
+def is_permanent_archived_sync_error(result: dict[str, Any]) -> bool:
+    """Return whether a typed per-event rejection must never be retried."""
+
+    return result.get("status") == "error" and result.get("code") in PERMANENT_ARCHIVED_SYNC_ERROR_CODES
 
 
 def _as_json_dict(value: Any) -> dict[str, Any]:

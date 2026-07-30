@@ -11,6 +11,7 @@ reused across projects and executed locally or remotely.
    cookbook
    owners-libraries-handles
    daemon-security-telemetry
+   release-evidence
 
 .. toctree::
    :maxdepth: 2

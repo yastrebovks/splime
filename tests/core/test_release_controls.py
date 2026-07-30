@@ -17,18 +17,94 @@ from tools import build_release_artifacts
 from tools import verify_published_release
 
 
+SPL_ROOT = Path(__file__).resolve().parents[2]
+DOCKER_ROOT = SPL_ROOT / "deploy" / "dockerhub"
+
+
 def _python_manifest(payload: bytes) -> dict[str, Any]:
+    filename = "splime-0.4.5-py3-none-any.whl"
     return {
+        "schema_version": 2,
         "version": "0.4.5",
         "python": {
             "artifacts": [
                 {
-                    "filename": "splime-0.4.5-py3-none-any.whl",
+                    "filename": filename,
+                    "url": f"https://files.test/{filename}",
                     "sha256": hashlib.sha256(payload).hexdigest(),
                 }
             ]
         },
     }
+
+
+def test_canonical_docker_context_is_exact_bounded_and_private_free() -> None:
+    expected = {
+        ".dockerignore",
+        "Dockerfile",
+        "README.md",
+        "docker-compose.yml",
+        "publish.sh",
+    }
+    observed = {path.name for path in DOCKER_ROOT.iterdir()}
+
+    assert observed == expected
+    assert all((DOCKER_ROOT / name).is_file() for name in expected)
+    assert all(not (DOCKER_ROOT / name).is_symlink() for name in expected)
+    assert (DOCKER_ROOT / ".dockerignore").read_text(encoding="utf-8") == (
+        "# This image installs splime from PyPI and copies nothing from the build\n"
+        "# context, so ignore everything to keep the context empty and builds fast.\n"
+        "*\n"
+    )
+    dockerfile = (DOCKER_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY ." not in dockerfile
+    assert dockerfile.count("COPY ") == 1
+    assert "COPY --from=docker:27-cli" in dockerfile
+
+
+def test_canonical_docker_source_pins_the_exact_release_and_oci_identity() -> None:
+    manifest = json.loads((SPL_ROOT / "release-manifest.json").read_text(encoding="utf-8"))
+    version = manifest["version"]
+    dockerfile = (DOCKER_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    compose = (DOCKER_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    publish = DOCKER_ROOT / "publish.sh"
+    publish_text = publish.read_text(encoding="utf-8")
+    combined = "\n".join((dockerfile, compose, publish_text, (DOCKER_ROOT / "README.md").read_text(encoding="utf-8")))
+
+    assert version == "0.4.6"
+    assert f"ARG SPL_VERSION={version}" in dockerfile
+    assert 'python -m pip install "splime==${SPL_VERSION}"' in dockerfile
+    assert f"image: {manifest['docker']['repository']}:{version}" in compose
+    assert f'VERSION="${{1:-{version}}}"' in publish_text
+    assert "0.4.5" not in combined
+    assert os.access(publish, os.X_OK)
+    for label in (
+        "org.opencontainers.image.title",
+        "org.opencontainers.image.description",
+        "org.opencontainers.image.version",
+        "org.opencontainers.image.source",
+        "org.opencontainers.image.url",
+        "org.opencontainers.image.licenses",
+    ):
+        assert label in dockerfile
+    assert 'org.opencontainers.image.version="${SPL_VERSION}"' in dockerfile
+
+
+def test_canonical_docker_runtime_is_non_root_loopback_first_and_socket_opt_in() -> None:
+    dockerfile = (DOCKER_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    compose = (DOCKER_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    readme = (DOCKER_ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "ARG SPL_UID=10001" in dockerfile
+    assert "ARG SPL_GID=10001" in dockerfile
+    assert "USER spl:spl" in dockerfile
+    assert "127.0.0.1:8765:8765" in compose
+    assert "127.0.0.1:8765:8765" in readme
+    assert "docker.sock" not in compose
+    assert "/var/run/docker.sock" in readme
+    assert "socket is **not** mounted" in readme.casefold()
+    assert "cap_drop:" in compose and "- ALL" in compose
+    assert "no-new-privileges:true" in compose
 
 
 def _console_fixture() -> tuple[dict[str, Any], bytes, dict[str, tuple[bytes, dict[str, str]]]]:
@@ -219,7 +295,7 @@ def test_verify_pypi_accepts_exact_declared_release(monkeypatch: pytest.MonkeyPa
     manifest = _python_manifest(payload)
     filename = manifest["python"]["artifacts"][0]["filename"]
     digest = manifest["python"]["artifacts"][0]["sha256"]
-    project_url = "https://files.test/release.whl"
+    project_url = manifest["python"]["artifacts"][0]["url"]
     project = {
         "urls": [
             {
@@ -289,6 +365,29 @@ def test_verify_pypi_rejects_metadata_hash_drift(monkeypatch: pytest.MonkeyPatch
         verify_published_release.verify_pypi(manifest)
 
 
+def test_verify_pypi_rejects_metadata_url_drift(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = b"wheel bytes"
+    manifest = _python_manifest(payload)
+    artifact = manifest["python"]["artifacts"][0]
+    project = {
+        "urls": [
+            {
+                "filename": artifact["filename"],
+                "digests": {"sha256": artifact["sha256"]},
+                "url": f"https://mirror.test/{artifact['filename']}",
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        verify_published_release,
+        "fetch",
+        lambda url: (json.dumps(project).encode(), {}) if url.endswith("/json") else (payload, {}),
+    )
+
+    with pytest.raises(SystemExit, match="metadata URL mismatch"):
+        verify_published_release.verify_pypi(manifest)
+
+
 def test_verify_public_artifacts_accepts_exact_revalidated_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = b'{"nbformat":4}'
     url = "https://splime.test/downloads/splime-cookbook.ipynb"
@@ -349,6 +448,91 @@ def test_verify_public_artifacts_rejects_empty_manifest() -> None:
         verify_published_release.verify_public_artifacts({"public_artifacts": []})
 
 
+def test_verify_github_release_assets_requires_exact_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset = b"reviewed release asset"
+    release_url = "https://github.test/releases/tag/v0.4.6"
+    asset_url = "https://github.test/releases/download/v0.4.6/asset.bin"
+    manifest = {
+        "github_release": {
+            "url": release_url,
+            "assets": [
+                {
+                    "name": "asset.bin",
+                    "url": asset_url,
+                    "sha256": hashlib.sha256(asset).hexdigest(),
+                }
+            ],
+        }
+    }
+    responses = {
+        release_url: (b"release page", {}),
+        asset_url: (asset, {}),
+    }
+    monkeypatch.setattr(verify_published_release, "fetch", responses.__getitem__)
+
+    verify_published_release.verify_github_release_assets(manifest)
+
+    manifest["github_release"]["assets"][0]["url"] = "https://github.test/releases/download/v0.4.6/other.bin"
+    with pytest.raises(SystemExit, match="URL does not end"):
+        verify_published_release.verify_github_release_assets(manifest)
+    manifest["github_release"]["assets"][0]["url"] = asset_url
+
+    responses[asset_url] = (asset + b" drift", {})
+    with pytest.raises(SystemExit, match="checksum mismatch"):
+        verify_published_release.verify_github_release_assets(manifest)
+
+
+def test_verify_docker_requires_manifest_and_platform_digests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verification_url = "https://hub.test/tags/0.4.6"
+    publication_url = "https://hub.test/repository/tags?name=0.4.6"
+    manifest = {
+        "docker": {
+            "tag": "0.4.6",
+            "manifest_digest": f"sha256:{'a' * 64}",
+            "platform_digests": {
+                "linux/amd64": f"sha256:{'b' * 64}",
+                "linux/arm64": f"sha256:{'c' * 64}",
+            },
+            "verification_url": verification_url,
+            "publication_url": publication_url,
+        }
+    }
+    tag = {
+        "name": "0.4.6",
+        "digest": f"sha256:{'a' * 64}",
+        "images": [
+            {
+                "os": "linux",
+                "architecture": "amd64",
+                "digest": f"sha256:{'b' * 64}",
+            },
+            {
+                "os": "linux",
+                "architecture": "arm64",
+                "digest": f"sha256:{'c' * 64}",
+            },
+        ],
+    }
+
+    def fake_fetch(url: str) -> tuple[bytes, dict[str, str]]:
+        if url == verification_url:
+            return json.dumps(tag).encode(), {}
+        if url == publication_url:
+            return b"tags", {}
+        return pytest.fail(f"unexpected URL: {url}")
+
+    monkeypatch.setattr(verify_published_release, "fetch", fake_fetch)
+    verify_published_release.verify_docker(manifest)
+
+    tag["images"][1]["digest"] = f"sha256:{'d' * 64}"
+    with pytest.raises(SystemExit, match="platform digest mismatch"):
+        verify_published_release.verify_docker(manifest)
+
+
 def test_verify_console_accepts_pinned_complete_graph(monkeypatch: pytest.MonkeyPatch) -> None:
     manifest, _, responses = _console_fixture()
     monkeypatch.setattr(verify_published_release, "fetch", responses.__getitem__)
@@ -392,3 +576,336 @@ def test_verify_console_requires_complete_revalidation_policy(monkeypatch: pytes
 
     with pytest.raises(SystemExit, match="max-age=0"):
         verify_published_release.verify_console(manifest)
+
+
+def test_v1_release_manifest_remains_a_supported_historical_reader() -> None:
+    verify_published_release.require_publishable_manifest({"schema_version": 1, "release_id": "splime-0.4.5"})
+
+
+def test_declared_v2_manifest_cannot_be_published() -> None:
+    with pytest.raises(SystemExit, match="not publishable"):
+        verify_published_release.require_publishable_manifest(
+            {
+                "schema_version": 2,
+                "release_id": "splime-0.4.6",
+                "evidence": {"state": "declared"},
+            }
+        )
+
+
+def test_v2_publishable_state_still_requires_exact_component_evidence() -> None:
+    with pytest.raises(SystemExit, match="exactly framework"):
+        verify_published_release.require_publishable_manifest(
+            {
+                "schema_version": 2,
+                "release_id": "splime-0.4.6",
+                "evidence": {"state": "published"},
+                "components": {
+                    "server": {
+                        "source_commit": None,
+                        "artifact": {"sha256": None},
+                    }
+                },
+                "python": {"artifacts": []},
+                "console": {"integrity_sha256": None},
+            }
+        )
+
+
+def test_v2_publishable_guard_rejects_empty_artifact_sets() -> None:
+    component = {
+        "source_binding": "pinned_commit",
+        "source_ref": "v0.4.6",
+        "source_commit": "1" * 40,
+        "artifact": {"sha256": "2" * 64},
+    }
+    with pytest.raises(SystemExit, match="non-empty Python artifacts"):
+        verify_published_release.require_publishable_manifest(
+            {
+                "schema_version": 2,
+                "release_id": "splime-0.4.6",
+                "version": "0.4.6",
+                "evidence": {"state": "published"},
+                "components": {
+                    "framework": {
+                        **component,
+                        "source_binding": "signed_tag_external_provenance",
+                    },
+                    "daemon": {
+                        **component,
+                        "source_binding": "signed_tag_external_provenance",
+                    },
+                    "server": component,
+                    "console": component,
+                },
+                "python": {"artifacts": []},
+                "public_artifacts": [{"url": "x", "sha256": "3" * 64}],
+                "console": {"integrity_sha256": "4" * 64},
+            }
+        )
+
+
+def test_v2_publishable_guard_requires_github_and_immutable_docker_evidence() -> None:
+    component = {
+        "source_binding": "pinned_commit",
+        "source_ref": "v0.4.6",
+        "source_commit": "1" * 40,
+        "artifact": {"sha256": "2" * 64},
+    }
+    manifest = {
+        "schema_version": 2,
+        "release_id": "splime-0.4.6",
+        "version": "0.4.6",
+        "evidence": {"state": "published"},
+        "components": {
+            "framework": {
+                **component,
+                "source_binding": "signed_tag_external_provenance",
+            },
+            "daemon": {
+                **component,
+                "source_binding": "signed_tag_external_provenance",
+            },
+            "server": component,
+            "console": component,
+        },
+        "python": {
+            "artifacts": [
+                {
+                    "filename": "splime.whl",
+                    "url": "https://files.test/splime.whl",
+                    "sha256": "3" * 64,
+                }
+            ]
+        },
+        "public_artifacts": [{"url": "https://public.test/a", "sha256": "4" * 64}],
+        "console": {"integrity_sha256": "5" * 64},
+        "github_release": {
+            "assets": [{"name": "asset.bin", "sha256": "6" * 64}],
+        },
+        "docker": {
+            "manifest_digest": f"sha256:{'7' * 64}",
+            "platform_digests": {
+                "linux/amd64": f"sha256:{'8' * 64}",
+                "linux/arm64": f"sha256:{'9' * 64}",
+            },
+        },
+    }
+
+    verify_published_release.require_publishable_manifest(manifest)
+
+    manifest["docker"]["manifest_digest"] = None
+    with pytest.raises(SystemExit, match="immutable Docker manifest digest"):
+        verify_published_release.require_publishable_manifest(manifest)
+
+
+def test_signed_source_tag_must_identify_the_checked_out_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observations = iter(["", "1" * 40, "2" * 40])
+    monkeypatch.setattr(
+        verify_published_release,
+        "_run_git",
+        lambda _repository, *_arguments: next(observations),
+    )
+
+    with pytest.raises(SystemExit, match="does not identify"):
+        verify_published_release.verify_signed_source_tag(
+            {"version": "0.4.6"},
+            repository=tmp_path,
+        )
+
+
+def test_signed_source_tag_must_match_both_external_bom_components(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    commit = "1" * 40
+    manifest = {
+        "version": "0.4.6",
+        "components": {
+            name: {
+                "source_binding": "signed_tag_external_provenance",
+                "source_ref": "v0.4.6",
+                "source_commit": commit,
+            }
+            for name in ("framework", "daemon")
+        },
+    }
+    observations = iter(["", commit, commit])
+    monkeypatch.setattr(
+        verify_published_release,
+        "_run_git",
+        lambda _repository, *_arguments: next(observations),
+    )
+
+    verify_published_release.verify_signed_source_tag(
+        manifest,
+        repository=tmp_path,
+    )
+
+    manifest["components"]["daemon"]["source_commit"] = "2" * 40
+    observations = iter(["", commit, commit])
+    with pytest.raises(SystemExit, match="external BOM component daemon"):
+        verify_published_release.verify_signed_source_tag(
+            manifest,
+            repository=tmp_path,
+        )
+
+
+def test_published_manifest_remote_bytes_must_match_reviewed_bom_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "release-manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "release_id": "splime-0.4.6",
+                "version": "0.4.6",
+                "manifest_url": "https://release.test/release-manifest.json",
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        verify_published_release,
+        "require_publishable_manifest",
+        lambda _manifest: None,
+    )
+    monkeypatch.setattr(
+        verify_published_release,
+        "verify_signed_source_tag",
+        lambda _manifest, *, repository: None,
+    )
+    monkeypatch.setattr(
+        verify_published_release,
+        "fetch",
+        lambda _url: (
+            json.dumps(json.loads(manifest_path.read_text(encoding="utf-8"))).encode(),
+            {},
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "verify_published_release.py",
+            "--manifest",
+            str(manifest_path),
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="bytes do not match"):
+        verify_published_release.main()
+
+
+def test_console_build_identity_rejects_non_allowlisted_provenance() -> None:
+    manifest = {
+        "release_id": "splime-0.4.6",
+        "packages": {"console": "0.4.6"},
+        "components": {
+            "console": {
+                "repository": "https://example.invalid/console",
+                "source_ref": "v0.4.6",
+                "source_commit": "1" * 40,
+                "contracts": {"console_server": "console-server/v1"},
+            }
+        },
+    }
+    build = {
+        "schema_version": 1,
+        "component": "console",
+        "release_id": "splime-0.4.6",
+        "version": "0.4.6",
+        "evidence_state": "built",
+        "source": {
+            "repository": "https://example.invalid/console",
+            "ref": "v0.4.6",
+            "binding": "pinned_commit",
+            "commit": "1" * 40,
+        },
+        "build": {"built_at": "2026-07-30T12:00:00+00:00"},
+        "contracts": {"console_server": "console-server/v1"},
+    }
+    verify_published_release.require_console_build_identity(build, manifest)
+
+    build["builder"] = {
+        "hostname": "private-host",
+        "credential": "must-not-cross-the-boundary",
+    }
+    with pytest.raises(SystemExit, match="does not match"):
+        verify_published_release.require_console_build_identity(build, manifest)
+
+
+def test_server_deployment_verification_separates_receipt_from_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = {
+        "schema_version": 2,
+        "release_id": "splime-0.4.6",
+        "packages": {"server": "0.4.6"},
+        "server": {"schema_target": 32},
+        "components": {
+            "server": {
+                "source_ref": "v0.4.6",
+                "source_commit": "a" * 40,
+                "artifact": {"sha256": "b" * 64},
+            }
+        },
+    }
+    manifest_bytes = json.dumps(manifest).encode()
+    receipt = {
+        "schema_version": 1,
+        "release_id": manifest["release_id"],
+        "component": "server",
+        "version": "0.4.6",
+        "source_ref": "v0.4.6",
+        "source_commit": "a" * 40,
+        "artifact_sha256": "b" * 64,
+        "release_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "schema_target": 32,
+        "deployed_at": "2026-07-29T20:00:00+00:00",
+        "environment_class": "staging",
+    }
+    responses: dict[str, dict[str, Any]] = {
+        "https://server.test/version": {
+            "contract": "version_authority/v1",
+            "schema_version": 1,
+            "component": "server",
+            "deployment": {
+                "state": "present",
+                "reason_code": "deployment_receipt_present",
+                **receipt,
+            },
+            "database_schema": {"current": 32, "target": 32},
+        },
+        "https://server.test/ready": {"ready": True, "checks": {}},
+    }
+
+    def fake_fetch(url: str) -> tuple[bytes, dict[str, str]]:
+        return (
+            json.dumps(responses[url]).encode(),
+            {"cache-control": "no-cache, max-age=0, must-revalidate"},
+        )
+
+    monkeypatch.setattr(verify_published_release, "fetch", fake_fetch)
+    verify_published_release.verify_server_deployment(
+        manifest,
+        manifest_bytes=manifest_bytes,
+        version_url="https://server.test/version",
+        ready_url="https://server.test/ready",
+    )
+
+    responses["https://server.test/ready"]["ready"] = False
+    with pytest.raises(SystemExit, match="not operationally ready"):
+        verify_published_release.verify_server_deployment(
+            manifest,
+            manifest_bytes=manifest_bytes,
+            version_url="https://server.test/version",
+            ready_url="https://server.test/ready",
+        )

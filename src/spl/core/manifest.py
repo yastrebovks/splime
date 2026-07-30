@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -35,6 +36,7 @@ SENSITIVE_INLINE_KEY_FRAGMENTS = SENSITIVE_KEY_FRAGMENTS
 
 KeepPolicy: TypeAlias = bool | Literal["on_failure"]
 RetentionDisposition: TypeAlias = Literal["active", "retain", "remove"]
+ArtifactProducerKey: TypeAlias = tuple[str, str, int]
 
 
 def utc_now() -> str:
@@ -161,6 +163,135 @@ def read_manifest(path: Path) -> dict[str, Any]:
     """Read a run manifest JSON file."""
 
     return dict(json.loads(path.read_text(encoding="utf-8")))
+
+
+def manifest_sha256(manifest: Mapping[str, Any]) -> str:
+    """Return a deterministic digest without exposing manifest content."""
+
+    encoded = json_dumps(
+        dict(manifest),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def terminal_manifest_evidence(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the allowlisted terminal evidence that may cross to the server.
+
+    This is intentionally a summary plus a digest, not a redacted manifest.
+    The digest identifies what the authenticated daemon recorded; it is not a
+    signature, sandbox attestation, or proof against a compromised Worker.
+    """
+
+    payload = dict(manifest)
+    schema_version = payload.get("schema_version")
+    if schema_version != RUN_MANIFEST_SCHEMA_VERSION:
+        raise ValueError("run manifest schema is not supported for central evidence")
+    status = payload.get("status")
+    if status not in TERMINAL_RUN_STATUSES:
+        raise ValueError("only a terminal run manifest may produce central evidence")
+    nodes = payload.get("nodes")
+    edges = payload.get("edges")
+    pipeline = payload.get("pipeline")
+    if not isinstance(nodes, dict) or not isinstance(edges, list) or not isinstance(pipeline, dict):
+        raise ValueError("run manifest structure is incomplete")
+    captured_at = payload.get("finished_at")
+    if not isinstance(captured_at, str) or not captured_at:
+        raise ValueError("terminal run manifest is missing finished_at")
+    object_version_id = pipeline.get("object_version_id")
+    pipeline_content_hash = pipeline.get("content_hash")
+    return {
+        "schema_version": schema_version,
+        "digest_sha256": manifest_sha256(payload),
+        "captured_at": captured_at,
+        "summary": {
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "pipeline_content_hash": (pipeline_content_hash if isinstance(pipeline_content_hash, str) else None),
+            "object_version_id": (object_version_id if isinstance(object_version_id, str) else None),
+        },
+    }
+
+
+def manifest_artifact_producers(
+    manifest: Mapping[str, Any],
+) -> dict[ArtifactProducerKey, dict[str, Any]]:
+    """Index exact retained output refs that prove an artifact producer.
+
+    Filename alone is never evidence. A binding requires one local manifest
+    output whose relative URI, digest, and size all match the artifact. If two
+    outputs claim the same exact file identity, the binding is ambiguous and
+    deliberately omitted.
+    """
+
+    nodes = manifest.get("nodes")
+    if not isinstance(nodes, Mapping):
+        return {}
+    producers: dict[ArtifactProducerKey, dict[str, Any]] = {}
+    ambiguous: set[ArtifactProducerKey] = set()
+    for stored_node_id, raw_node in nodes.items():
+        if not isinstance(stored_node_id, str) or not isinstance(raw_node, Mapping):
+            continue
+        node_id = raw_node.get("id")
+        if node_id != stored_node_id:
+            continue
+        alias = raw_node.get("alias")
+        if alias is not None and not isinstance(alias, str):
+            alias = None
+        outputs = raw_node.get("outputs")
+        if not isinstance(outputs, Mapping):
+            continue
+        for output_port, raw_output in outputs.items():
+            if not isinstance(output_port, str) or not isinstance(raw_output, Mapping):
+                continue
+            if raw_output.get("kind") != "artifact":
+                continue
+            ref = raw_output.get("ref")
+            if not isinstance(ref, Mapping):
+                continue
+            uri = ref.get("uri")
+            sha256 = ref.get("sha256")
+            size = ref.get("size")
+            if (
+                not isinstance(uri, str)
+                or not isinstance(sha256, str)
+                or len(sha256) != 64
+                or any(character not in "0123456789abcdefABCDEF" for character in sha256)
+                or isinstance(size, bool)
+                or not isinstance(size, int)
+                or size < 0
+            ):
+                continue
+            output_sha256 = raw_output.get("sha256")
+            if output_sha256 is not None and (
+                not isinstance(output_sha256, str) or output_sha256.casefold() != sha256.casefold()
+            ):
+                continue
+            relative_path = Path(uri)
+            if relative_path.is_absolute() or relative_path.parts != (
+                "artifacts",
+                relative_path.name,
+            ):
+                continue
+            name = relative_path.name
+            if not name or name in {".", ".."}:
+                continue
+            key = (name, sha256.casefold(), size)
+            producer = {
+                "node_id": node_id,
+                "alias": alias,
+                "output_port": output_port,
+            }
+            existing = producers.get(key)
+            if existing is not None and existing != producer:
+                ambiguous.add(key)
+                continue
+            producers[key] = producer
+    for key in ambiguous:
+        producers.pop(key, None)
+    return producers
 
 
 def run_dir_size(path: Path) -> int:

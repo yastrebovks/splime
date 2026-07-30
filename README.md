@@ -22,13 +22,13 @@ redeploying.
 
 - Python **3.13+**
 - POSIX for local daemon environment builds and timeout-safe worker execution
-  in 0.4.5 (Windows Job Object support is not yet implemented; Windows
+  in 0.4.6 (Windows Job Object support is not yet implemented; Windows
   client-only use is unaffected)
 
 ## Install
 
 ```bash
-python3.13 -m pip install "splime==0.4.5"
+python3.13 -m pip install "splime==0.4.6"
 ```
 
 The distribution is named `splime`; the Python import package is `spl`.

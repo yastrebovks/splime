@@ -186,6 +186,123 @@ The environment equivalent is ``SPL_DAEMON_TELEMETRY``. The active level and
 content-availability flags are visible in ``/health``, ``/diagnostics``, the
 sync-status response, and Console run detail.
 
+The daemon also overwrites the nonsecret ``spl.telemetry_policy.v1`` machine
+capability on every central-server connect, reconnect, and sync. It contains the
+active level, best-effort redaction mode, configured sensitive-field count, and
+whether diagnostic text or raw values are eligible to be mirrored. This lets a
+compatible server describe the selected Worker's policy in a point-in-time Run
+preflight without exposing field paths or values. Missing or malformed
+capabilities from older Workers remain unknown; the advertisement does not
+override payload bounds, make redaction a privacy boundary, or guarantee that a
+queued Run will execute under an unchanged policy.
+
+Worker operations evidence
+--------------------------
+
+The daemon also overwrites ``spl.worker_operations.v1`` on every connect,
+reconnect, and sync. This is a versioned, nonsecret allowlist for the Console's
+Worker operations view; caller-provided content under that key is ignored. The
+payload has this shape::
+
+   {
+     "schema_version": 1,
+     "observed_at": "<daemon timestamp>",
+     "sync": {
+       "evidence": "observed | unknown",
+       "pending": 0,
+       "retryable": 0,
+       "by_status": {"pending": 0, "failed": 0, "sent": 0},
+       "oldest_pending_at": null
+     },
+     "environment_builds": {
+       "evidence": "observed | unknown",
+       "total": 0,
+       "by_status": {
+         "absent": 0,
+         "creating": 0,
+         "ready": 0,
+         "failed": 0
+       },
+       "runtime_types": [],
+       "latest_updated_at": null
+     },
+     "runtimes": {
+       "implemented_object_modes": ["docker", "venv"],
+       "implemented_node_modes": ["docker", "native", "venv-subprocess"],
+       "availability": "unverified",
+       "reason": "runtime_availability_not_probed"
+     },
+     "diagnostics": {
+       "availability": "local_only",
+       "command": "spl-daemon doctor --json",
+       "sharing": "explicit_consent_required"
+     }
+   }
+
+``sync`` uses exact database aggregates rather than the bounded diagnostic event
+page. ``retryable`` counts pending events plus failed events marked retryable.
+The build totals cover known cached build records only; a zero ``absent`` count
+does not prove that every Object requirement has a materialized build. Runtime
+names describe implementations present in this daemon version. They do not
+prove that Docker, an interpreter, an image, or a compatible environment is
+currently available, and they are not capacity evidence.
+
+If a local aggregate cannot be read or validated, its section reports
+``evidence: unknown``, null values, and a stable reason code instead of zeroes.
+The server should use its receipt timestamp for network freshness because the
+daemon's ``observed_at`` clock may differ. Heartbeat current, snapshot receipt,
+sync backlog, and build state remain independent facts.
+
+The capability never includes event payloads or kinds, errors, logs, paths,
+package or environment specifications, tokens or token hints, Object identities,
+Run identities, images, or doctor output. ``spl-daemon doctor --json`` remains a
+local operator command. Exporting any doctor result requires a separately
+approved allowlist and an explicit consent interaction; arbitrary local
+diagnostics must not be uploaded.
+
+Terminal manifest evidence
+--------------------------
+
+A claim-fencing-capable daemon advertises ``spl.execution_manifest.v1`` and
+may attach an allowlisted evidence envelope to a terminal ``run_update``. The
+envelope contains only schema version, deterministic SHA-256 digest, capture
+time, source, node/edge counts, exact central Object version, and Pipeline
+content hash. The full manifest, graph, input/output values, paths, commands,
+errors, and runtime records remain local.
+
+Artifact producer evidence is attached only when one retained manifest output
+reference matches the uploaded artifact's relative name, SHA-256, and size.
+The daemon never infers a producer from a filename, current Object graph, or
+event order, and ambiguous matches remain unknown. The server derives the
+accepted attempt from the current claim; the daemon does not assert an attempt
+number. A digest identifies what the authenticated daemon recorded, not a
+signature, sandbox attestation, or proof against a compromised Worker.
+
+``spl.worker_build.v1`` separately advertises the installed ``splime`` package
+version and supported protocol versions. Source ref and artifact digest remain
+unknown until release/deployment attestation supplies them; equal package
+versions alone do not prove compatibility.
+
+Central execution capability boundaries
+---------------------------------------
+
+The central Worker protocol remains outbound polling through ``/sync``. It has
+no server-push, SSE, WebSocket, live-log, tail, or streaming transport.
+Stdout/stderr content can be mirrored only as bounded terminal telemetry under
+the selected policy; its presence never means that Console can follow a Run
+live.
+
+``Resume`` remains a local retained-Pipeline operation. The local daemon route
+and SDK create a child from eligible retained state on that same daemon.
+There is no central Resume command, eligibility endpoint, or hosted-Console
+bridge. A central Retry may execute user code again and is not Resume.
+
+Execution approval is a separately approved 0.5 roadmap contract, not an
+implemented daemon status or claim gate in this slice. The daemon does not
+recognize ``pending_approval``, approve or reject Runs, or infer approval from
+queue permission. Older and current unprotected queue semantics therefore
+remain unchanged.
+
 Redaction
 ---------
 

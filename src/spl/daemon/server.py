@@ -63,6 +63,7 @@ import sys
 import threading
 import time
 from datetime import UTC, datetime
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, cast
@@ -74,7 +75,12 @@ from spl._timeout import TimeoutDomain, validate_timeout_seconds
 from spl.core import json_contract as m_json_contract
 from spl.core import manifest as m_manifest
 from spl.core import resume as m_resume
-from spl.core.node_runtime import DOCKER_NODE_RUNTIME, RUNTIME_TAG_NAME, explicit_docker_image_spec_hash
+from spl.core.node_runtime import (
+    DOCKER_NODE_RUNTIME,
+    NODE_RUNTIME_BACKENDS,
+    RUNTIME_TAG_NAME,
+    explicit_docker_image_spec_hash,
+)
 from spl.core.entities.pipeline import Pipeline
 from spl.core.ir.utils import spl_import_from_file
 from spl.daemon.callback_capability import (
@@ -90,7 +96,13 @@ from spl.daemon.docker_environment import DockerEnvironmentManager
 from spl.daemon.docker_pool import DockerPool
 from spl.daemon.environment import EnvironmentBuildError
 from spl.daemon.environment import EnvironmentManager as VenvEnvironmentManager
-from spl.daemon.environment_base import EnvironmentManagerProtocol
+from spl.daemon.environment_base import (
+    ABSENT,
+    CREATING,
+    FAILED,
+    READY,
+    EnvironmentManagerProtocol,
+)
 from spl.daemon.heartbeat_service import HeartbeatService
 from spl.daemon.home_lock import DaemonHomeLock, DaemonInstanceIdentity
 from spl.daemon.interpreter_visibility import environment_record_interpreter_substitution
@@ -102,6 +114,7 @@ from spl.daemon.remote_client import (
     STALE_RUN_CLAIM_ERROR_CODE,
     ServerClient,
     ServerClientError,
+    is_permanent_archived_sync_error,
     is_stale_run_claim_error,
     is_sync_event_identity_collision_error,
 )
@@ -115,6 +128,7 @@ from spl.daemon.routes.remote import register_remote_routes
 from spl.daemon.routes.runs import register_run_routes
 from spl.daemon.routes.server_connections import register_server_connection_routes
 from spl.daemon.runtime_backend import (
+    RUNTIME_BACKENDS,
     RunContext,
     RuntimeBackendRegistry,
     RuntimeBackendServices,
@@ -223,6 +237,13 @@ SERVER_CHANNEL_LEASE_METHODS = frozenset(
     }
 )
 SYNC_REQUEST_TIMEOUT_SECONDS = 15.0
+TELEMETRY_POLICY_CAPABILITY = "spl.telemetry_policy.v1"
+WORKER_OPERATIONS_CAPABILITY = "spl.worker_operations.v1"
+WORKER_OPERATIONS_SCHEMA_VERSION = 1
+EXECUTION_MANIFEST_CAPABILITY = "spl.execution_manifest.v1"
+EXECUTION_MANIFEST_CAPABILITY_VERSION = 1
+WORKER_BUILD_CAPABILITY = "spl.worker_build.v1"
+WORKER_BUILD_SCHEMA_VERSION = 1
 LOGGER = logging.getLogger(__name__)
 
 
@@ -1039,13 +1060,195 @@ class DaemonRuntime:
         )
 
     @staticmethod
-    def _claim_fencing_capabilities(
+    def _unknown_worker_sync_operations(reason: str) -> dict[str, Any]:
+        return {
+            "evidence": "unknown",
+            "pending": None,
+            "retryable": None,
+            "by_status": {
+                "pending": None,
+                "failed": None,
+                "sent": None,
+            },
+            "oldest_pending_at": None,
+            "reason": reason,
+        }
+
+    def _worker_sync_operations(self) -> dict[str, Any]:
+        """Return exact aggregate queue evidence without payload or error content."""
+
+        try:
+            summary = self.store.sync_event_status_summary()
+            raw_by_status = summary["by_status"]
+            if not isinstance(raw_by_status, dict):
+                raise TypeError("sync by_status is not a mapping")
+            allowed_statuses = {"pending", "failed", "sent"}
+            if set(raw_by_status) - allowed_statuses:
+                raise ValueError("sync status vocabulary is not recognized")
+            by_status = {
+                status: self._nonnegative_operation_count(raw_by_status.get(status, 0))
+                for status in ("pending", "failed", "sent")
+            }
+            retryable = self._nonnegative_operation_count(summary["retryable"])
+            if retryable < by_status["pending"] or retryable > by_status["pending"] + by_status["failed"]:
+                raise ValueError("retryable sync count contradicts status counts")
+            oldest_pending_at = summary.get("oldest_pending_at")
+            if by_status["pending"]:
+                oldest_pending_at = self._operation_timestamp(oldest_pending_at)
+                if oldest_pending_at is None:
+                    raise ValueError("oldest pending timestamp is unavailable")
+            else:
+                oldest_pending_at = None
+        except Exception:
+            return self._unknown_worker_sync_operations("worker_sync_summary_unavailable")
+        return {
+            "evidence": "observed",
+            "pending": by_status["pending"],
+            "retryable": retryable,
+            "by_status": by_status,
+            "oldest_pending_at": oldest_pending_at,
+        }
+
+    @staticmethod
+    def _unknown_worker_environment_builds(reason: str) -> dict[str, Any]:
+        return {
+            "evidence": "unknown",
+            "total": None,
+            "by_status": {
+                ABSENT: None,
+                CREATING: None,
+                READY: None,
+                FAILED: None,
+            },
+            "runtime_types": None,
+            "latest_updated_at": None,
+            "reason": reason,
+        }
+
+    def _worker_environment_builds(self) -> dict[str, Any]:
+        """Return aggregate cached-build evidence without local specifications."""
+
+        try:
+            records = self.store.list_environment_builds()
+            if not isinstance(records, list):
+                raise TypeError("environment build records are not a list")
+            by_status = {
+                ABSENT: 0,
+                CREATING: 0,
+                READY: 0,
+                FAILED: 0,
+            }
+            runtime_types: set[str] = set()
+            updated_at_values: list[str] = []
+            for record in records:
+                if not isinstance(record, dict):
+                    raise TypeError("environment build record is not a mapping")
+                status = record.get("status")
+                if status not in by_status:
+                    raise ValueError("environment build status is not recognized")
+                runtime_type = record.get("runtime_type")
+                if runtime_type not in RUNTIME_BACKENDS:
+                    raise ValueError("environment build runtime is not recognized")
+                updated_at = self._operation_timestamp(record.get("updated_at"))
+                if updated_at is None:
+                    raise ValueError("environment build timestamp is unavailable")
+                by_status[str(status)] += 1
+                runtime_types.add(str(runtime_type))
+                updated_at_values.append(updated_at)
+        except Exception:
+            return self._unknown_worker_environment_builds("worker_environment_build_summary_unavailable")
+        return {
+            "evidence": "observed",
+            "total": len(records),
+            "by_status": by_status,
+            "runtime_types": sorted(runtime_types),
+            "latest_updated_at": max(updated_at_values) if updated_at_values else None,
+        }
+
+    def _worker_operations_capability(self) -> dict[str, Any]:
+        """Return versioned, allowlisted Worker evidence for the central server."""
+
+        return {
+            "schema_version": WORKER_OPERATIONS_SCHEMA_VERSION,
+            "observed_at": utc_now(),
+            "sync": self._worker_sync_operations(),
+            "environment_builds": self._worker_environment_builds(),
+            "runtimes": {
+                "implemented_object_modes": sorted(RUNTIME_BACKENDS),
+                "implemented_node_modes": sorted(NODE_RUNTIME_BACKENDS),
+                "availability": "unverified",
+                "reason": "runtime_availability_not_probed",
+            },
+            "diagnostics": {
+                "availability": "local_only",
+                "command": "spl-daemon doctor --json",
+                "sharing": "explicit_consent_required",
+            },
+        }
+
+    @staticmethod
+    def _execution_manifest_capability() -> dict[str, Any]:
+        """Describe the bounded terminal evidence this daemon can report."""
+
+        return {
+            "schema_version": EXECUTION_MANIFEST_CAPABILITY_VERSION,
+            "terminal_summary": True,
+            "artifact_producer_evidence": True,
+            "full_manifest": False,
+        }
+
+    @staticmethod
+    def _worker_build_capability() -> dict[str, Any]:
+        """Return installed-package evidence without claiming artifact provenance."""
+
+        try:
+            package_version: str | None = importlib_metadata.version("splime")
+        except importlib_metadata.PackageNotFoundError:
+            package_version = None
+        return {
+            "schema_version": WORKER_BUILD_SCHEMA_VERSION,
+            "package": "splime",
+            "package_version": package_version,
+            "version_evidence": ("installed_distribution_metadata" if package_version is not None else "unknown"),
+            "artifact_sha256": None,
+            "source_ref": None,
+            "protocols": {
+                RUN_CLAIM_FENCING_CAPABILITY: RUN_CLAIM_FENCING_VERSION,
+                EXECUTION_MANIFEST_CAPABILITY: EXECUTION_MANIFEST_CAPABILITY_VERSION,
+                WORKER_OPERATIONS_CAPABILITY: WORKER_OPERATIONS_SCHEMA_VERSION,
+            },
+        }
+
+    @staticmethod
+    def _nonnegative_operation_count(value: Any) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("operation count must be a non-negative integer")
+        return value
+
+    @staticmethod
+    def _operation_timestamp(value: Any) -> str | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(UTC).isoformat()
+
+    def _authoritative_server_capabilities(
+        self,
         capabilities: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """Advertise the daemon's worker-claim protocol without trusting input."""
+        """Advertise daemon-owned server capabilities without trusting input."""
 
         advertised = dict(capabilities or {})
         advertised[RUN_CLAIM_FENCING_CAPABILITY] = RUN_CLAIM_FENCING_VERSION
+        advertised[TELEMETRY_POLICY_CAPABILITY] = self.telemetry_policy.status()
+        advertised[WORKER_OPERATIONS_CAPABILITY] = self._worker_operations_capability()
+        advertised[EXECUTION_MANIFEST_CAPABILITY] = self._execution_manifest_capability()
+        advertised[WORKER_BUILD_CAPABILITY] = self._worker_build_capability()
         return advertised
 
     def connect_server(
@@ -1067,7 +1270,7 @@ class DaemonRuntime:
             user_token=user_token,
             machine_id=machine_id,
             display_name=display_name,
-            capabilities=self._claim_fencing_capabilities(capabilities),
+            capabilities=self._authoritative_server_capabilities(capabilities),
             heartbeat_interval_seconds=heartbeat_interval_seconds,
         )
         if not result.get("reused") and result.get("connection") is not None:
@@ -2566,7 +2769,7 @@ class DaemonRuntime:
             }
         credentials = {
             **credentials,
-            "capabilities": self._claim_fencing_capabilities(credentials.get("capabilities")),
+            "capabilities": self._authoritative_server_capabilities(credentials.get("capabilities")),
         }
 
         if probe_server_channel and credentials.get("status") == "needs_reconnect":
@@ -2682,7 +2885,7 @@ class DaemonRuntime:
                         machine_id=credentials["machine_id"],
                         heartbeat_interval_seconds=self._safe_heartbeat_interval(credentials),
                         events=wire_events,
-                        capabilities=self._claim_fencing_capabilities(credentials.get("capabilities")),
+                        capabilities=self._authoritative_server_capabilities(credentials.get("capabilities")),
                         claim_id=claim_id,
                     )
                 except ServerClientError as exc:
@@ -2785,6 +2988,7 @@ class DaemonRuntime:
                         self.store.mark_sync_event_failed(
                             event_id,
                             result.get("error") or "sync event failed",
+                            retryable=not is_permanent_archived_sync_error(result),
                         )
 
             if adopted_count:
@@ -2846,7 +3050,7 @@ class DaemonRuntime:
             remote = server.connect_machine(
                 machine_id=credentials["machine_id"],
                 display_name=credentials.get("display_name"),
-                capabilities=self._claim_fencing_capabilities(credentials.get("capabilities")),
+                capabilities=self._authoritative_server_capabilities(credentials.get("capabilities")),
                 heartbeat_interval_seconds=self._safe_heartbeat_interval(credentials),
             )
         except Exception as exc:
@@ -3312,12 +3516,22 @@ class DaemonRuntime:
                 progress_interval_seconds=progress_interval,
             )
             if final_state["status"] != "succeeded":
+                manifest_evidence, _ = self._claim_bound_manifest_evidence(
+                    final_state,
+                    claim_id=claim_id,
+                    server_object_version_id=version.get("version_id"),
+                )
+                terminal_payload: dict[str, Any] = {
+                    "local_run": self._local_run_delivery_proof(final_state),
+                }
+                if manifest_evidence is not None:
+                    terminal_payload["manifest_evidence"] = manifest_evidence
                 queued = self._send_server_run_update(
                     connection_id,
                     run_id=run_id,
                     status="failed",
                     error=final_state.get("error") or "local run failed",
-                    payload={"local_run": self._local_run_delivery_proof(final_state)},
+                    payload=terminal_payload,
                     claim_id=claim_id,
                 )
                 self._mark_remote_local_terminal_queued(
@@ -3332,18 +3546,35 @@ class DaemonRuntime:
             if not completed_state.get("result_present"):
                 raise RuntimeError("local run succeeded without committing a result value")
             result = completed_state["result"]
+            manifest_evidence, artifact_producers = self._claim_bound_manifest_evidence(
+                final_state,
+                claim_id=claim_id,
+                server_object_version_id=version.get("version_id"),
+            )
+            artifact_evidence_kwargs: dict[str, Any] = {}
+            if manifest_evidence is not None:
+                artifact_evidence_kwargs = {
+                    "manifest_evidence": manifest_evidence,
+                    "artifact_producers": artifact_producers,
+                }
             artifacts = self._prepare_remote_run_artifacts(
                 connection_id,
                 run_id,
                 final_state,
                 claim_id=claim_id,
+                **artifact_evidence_kwargs,
             )
+            terminal_payload = {
+                "local_run": self._local_run_delivery_proof(final_state),
+            }
+            if manifest_evidence is not None:
+                terminal_payload["manifest_evidence"] = manifest_evidence
             queued = self._send_server_run_update(
                 connection_id,
                 run_id=run_id,
                 status="succeeded",
                 result=result,
-                payload={"local_run": self._local_run_delivery_proof(final_state)},
+                payload=terminal_payload,
                 artifacts=artifacts,
                 claim_id=claim_id,
             )
@@ -3364,12 +3595,22 @@ class DaemonRuntime:
                     local_state = self.store.get_run(str(local_run["id"]))
                 except KeyError:
                     local_state = None
+            manifest_evidence, _ = self._claim_bound_manifest_evidence(
+                local_state,
+                claim_id=claim_id,
+                server_object_version_id=version.get("version_id"),
+            )
+            terminal_payload = {}
+            if local_state is not None:
+                terminal_payload["local_run"] = self._local_run_delivery_proof(local_state)
+            if manifest_evidence is not None:
+                terminal_payload["manifest_evidence"] = manifest_evidence
             queued = self._send_server_run_update(
                 connection_id,
                 run_id=run_id,
                 status="failed",
                 error=repr(exc),
-                payload={"local_run": self._local_run_delivery_proof(local_state)} if local_state is not None else None,
+                payload=terminal_payload,
                 claim_id=claim_id,
             )
             if local_state is not None:
@@ -3652,6 +3893,80 @@ class DaemonRuntime:
 
         return {"id": str(state["id"]), "status": str(state["status"])}
 
+    def _claim_bound_manifest_evidence(
+        self,
+        state: dict[str, Any] | None,
+        *,
+        claim_id: str | None,
+        server_object_version_id: str | None,
+    ) -> tuple[dict[str, Any] | None, dict[m_manifest.ArtifactProducerKey, dict[str, Any]]]:
+        """Return bounded evidence only for an exact, claim-fenced attempt."""
+
+        if state is None or claim_id is None or server_object_version_id is None:
+            return None, {}
+        raw_manifest = state.get("manifest")
+        if not isinstance(raw_manifest, dict):
+            return None, {}
+        try:
+            if raw_manifest.get("run_id") != state.get("id"):
+                raise ValueError("manifest run identity does not match local state")
+            if raw_manifest.get("status") != state.get("status"):
+                raise ValueError("manifest status does not match local state")
+            evidence = m_manifest.terminal_manifest_evidence(raw_manifest)
+            local_version_id = evidence["summary"].get("object_version_id")
+            if not isinstance(local_version_id, str):
+                raise ValueError("manifest is missing its local object version")
+            local_version = self.store.get_object_version(
+                local_version_id,
+                include_yaml=False,
+            )
+            if local_version.get("remote_version_id") != server_object_version_id:
+                raise ValueError("manifest object version is not bound to the server job")
+            evidence["summary"]["object_version_id"] = server_object_version_id
+            return (
+                {
+                    **evidence,
+                    "source": "worker_retained_manifest",
+                },
+                m_manifest.manifest_artifact_producers(raw_manifest),
+            )
+        except (KeyError, TypeError, ValueError):
+            LOGGER.warning(
+                "terminal manifest evidence is unavailable for local run %s",
+                state.get("id"),
+                extra={
+                    "spl_event": "terminal_manifest_evidence_unavailable",
+                    "local_run_id": state.get("id"),
+                },
+            )
+            return None, {}
+
+    @staticmethod
+    def _artifact_producer_evidence(
+        metadata: dict[str, Any],
+        *,
+        manifest_evidence: dict[str, Any] | None,
+        artifact_producers: dict[m_manifest.ArtifactProducerKey, dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Return one exact producer binding, never a filename inference."""
+
+        if manifest_evidence is None:
+            return None
+        key = (
+            str(metadata["name"]),
+            str(metadata["sha256"]).casefold(),
+            int(metadata["size"]),
+        )
+        producer = artifact_producers.get(key)
+        if producer is None:
+            return None
+        return {
+            "manifest_digest_sha256": manifest_evidence["digest_sha256"],
+            "node_id": producer["node_id"],
+            "alias": producer["alias"],
+            "output_port": producer["output_port"],
+        }
+
     def _prepare_remote_run_artifacts(
         self,
         connection_id: str,
@@ -3659,6 +3974,8 @@ class DaemonRuntime:
         run_state: dict[str, Any],
         *,
         claim_id: str | None = None,
+        manifest_evidence: dict[str, Any] | None = None,
+        artifact_producers: dict[m_manifest.ArtifactProducerKey, dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Prepare result artifacts without publishing from a stale attempt."""
 
@@ -3681,6 +3998,13 @@ class DaemonRuntime:
             if not path.is_file():
                 continue
             metadata = self._artifact_file_metadata(path)
+            producer_evidence = self._artifact_producer_evidence(
+                metadata,
+                manifest_evidence=manifest_evidence,
+                artifact_producers=artifact_producers or {},
+            )
+            if producer_evidence is not None:
+                metadata["producer_evidence"] = producer_evidence
             inline_allowed = (
                 metadata["size"] <= DEFAULT_INLINE_REMOTE_ARTIFACT_MAX_BYTES
                 and inline_bytes + metadata["size"] <= DEFAULT_INLINE_REMOTE_ARTIFACT_TOTAL_MAX_BYTES

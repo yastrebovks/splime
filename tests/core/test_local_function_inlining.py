@@ -20,6 +20,8 @@ import sys
 import textwrap
 from pathlib import Path
 
+import spl
+
 from spl.core.ir.utils import spl_export_to_file, spl_import_from_file
 
 
@@ -38,6 +40,33 @@ def _forget_package(name: str) -> None:
     for module in list(sys.modules):
         if module == name or module.startswith(name + "."):
             del sys.modules[module]
+
+
+def _export_dir_helper(value):
+    return value + 1
+
+
+def _export_dir_consumer(value):
+    return _export_dir_helper(value) * 2
+
+
+def test_top_level_export_to_dir_round_trips_cross_file_dependency(tmp_path: Path) -> None:
+    spl.spl_export_to_dir(tmp_path, [_export_dir_consumer, _export_dir_helper])
+
+    assert {path.name for path in tmp_path.glob("*.yaml")} == {
+        "_export_dir_consumer.yaml",
+        "_export_dir_helper.yaml",
+    }
+    consumer_path = tmp_path / "_export_dir_consumer.yaml"
+    consumer_yaml = consumer_path.read_text(encoding="utf-8")
+    assert "!DSPLImport" in consumer_yaml
+    assert "path: ./_export_dir_helper.yaml" in consumer_yaml
+
+    namespace: dict = {}
+    spl.spl_import_from_file(consumer_path, globals=namespace)
+
+    assert namespace["_export_dir_helper"](20) == 21
+    assert namespace["_export_dir_consumer"](20) == 42
 
 
 def test_inlines_local_functions_across_deep_files(tmp_path: Path) -> None:

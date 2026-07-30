@@ -2,17 +2,126 @@ name: Verify published release assets
 
 on:
   workflow_dispatch:
+    inputs:
+      source-repository:
+        description: "Trusted GitHub owner/repository containing the signed source tag"
+        required: true
+        default: "yastrebovks/splime"
+        type: string
+      release-tag:
+        description: "Exact signed source tag referenced by the released BOM"
+        required: true
+        type: string
+      release-manifest-url:
+        description: "HTTPS URL of the released external manifest"
+        required: true
+        type: string
+      release-manifest-sha256:
+        description: "Reviewed SHA-256 of the released external manifest"
+        required: true
+        type: string
+      server-version-url:
+        description: "Staged/production server /version URL"
+        required: true
+        type: string
+      server-ready-url:
+        description: "Staged/production server /ready URL"
+        required: true
+        type: string
 
 jobs:
   verify-urls:
-    name: Verify URLs, checksums, Console cache, and Docker tag
+    name: Verify external BOM, source trust, public bytes, and deployment
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out the explicit trusted signed source tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source-repository }}
+          ref: ${{ inputs.release-tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: python tools/verify_published_release.py
+
+      - name: Import the trusted release-signing public key
+        env:
+          SPL_RELEASE_SIGNING_PUBLIC_KEY: ${{ secrets.SPL_RELEASE_SIGNING_PUBLIC_KEY }}
+        run: |
+          test -n "${SPL_RELEASE_SIGNING_PUBLIC_KEY}"
+          printf '%s' "${SPL_RELEASE_SIGNING_PUBLIC_KEY}" | gpg --batch --import
+          git verify-tag "${{ inputs.release-tag }}"
+
+      - name: Download and bind the released external manifest
+        env:
+          RELEASE_MANIFEST_SHA256: ${{ inputs.release-manifest-sha256 }}
+          RELEASE_MANIFEST_URL: ${{ inputs.release-manifest-url }}
+          RELEASE_SOURCE_REPOSITORY: ${{ inputs.source-repository }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import urllib.parse
+          import urllib.request
+
+          url = os.environ["RELEASE_MANIFEST_URL"]
+          parsed = urllib.parse.urlparse(url)
+          if parsed.scheme != "https" or parsed.username or parsed.password or parsed.fragment:
+              raise SystemExit("released manifest URL must be credential-free HTTPS")
+          expected = os.environ["RELEASE_MANIFEST_SHA256"]
+          if re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+              raise SystemExit("released manifest SHA-256 must be full lowercase hexadecimal")
+          request = urllib.request.Request(
+              url,
+              headers={"User-Agent": "splime-release-workflow/1"},
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              payload = response.read()
+          if hashlib.sha256(payload).hexdigest() != expected:
+              raise SystemExit("released manifest checksum does not match reviewed SHA-256")
+          manifest = json.loads(payload)
+          repository = os.environ["RELEASE_SOURCE_REPOSITORY"]
+          if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None:
+              raise SystemExit("trusted source repository must use owner/repository form")
+          expected_repository = f"https://github.com/{repository}"
+          tag = os.environ["RELEASE_TAG"]
+          if manifest.get("manifest_url") != url:
+              raise SystemExit("released manifest URL is not self-consistent")
+          if tag != f"v{manifest.get('version')}":
+              raise SystemExit("explicit source tag does not match released manifest version")
+          for component in ("framework", "daemon"):
+              source = manifest.get("components", {}).get(component, {})
+              if source.get("repository") != expected_repository or source.get("source_ref") != tag:
+                  raise SystemExit(f"released {component} source trust does not match explicit inputs")
+          target = Path("release-evidence/release-manifest.json")
+          target.parent.mkdir()
+          target.write_bytes(payload)
+          PY
+
+      - name: Verify published bytes, receipt, and operational readiness
+        run: |
+          python tools/verify_published_release.py \
+            --manifest release-evidence/release-manifest.json \
+            --source-repository . \
+            --server-version-url "${{ inputs.server-version-url }}" \
+            --server-ready-url "${{ inputs.server-ready-url }}"
+
+      - name: Preserve the verified released manifest for downstream checks
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-published-release-manifest
+          path: release-evidence/release-manifest.json
+          if-no-files-found: error
+          retention-days: 14
 
   clean-install:
     name: Clean PyPI install (${{ matrix.os }})
@@ -23,13 +132,21 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Download verified released manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: verified-published-release-manifest
+          path: release-evidence
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+
       - name: Install and inspect the exact public package
         shell: bash
         run: |
+          VERSION="$(python -c 'import json; print(json.load(open("release-evidence/release-manifest.json"))["version"])')"
           python -m venv release-smoke
           if [ -x release-smoke/Scripts/python.exe ]; then
             PYTHON=release-smoke/Scripts/python.exe
@@ -37,7 +154,7 @@ jobs:
             PYTHON=release-smoke/bin/python
           fi
           "$PYTHON" -m pip install --upgrade pip
-          "$PYTHON" -m pip install "splime==0.4.5"
+          "$PYTHON" -m pip install "splime==$VERSION"
           "$PYTHON" -c "from spl import SPLClient; print(SPLClient)"
           "$PYTHON" -m spl.daemon --version
 
@@ -46,13 +163,29 @@ jobs:
     needs: verify-urls
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Pull exact tag and verify release label
+      - name: Download verified released manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: verified-published-release-manifest
+          path: release-evidence
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Pull exact immutable digest and verify release label
         run: |
-          docker pull yastrebovks/spl-daemon:0.4.5
-          test "$(docker image inspect yastrebovks/spl-daemon:0.4.5 --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')" = "0.4.5"
+          VERSION="$(python -c 'import json; print(json.load(open("release-evidence/release-manifest.json"))["docker"]["tag"])')"
+          IMAGE_REF="$(python -c 'import json; d=json.load(open("release-evidence/release-manifest.json"))["docker"]; print(d["repository"] + "@" + d["manifest_digest"])')"
+          docker pull "$IMAGE_REF"
+          test "$(docker image inspect "$IMAGE_REF" \
+            --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')" = "$VERSION"
+          printf 'IMAGE_REF=%s\n' "$IMAGE_REF" >> "$GITHUB_ENV"
+
       - name: Start release image
-        run: docker run -d --name splime-release-smoke yastrebovks/spl-daemon:0.4.5
+        run: docker run -d --name splime-release-smoke "$IMAGE_REF"
+
       - name: Wait for container health
         run: |
           for attempt in $(seq 1 60); do
@@ -63,6 +196,7 @@ jobs:
           done
           docker logs splime-release-smoke
           exit 1
+
       - name: Stop smoke container
         if: always()
         run: docker rm -f splime-release-smoke || true

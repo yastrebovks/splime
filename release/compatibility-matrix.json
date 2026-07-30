@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "release_id": "splime-0.4.6",
+  "policy": {
+    "console_server": "lockstep",
+    "daemon_server": "capability_negotiated",
+    "version_window": "N and N-1 only for rows whose complete path is tested"
+  },
+  "rows": [
+    {
+      "path": "console_to_server",
+      "status": "tested",
+      "producer": "console 0.4.6",
+      "consumer": "server 0.4.6",
+      "required_contract": "console-server/v1",
+      "fallback": "visible release mismatch; affected actions fail closed",
+      "test_gate": "spl-frontend/tests/release-integrity.test.mjs and spl-server/tests/test_console_structural_contracts.py"
+    },
+    {
+      "path": "daemon_claim_fencing",
+      "status": "unverified",
+      "producer": "daemon 0.4.5 or 0.4.6",
+      "consumer": "server 0.4.6",
+      "required_contract": "run_claim_fencing",
+      "fallback": "No N-1 release promise until a released 0.4.5 artifact is exercised end to end; legacy unfenced behavior remains separately gated",
+      "test_gate": "future cross-version artifact matrix"
+    },
+    {
+      "path": "daemon_terminal_manifest_evidence",
+      "status": "tested",
+      "producer": "daemon 0.4.6",
+      "consumer": "server 0.4.6",
+      "required_contract": "spl.execution_manifest.v1",
+      "fallback": "manifest evidence is unknown or not_mirrored; never inferred",
+      "test_gate": "spl/tests/daemon/test_structural_wire_contracts.py and spl-server/tests/test_console_structural_contracts.py"
+    },
+    {
+      "path": "daemon_worker_operations",
+      "status": "unverified",
+      "producer": "daemon 0.4.6",
+      "consumer": "server 0.4.6",
+      "required_contract": "spl.worker_operations.v1",
+      "fallback": "unsupported operational checks remain unverified; no cross-layer compatibility promise is made",
+      "test_gate": "future server/Console semantic capability matrix"
+    },
+    {
+      "path": "daemon_worker_build_projection",
+      "status": "tested",
+      "producer": "daemon 0.4.6",
+      "consumer": "server and Console 0.4.6",
+      "required_contract": "spl.worker_build.v1",
+      "fallback": "missing or invalid build evidence remains unknown and never proves execution compatibility or readiness",
+      "test_gate": "spl/tests/daemon/test_structural_wire_contracts.py, spl-server/tests/test_worker_machine_projection.py, and spl-frontend/tests/structural-contracts.test.mjs"
+    },
+    {
+      "path": "daemon_telemetry_policy",
+      "status": "tested",
+      "producer": "daemon 0.4.6",
+      "consumer": "server and Console 0.4.6",
+      "required_contract": "spl.telemetry_policy.v1",
+      "fallback": "missing or invalid telemetry evidence remains unknown or not mirrored; policy is never inferred from Run state",
+      "test_gate": "spl/tests/daemon/test_sol_074_claim_fencing.py, spl-server/tests/test_execution_preflight.py, and spl-frontend/tests/execution-preflight.test.mjs"
+    }
+  ]
+}

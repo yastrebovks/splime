@@ -276,7 +276,9 @@ def test_daemon_client_pull_server_object_sends_ref_payload() -> None:
     )
 
 
-def test_daemon_client_pull_all_batches_catalog_once_and_aggregates_receipt() -> None:
+def test_daemon_client_pull_all_batches_catalog_once_and_aggregates_receipt(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     class PullAllRecordingClient(Client):
         def __init__(self) -> None:
             super().__init__("http://daemon.local")
@@ -332,7 +334,6 @@ def test_daemon_client_pull_all_batches_catalog_once_and_aggregates_receipt() ->
         owner_id="owner-1",
         library="risk",
         all_versions=True,
-        progress=False,
     )
 
     assert receipt == {
@@ -342,6 +343,12 @@ def test_daemon_client_pull_all_batches_catalog_once_and_aggregates_receipt() ->
         "failed": [],
         "ambiguous_names": [],
     }
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == [
+        "[spl] pull_all 1/2: owner-1/risk/score_a@v2",
+        "[spl] pull_all 2/2: owner-1/risk/score_b@v3",
+    ]
     assert client.requests == [
         ("GET", "/server/objects?owner=owner-1&library=risk&view=summary", None),
         (

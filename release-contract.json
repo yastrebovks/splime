@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "release_id": "splime-0.4.6",
+  "version": "0.4.6",
+  "source_tag": "v0.4.6",
+  "components": {
+    "framework": {
+      "repository": "https://github.com/yastrebovks/splime",
+      "workspace": "spl",
+      "package": "splime",
+      "version": "0.4.6",
+      "source_ref": "v0.4.6",
+      "source_binding": "signed_tag_external_provenance",
+      "source_commit": null,
+      "artifact": "splime"
+    },
+    "daemon": {
+      "repository": "https://github.com/yastrebovks/splime",
+      "workspace": "spl",
+      "package": "splime",
+      "version": "0.4.6",
+      "source_ref": "v0.4.6",
+      "source_binding": "signed_tag_external_provenance",
+      "source_commit": null,
+      "artifact": "splime"
+    },
+    "server": {
+      "repository": "gitlab.com/spl894143/spl-server",
+      "workspace": "spl-server",
+      "package": "spl-server",
+      "version": "0.4.6",
+      "source_ref": "v0.4.6",
+      "source_binding": "pinned_commit",
+      "source_commit": null,
+      "artifact": "spl-server"
+    },
+    "console": {
+      "repository": "gitlab.com/spl894143/spl-frontend",
+      "workspace": "spl-frontend",
+      "package": "splime-console",
+      "version": "0.4.6",
+      "source_ref": "v0.4.6",
+      "source_binding": "pinned_commit",
+      "source_commit": null,
+      "artifact": "splime-console"
+    }
+  },
+  "contracts": {
+    "console_server": "console-server/v1",
+    "daemon_server_capabilities": [
+      "run_claim_fencing",
+      "spl.telemetry_policy.v1",
+      "spl.execution_manifest.v1",
+      "spl.worker_operations.v1",
+      "spl.worker_build.v1"
+    ],
+    "manifest_evidence": "spl.execution_manifest.v1",
+    "console_persisted_data": 4,
+    "release_manifest": 2,
+    "deployment_receipt": 1
+  },
+  "server_schema_target": 32,
+  "compatibility_matrix": "release/compatibility-matrix.json"
+}

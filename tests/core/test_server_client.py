@@ -16,6 +16,11 @@ class RecordingServerClient(SPLServerClient):
         super().__init__("external-token", base_url="http://server.local")
         self.requests: list[tuple[str, str, dict[str, Any] | None]] = []
         self.byte_paths: list[str] = []
+        self.run_state: dict[str, Any] = {
+            "id": "run-1",
+            "status": "succeeded",
+            "result": {"value": 7},
+        }
 
     def _json_request(
         self,
@@ -27,7 +32,7 @@ class RecordingServerClient(SPLServerClient):
         if method == "POST" and path == "/remote-runs":
             return {"id": "run-1", "status": "queued"}
         if method == "GET" and path == "/remote-runs/run-1":
-            return {"id": "run-1", "status": "succeeded", "result": {"value": 7}}
+            return dict(self.run_state)
         if method == "GET" and path == "/remote-runs/run-1/detail":
             return {
                 "run": {"id": "run-1", "status": "succeeded"},
@@ -36,6 +41,10 @@ class RecordingServerClient(SPLServerClient):
             }
         if method == "GET" and path == "/remote-runs/run-1/artifacts":
             return [{"name": "score.json"}]
+        if method == "POST" and path == "/remote-runs/run-1/cancel":
+            return {"id": "run-1", "status": "cancelled"}
+        if method == "POST" and path == "/remote-runs/run-1/retry":
+            return {"id": "run-2", "status": "queued"}
         return []
 
     def _bytes_request(self, path: str) -> bytes:
@@ -207,10 +216,59 @@ def test_server_remote_run_artifact_helpers(tmp_path: Path) -> None:
     assert run.artifact_names() == ["score.json"]
     assert run.artifact_bytes("score.json") == b'{"score": 0.91}'
     downloaded = run.download_artifact("score.json", tmp_path)
+    downloaded_all = run.download_artifacts(tmp_path / "all")
 
     assert downloaded == tmp_path / "score.json"
     assert downloaded.read_bytes() == b'{"score": 0.91}'
+    assert downloaded_all == {"score.json": tmp_path / "all" / "score.json"}
+    assert downloaded_all["score.json"].read_bytes() == b'{"score": 0.91}'
     assert client.byte_paths == [
         "/remote-runs/run-1/artifacts/score.json",
         "/remote-runs/run-1/artifacts/score.json",
+        "/remote-runs/run-1/artifacts/score.json",
     ]
+
+
+def test_server_remote_run_cancel_and_retry_delegate_to_client_actions() -> None:
+    client = RecordingServerClient()
+    run = client.start("fraud_score", library="risk")
+
+    cancelled = run.cancel()
+    retried = run.retry()
+
+    assert cancelled == {"id": "run-1", "status": "cancelled"}
+    assert run.status == "cancelled"
+    assert retried.id == "run-2"
+    assert retried.status == "queued"
+    assert retried.mode == "server"
+    assert client.requests[-2:] == [
+        ("POST", "/remote-runs/run-1/cancel", None),
+        ("POST", "/remote-runs/run-1/retry", None),
+    ]
+
+
+def test_server_remote_run_wait_times_out() -> None:
+    client = RecordingServerClient()
+    run = client.start("fraud_score", library="risk")
+    client.run_state = {"id": "run-1", "status": "running"}
+
+    with pytest.raises(TimeoutError, match="'run-1' did not finish in time"):
+        run.wait(poll_interval=0, timeout_seconds=0)
+
+    assert run.status == "running"
+    assert client.requests[-1] == ("GET", "/remote-runs/run-1", None)
+
+
+def test_server_remote_run_collect_reports_unsuccessful_terminal_state() -> None:
+    client = RecordingServerClient()
+    run = client.start("fraud_score", library="risk")
+    client.run_state = {
+        "id": "run-1",
+        "status": "failed",
+        "error": "worker exploded",
+    }
+
+    with pytest.raises(RuntimeError, match=r"server run 'run-1' ended as 'failed': worker exploded"):
+        run.collect(poll_interval=0)
+
+    assert client.requests[-1] == ("GET", "/remote-runs/run-1", None)

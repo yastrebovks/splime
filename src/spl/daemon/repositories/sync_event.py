@@ -421,6 +421,15 @@ class SyncEventRepository(RepositoryBase):
                 LIMIT 1
                 """
             ).fetchone()
+            oldest_pending = self._conn.execute(
+                """
+                SELECT created_at
+                FROM sync_events
+                WHERE status = 'pending'
+                ORDER BY created_at, id
+                LIMIT 1
+                """
+            ).fetchone()
             last_error = self._conn.execute(
                 """
                 SELECT id, kind, error, updated_at
@@ -430,10 +439,20 @@ class SyncEventRepository(RepositoryBase):
                 LIMIT 1
                 """
             ).fetchone()
+            retryable = self._conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM sync_events
+                WHERE status = 'pending'
+                   OR (status = 'failed' AND retryable = 1)
+                """
+            ).fetchone()
         return {
             "by_status": {str(row["status"]): int(row["count"]) for row in count_rows},
             "oldest_event": dict(oldest) if oldest is not None else None,
+            "oldest_pending_at": (str(oldest_pending["created_at"]) if oldest_pending is not None else None),
             "last_error": dict(last_error) if last_error is not None else None,
+            "retryable": int(retryable["count"]) if retryable is not None else 0,
         }
 
     def prune_sync_events(
