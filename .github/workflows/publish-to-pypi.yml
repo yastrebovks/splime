@@ -48,7 +48,9 @@ jobs:
           ref: ${{ github.workflow_sha }}
           path: release-controls
           persist-credentials: false
-          sparse-checkout: .github/release-signing-public-key.asc
+          sparse-checkout: |
+            .github/gitlab-known-hosts
+            .github/release-signing-public-key.asc
           sparse-checkout-cone-mode: false
 
       - name: Check out the exact framework/daemon source tag
@@ -79,13 +81,14 @@ jobs:
           ssh-private-key: ${{ secrets.SPL_RELEASE_GITLAB_SSH_KEY }}
 
       - name: Install the pinned GitLab host keys
-        env:
-          SPL_RELEASE_GITLAB_KNOWN_HOSTS: ${{ secrets.SPL_RELEASE_GITLAB_KNOWN_HOSTS }}
         run: |
-          test -n "${SPL_RELEASE_GITLAB_KNOWN_HOSTS}"
+          KNOWN_HOSTS_PATH="${GITHUB_WORKSPACE}/release-controls/.github/gitlab-known-hosts"
+          printf '%s  %s\n' \
+            "0a05b156080b28acbb84e38be631f1cfe49c8fa9379cac1a1395346eb82328a8" \
+            "${KNOWN_HOSTS_PATH}" \
+            | sha256sum --check --strict -
           install -d -m 0700 "${HOME}/.ssh"
-          printf '%s\n' "${SPL_RELEASE_GITLAB_KNOWN_HOSTS}" > "${HOME}/.ssh/known_hosts"
-          chmod 0600 "${HOME}/.ssh/known_hosts"
+          install -m 0600 "${KNOWN_HOSTS_PATH}" "${HOME}/.ssh/known_hosts"
 
       - name: Validate the requested release tag against the tracked declaration
         working-directory: release-workspace/spl
@@ -145,12 +148,59 @@ jobs:
   test:
     name: Run unit tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: release-workspace/spl
     steps:
+      - name: Check out the versioned GitLab host keys
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: release-controls
+          persist-credentials: false
+          sparse-checkout: .github/gitlab-known-hosts
+          sparse-checkout-cone-mode: false
+
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          path: release-workspace/spl
+          persist-credentials: false
           ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Configure authenticated GitLab source trust
+        uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.SPL_RELEASE_GITLAB_SSH_KEY }}
+
+      - name: Install the pinned GitLab host keys
+        run: |
+          KNOWN_HOSTS_PATH="${GITHUB_WORKSPACE}/release-controls/.github/gitlab-known-hosts"
+          printf '%s  %s\n' \
+            "0a05b156080b28acbb84e38be631f1cfe49c8fa9379cac1a1395346eb82328a8" \
+            "${KNOWN_HOSTS_PATH}" \
+            | sha256sum --check --strict -
+          install -d -m 0700 "${HOME}/.ssh"
+          install -m 0600 "${KNOWN_HOSTS_PATH}" "${HOME}/.ssh/known_hosts"
+
+      - name: Check out pinned server and Console sources
+        run: |
+          SERVER_REF="$(python -c 'import json; print(json.load(open("release-contract.json"))["components"]["server"]["source_ref"])')"
+          CONSOLE_REF="$(python -c 'import json; print(json.load(open("release-contract.json"))["components"]["console"]["source_ref"])')"
+          git clone --branch "${SERVER_REF}" --depth 1 \
+            git@gitlab.com:spl894143/spl-server.git \
+            "${GITHUB_WORKSPACE}/release-workspace/spl-server"
+          git clone --branch "${CONSOLE_REF}" --depth 1 \
+            git@gitlab.com:spl894143/spl-frontend.git \
+            "${GITHUB_WORKSPACE}/release-workspace/spl-frontend"
 
       - name: Fetch and verify the reviewed canonical public cookbook
         run: |
@@ -171,11 +221,6 @@ jobs:
             | sha256sum --check --strict -
           echo "SPL_RELEASE_COOKBOOK_PATH=${RUNNER_TEMP}/splime-cookbook.ipynb" \
             >> "${GITHUB_ENV}"
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
 
       - name: Install package with test extras
         run: |
@@ -209,7 +254,9 @@ jobs:
           ref: ${{ github.workflow_sha }}
           path: release-controls
           persist-credentials: false
-          sparse-checkout: .github/release-signing-public-key.asc
+          sparse-checkout: |
+            .github/gitlab-known-hosts
+            .github/release-signing-public-key.asc
           sparse-checkout-cone-mode: false
 
       - name: Check out the exact framework/daemon source tag
@@ -246,13 +293,14 @@ jobs:
           ssh-private-key: ${{ secrets.SPL_RELEASE_GITLAB_SSH_KEY }}
 
       - name: Install the pinned GitLab host keys
-        env:
-          SPL_RELEASE_GITLAB_KNOWN_HOSTS: ${{ secrets.SPL_RELEASE_GITLAB_KNOWN_HOSTS }}
         run: |
-          test -n "${SPL_RELEASE_GITLAB_KNOWN_HOSTS}"
+          KNOWN_HOSTS_PATH="${GITHUB_WORKSPACE}/release-controls/.github/gitlab-known-hosts"
+          printf '%s  %s\n' \
+            "0a05b156080b28acbb84e38be631f1cfe49c8fa9379cac1a1395346eb82328a8" \
+            "${KNOWN_HOSTS_PATH}" \
+            | sha256sum --check --strict -
           install -d -m 0700 "${HOME}/.ssh"
-          printf '%s\n' "${SPL_RELEASE_GITLAB_KNOWN_HOSTS}" > "${HOME}/.ssh/known_hosts"
-          chmod 0600 "${HOME}/.ssh/known_hosts"
+          install -m 0600 "${KNOWN_HOSTS_PATH}" "${HOME}/.ssh/known_hosts"
 
       - name: Resolve the externally observed component sources
         id: source

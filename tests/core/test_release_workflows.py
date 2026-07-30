@@ -54,7 +54,9 @@ def test_publish_workflow_builds_every_authoritative_component_from_pinned_sourc
     assert "github.workflow_sha" in text
     assert signing_key.is_file()
     assert "31E24377474710AF950C81C6B8C5D1937087FA85" in text
-    assert "SPL_RELEASE_GITLAB_KNOWN_HOSTS" in text
+    assert "secrets.SPL_RELEASE_GITLAB_KNOWN_HOSTS" not in text
+    assert (SPL_ROOT / ".github" / "gitlab-known-hosts").is_file()
+    assert "0a05b156080b28acbb84e38be631f1cfe49c8fa9379cac1a1395346eb82328a8" in text
     assert 'checkout --detach "${SERVER_COMMIT}"' in text
     assert 'checkout --detach "${CONSOLE_COMMIT}"' in text
     assert "tools/build_release_artifacts.py" in text
@@ -87,8 +89,11 @@ def test_publish_workflow_makes_the_public_cookbook_contract_mandatory() -> None
     assert workflow["env"]["PUBLIC_COOKBOOK_SHA256"] == (
         "${{ inputs.cookbook-sha256 || '15ae5b809223426f26b998fd3f5b6aef1bf10e9d0b6e74dfdeef2572405f368d' }}"
     )
-    checkout = test_job["steps"][0]["with"]
+    checkout = test_job["steps"][1]["with"]
     assert checkout["ref"] == "${{ env.RELEASE_TAG }}"
+    assert checkout["path"] == "release-workspace/spl"
+    assert test_job["defaults"]["run"]["working-directory"] == "release-workspace/spl"
+    assert "Check out pinned server and Console sources" in text
     assert "Fetch and verify the reviewed canonical public cookbook" in text
     assert "--proto '=https' --proto-redir '=https'" in text
     assert "sha256sum --check --strict" in text
