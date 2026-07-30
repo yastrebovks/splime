@@ -2,6 +2,8 @@ name: Publish to PyPI
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*.*.*"
   release:
@@ -31,7 +33,7 @@ on:
           - pypi
 
 env:
-  RELEASE_TAG: ${{ inputs.release-tag || github.event.release.tag_name || github.ref_name }}
+  RELEASE_TAG: ${{ (github.event_name == 'push' && github.ref_type == 'branch' && 'v0.4.6') || inputs.release-tag || github.event.release.tag_name || github.ref_name }}
   PUBLIC_COOKBOOK_URL: ${{ inputs.cookbook-url || 'https://splime.io/downloads/splime-cookbook.ipynb' }}
   PUBLIC_COOKBOOK_SHA256: ${{ inputs.cookbook-sha256 || '15ae5b809223426f26b998fd3f5b6aef1bf10e9d0b6e74dfdeef2572405f368d' }}
 
@@ -42,6 +44,15 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Check out the versioned release-signing public key
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: release-controls
+          persist-credentials: false
+          sparse-checkout: .github/release-signing-public-key.asc
+          sparse-checkout-cone-mode: false
+
       - name: Check out the exact framework/daemon source tag
         uses: actions/checkout@v4
         with:
@@ -56,11 +67,12 @@ jobs:
           python-version: "3.13"
 
       - name: Import the trusted release-signing public key
-        env:
-          SPL_RELEASE_SIGNING_PUBLIC_KEY: ${{ secrets.SPL_RELEASE_SIGNING_PUBLIC_KEY }}
         run: |
-          test -n "${SPL_RELEASE_SIGNING_PUBLIC_KEY}"
-          printf '%s' "${SPL_RELEASE_SIGNING_PUBLIC_KEY}" | gpg --batch --import
+          KEY_PATH="${GITHUB_WORKSPACE}/release-controls/.github/release-signing-public-key.asc"
+          test "$(gpg --batch --show-keys --with-colons "${KEY_PATH}" \
+            | awk -F: '$1 == "fpr" { print $10; exit }')" \
+            = "31E24377474710AF950C81C6B8C5D1937087FA85"
+          gpg --batch --import "${KEY_PATH}"
           git -C release-workspace/spl verify-tag "${RELEASE_TAG}"
 
       - name: Configure authenticated GitLab source trust
@@ -193,6 +205,15 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Check out the versioned release-signing public key
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: release-controls
+          persist-credentials: false
+          sparse-checkout: .github/release-signing-public-key.asc
+          sparse-checkout-cone-mode: false
+
       - name: Check out the exact framework/daemon source tag
         uses: actions/checkout@v4
         with:
@@ -213,11 +234,12 @@ jobs:
           python-version: "3.13"
 
       - name: Import the trusted release-signing public key
-        env:
-          SPL_RELEASE_SIGNING_PUBLIC_KEY: ${{ secrets.SPL_RELEASE_SIGNING_PUBLIC_KEY }}
         run: |
-          test -n "${SPL_RELEASE_SIGNING_PUBLIC_KEY}"
-          printf '%s' "${SPL_RELEASE_SIGNING_PUBLIC_KEY}" | gpg --batch --import
+          KEY_PATH="${GITHUB_WORKSPACE}/release-controls/.github/release-signing-public-key.asc"
+          test "$(gpg --batch --show-keys --with-colons "${KEY_PATH}" \
+            | awk -F: '$1 == "fpr" { print $10; exit }')" \
+            = "31E24377474710AF950C81C6B8C5D1937087FA85"
+          gpg --batch --import "${KEY_PATH}"
           git -C release-workspace/spl verify-tag "${RELEASE_TAG}"
 
       - name: Configure authenticated GitLab source trust
@@ -544,7 +566,7 @@ jobs:
       - install-test
     runs-on: ubuntu-latest
     if: >-
-      github.event_name == 'push' ||
+      (github.event_name == 'push' && github.ref_type == 'tag') ||
       (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi')
     environment:
       name: testpypi
@@ -601,6 +623,7 @@ jobs:
     runs-on: ubuntu-latest
     if: >-
       github.event_name == 'release' ||
+      (github.event_name == 'push' && github.ref_type == 'branch' && github.ref_name == 'main') ||
       (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
     environment:
       name: pypi

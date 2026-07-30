@@ -47,9 +47,13 @@ def test_publish_workflow_uses_external_source_and_built_evidence() -> None:
 
 def test_publish_workflow_builds_every_authoritative_component_from_pinned_source() -> None:
     text = PUBLISH_WORKFLOW.read_text(encoding="utf-8")
+    signing_key = SPL_ROOT / ".github" / "release-signing-public-key.asc"
 
     assert "verify-tag" in text
-    assert "SPL_RELEASE_SIGNING_PUBLIC_KEY" in text
+    assert "secrets.SPL_RELEASE_SIGNING_PUBLIC_KEY" not in text
+    assert "github.workflow_sha" in text
+    assert signing_key.is_file()
+    assert "31E24377474710AF950C81C6B8C5D1937087FA85" in text
     assert "SPL_RELEASE_GITLAB_KNOWN_HOSTS" in text
     assert 'checkout --detach "${SERVER_COMMIT}"' in text
     assert 'checkout --detach "${CONSOLE_COMMIT}"' in text
@@ -72,10 +76,12 @@ def test_publish_workflow_makes_the_public_cookbook_contract_mandatory() -> None
     assert inputs["cookbook-url"]["required"] == "true"
     assert inputs["cookbook-sha256"]["required"] == "true"
     assert set(workflow["on"]) == {"push", "release", "workflow_dispatch"}
+    assert workflow["on"]["push"]["branches"] == ["main"]
     assert workflow["on"]["push"]["tags"] == ["v*.*.*"]
     assert workflow["on"]["release"]["types"] == ["published"]
     assert workflow["env"]["RELEASE_TAG"] == (
-        "${{ inputs.release-tag || github.event.release.tag_name || github.ref_name }}"
+        "${{ (github.event_name == 'push' && github.ref_type == 'branch' && 'v0.4.6') || "
+        "inputs.release-tag || github.event.release.tag_name || github.ref_name }}"
     )
     assert workflow["env"]["PUBLIC_COOKBOOK_URL"] == (
         "${{ inputs.cookbook-url || 'https://splime.io/downloads/splime-cookbook.ipynb' }}"
@@ -91,10 +97,13 @@ def test_publish_workflow_makes_the_public_cookbook_contract_mandatory() -> None
     assert "SPL_RELEASE_COOKBOOK_PATH=" in text
     assert test_job["steps"][-1]["run"] == 'python -m pytest -m "not smoke" -q'
     assert workflow["jobs"]["publish-testpypi"]["if"] == (
-        "github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi')"
+        "(github.event_name == 'push' && github.ref_type == 'tag') || "
+        "(github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi')"
     )
     assert workflow["jobs"]["publish-pypi"]["if"] == (
-        "github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')"
+        "github.event_name == 'release' || "
+        "(github.event_name == 'push' && github.ref_type == 'branch' && github.ref_name == 'main') || "
+        "(github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')"
     )
 
 
