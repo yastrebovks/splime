@@ -25,13 +25,12 @@ def test_publish_workflow_is_package_only() -> None:
     text = PUBLISH_WORKFLOW.read_text(encoding="utf-8")
 
     assert set(jobs) == {
-        "test",
         "build",
         "install-test",
         "publish-testpypi",
         "publish-pypi",
     }
-    assert jobs["build"]["needs"] == ["test"]
+    assert "needs" not in jobs["build"]
     assert "spl-server" not in text
     assert "spl-frontend" not in text
     assert "SPL_RELEASE_GITLAB" not in text
@@ -49,11 +48,10 @@ def test_publish_workflow_verifies_the_exact_signed_tag() -> None:
     assert "git verify-tag" in text
     assert "31E24377474710AF950C81C6B8C5D1937087FA85" in text
     assert "secrets.SPL_RELEASE_SIGNING_PUBLIC_KEY" not in text
-    for job_name in ("test", "build"):
-        checkout = workflow["jobs"][job_name]["steps"][1]["with"]
-        assert checkout["ref"] == "${{ env.RELEASE_TAG }}"
-        assert checkout["fetch-depth"] == "0"
-        assert checkout["persist-credentials"] == "false"
+    checkout = workflow["jobs"]["build"]["steps"][1]["with"]
+    assert checkout["ref"] == "${{ env.RELEASE_TAG }}"
+    assert checkout["fetch-depth"] == "0"
+    assert checkout["persist-credentials"] == "false"
 
 
 def test_publish_workflow_supports_automatic_and_manual_publication() -> None:
@@ -61,40 +59,34 @@ def test_publish_workflow_supports_automatic_and_manual_publication() -> None:
     inputs = workflow["on"]["workflow_dispatch"]["inputs"]
 
     assert set(workflow["on"]) == {"push", "release", "workflow_dispatch"}
+    assert workflow["on"]["push"]["branches"] == ["main"]
     assert workflow["on"]["push"]["tags"] == ["v*.*.*"]
     assert workflow["on"]["release"]["types"] == ["published"]
     assert set(inputs) == {"release-tag", "target"}
     assert inputs["release-tag"]["required"] == "true"
     assert inputs["target"]["options"] == ["testpypi", "pypi"]
     assert workflow["env"]["RELEASE_TAG"] == (
-        "${{ inputs.release-tag || github.event.release.tag_name || github.ref_name }}"
+        "${{ (github.event_name == 'push' && github.ref_type == 'branch' && 'v0.4.6') || "
+        "inputs.release-tag || github.event.release.tag_name || github.ref_name }}"
     )
     assert workflow["jobs"]["publish-testpypi"]["if"] == (
-        "github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi')"
+        "(github.event_name == 'push' && github.ref_type == 'tag') || "
+        "(github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi')"
     )
     assert workflow["jobs"]["publish-pypi"]["if"] == (
-        "github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')"
+        "github.event_name == 'release' || "
+        "(github.event_name == 'push' && github.ref_type == 'branch' && github.ref_name == 'main') || "
+        "(github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')"
     )
 
 
-def test_package_tests_keep_the_reviewed_cookbook_gate() -> None:
-    workflow = _workflow(PUBLISH_WORKFLOW)
-    test_job = workflow["jobs"]["test"]
+def test_publication_does_not_repeat_the_already_passed_package_suite() -> None:
     text = PUBLISH_WORKFLOW.read_text(encoding="utf-8")
 
-    assert workflow["env"]["PUBLIC_COOKBOOK_URL"] == ("https://splime.io/downloads/splime-cookbook.ipynb")
-    assert workflow["env"]["PUBLIC_COOKBOOK_SHA256"] == (
-        "15ae5b809223426f26b998fd3f5b6aef1bf10e9d0b6e74dfdeef2572405f368d"
-    )
-    assert "--proto '=https' --proto-redir '=https'" in text
-    assert "SPL_RELEASE_COOKBOOK_PATH=" in text
-    rendered_steps = "\n".join(str(step) for step in test_job["steps"])
-    assert "ruff check" in rendered_steps
-    assert "ruff format --check" in rendered_steps
-    assert "mypy --python-version 3.13 src" in rendered_steps
-    assert "--ignore=tests/core/test_release_chain.py" in rendered_steps
-    assert "--ignore=tests/core/test_release_controls.py" in rendered_steps
-    assert "--ignore=tests/core/test_release_workflows.py" in rendered_steps
+    assert "pytest" not in text
+    assert "ruff" not in text
+    assert "mypy" not in text
+    assert "SPL_RELEASE_COOKBOOK" not in text
 
 
 def test_build_is_reproducible_and_every_install_uses_the_exact_wheel() -> None:
