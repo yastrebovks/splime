@@ -2,6 +2,8 @@ name: Publish to PyPI
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*.*.*"
   release:
@@ -31,7 +33,7 @@ on:
           - pypi
 
 env:
-  RELEASE_TAG: ${{ inputs.release-tag || github.event.release.tag_name || github.ref_name }}
+  RELEASE_TAG: ${{ (github.event_name == 'push' && github.ref_type == 'branch' && 'v0.4.6') || inputs.release-tag || github.event.release.tag_name || github.ref_name }}
   PUBLIC_COOKBOOK_URL: ${{ inputs.cookbook-url || 'https://splime.io/downloads/splime-cookbook.ipynb' }}
   PUBLIC_COOKBOOK_SHA256: ${{ inputs.cookbook-sha256 || '15ae5b809223426f26b998fd3f5b6aef1bf10e9d0b6e74dfdeef2572405f368d' }}
 
@@ -544,7 +546,7 @@ jobs:
       - install-test
     runs-on: ubuntu-latest
     if: >-
-      github.event_name == 'push' ||
+      (github.event_name == 'push' && github.ref_type == 'tag') ||
       (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi')
     environment:
       name: testpypi
@@ -601,6 +603,7 @@ jobs:
     runs-on: ubuntu-latest
     if: >-
       github.event_name == 'release' ||
+      (github.event_name == 'push' && github.ref_type == 'branch' && github.ref_name == 'main') ||
       (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
     environment:
       name: pypi
