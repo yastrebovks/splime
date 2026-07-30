@@ -71,9 +71,18 @@ def test_publish_workflow_makes_the_public_cookbook_contract_mandatory() -> None
 
     assert inputs["cookbook-url"]["required"] == "true"
     assert inputs["cookbook-sha256"]["required"] == "true"
-    assert set(workflow["on"]) == {"workflow_dispatch"}
-    assert workflow["env"]["PUBLIC_COOKBOOK_URL"]
-    assert workflow["env"]["PUBLIC_COOKBOOK_SHA256"]
+    assert set(workflow["on"]) == {"push", "release", "workflow_dispatch"}
+    assert workflow["on"]["push"]["tags"] == ["v*.*.*"]
+    assert workflow["on"]["release"]["types"] == ["published"]
+    assert workflow["env"]["RELEASE_TAG"] == (
+        "${{ inputs.release-tag || github.event.release.tag_name || github.ref_name }}"
+    )
+    assert workflow["env"]["PUBLIC_COOKBOOK_URL"] == (
+        "${{ inputs.cookbook-url || 'https://splime.io/downloads/splime-cookbook.ipynb' }}"
+    )
+    assert workflow["env"]["PUBLIC_COOKBOOK_SHA256"] == (
+        "${{ inputs.cookbook-sha256 || '15ae5b809223426f26b998fd3f5b6aef1bf10e9d0b6e74dfdeef2572405f368d' }}"
+    )
     checkout = test_job["steps"][0]["with"]
     assert checkout["ref"] == "${{ env.RELEASE_TAG }}"
     assert "Fetch and verify the reviewed canonical public cookbook" in text
@@ -81,8 +90,12 @@ def test_publish_workflow_makes_the_public_cookbook_contract_mandatory() -> None
     assert "sha256sum --check --strict" in text
     assert "SPL_RELEASE_COOKBOOK_PATH=" in text
     assert test_job["steps"][-1]["run"] == 'python -m pytest -m "not smoke" -q'
-    assert workflow["jobs"]["publish-testpypi"]["if"] == "inputs.target == 'testpypi'"
-    assert workflow["jobs"]["publish-pypi"]["if"] == "inputs.target == 'pypi'"
+    assert workflow["jobs"]["publish-testpypi"]["if"] == (
+        "github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi')"
+    )
+    assert workflow["jobs"]["publish-pypi"]["if"] == (
+        "github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')"
+    )
 
 
 def test_publish_jobs_receive_only_the_verified_reviewed_bundle() -> None:
