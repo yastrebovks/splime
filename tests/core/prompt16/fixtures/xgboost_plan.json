@@ -1,0 +1,43 @@
+{
+  "schema": "splime.generated-plan/v1",
+  "schema_version": 1,
+  "kind": "pipeline",
+  "name": "xgboost_pipeline",
+  "nodes": [
+    {
+      "id": "fit_model",
+      "function": "fit_xgboost_model",
+      "runtime": "native"
+    }
+  ],
+  "edges": [
+    {
+      "from": {
+        "kind": "input",
+        "name": "rows"
+      },
+      "to": {
+        "node_id": "fit_model",
+        "port": "rows"
+      },
+      "adapter": null
+    }
+  ],
+  "outputs": [
+    {
+      "name": "model_summary",
+      "node_id": "fit_model",
+      "port": "default"
+    }
+  ],
+  "dependencies": [
+    {
+      "package": "xgboost",
+      "version": "3.3.0",
+      "modules": [
+        "xgboost"
+      ]
+    }
+  ],
+  "adapters": []
+}

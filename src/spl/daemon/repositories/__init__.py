@@ -2,6 +2,7 @@
 
 from spl.daemon.repositories.env import EnvRepository
 from spl.daemon.repositories.library import LibraryRepository
+from spl.daemon.repositories.library_adapter import LibraryAdapterRepository
 from spl.daemon.repositories.object import ObjectRepository
 from spl.daemon.repositories.run import RunRepository
 from spl.daemon.repositories.server_connection import ServerConnectionRepository
@@ -10,6 +11,7 @@ from spl.daemon.repositories.sync_event import SyncEventRepository
 __all__ = [
     "EnvRepository",
     "LibraryRepository",
+    "LibraryAdapterRepository",
     "ObjectRepository",
     "RunRepository",
     "ServerConnectionRepository",

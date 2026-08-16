@@ -33,6 +33,7 @@ NATIVE_NODE_RUNTIME = "native"
 VENV_SUBPROCESS_NODE_RUNTIME = "venv-subprocess"
 DOCKER_NODE_RUNTIME = "docker"
 RUNTIME_TAG_NAME = "runtime"
+REMOTE_RUN_RUNTIME_OVERRIDES_CAPABILITY = "spl.remote_run.runtime_overrides.v1"
 NODE_TIMEOUT_SECONDS_KEY = "node_timeout_seconds"
 _SPL_NODE_CONTAINER_WORKDIR = "/spl-node"
 _SPL_OBJECT_RUNTIME_BACKEND_ENV = "SPL_OBJECT_RUNTIME_BACKEND"
@@ -45,7 +46,7 @@ _DOCKER_NODE_IMAGE_REMEDIATION = (
 
 LOGGER = logging.getLogger(__name__)
 
-RunRuntimeOverrides = Mapping[str, str]
+RunRuntimeOverrides = str | Mapping[str, str]
 NormalizedRunRuntimeOverrides = dict[Node, str]
 
 
@@ -343,12 +344,20 @@ def validate_run_runtime_overrides(
     pipeline: Pipeline,
     runtimes: RunRuntimeOverrides | None,
 ) -> NormalizedRunRuntimeOverrides:
-    """Validate run-level runtime overrides and normalize aliases to nodes."""
+    """Validate run-level runtime overrides and normalize them to nodes.
+
+    A mapping keeps the established per-alias behavior.  A string is the
+    whole-Pipeline shorthand and applies to every local Function node; remote
+    references keep their own execution authority.
+    """
 
     if runtimes is None:
         return {}
+    if isinstance(runtimes, str):
+        runtime_name = _validate_runtime_name(runtimes)
+        return {node: runtime_name for node in pipeline.nodes if isinstance(node, NodeFunction)}
     if not isinstance(runtimes, Mapping):
-        raise TypeError("run runtime overrides must be a mapping")
+        raise TypeError("run runtime overrides must be a runtime name or mapping")
     normalized: NormalizedRunRuntimeOverrides = {}
     for alias, runtime_name in runtimes.items():
         if not isinstance(alias, str) or not alias:

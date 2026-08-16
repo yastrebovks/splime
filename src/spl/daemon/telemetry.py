@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from itertools import islice
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -33,6 +33,8 @@ TELEMETRY_SENSITIVE_VALUE_LIMIT = 256
 TELEMETRY_NODE_DETAIL_LIMIT = 100
 TELEMETRY_METADATA_TEXT_MAX_WIRE_BYTES = 200
 TELEMETRY_METADATA_STREAM_SIZE_MAX_BYTES = TELEMETRY_STREAM_MAX_BYTES
+EXECUTION_TELEMETRY_SCHEMA_VERSION = 1
+EXECUTION_TELEMETRY_MAX_BYTES = 64 * 1024
 
 # These are the daemon/server sync contract limits. Keep every producer on this
 # one definition so queue admission and batching cannot drift apart.
@@ -199,6 +201,116 @@ class TelemetryPolicy:
         _fit_payload(payload)
         _synchronize_availability(payload)
         return payload
+
+    def build_execution_telemetry_envelope(
+        self,
+        state: dict[str, Any],
+        *,
+        observed_at: str | None = None,
+        artifact_count: int | None = None,
+        artifact_count_truncated: bool = False,
+        preflight_omissions: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Build bounded execution evidence without functional payload bodies.
+
+        Remote result and artifact delivery is an independent run-update
+        contract.  This projection therefore reuses the local telemetry
+        policy's redaction and bounds, but never includes raw inputs, results,
+        streams, or artifact bodies.
+        """
+
+        safe_state = dict(state)
+        safe_state.setdefault("id", "remote-execution")
+        local_projection = self.build_local_run_payload(
+            safe_state,
+            {
+                "display_name": "remote-execution",
+                "local_name": "remote-execution",
+            },
+            artifact_count=artifact_count,
+            artifact_count_truncated=artifact_count_truncated,
+            preflight_omissions=preflight_omissions,
+        )
+        telemetry = local_projection["telemetry"]
+        omissions = list(telemetry.get("omissions") or ())
+        error = telemetry.get("error")
+        error_details_available = False
+        projected_error = dict(error) if isinstance(error, dict) else None
+        projected_message = local_projection.get("error")
+        if self.level in {"diagnostic", "full"} and isinstance(projected_message, str) and projected_message:
+            bounded_message, message_truncated = _bounded_utf8(
+                projected_message,
+                TELEMETRY_ERROR_MAX_BYTES,
+            )
+            if message_truncated:
+                _add_omission(omissions, "error_text_limit")
+            if projected_error is None:
+                projected_error = {
+                    "type": _error_type(projected_message) or "Error",
+                    "message": bounded_message,
+                }
+            else:
+                projected_error["message"] = bounded_message
+            error_details_available = True
+
+        normalized_observed_at = _execution_observed_at(observed_at)
+        bounded_omissions = list(
+            dict.fromkeys(
+                bounded
+                for reason in omissions
+                if (
+                    bounded := _bounded_metadata_text(
+                        reason,
+                        omissions=None,
+                    )
+                )
+                is not None
+            )
+        )
+        envelope = {
+            "schema_version": EXECUTION_TELEMETRY_SCHEMA_VERSION,
+            "level": self.level,
+            "observed_at": normalized_observed_at,
+            "redaction": TELEMETRY_REDACTION_MODE,
+            "functional_delivery": "independent",
+            "source_result_present": bool(local_projection["source_result_present"]),
+            "availability": {
+                "input": False,
+                "result": False,
+                "streams": False,
+                "artifact_bodies": False,
+                "error_details": error_details_available,
+            },
+            "summary": telemetry["summary"],
+            "nodes": [
+                {
+                    field: _nonempty_optional_execution_text(node.get(field))
+                    for field in (
+                        "id",
+                        "alias",
+                        "name",
+                        "kind",
+                        "status",
+                        "fingerprint_sha256",
+                    )
+                }
+                for node in telemetry["nodes"]
+                if isinstance(node, dict)
+            ],
+            "hashes": {
+                field: _nonempty_optional_execution_text(
+                    telemetry["hashes"].get(field),
+                )
+                for field in (
+                    "pipeline_content_hash",
+                    "runtime_build_hash",
+                )
+            },
+            "error": projected_error,
+            "omissions": bounded_omissions,
+        }
+        _fit_execution_telemetry_envelope(envelope)
+        return envelope
 
 
 def normalize_telemetry_level(value: str) -> TelemetryLevel:
@@ -675,6 +787,70 @@ def _payload_fits(payload: dict[str, Any]) -> bool:
         return m_json_contract.compact_json_fits(payload, SYNC_EVENT_PAYLOAD_BUDGET)
     except (RecursionError, ValueError):
         return False
+
+
+def _execution_observed_at(value: str | None) -> str:
+    observed_at = value or datetime.now(UTC).isoformat()
+    if not isinstance(observed_at, str) or len(observed_at) > 128:
+        raise ValueError("execution telemetry observed_at must be a bounded timestamp")
+    try:
+        parsed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("execution telemetry observed_at must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("execution telemetry observed_at must include a timezone")
+    return parsed.astimezone(UTC).isoformat()
+
+
+def _nonempty_optional_execution_text(value: Any) -> str | None:
+    """Match the server's optional-text contract without inventing evidence."""
+
+    return value if isinstance(value, str) and bool(value) else None
+
+
+def _execution_telemetry_fits(envelope: dict[str, Any]) -> bool:
+    try:
+        return m_json_contract.compact_json_fits(
+            envelope,
+            EXECUTION_TELEMETRY_MAX_BYTES,
+        )
+    except (RecursionError, ValueError):
+        return False
+
+
+def _fit_execution_telemetry_envelope(envelope: dict[str, Any]) -> None:
+    """Keep optional execution evidence inside its independent wire budget."""
+
+    if _execution_telemetry_fits(envelope):
+        return
+    omissions = envelope["omissions"]
+    nodes = envelope["nodes"]
+    if isinstance(nodes, list) and nodes:
+        _add_omission(omissions, "execution_telemetry_node_limit")
+        while nodes and not _execution_telemetry_fits(envelope):
+            nodes.pop()
+        summary = envelope["summary"]
+        summary["node_detail_count"] = len(nodes)
+        summary["node_detail_count_truncated"] = True
+        if _execution_telemetry_fits(envelope):
+            return
+
+    error = envelope.get("error")
+    availability = envelope["availability"]
+    if isinstance(error, dict) and availability.get("error_details") is True:
+        error["message"] = "[details omitted to fit execution telemetry]"
+        availability["error_details"] = False
+        _add_omission(omissions, "execution_telemetry_error_limit")
+        if _execution_telemetry_fits(envelope):
+            return
+
+    if isinstance(nodes, list) and nodes:
+        nodes.clear()
+        envelope["summary"]["node_detail_count"] = 0
+        envelope["summary"]["node_detail_count_truncated"] = True
+        _add_omission(omissions, "execution_telemetry_node_limit")
+    if not _execution_telemetry_fits(envelope):
+        raise ValueError("execution telemetry exceeds its independent wire budget")
 
 
 def _bounded_metadata_text(

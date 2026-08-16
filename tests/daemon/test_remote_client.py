@@ -69,6 +69,26 @@ def test_server_client_uses_user_bearer_for_library_admin_calls() -> None:
     }
 
 
+def test_server_client_polls_cross_machine_run_with_user_auth(monkeypatch) -> None:
+    client = ServerClient(
+        "https://splime.io/api/",
+        "machine-token",
+        user_token="user-token",
+    )
+    calls = []
+
+    def fake_json_request(method, path, payload=None, *, auth="machine"):
+        calls.append((method, path, payload, auth))
+        return {"id": "run-cross-machine", "status": "queued"}
+
+    monkeypatch.setattr(client, "_json_request", fake_json_request)
+
+    assert client.get_remote_run("run-cross-machine")["status"] == "queued"
+    assert calls == [
+        ("GET", "/remote-runs/run-cross-machine", None, "user"),
+    ]
+
+
 def test_server_client_surfaces_actionable_redirect_error(monkeypatch) -> None:
     def refuse_redirect(request: Any, **kwargs: Any) -> None:
         del kwargs

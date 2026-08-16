@@ -58,6 +58,15 @@ spl.core.json\_contract module
    :show-inheritance:
    :undoc-members:
 
+spl.core.library\_adapters module
+---------------------------------
+
+.. automodule:: spl.core.library_adapters
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.core.manifest module
 ------------------------
 
@@ -89,6 +98,33 @@ spl.core.resume module
 ----------------------
 
 .. automodule:: spl.core.resume
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.core.runtime\_port\_adapters module
+---------------------------------------
+
+.. automodule:: spl.core.runtime_port_adapters
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.core.source\_analysis module
+--------------------------------
+
+.. automodule:: spl.core.source_analysis
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.core.source\_preparation module
+-----------------------------------
+
+.. automodule:: spl.core.source_preparation
    :members:
    :private-members:
    :show-inheritance:

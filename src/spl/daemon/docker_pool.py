@@ -15,7 +15,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Protocol
+from typing import TYPE_CHECKING, Any, Iterator, Protocol
 from urllib.parse import urlparse, urlunparse
 from uuid import uuid4
 
@@ -24,6 +24,9 @@ from spl.core import json_contract as m_json_contract
 from spl.daemon.callback_capability import CALLBACK_CAPABILITY_ENV
 from spl.daemon.runtime_dependencies import DockerEnvironmentBuilderProtocol
 from spl.daemon.store import RegistryStore, utc_now, validate_name
+
+if TYPE_CHECKING:
+    from spl.daemon.lifecycle import LifecycleController, LifecycleWorkLease
 
 OBJECT_DOCKER_RUNTIME_ENV = "SPL_OBJECT_RUNTIME_BACKEND"
 OBJECT_DOCKER_RUNTIME_VALUE = "docker"
@@ -291,6 +294,7 @@ class DockerPool:
         self._starting: set[str] = set()
         self._next_container_generation = 1
         self._closed = False
+        self._lifecycle: LifecycleController | None = None
         if self.enabled and stable_identity is None:
             raise ValueError(
                 "docker pooling requires a daemon instance identity; start the daemon with its home lock enabled"
@@ -320,6 +324,11 @@ class DockerPool:
     @property
     def should_prewarm(self) -> bool:
         return self.enabled and self.prewarm and self.pool_size > 0
+
+    def bind_lifecycle(self, lifecycle: LifecycleController) -> None:
+        """Bind asynchronous prewarm work to daemon lifecycle admission."""
+
+        self._lifecycle = lifecycle
 
     def worker_identity_env(self, run_id: str) -> dict[str, str]:
         """Return nonsecret identity fields propagated to one run worker."""
@@ -399,7 +408,7 @@ class DockerPool:
         pythonpath_entries = []
         for index, (_, source_root) in enumerate(source_roots):
             container_path = f"/opt/splime/src{index}"
-            mounts.extend(["-v", f"{source_root}:{container_path}:ro"])
+            mounts.extend(["-v", f"{source_root / 'spl'}:{container_path}/spl:ro"])
             pythonpath_entries.append(container_path)
 
         network_args, daemon_url = self.network_args(
@@ -497,7 +506,20 @@ class DockerPool:
         return self.enabled and self.pool_size > 0 and run_dir.resolve() == workdir.resolve()
 
     def prewarm_object(self, object_record: dict[str, Any]) -> None:
+        lease: LifecycleWorkLease | None = None
+        if self._lifecycle is not None:
+            # Reserve synchronously, before creating the thread.  A prewarm
+            # admitted under an existing Run/registration lineage may finish
+            # during drain; a new root prewarm after the boundary is rejected.
+            lease = self._lifecycle.reserve_current_or_root(
+                "environment_build",
+                queued=True,
+            )
+
         def prewarm() -> None:
+            if lease is not None:
+                lease.activate()
+                lease.attach_current_thread()
             try:
                 environment_record = self.environment_manager.ensure_ready(
                     object_record,
@@ -511,13 +533,22 @@ class DockerPool:
                 self.release_container(record)
             except Exception:
                 return
+            finally:
+                if lease is not None:
+                    lease.detach_current_thread()
+                    lease.complete(seal_lineage=lease.root)
 
         thread = threading.Thread(
             target=prewarm,
             name=f"spl-docker-prewarm-{object_record['version_id']}",
             daemon=True,
         )
-        thread.start()
+        try:
+            thread.start()
+        except Exception:
+            if lease is not None:
+                lease.complete(seal_lineage=lease.root)
+            raise
 
     def ensure_container(
         self,
@@ -688,7 +719,7 @@ class DockerPool:
         pythonpath_entries = []
         for index, (_, source_root) in enumerate(source_roots):
             container_path = f"/opt/splime/src{index}"
-            mounts.extend(["-v", f"{source_root}:{container_path}:ro"])
+            mounts.extend(["-v", f"{source_root / 'spl'}:{container_path}/spl:ro"])
             pythonpath_entries.append(container_path)
 
         network_args, _ = self.network_args(object_record, runtime_config)

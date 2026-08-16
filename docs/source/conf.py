@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.abspath("../../src"))
 project = "splime"
 copyright = "2026, Yastrebov Kirill"
 author = "Yastrebov Kirill"
-release = "0.4.6"
+release = "0.4.7"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -71,19 +71,24 @@ apidoc_modules = [
 # the fix has to live here, not in the generated reST.  Policy: NodeRemote is
 # documented on its defining page (spl.core.entities.node_remote) and on the
 # primary ``spl`` facade page; the secondary ``spl.core`` re-export skips it.
+# ``DDistribution`` has the same three-way shape now that ``spl.adapters`` is
+# a stable public adapter-authoring surface.  Keep its established ``spl``
+# facade and defining page, and suppress only the adapters-module alias.
 # Deliberately member-targeted: a generic "skip all secondary re-exports"
 # rule would silently drop e.g. ``Client`` from the spl.daemon page, where no
 # duplicate exists (single alias + real never warns).
 
 
 def _skip_duplicate_node_remote_reexport(app, what, name, obj, skip, options):
-    if skip or what != "module" or name != "NodeRemote":
+    if skip or what != "module":
         return None
     # Sphinx 9 (current autodoc) tracks the module being documented on
     # env.current_document; the legacy class-based autodoc used temp_data.
     current_document = getattr(app.env, "current_document", None)
     modname = getattr(current_document, "autodoc_module", "") or app.env.temp_data.get("autodoc:module", "")
-    if modname == "spl.core":
+    if name == "NodeRemote" and modname == "spl.core":
+        return True  # skip: keep the spl facade + canonical page only
+    if name == "DDistribution" and modname == "spl.adapters":
         return True  # skip: keep the spl facade + canonical page only
     return None
 

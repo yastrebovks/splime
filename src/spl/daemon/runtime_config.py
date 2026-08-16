@@ -12,6 +12,7 @@ DEFAULT_RUNTIME_MODE = "venv"
 DEFAULT_DOCKER_PYTHON = "3.13"
 DEFAULT_DOCKER_DISTRO = "trixie"
 SUPPORTED_RUNTIME_MODES = {"venv", "docker"}
+SUPPORTED_NODE_RUNTIME_MODES = {"native", "venv-subprocess", "docker"}
 SUPPORTED_DOCKER_NETWORK_MODES = {"auto", "none", "enabled"}
 DEFAULT_DOCKER_PIDS_LIMIT = 256
 DEFAULT_DOCKER_TMPFS_SIZE = "512m"
@@ -69,6 +70,54 @@ def normalize_runtime_config(value: dict[str, Any] | None) -> dict[str, Any]:
         docker_config["pull"] = bool(raw["pull"])
     _copy_node_runtime_fields(docker_config, raw)
     return docker_config
+
+
+def runtime_config_for_run(
+    object_kind: str,
+    value: dict[str, Any] | None,
+    runtimes: str | Mapping[str, str] | None,
+) -> dict[str, Any]:
+    """Return the effective, run-scoped Object runtime configuration.
+
+    Per-node mappings retain the existing Pipeline contract.  A string is a
+    whole-object shorthand: for a Function it selects the Object backend;
+    for a Pipeline it selects every local Function-node backend.  Pipeline
+    Docker fan-out needs a venv conductor so Docker is never nested inside an
+    Object-level Docker worker.
+    """
+
+    config = normalize_runtime_config(value)
+    if object_kind == "function":
+        if isinstance(runtimes, Mapping) and runtimes:
+            raise ValueError(
+                "Function runtimes must be a single runtime name; per-node mappings are supported only for Pipelines"
+            )
+        if not isinstance(runtimes, str):
+            return config
+        if runtimes not in SUPPORTED_RUNTIME_MODES:
+            raise ValueError("Function runtime must be 'venv' or 'docker'")
+        if runtimes == config["mode"]:
+            return config
+        if runtimes == "venv":
+            return _venv_conductor_config(config)
+        docker_options: dict[str, Any] = dict(config["docker"]) if isinstance(config.get("docker"), dict) else {}
+        return normalize_runtime_config({"mode": "docker", **docker_options})
+
+    if object_kind == "pipeline":
+        if isinstance(runtimes, str) and runtimes not in SUPPORTED_NODE_RUNTIME_MODES:
+            raise ValueError("Pipeline runtime must be 'native', 'venv-subprocess', or 'docker'")
+        selects_docker_node = runtimes == "docker" or (isinstance(runtimes, Mapping) and "docker" in runtimes.values())
+        if selects_docker_node and config["mode"] == "docker":
+            return _venv_conductor_config(config)
+    return config
+
+
+def _venv_conductor_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    raw: dict[str, Any] = {"mode": "venv"}
+    for key in ("node_runtime", "node_timeout_seconds", "docker"):
+        if key in config:
+            raw[key] = config[key]
+    return normalize_runtime_config(raw)
 
 
 def normalize_docker_runtime_options(value: Mapping[str, Any] | None) -> dict[str, Any]:

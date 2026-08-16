@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
+import stat
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -21,6 +23,18 @@ from urllib.request import Request
 
 from spl._http import DEFAULT_HTTP_TIMEOUT_SECONDS, urlopen_verified
 from spl.core import json_contract as m_json_contract
+from spl.core.runtime_port_adapters import (
+    RUNTIME_ADAPTER_SEMANTIC_OVERRIDE_CAPABILITY,
+    RUNTIME_ADAPTER_SEMANTIC_OVERRIDE_CAPABILITY_VERSION,
+    RUNTIME_PORT_ADAPTERS_CAPABILITY,
+    RUNTIME_PORT_ADAPTERS_CAPABILITY_VERSION,
+)
+from spl.core.library_adapters import (
+    LIBRARY_ADAPTER_CAPABILITY_VERSION,
+    LIBRARY_ADAPTER_CATALOG_CAPABILITY,
+    LIBRARY_ADAPTER_PUBLISH_CAPABILITY,
+    RUNTIME_LIBRARY_ADAPTER_REF_CAPABILITY,
+)
 
 DEFAULT_DAEMON_HOST = "127.0.0.1"
 DEFAULT_DAEMON_PORT = 8765
@@ -37,6 +51,84 @@ LIBRARY_DELETE_UNSUPPORTED_MESSAGE = (
 
 OfflinePolicy = Literal["queue", "wait", "fail_fast"]
 RunSource = Literal["auto", "local"]
+
+_SAFE_ARTIFACT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
+
+
+def _safe_artifact_download_name(value: Any) -> str:
+    if not isinstance(value, str) or not _SAFE_ARTIFACT_NAME.fullmatch(value) or value in {".", ".."}:
+        raise ValueError("artifact download name must be one safe filename")
+    return value
+
+
+def _safe_write_download(target_path: Path, data: bytes) -> Path:
+    """Atomically write bytes through an anchored no-follow directory handle."""
+
+    absolute_target = target_path.absolute()
+    parent = absolute_target.parent
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(parent.anchor, directory_flags)
+    try:
+        for component in parent.parts[1:]:
+            try:
+                child_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+                except FileExistsError:
+                    pass
+                try:
+                    child_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+                except OSError:
+                    raise ValueError("download destination must not traverse a symbolic link") from None
+            except OSError:
+                raise ValueError("download destination must not traverse a symbolic link") from None
+            try:
+                if not stat.S_ISDIR(os.fstat(child_fd).st_mode):
+                    raise ValueError("download destination parent must be a regular directory")
+            except BaseException:
+                os.close(child_fd)
+                raise
+            os.close(directory_fd)
+            directory_fd = child_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+    temporary_name = f".{absolute_target.name}.{secrets.token_hex(8)}.tmp"
+    descriptor: int | None = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.close(descriptor)
+        descriptor = None
+        try:
+            existing = os.stat(absolute_target.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and not stat.S_ISREG(existing.st_mode):
+            raise ValueError("download destination must be a regular file or absent")
+        os.replace(
+            temporary_name,
+            absolute_target.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
+    return target_path
 
 
 def default_daemon_home() -> Path:
@@ -742,6 +834,93 @@ class Client:
 
         return _as_json_dict(self._json_request("GET", "/health"))
 
+    def require_runtime_port_adapters_capability(self) -> dict[str, Any]:
+        """Prove additive runtime-adapter support before a Run mutation."""
+
+        message = (
+            "local SPL daemon does not support runtime port adapters; "
+            "upgrade and restart the daemon before using adapters or FileInput"
+        )
+        try:
+            document = self._json_request("GET", "/meta/capabilities")
+        except ClientError as exc:
+            if str(exc).startswith("404:"):
+                raise ClientError(message) from None
+            raise
+        if not isinstance(document, Mapping):
+            raise ClientError(message)
+        capabilities = document.get("capabilities")
+        capability = capabilities.get(RUNTIME_PORT_ADAPTERS_CAPABILITY) if isinstance(capabilities, Mapping) else None
+        if (
+            not isinstance(capability, Mapping)
+            or set(capability) != {"state", "version", "reason"}
+            or capability.get("state") != "supported"
+            or capability.get("version") != RUNTIME_PORT_ADAPTERS_CAPABILITY_VERSION
+            or capability.get("reason") is not None
+        ):
+            raise ClientError(message)
+        return dict(capability)
+
+    def require_runtime_adapter_semantic_override_capability(self) -> dict[str, Any]:
+        """Prove semantic-advisory support before sending its additive sibling."""
+
+        message = (
+            "local SPL daemon does not support explicit runtime adapter semantic advisories; "
+            "upgrade and restart the daemon before selecting this adapter"
+        )
+        try:
+            document = self._json_request("GET", "/meta/capabilities")
+        except ClientError as exc:
+            if str(exc).startswith("404:"):
+                raise ClientError(message) from None
+            raise
+        capabilities = document.get("capabilities") if isinstance(document, Mapping) else None
+        capability = (
+            capabilities.get(RUNTIME_ADAPTER_SEMANTIC_OVERRIDE_CAPABILITY)
+            if isinstance(capabilities, Mapping)
+            else None
+        )
+        if (
+            not isinstance(capability, Mapping)
+            or set(capability) != {"state", "version", "reason"}
+            or capability.get("state") != "supported"
+            or capability.get("version") != RUNTIME_ADAPTER_SEMANTIC_OVERRIDE_CAPABILITY_VERSION
+            or capability.get("reason") is not None
+        ):
+            raise ClientError(message)
+        return dict(capability)
+
+    def require_library_adapter_capability(self, capability_id: str) -> dict[str, Any]:
+        """Prove one additive Library Adapter capability before using it."""
+
+        if capability_id not in {
+            LIBRARY_ADAPTER_CATALOG_CAPABILITY,
+            LIBRARY_ADAPTER_PUBLISH_CAPABILITY,
+            RUNTIME_LIBRARY_ADAPTER_REF_CAPABILITY,
+        }:
+            raise ValueError("library adapter capability is not recognized")
+        message = (
+            "local SPL daemon does not support Library Adapters; "
+            "upgrade and restart the daemon before using this feature"
+        )
+        try:
+            document = self._json_request("GET", "/meta/capabilities")
+        except ClientError as exc:
+            if str(exc).startswith("404:"):
+                raise ClientError(message) from None
+            raise
+        capabilities = document.get("capabilities") if isinstance(document, Mapping) else None
+        capability = capabilities.get(capability_id) if isinstance(capabilities, Mapping) else None
+        if (
+            not isinstance(capability, Mapping)
+            or set(capability) != {"state", "version", "reason"}
+            or capability.get("state") != "supported"
+            or capability.get("version") != LIBRARY_ADAPTER_CAPABILITY_VERSION
+            or capability.get("reason") is not None
+        ):
+            raise ClientError(message)
+        return dict(capability)
+
     def connect_server(
         self,
         *,
@@ -1312,6 +1491,144 @@ class Client:
             query_parts.append("view=summary")
         return _as_object_listing(self._json_request("GET", f"/objects?{'&'.join(query_parts)}"))
 
+    def list_library_adapters(
+        self,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+        query: str | None = None,
+        direction: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Return one bounded page from the code-free Adapter catalog."""
+
+        self.require_library_adapter_capability(LIBRARY_ADAPTER_CATALOG_CAPABILITY)
+        params: dict[str, str] = {"limit": str(limit)}
+        if owner_id is not None:
+            params["owner_id"] = owner_id
+        if library is not None:
+            params["library"] = library
+        if query is not None:
+            params["q"] = query
+        if direction is not None:
+            params["direction"] = direction
+        if cursor is not None:
+            params["cursor"] = cursor
+        return _as_json_dict(self._json_request("GET", f"/library-adapters?{urlencode(params)}"))
+
+    def get_library_adapter(
+        self,
+        adapter_id: str,
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        self.require_library_adapter_capability(LIBRARY_ADAPTER_CATALOG_CAPABILITY)
+        params = {key: value for key, value in (("owner_id", owner_id), ("library", library)) if value is not None}
+        suffix = f"?{urlencode(params)}" if params else ""
+        return _as_json_dict(
+            self._json_request(
+                "GET",
+                f"/library-adapters/{quote(adapter_id)}{suffix}",
+            )
+        )
+
+    def library_adapter_versions(
+        self,
+        adapter_id: str,
+        *,
+        limit: int = 100,
+        cursor: str | None = None,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        self.require_library_adapter_capability(LIBRARY_ADAPTER_CATALOG_CAPABILITY)
+        params = {"limit": str(limit)}
+        if cursor is not None:
+            params["cursor"] = cursor
+        if owner_id is not None:
+            params["owner_id"] = owner_id
+        if library is not None:
+            params["library"] = library
+        return _as_json_dict(
+            self._json_request(
+                "GET",
+                f"/library-adapters/{quote(adapter_id)}/versions?{urlencode(params)}",
+            )
+        )
+
+    def get_library_adapter_version(
+        self,
+        adapter_id: str,
+        adapter_version_id: str,
+        *,
+        include_source: bool = False,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        self.require_library_adapter_capability(
+            LIBRARY_ADAPTER_PUBLISH_CAPABILITY if include_source else LIBRARY_ADAPTER_CATALOG_CAPABILITY
+        )
+        source_suffix = "/source" if include_source else ""
+        params = {key: value for key, value in (("owner_id", owner_id), ("library", library)) if value is not None}
+        query_suffix = f"?{urlencode(params)}" if params else ""
+        return _as_json_dict(
+            self._json_request(
+                "GET",
+                "/library-adapters/{}/versions/{}{}".format(
+                    quote(adapter_id),
+                    quote(adapter_version_id),
+                    source_suffix,
+                )
+                + query_suffix,
+            )
+        )
+
+    def preflight_library_adapter(
+        self,
+        publication: Mapping[str, Any],
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        self.require_library_adapter_capability(LIBRARY_ADAPTER_PUBLISH_CAPABILITY)
+        params: dict[str, str] = {}
+        if owner_id is not None:
+            params["owner_id"] = owner_id
+        if library is not None:
+            params["library"] = library
+        suffix = f"?{urlencode(params)}" if params else ""
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/library-adapters/preflight{suffix}",
+                dict(publication),
+            )
+        )
+
+    def publish_library_adapter(
+        self,
+        publication: Mapping[str, Any],
+        *,
+        owner_id: str | None = None,
+        library: str | None = None,
+        local_only: bool = False,
+    ) -> dict[str, Any]:
+        self.require_library_adapter_capability(LIBRARY_ADAPTER_PUBLISH_CAPABILITY)
+        params: dict[str, str] = {"local_only": "true" if local_only else "false"}
+        if owner_id is not None:
+            params["owner_id"] = owner_id
+        if library is not None:
+            params["library"] = library
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/library-adapters?{urlencode(params)}",
+                dict(publication),
+            )
+        )
+
     def search_objects(self, query: str) -> list[dict[str, Any]]:
         """Search registered objects by name, description, and metadata."""
 
@@ -1347,6 +1664,7 @@ class Client:
         name_or_id: str,
         *,
         version: int | None = None,
+        version_id: str | None = None,
         owner_id: str | None = None,
         library: str | None = None,
         function: str | None = None,
@@ -1363,6 +1681,8 @@ class Client:
         query = []
         if version is not None:
             query.append(f"version={version}")
+        if version_id is not None:
+            query.append(f"version_id={quote(version_id)}")
         if function is not None:
             query.append(f"function={quote(function)}")
         if owner_id is not None:
@@ -1374,6 +1694,10 @@ class Client:
         try:
             return _as_json_dict(self._json_request("GET", path))
         except ClientError as local_error:
+            if version_id is not None:
+                # Exact version signatures must never be silently projected
+                # from a different remote/current version.
+                raise
             if library is not None:
                 raise
             if owner_id is None and library is None:
@@ -1580,7 +1904,11 @@ class Client:
         source: RunSource = "auto",
         remote: bool | None = None,
         keep: bool | str | None = None,
-        runtimes: dict[str, str] | None = None,
+        runtimes: str | dict[str, str] | None = None,
+        runtime_port_adapters: dict[str, Any] | None = None,
+        runtime_library_adapter_refs: dict[str, Any] | None = None,
+        runtime_adapter_semantic_advisories: dict[str, Any] | None = None,
+        adapter_policy: dict[str, Any] | None = None,
         wait: bool = False,
     ) -> dict[str, Any]:
         """Start a daemon run and return its initial state."""
@@ -1616,6 +1944,14 @@ class Client:
             payload["keep"] = keep
         if runtimes is not None:
             payload["runtimes"] = runtimes
+        if runtime_port_adapters is not None:
+            payload["runtime_port_adapters"] = runtime_port_adapters
+        if runtime_library_adapter_refs is not None:
+            payload["runtime_library_adapter_refs"] = runtime_library_adapter_refs
+        if runtime_adapter_semantic_advisories is not None:
+            payload["runtime_adapter_semantic_advisories"] = runtime_adapter_semantic_advisories
+        if adapter_policy is not None:
+            payload["adapter_policy"] = adapter_policy
         if wait:
             payload["wait"] = True
         # Some compatibility daemon routes may honor wait=True by holding the
@@ -1644,13 +1980,12 @@ class Client:
     ) -> Path:
         """Download one server-side artifact through the local daemon."""
 
+        artifact_name = _safe_artifact_download_name(artifact_name)
         target_path = Path(target)
         if target_path.is_dir():
             target_path = target_path / artifact_name
-        target_path.parent.mkdir(parents=True, exist_ok=True)
         data = self._bytes_request(f"/remote-runs/{quote(run_id)}/artifacts/{quote(artifact_name)}")
-        target_path.write_bytes(data)
-        return target_path
+        return _safe_write_download(target_path, data)
 
     def wait_remote_run(
         self,
@@ -1668,7 +2003,23 @@ class Client:
 
         started = time.monotonic()
         while True:
-            state = self.get_remote_run(run_id)
+            try:
+                state = self.get_remote_run(run_id)
+            except ClientError as exc:
+                # The Run has already been admitted. A transient failure while
+                # reading its state must not turn into a second POST/replay at
+                # the SDK layer. Keep polling the same immutable Run id within
+                # the caller's existing overall timeout.
+                if exc.status_code not in {502, 503, 504}:
+                    raise
+                elapsed = time.monotonic() - started
+                if timeout_seconds is not None and elapsed > timeout_seconds:
+                    raise TimeoutError(f"remote run did not finish within {timeout_seconds} seconds") from exc
+                delay = poll_interval
+                if timeout_seconds is not None:
+                    delay = min(delay, max(0.0, timeout_seconds - elapsed))
+                time.sleep(delay)
+                continue
             if on_state is not None:
                 on_state(state)
             if state["status"] in {"succeeded", "failed", "cancelled", "stale"}:
@@ -1691,7 +2042,7 @@ class Client:
         output: str | None = None,
         timeout_seconds: float | None = None,
         adapters: dict[str, Any] | None = None,
-        runtimes: dict[str, str] | None = None,
+        runtimes: str | dict[str, str] | None = None,
         keep: bool | str | None = None,
         wait: bool = False,
     ) -> dict[str, Any]:
@@ -1812,10 +2163,9 @@ class Client:
     ) -> Path:
         """Download one artifact file into ``target`` and return its path."""
 
+        artifact_name = _safe_artifact_download_name(artifact_name)
         target_path = Path(target)
         if target_path.is_dir():
             target_path = target_path / artifact_name
-        target_path.parent.mkdir(parents=True, exist_ok=True)
         data = self._bytes_request(f"/runs/{quote(run_id)}/artifacts/{quote(artifact_name)}")
-        target_path.write_bytes(data)
-        return target_path
+        return _safe_write_download(target_path, data)

@@ -23,10 +23,37 @@ spl.daemon.\_\_main\_\_ module
    :show-inheritance:
    :undoc-members:
 
+spl.daemon.ai\_assistant module
+-------------------------------
+
+.. automodule:: spl.daemon.ai_assistant
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.ai\_preview module
+-----------------------------
+
+.. automodule:: spl.daemon.ai_preview
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.daemon.artifact\_access module
 ----------------------------------
 
 .. automodule:: spl.daemon.artifact_access
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.browser\_adapter\_run module
+---------------------------------------
+
+.. automodule:: spl.daemon.browser_adapter_run
    :members:
    :private-members:
    :show-inheritance:
@@ -63,6 +90,15 @@ spl.daemon.client module
 ------------------------
 
 .. automodule:: spl.daemon.client
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.connected\_ide module
+--------------------------------
+
+.. automodule:: spl.daemon.connected_ide
    :members:
    :private-members:
    :show-inheritance:
@@ -113,6 +149,15 @@ spl.daemon.environment\_base module
    :show-inheritance:
    :undoc-members:
 
+spl.daemon.guarded\_local\_run module
+-------------------------------------
+
+.. automodule:: spl.daemon.guarded_local_run
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.daemon.heartbeat\_service module
 ------------------------------------
 
@@ -131,6 +176,15 @@ spl.daemon.home\_lock module
    :show-inheritance:
    :undoc-members:
 
+spl.daemon.ide\_metadata module
+-------------------------------
+
+.. automodule:: spl.daemon.ide_metadata
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.daemon.interpreter\_visibility module
 -----------------------------------------
 
@@ -140,10 +194,46 @@ spl.daemon.interpreter\_visibility module
    :show-inheritance:
    :undoc-members:
 
+spl.daemon.library\_adapters module
+-----------------------------------
+
+.. automodule:: spl.daemon.library_adapters
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.lifecycle module
+---------------------------
+
+.. automodule:: spl.daemon.lifecycle
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.lifecycle\_startup module
+------------------------------------
+
+.. automodule:: spl.daemon.lifecycle_startup
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.daemon.metadata module
 --------------------------
 
 .. automodule:: spl.daemon.metadata
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.prepared\_validation module
+--------------------------------------
+
+.. automodule:: spl.daemon.prepared_validation
    :members:
    :private-members:
    :show-inheritance:
@@ -176,6 +266,15 @@ spl.daemon.run\_progress module
    :show-inheritance:
    :undoc-members:
 
+spl.daemon.runtime\_adapter\_registry module
+--------------------------------------------
+
+.. automodule:: spl.daemon.runtime_adapter_registry
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.daemon.runtime\_backend module
 ----------------------------------
 
@@ -198,6 +297,24 @@ spl.daemon.runtime\_dependencies module
 ---------------------------------------
 
 .. automodule:: spl.daemon.runtime_dependencies
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.runtime\_library\_adapters module
+--------------------------------------------
+
+.. automodule:: spl.daemon.runtime_library_adapters
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.runtime\_port\_adapters module
+-----------------------------------------
+
+.. automodule:: spl.daemon.runtime_port_adapters
    :members:
    :private-members:
    :show-inheritance:

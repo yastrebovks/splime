@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "source": {
+    "workspace": "development/spl",
+    "branch": "master",
+    "head": "17104360a996ce71800117604f38a8ff429f0c26",
+    "status_entries": 152,
+    "status_sha256": "3319ddf8d2aa0028ee87d181aea93bb966076d26d36bbce674e2ba9db4db90aa",
+    "manifest_paths": 323,
+    "manifest_sha256": "147d5d05ea294befe366d9ff57bbc9c26b473a83f4bb20d5ed2c4a4361646139",
+    "content_manifest_sha256": "a60490104cb923dcd3049c0a83e87f3f42524d509a3c70bf091b9dd7d0ade67b"
+  },
+  "target": {
+    "workspace": "Release/spl",
+    "branch": "main",
+    "base_head": "14430da141e8d089fbdd543c9aa4410377903963",
+    "copied_paths": 322
+  },
+  "exclusions": {
+    "ignored_runtime_and_build_state": true,
+    "active_path_preserved_from_public_repository": ".github/workflows/publish-to-pypi.yml",
+    "reason": "retain the newer signed-tag package-only trusted-publishing workflow"
+  },
+  "archived_development_controls": [
+    {
+      "source_path": ".github/workflows/publish-to-pypi.yml",
+      "archive_path": "release/0.4.7/archived-development-release-controls/.github/workflows/publish-to-pypi.yml",
+      "sha256": "dca54aad90eac859ab62585616dd748a32e7a90c7446afe326c585b4a190a9e7"
+    },
+    {
+      "source_path": "tests/core/test_release_workflows.py",
+      "archive_path": "release/0.4.7/archived-development-release-controls/tests/core/test_release_workflows.py",
+      "sha256": "823331f33c3f4b70691d7a3478ea3d796f68527ac030e0dc47c07a165a4392b2"
+    }
+  ],
+  "release_normalization": {
+    "version": "0.4.7",
+    "server_schema_target": 43,
+    "target_only_release_signing_key_preserved": true,
+    "source_worktree_mutated": false
+  }
+}

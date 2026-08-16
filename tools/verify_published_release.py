@@ -13,7 +13,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-USER_AGENT = "splime-release-verifier/0.4.6"
+USER_AGENT = "splime-release-verifier/0.4.7"
 
 
 def main() -> int:

@@ -338,6 +338,85 @@ class ServerClientProtocol(Protocol):
         """Remove an object from a library."""
         ...
 
+    def preflight_library_adapter(
+        self,
+        owner: str,
+        library: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Validate one source-bearing Adapter publication without mutation."""
+        ...
+
+    def publish_library_adapter(
+        self,
+        owner: str,
+        library: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Publish one exact Adapter version without transport replay."""
+        ...
+
+    def list_library_adapters(
+        self,
+        *,
+        owner: str | None = None,
+        library: str | None = None,
+        query: str | None = None,
+        direction: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+        target_machine_id: str | None = None,
+        execution_target: str | None = None,
+    ) -> dict[str, Any]:
+        """Return one bounded source-free Adapter catalog page."""
+        ...
+
+    def get_library_adapter(
+        self,
+        owner: str,
+        library: str,
+        name_or_id: str,
+        *,
+        target_machine_id: str | None = None,
+        execution_target: str | None = None,
+    ) -> dict[str, Any]:
+        """Return one source-free Adapter detail."""
+        ...
+
+    def list_library_adapter_versions(
+        self,
+        owner: str,
+        library: str,
+        name_or_id: str,
+        *,
+        limit: int = 100,
+        target_machine_id: str | None = None,
+        execution_target: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return immutable Adapter version history."""
+        ...
+
+    def get_library_adapter_version(
+        self,
+        owner: str,
+        library: str,
+        name_or_id: str,
+        adapter_version_id: str,
+        *,
+        include_source: bool = False,
+        target_machine_id: str | None = None,
+        execution_target: str | None = None,
+    ) -> dict[str, Any]:
+        """Return one exact Adapter version, with source only when authorized."""
+        ...
+
+    def resolve_local_library_adapter_source(
+        self,
+        ref: dict[str, Any],
+        *,
+        target_machine_id: str,
+    ) -> dict[str, Any]: ...
+
     def list_objects(
         self,
         *,
@@ -401,8 +480,9 @@ class ServerClientProtocol(Protocol):
         events: list[dict[str, Any]],
         capabilities: dict[str, Any] | None = None,
         claim_id: str | None = None,
+        claim_jobs: bool | None = None,
     ) -> dict[str, Any]:
-        """Send one sync request under an optional worker claim."""
+        """Send one sync request under optional worker and claim controls."""
         ...
 
     def create_remote_run(
@@ -414,8 +494,101 @@ class ServerClientProtocol(Protocol):
         """Create one server run through the idempotent direct route."""
         ...
 
+    def create_remote_run_admission(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create or reconcile a runtime-adapter Run admission."""
+        ...
+
+    def get_remote_run_admission(self, request_id: str) -> dict[str, Any]:
+        """Read one requester-fenced runtime-adapter admission."""
+        ...
+
+    def upload_remote_run_admission_input(
+        self,
+        request_id: str,
+        name: str,
+        body: bytes,
+        *,
+        size: int,
+        sha256: str,
+    ) -> dict[str, Any]:
+        """Upload one declared runtime input."""
+        ...
+
+    def upload_remote_run_admission_custom_bundle(
+        self,
+        request_id: str,
+        body: bytes,
+        *,
+        size: int,
+        sha256: str,
+    ) -> dict[str, Any]:
+        """Upload the singular declared custom adapter bundle."""
+        ...
+
+    def finalize_remote_run_admission(self, request_id: str) -> dict[str, Any]:
+        """Atomically finalize a complete runtime-adapter admission."""
+        ...
+
+    def cancel_remote_run_admission(self, request_id: str) -> dict[str, Any]:
+        """Cancel an incomplete runtime-adapter admission."""
+        ...
+
+    def claimed_runtime_input_bytes(
+        self,
+        download_url: str,
+        *,
+        claim_id: str,
+        expected_size: int,
+        expected_sha256: str,
+    ) -> bytes:
+        """Download and verify one claim-fenced runtime input."""
+        ...
+
     def get_remote_run(self, run_id: str) -> dict[str, Any]:
         """Return a remote run."""
+        ...
+
+    def list_remote_runs(self) -> list[dict[str, Any]]:
+        """Return remote Runs visible to the connected user."""
+        ...
+
+    def get_remote_run_detail(self, run_id: str) -> dict[str, Any]:
+        """Return one remote Run detail snapshot."""
+        ...
+
+    def list_remote_run_events(self, run_id: str) -> list[dict[str, Any]]:
+        """Return one remote Run event snapshot."""
+        ...
+
+    def get_server_version(self) -> dict[str, Any]:
+        """Return non-secret server release and capability evidence."""
+        ...
+
+    def preflight_remote_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Evaluate one read-only remote execution preflight."""
+        ...
+
+    def get_ai_preview_capabilities(self) -> dict[str, Any]:
+        """Return the closed central AI Preview capability document."""
+        ...
+
+    def get_ai_assistant_capabilities(self) -> dict[str, Any]:
+        """Return the closed central AI helper capability document."""
+        ...
+
+    def ai_preview_request_contains_configured_credential(
+        self,
+        payload: dict[str, Any],
+    ) -> bool:
+        """Return whether notebook evidence contains an active client credential."""
+        ...
+
+    def create_ai_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Submit one synchronous, non-replayed AI Preview request."""
+        ...
+
+    def create_ai_assistant(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Submit one synchronous, non-replayed AI helper request."""
         ...
 
     def list_artifacts(self, run_id: str) -> list[dict[str, Any]]:

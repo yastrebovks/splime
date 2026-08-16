@@ -10,6 +10,7 @@ import pytest
 # ``spl.client`` shim would not affect lookups inside ``spl._client``.
 import spl._client as spl_client_module
 from spl._client import SPLClient
+from spl.adapters import TEXT_FILE_UTF8, FileInput
 from spl.core import manifest as m_manifest
 from spl.core.entities.node_remote import NodeRemote
 from spl.daemon_client import Client, ClientError
@@ -79,6 +80,134 @@ def test_daemon_client_run_sends_owner_library_and_remote_flag() -> None:
         "offline_policy": "queue",
         "remote": True,
     }
+
+
+def test_daemon_client_run_sends_exact_object_version_selectors() -> None:
+    client = RecordingClient()
+
+    client.run("fraud_score", version=7, version_id="object-version-7")
+
+    method, path, payload = client.requests[-1]
+    assert method == "POST"
+    assert path == "/runs"
+    assert payload == {
+        "object": "fraud_score",
+        "source": "auto",
+        "version": 7,
+        "version_id": "object-version-7",
+    }
+
+
+def test_spl_client_adapters_none_keeps_exact_legacy_json_wire() -> None:
+    daemon = RecordingClient()
+    client = SPLClient(daemon_port=8765)
+    client._daemon = daemon
+
+    client.submit(
+        "legacy_json",
+        args=[1, "two"],
+        kwargs={"nested": {"ok": True, "values": [None, 3.5]}},
+        source="local",
+        adapters=None,
+    )
+    assert daemon.requests[-1] == (
+        "POST",
+        "/runs",
+        {
+            "object": "legacy_json",
+            "source": "local",
+            "args": [1, "two"],
+            "kwargs": {"nested": {"ok": True, "values": [None, 3.5]}},
+            "remote": False,
+        },
+    )
+
+
+@pytest.mark.parametrize("request_kind", ["explicit-adapter", "file-input"])
+def test_current_client_rejects_adapter_request_before_mutating_an_old_daemon(
+    tmp_path: Path,
+    request_kind: str,
+) -> None:
+    class OldDaemon:
+        def __init__(self) -> None:
+            self.signature_calls = 0
+            self.run_calls = 0
+
+        def signature(self, name: str, **selectors: Any) -> dict[str, Any]:
+            del name, selectors
+            self.signature_calls += 1
+            raise AssertionError("old daemon signature must not be queried")
+
+        def run(self, name: str, **payload: Any) -> dict[str, Any]:
+            del name, payload
+            self.run_calls += 1
+            raise AssertionError("old daemon Run must not be mutated")
+
+    daemon = OldDaemon()
+    client = SPLClient(daemon_port=8765)
+    client._daemon = daemon  # type: ignore[assignment]
+    value: Any = "payload"
+    adapters: Any = {"inputs": {"value": TEXT_FILE_UTF8}}
+    if request_kind == "file-input":
+        source = tmp_path / "old-daemon-input.bin"
+        source.write_bytes(b"payload")
+        value = FileInput(source)
+        adapters = None
+
+    with pytest.raises(
+        ClientError,
+        match="upgrade and restart the daemon before using adapters or FileInput",
+    ):
+        client.submit("legacy_json", kwargs={"value": value}, adapters=adapters)
+
+    assert daemon.signature_calls == 0
+    assert daemon.run_calls == 0
+
+
+def test_daemon_artifact_download_rejects_preexisting_symlink(tmp_path: Path) -> None:
+    class BytesClient(Client):
+        def _bytes_request(self, path: str) -> bytes:
+            del path
+            return b"adapter-output"
+
+    client = BytesClient("http://daemon.local")
+    target = tmp_path / "results"
+    target.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"preserve")
+    (target / "runtime-default.txt").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="regular file"):
+        client.download_artifact("run-1", "runtime-default.txt", target)
+    assert outside.read_bytes() == b"preserve"
+
+
+def test_spl_client_scoped_source_local_survives_daemon_client_fallback() -> None:
+    daemon = RecordingClient()
+    client = SPLClient(daemon_port=8765)
+    client._daemon = daemon
+
+    run = client.submit(
+        "demo_traktorist",
+        owner="admin1",
+        library="default",
+        source="local",
+        kwargs={"a": 0, "b": 0, "scale": 0},
+    )
+
+    assert run.mode == "local"
+    assert daemon.requests[-1] == (
+        "POST",
+        "/runs",
+        {
+            "object": "demo_traktorist",
+            "source": "local",
+            "kwargs": {"a": 0, "b": 0, "scale": 0},
+            "object_owner_id": "admin1",
+            "library": "default",
+            "remote": False,
+        },
+    )
 
 
 def test_daemon_and_sdk_sync_operator_surfaces_preserve_arguments() -> None:
@@ -1762,6 +1891,37 @@ def test_spl_client_submit_is_async_alias_for_start() -> None:
     }
 
 
+def test_spl_client_submit_passes_exact_object_version_selectors_to_daemon() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+
+    client.submit(
+        "fraud_score",
+        version=7,
+        version_id="object-version-7",
+    )
+
+    assert fake_daemon.run_calls[-1]["version"] == 7
+    assert fake_daemon.run_calls[-1]["version_id"] == "object-version-7"
+
+
+def test_spl_client_call_passes_exact_object_version_selectors_to_daemon() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+
+    client.call(
+        "fraud_score",
+        version=7,
+        version_id="object-version-7",
+        progress=False,
+    )
+
+    assert fake_daemon.run_calls[-1]["version"] == 7
+    assert fake_daemon.run_calls[-1]["version_id"] == "object-version-7"
+
+
 def test_spl_client_rejects_run_adapter_overrides_before_daemon_call() -> None:
     client = SPLClient(daemon_port=8765)
     fake_daemon = FakeDaemon()
@@ -1784,6 +1944,16 @@ def test_spl_client_passes_runtime_overrides_to_daemon() -> None:
     client.submit("fraud_score", runtimes={"heavy": "venv-subprocess"})
 
     assert fake_daemon.run_calls[-1]["runtimes"] == {"heavy": "venv-subprocess"}
+
+
+def test_spl_client_passes_whole_object_runtime_to_daemon() -> None:
+    client = SPLClient(daemon_port=8765)
+    fake_daemon = FakeDaemon()
+    client._daemon = fake_daemon
+
+    client.submit("fraud_score", runtimes="docker")
+
+    assert fake_daemon.run_calls[-1]["runtimes"] == "docker"
 
 
 def test_spl_client_resume_passes_daemon_resume_options() -> None:
@@ -2800,8 +2970,29 @@ def test_spl_client_call_and_signature_accept_internal_function() -> None:
 
 
 def test_spl_client_call_without_remote_selectors_is_local() -> None:
+    class PollRecordingDaemon(FakeDaemon):
+        def __init__(self) -> None:
+            super().__init__()
+            self.local_poll_intervals: list[float] = []
+
+        def wait_run(
+            self,
+            run_id: str,
+            *,
+            poll_interval: float,
+            timeout_seconds: float | None,
+            on_state: Any | None = None,
+        ) -> dict[str, Any]:
+            self.local_poll_intervals.append(poll_interval)
+            return super().wait_run(
+                run_id,
+                poll_interval=poll_interval,
+                timeout_seconds=timeout_seconds,
+                on_state=on_state,
+            )
+
     client = SPLClient(daemon_port=8765)
-    fake_daemon = FakeDaemon()
+    fake_daemon = PollRecordingDaemon()
     client._daemon = fake_daemon
 
     result = client.call("local_score", kwargs={"customer_id": 42})
@@ -2813,11 +3004,33 @@ def test_spl_client_call_without_remote_selectors_is_local() -> None:
     assert fake_daemon.run_calls[-1]["target_machine"] is None
     assert fake_daemon.run_calls[-1]["object_owner_id"] is None
     assert fake_daemon.run_calls[-1]["library"] is None
+    assert fake_daemon.local_poll_intervals == [0.25]
 
 
 def test_spl_client_call_with_remote_selectors_returns_server_mode() -> None:
+    class PollRecordingDaemon(FakeDaemon):
+        def __init__(self) -> None:
+            super().__init__()
+            self.remote_poll_intervals: list[float] = []
+
+        def wait_remote_run(
+            self,
+            run_id: str,
+            *,
+            poll_interval: float,
+            timeout_seconds: float | None,
+            on_state: Any | None = None,
+        ) -> dict[str, Any]:
+            self.remote_poll_intervals.append(poll_interval)
+            return super().wait_remote_run(
+                run_id,
+                poll_interval=poll_interval,
+                timeout_seconds=timeout_seconds,
+                on_state=on_state,
+            )
+
     client = SPLClient(daemon_port=8765)
-    fake_daemon = FakeDaemon()
+    fake_daemon = PollRecordingDaemon()
     client._daemon = fake_daemon
 
     result = client.call(
@@ -2831,6 +3044,7 @@ def test_spl_client_call_with_remote_selectors_returns_server_mode() -> None:
     assert result.server_side is True
     assert result.value == {"score": 0.91}
     assert fake_daemon.run_calls[-1]["remote"] is True
+    assert fake_daemon.remote_poll_intervals == [1.0]
 
 
 def test_spl_client_preserves_auto_resolve_field_names_through_run_collection() -> None:
@@ -2921,7 +3135,7 @@ def test_spl_client_local_scoped_call_surfaces_cross_owner_hint_verbatim() -> No
         client.call("score", library="default", progress=False)
 
     assert str(exc_info.value) == hint
-    assert fake_daemon.run_calls[-1]["remote"] is None
+    assert fake_daemon.run_calls[-1]["remote"] is False
 
 
 def test_node_remote_canonicalizes_handle_only_after_signature_round_trip(

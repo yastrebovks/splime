@@ -10,11 +10,14 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator, Protocol
+from typing import TYPE_CHECKING, Any, Iterator, Protocol
 
 from spl._process import run_process_tree
 from spl._timeout import TimeoutDomain, validate_timeout_seconds
 from spl.daemon.store import RegistryStore, utc_now
+
+if TYPE_CHECKING:
+    from spl.daemon.lifecycle import LifecycleController, LifecycleWorkLease
 
 ABSENT = "absent"
 CREATING = "creating"
@@ -88,6 +91,12 @@ class BaseEnvironmentManager(ABC):
         self._lock = threading.RLock()
         self._conditions: dict[str, threading.Condition] = {}
         self._active_builds: set[str] = set()
+        self._lifecycle: LifecycleController | None = None
+
+    def bind_lifecycle(self, lifecycle: LifecycleController) -> None:
+        """Bind the daemon-owned admission authority before builds begin."""
+
+        self._lifecycle = lifecycle
 
     def status_for_object(self, object_record: dict[str, Any]) -> dict[str, Any]:
         """Return the cached build status for an object version."""
@@ -192,22 +201,40 @@ class BaseEnvironmentManager(ABC):
         condition: threading.Condition,
     ) -> None:
         spec_hash = spec["spec_hash"]
-        self._active_builds.add(spec_hash)
-        self._upsert_creating_record(spec)
-        thread = threading.Thread(
-            target=self._build_thread_main,
-            args=(spec, condition),
-            name=self._build_thread_name(spec_hash),
-            daemon=True,
+        lifecycle_lease = (
+            self._lifecycle.reserve_current_or_root(
+                "environment_build",
+                queued=True,
+            )
+            if self._lifecycle is not None
+            else None
         )
-        thread.start()
+        try:
+            self._active_builds.add(spec_hash)
+            self._upsert_creating_record(spec)
+            thread = threading.Thread(
+                target=self._build_thread_main,
+                args=(spec, condition, lifecycle_lease),
+                name=self._build_thread_name(spec_hash),
+                daemon=True,
+            )
+            thread.start()
+        except Exception:
+            self._active_builds.discard(spec_hash)
+            if lifecycle_lease is not None:
+                lifecycle_lease.complete(seal_lineage=lifecycle_lease.root)
+            raise
 
     def _build_thread_main(
         self,
         spec: dict[str, Any],
         condition: threading.Condition,
+        lifecycle_lease: LifecycleWorkLease | None = None,
     ) -> None:
         spec_hash = spec["spec_hash"]
+        if lifecycle_lease is not None:
+            lifecycle_lease.activate()
+            lifecycle_lease.attach_current_thread()
         try:
             self._run_build(spec)
             self.store.update_environment_build(
@@ -229,6 +256,9 @@ class BaseEnvironmentManager(ABC):
             with condition:
                 self._active_builds.discard(spec_hash)
                 condition.notify_all()
+            if lifecycle_lease is not None:
+                lifecycle_lease.detach_current_thread()
+                lifecycle_lease.complete(seal_lineage=lifecycle_lease.root)
 
     def _run_build(self, spec: dict[str, Any]) -> None:
         self._build_environment(spec)

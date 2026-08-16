@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -17,6 +18,48 @@ from spl.daemon.environment_base import (
 )
 from spl.daemon.runtime_config import normalize_runtime_config
 from spl.daemon.store import json_dumps, utc_now
+
+
+_DEFAULT_DOCKER_CLI_CANDIDATES = (
+    Path("/usr/local/bin/docker"),
+    Path("/opt/homebrew/bin/docker"),
+    Path("/Applications/Docker.app/Contents/Resources/bin/docker"),
+    Path("/snap/bin/docker"),
+)
+
+
+def ensure_docker_cli_on_path(
+    *,
+    candidates: tuple[Path, ...] | None = None,
+) -> str | None:
+    """Return Docker's executable and activate a verified standard install path.
+
+    GUI service launchers commonly provide only the system ``PATH`` on macOS,
+    omitting Homebrew and Docker Desktop locations.  An already-resolvable
+    executable always wins.  Otherwise only the parent of an exact, executable
+    Docker candidate is prepended; no unverified directory is introduced.
+    """
+
+    resolved = shutil.which("docker")
+    if resolved is not None:
+        return resolved
+
+    search_candidates = candidates if candidates is not None else _DEFAULT_DOCKER_CLI_CANDIDATES
+    for candidate in search_candidates:
+        try:
+            usable = candidate.is_file() and os.access(candidate, os.X_OK)
+        except OSError:
+            usable = False
+        if not usable:
+            continue
+
+        directory = str(candidate.parent)
+        current_path = os.environ.get("PATH", "")
+        entries = current_path.split(os.pathsep) if current_path else []
+        if directory not in entries:
+            os.environ["PATH"] = os.pathsep.join([directory, *entries])
+        return shutil.which("docker") or str(candidate)
+    return None
 
 
 class DockerEnvironmentManager(BaseEnvironmentManager):

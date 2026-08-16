@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import socket
 import ssl
 import time
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator, Literal, cast
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request
 
 from spl._http import (
@@ -20,6 +21,19 @@ from spl._http import (
     urlopen_verified,
 )
 from spl.core import json_contract as m_json_contract
+from spl.daemon.ai_assistant import (
+    AI_ASSISTANT_UPSTREAM_CAPABILITIES_ROUTE,
+    AI_ASSISTANT_UPSTREAM_ROUTE,
+    MAX_RESPONSE_BYTES as MAX_AI_ASSISTANT_RESPONSE_BYTES,
+    AIAssistantContractError,
+    validate_error as validate_ai_assistant_error,
+)
+from spl.daemon.ai_preview import (
+    MAX_AI_PREVIEW_RESPONSE_BYTES,
+    AIPreviewContractError,
+    validate_ai_preview_error,
+)
+from spl.daemon.connected_ide import MAX_UPSTREAM_RESPONSE_BYTES
 
 DEFAULT_SERVER_URL = "https://splime.io/api"
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60.0
@@ -33,6 +47,13 @@ SERVER_MAX_TRANSPORT_ATTEMPTS = 3
 TRANSIENT_SERVER_STATUS_CODES = frozenset({502, 503, 504})
 RUN_CLAIM_FENCING_CAPABILITY = "run_claim_fencing"
 RUN_CLAIM_FENCING_VERSION = 1
+SYNC_FLUSH_WITHOUT_CLAIM_CAPABILITY = "spl.sync.flush_without_claim.v1"
+SYNC_FLUSH_WITHOUT_CLAIM_VERSION = 1
+SYNC_CLAIM_CONTROL_ACK = {
+    "contract": "spl.sync.flush-without-claim/v1",
+    "claim_jobs": False,
+    "claim_suppressed": True,
+}
 RUN_CLAIM_HEADER = "X-Spl-Claim"
 RUN_CLAIM_PRIVATE_FIELD = "_spl_claim_id"
 STALE_RUN_CLAIM_ERROR_CODE = "stale_run_claim"
@@ -82,12 +103,54 @@ def is_permanent_archived_sync_error(result: dict[str, Any]) -> bool:
     return result.get("status") == "error" and result.get("code") in PERMANENT_ARCHIVED_SYNC_ERROR_CODES
 
 
+def validate_no_claim_sync_response(response: dict[str, Any]) -> None:
+    """Require the exact server acknowledgement for one no-claim sync.
+
+    An empty jobs array is deliberately insufficient: an old server could
+    ignore the request field and happen to have no queued work.
+    """
+
+    if response.get("claim_control") != SYNC_CLAIM_CONTROL_ACK:
+        raise ServerClientError(
+            502,
+            "central SPL daemon server did not prove claim suppression",
+            code="sync_claim_control_invalid",
+        )
+    jobs = response.get("jobs")
+    if not isinstance(jobs, list) or jobs:
+        raise ServerClientError(
+            502,
+            "central SPL daemon server returned work during no-claim sync",
+            code="sync_claim_control_invalid",
+        )
+
+
 def _as_json_dict(value: Any) -> dict[str, Any]:
     return cast(dict[str, Any], value)
 
 
 def _as_json_list(value: Any) -> list[dict[str, Any]]:
     return cast(list[dict[str, Any]], value)
+
+
+def _require_json_dict(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ServerClientError(
+            502,
+            "central SPL daemon server returned an invalid JSON object",
+            code="server_response_invalid",
+        )
+    return value
+
+
+def _require_json_dict_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ServerClientError(
+            502,
+            "central SPL daemon server returned an invalid JSON list",
+            code="server_response_invalid",
+        )
+    return value
 
 
 def _error_response(
@@ -107,7 +170,7 @@ def _error_response(
     if not isinstance(payload, dict):
         return raw, None, None
 
-    error = payload.get("error", raw)
+    error = payload.get("error", payload.get("safe_message", raw))
     code = payload.get("code")
     event_id = payload.get("event_id")
     if isinstance(error, dict):
@@ -123,6 +186,61 @@ def _error_response(
         str(code) if isinstance(code, str) else None,
         str(event_id) if isinstance(event_id, str) else None,
     )
+
+
+def _ai_preview_error_response(raw: str) -> tuple[str, str, None]:
+    """Accept only the central AI Preview endpoint's closed error envelope."""
+
+    def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object key")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(raw, object_pairs_hook=object_pairs)
+        if not isinstance(payload, dict):
+            raise ValueError("AI Preview error is not an object")
+        validate_ai_preview_error(payload)
+    except (AIPreviewContractError, json.JSONDecodeError, RecursionError, ValueError):
+        return (
+            "central SPL daemon server returned an invalid AI Preview error envelope",
+            "ai_preview_protocol_invalid",
+            None,
+        )
+    return payload["safe_message"], payload["code"], None
+
+
+def _ai_assistant_error_response(raw: str) -> tuple[str, str, None]:
+    """Accept only the central AI assistant's closed error envelope."""
+
+    def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object key")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(raw, object_pairs_hook=object_pairs)
+        if not isinstance(payload, dict):
+            raise ValueError("AI assistant error is not an object")
+        validate_ai_assistant_error(payload)
+    except (
+        AIAssistantContractError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ):
+        return (
+            "central SPL daemon server returned an invalid AI assistant error envelope",
+            "ai_assistant_protocol_invalid",
+            None,
+        )
+    return payload["safe_message"], payload["code"], None
 
 
 def _claim_headers(claim_id: str | None) -> dict[str, str]:
@@ -258,9 +376,16 @@ class ServerClient:
         post_send_retry_safe: bool = False,
         allow_transport_retries: bool = True,
         max_transport_attempts: int = SERVER_MAX_TRANSPORT_ATTEMPTS,
+        max_response_bytes: int | None = None,
+        compact_json: bool = False,
+        absolute_deadline_seconds: float | None = None,
     ) -> Any:
         if max_transport_attempts < 1:
             raise ValueError("max_transport_attempts must be at least 1")
+        if max_response_bytes is not None and max_response_bytes < 1:
+            raise ValueError("max_response_bytes must be positive when provided")
+        if absolute_deadline_seconds is not None and absolute_deadline_seconds <= 0:
+            raise ValueError("absolute_deadline_seconds must be positive when provided")
         body = None
         headers = self._headers(auth=auth)
         headers.update(extra_headers or {})
@@ -269,7 +394,7 @@ class ServerClient:
                 payload,
                 ensure_ascii=False,
                 sort_keys=False,
-                separators=None,
+                separators=(",", ":") if compact_json else None,
             ).encode("utf-8")
             headers["Content-Type"] = "application/json; charset=utf-8"
 
@@ -283,14 +408,63 @@ class ServerClient:
         connection_retries = 0
         post_send_retried = False
         attempt = 0
+        deadline = None if absolute_deadline_seconds is None else time.monotonic() + absolute_deadline_seconds
         while attempt < max_transport_attempts:
             attempt += 1
             try:
-                with urlopen_verified(request, timeout=self.request_timeout_seconds) as response:
-                    raw = response.read().decode("utf-8")
+                phase_timeout = self.request_timeout_seconds
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ServerClientError(
+                            504,
+                            "central SPL daemon server response exceeded its total deadline",
+                            code="server_response_timeout",
+                        )
+                    phase_timeout = remaining if phase_timeout is None else min(phase_timeout, remaining)
+                if deadline is None:
+                    response_context = urlopen_verified(
+                        request,
+                        timeout=phase_timeout,
+                    )
+                else:
+                    response_context = urlopen_verified(
+                        request,
+                        timeout=phase_timeout,
+                        connect_timeout=phase_timeout,
+                    )
+                with response_context as response:
+                    raw = (
+                        response.read().decode("utf-8")
+                        if max_response_bytes is None
+                        else self._read_json_text(
+                            response,
+                            max_response_bytes=max_response_bytes,
+                            deadline=deadline,
+                        )
+                    )
             except HTTPError as exc:
-                raw = exc.read().decode("utf-8")
-                message, error_code, event_id = _error_response(raw, http_error=exc)
+                raw = (
+                    exc.read().decode("utf-8")
+                    if max_response_bytes is None
+                    else self._read_json_text(
+                        exc,
+                        max_response_bytes=max_response_bytes,
+                        deadline=deadline,
+                    )
+                )
+                message: str
+                error_code: str | None
+                event_id: str | None
+                if path in {"/ai/preview", "/ai/preview/capabilities"}:
+                    message, error_code, event_id = _ai_preview_error_response(raw)
+                elif path in {
+                    AI_ASSISTANT_UPSTREAM_ROUTE,
+                    AI_ASSISTANT_UPSTREAM_CAPABILITIES_ROUTE,
+                }:
+                    message, error_code, event_id = _ai_assistant_error_response(raw)
+                else:
+                    message, error_code, event_id = _error_response(raw, http_error=exc)
                 message = f"central SPL daemon server returned {exc.code} at {self.base_url}{path}: {message}"
                 phase = _failure_phase(exc)
                 if (
@@ -363,16 +537,131 @@ class ServerClient:
 
         if not raw:
             return None
-        return json.loads(raw)
+        if max_response_bytes is None:
+            return json.loads(raw)
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, RecursionError) as exc:
+            raise ServerClientError(
+                502,
+                "central SPL daemon server returned invalid JSON",
+                code="server_response_invalid",
+            ) from exc
 
-    def _bytes_request(self, path: str) -> bytes:
-        request = Request(f"{self.base_url}{path}", headers=self._headers())
+    @staticmethod
+    def _read_json_text(
+        response: Any,
+        *,
+        max_response_bytes: int,
+        deadline: float | None = None,
+    ) -> str:
+        read1 = getattr(response, "read1", None)
+        if deadline is None or not callable(read1):
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    response.close()
+                    raise ServerClientError(
+                        504,
+                        "central SPL daemon server response exceeded its total deadline",
+                        code="server_response_timeout",
+                    )
+                ServerClient._set_response_read_timeout(response, remaining)
+            raw = response.read(max_response_bytes + 1)
+            return ServerClient._decode_bounded_json_text(
+                raw,
+                max_response_bytes=max_response_bytes,
+            )
+        chunks: list[bytes] = []
+        size = 0
+        while size <= max_response_bytes:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    response.close()
+                    raise ServerClientError(
+                        504,
+                        "central SPL daemon server response exceeded its total deadline",
+                        code="server_response_timeout",
+                    )
+                ServerClient._set_response_read_timeout(response, remaining)
+            chunk = read1(min(65_536, max_response_bytes + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        return ServerClient._decode_bounded_json_text(
+            b"".join(chunks),
+            max_response_bytes=max_response_bytes,
+        )
+
+    @staticmethod
+    def _decode_bounded_json_text(
+        raw: bytes,
+        *,
+        max_response_bytes: int,
+    ) -> str:
+        if len(raw) > max_response_bytes:
+            raise ServerClientError(
+                502,
+                "central SPL daemon server response exceeds the configured limit",
+                code="server_response_too_large",
+            )
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ServerClientError(
+                502,
+                "central SPL daemon server returned invalid UTF-8",
+                code="server_response_invalid",
+            ) from exc
+
+    @staticmethod
+    def _set_response_read_timeout(response: Any, remaining: float) -> None:
+        """Apply the shrinking total budget to the underlying response socket."""
+
+        fp = getattr(response, "fp", None)
+        raw = getattr(fp, "raw", None)
+        candidates = (
+            response,
+            fp,
+            raw,
+            getattr(response, "_sock", None),
+            getattr(fp, "_sock", None),
+            getattr(raw, "_sock", None),
+        )
+        for candidate in candidates:
+            settimeout = getattr(candidate, "settimeout", None)
+            if callable(settimeout):
+                settimeout(max(0.001, remaining))
+                return
+
+    def _bytes_request(
+        self,
+        path: str,
+        *,
+        extra_headers: dict[str, str] | None = None,
+        max_response_bytes: int | None = None,
+    ) -> bytes:
+        headers = self._headers()
+        headers.update(extra_headers or {})
+        request = Request(f"{self.base_url}{path}", headers=headers)
         try:
             with urlopen_verified(request, timeout=DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS) as response:
-                return cast(bytes, response.read())
+                raw = cast(
+                    bytes,
+                    response.read() if max_response_bytes is None else response.read(max_response_bytes + 1),
+                )
+                if max_response_bytes is not None and len(raw) > max_response_bytes:
+                    raise ServerClientError(
+                        502,
+                        "central SPL daemon server response exceeds the declared artifact size",
+                        code="server_response_too_large",
+                    )
+                return raw
         except HTTPError as exc:
-            raw = exc.read().decode("utf-8")
-            message, error_code, event_id = _error_response(raw, http_error=exc)
+            error_body = exc.read().decode("utf-8")
+            message, error_code, event_id = _error_response(error_body, http_error=exc)
             message = f"central SPL daemon server returned {exc.code} at {self.base_url}{path}: {message}"
             raise ServerClientError(
                 exc.code,
@@ -385,6 +674,46 @@ class ServerClient:
                 502,
                 (f"central SPL daemon server is not reachable at {self.base_url}: {exc.reason}"),
             ) from exc
+
+    def _bytes_upload_request(
+        self,
+        method: str,
+        path: str,
+        body: bytes,
+        *,
+        headers: dict[str, str],
+    ) -> Any:
+        request_headers = {
+            **self._headers(),
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(body)),
+            **headers,
+        }
+        request = Request(
+            f"{self.base_url}{path}",
+            data=body,
+            headers=request_headers,
+            method=method,
+        )
+        try:
+            with urlopen_verified(request, timeout=DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS) as response:
+                raw = response.read().decode("utf-8")
+        except HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            message, error_code, event_id = _error_response(raw, http_error=exc)
+            raise ServerClientError(
+                exc.code,
+                f"central SPL daemon server returned {exc.code} at {self.base_url}{path}: {message}",
+                code=error_code,
+                event_id=event_id,
+            ) from exc
+        except (OSError, URLError) as exc:
+            reason = getattr(exc, "reason", exc)
+            raise ServerClientError(
+                502,
+                f"central SPL daemon server is not reachable at {self.base_url}: {reason}",
+            ) from exc
+        return None if not raw else json.loads(raw)
 
     def _streaming_file_request(
         self,
@@ -617,6 +946,196 @@ class ServerClient:
             )
         )
 
+    def preflight_library_adapter(
+        self,
+        owner: str,
+        library: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/owners/{quote(owner)}/libraries/{quote(library)}/adapters/preflight",
+                payload,
+                auth="machine",
+                allow_transport_retries=False,
+                max_transport_attempts=1,
+            )
+        )
+
+    def publish_library_adapter(
+        self,
+        owner: str,
+        library: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        content_hash = payload.get("content_hash")
+        headers = {"Idempotency-Key": f"library_adapter_{content_hash}"} if isinstance(content_hash, str) else None
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/owners/{quote(owner)}/libraries/{quote(library)}/adapters",
+                payload,
+                auth="machine",
+                extra_headers=headers,
+                allow_transport_retries=False,
+                max_transport_attempts=1,
+            )
+        )
+
+    def list_library_adapters(
+        self,
+        *,
+        owner: str | None = None,
+        library: str | None = None,
+        query: str | None = None,
+        direction: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+        target_machine_id: str | None = None,
+        execution_target: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, str] = {"limit": str(limit)}
+        if owner is not None:
+            params["owner"] = owner
+        if library is not None:
+            params["library"] = library
+        if query is not None:
+            params["q"] = query
+        if direction is not None:
+            params["direction"] = direction
+        if cursor is not None:
+            params["cursor"] = cursor
+        if target_machine_id is not None:
+            params["target_machine_id"] = target_machine_id
+        if execution_target is not None:
+            params["execution_target"] = execution_target
+        return _as_json_dict(
+            self._json_request(
+                "GET",
+                f"/library-adapters?{urlencode(params)}",
+                auth="machine",
+                max_response_bytes=MAX_UPSTREAM_RESPONSE_BYTES,
+            )
+        )
+
+    def get_library_adapter(
+        self,
+        owner: str,
+        library: str,
+        name_or_id: str,
+        *,
+        target_machine_id: str | None = None,
+        execution_target: str | None = None,
+    ) -> dict[str, Any]:
+        params = {
+            key: value
+            for key, value in (
+                ("target_machine_id", target_machine_id),
+                ("execution_target", execution_target),
+            )
+            if value is not None
+        }
+        query = f"?{urlencode(params)}" if params else ""
+        return _as_json_dict(
+            self._json_request(
+                "GET",
+                "/owners/{}/libraries/{}/adapters/{}".format(quote(owner), quote(library), quote(name_or_id)) + query,
+                auth="machine",
+                max_response_bytes=MAX_UPSTREAM_RESPONSE_BYTES,
+            )
+        )
+
+    def list_library_adapter_versions(
+        self,
+        owner: str,
+        library: str,
+        name_or_id: str,
+        *,
+        limit: int = 100,
+        target_machine_id: str | None = None,
+        execution_target: str | None = None,
+    ) -> list[dict[str, Any]]:
+        params = {"limit": str(limit)}
+        if target_machine_id is not None:
+            params["target_machine_id"] = target_machine_id
+        if execution_target is not None:
+            params["execution_target"] = execution_target
+        return _as_json_list(
+            self._json_request(
+                "GET",
+                "/owners/{}/libraries/{}/adapters/{}/versions?{}".format(
+                    quote(owner),
+                    quote(library),
+                    quote(name_or_id),
+                    urlencode(params),
+                ),
+                auth="machine",
+                max_response_bytes=MAX_UPSTREAM_RESPONSE_BYTES,
+            )
+        )
+
+    def get_library_adapter_version(
+        self,
+        owner: str,
+        library: str,
+        name_or_id: str,
+        adapter_version_id: str,
+        *,
+        include_source: bool = False,
+        target_machine_id: str | None = None,
+        execution_target: str | None = None,
+    ) -> dict[str, Any]:
+        suffix = "/source" if include_source else ""
+        params = {
+            key: value
+            for key, value in (
+                ("target_machine_id", target_machine_id),
+                ("execution_target", execution_target),
+            )
+            if value is not None
+        }
+        query = f"?{urlencode(params)}" if params else ""
+        return _as_json_dict(
+            self._json_request(
+                "GET",
+                "/owners/{}/libraries/{}/adapters/{}/versions/{}{}".format(
+                    quote(owner),
+                    quote(library),
+                    quote(name_or_id),
+                    quote(adapter_version_id),
+                    suffix,
+                )
+                + query,
+                auth="machine",
+                max_response_bytes=2 * MAX_UPSTREAM_RESPONSE_BYTES,
+            )
+        )
+
+    def resolve_local_library_adapter_source(
+        self,
+        ref: dict[str, Any],
+        *,
+        target_machine_id: str,
+    ) -> dict[str, Any]:
+        """Resolve source for one exact remote Run ref; never retry transport."""
+
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                "/runtime/library-adapters/resolve-local-source",
+                {
+                    "schema_version": 1,
+                    "ref": dict(ref),
+                    "target_machine_id": target_machine_id,
+                    "requester_custom_code": "allow",
+                },
+                auth="machine",
+                max_response_bytes=2 * MAX_UPSTREAM_RESPONSE_BYTES,
+                allow_transport_retries=False,
+            )
+        )
+
     def list_objects(
         self,
         *,
@@ -735,24 +1254,33 @@ class ServerClient:
         events: list[dict[str, Any]],
         capabilities: dict[str, Any] | None = None,
         claim_id: str | None = None,
+        claim_jobs: bool | None = None,
     ) -> dict[str, Any]:
         """Send one sync batch with an optional worker-attempt capability."""
 
-        return _as_json_dict(
+        if claim_jobs is not None and not isinstance(claim_jobs, bool):
+            raise ValueError("claim_jobs must be a boolean when provided")
+        payload = {
+            "connection_id": connection_id,
+            "machine_id": machine_id,
+            "heartbeat_interval_seconds": heartbeat_interval_seconds,
+            "capabilities": capabilities or {},
+            "events": _sync_events_for_wire(events),
+        }
+        if claim_jobs is not None:
+            payload["claim_jobs"] = claim_jobs
+        response = _as_json_dict(
             self._json_request(
                 "POST",
                 "/sync",
-                {
-                    "connection_id": connection_id,
-                    "machine_id": machine_id,
-                    "heartbeat_interval_seconds": heartbeat_interval_seconds,
-                    "capabilities": capabilities or {},
-                    "events": _sync_events_for_wire(events),
-                },
+                payload,
                 extra_headers=_claim_headers(claim_id),
                 allow_transport_retries=False,
             )
         )
+        if claim_jobs is False:
+            validate_no_claim_sync_response(response)
+        return response
 
     def create_remote_run(
         self,
@@ -774,8 +1302,299 @@ class ServerClient:
             )
         )
 
+    def create_remote_run_admission(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Create or reconcile one immutable runtime-adapter admission."""
+
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                "/remote-run-admissions",
+                payload,
+                post_send_retry_safe=True,
+            )
+        )
+
+    def get_remote_run_admission(self, request_id: str) -> dict[str, Any]:
+        return _as_json_dict(
+            self._json_request(
+                "GET",
+                f"/remote-run-admissions/{quote(request_id)}",
+            )
+        )
+
+    def upload_remote_run_admission_input(
+        self,
+        request_id: str,
+        name: str,
+        body: bytes,
+        *,
+        size: int,
+        sha256: str,
+    ) -> dict[str, Any]:
+        if len(body) != size or hashlib.sha256(body).hexdigest() != sha256:
+            raise ValueError("runtime admission input bytes do not match their declaration")
+        return _as_json_dict(
+            self._bytes_upload_request(
+                "PUT",
+                f"/remote-run-admissions/{quote(request_id)}/inputs/{quote(name)}",
+                body,
+                headers={
+                    "X-SPL-Artifact-Size": str(size),
+                    "X-SPL-Artifact-Sha256": sha256,
+                },
+            )
+        )
+
+    def upload_remote_run_admission_custom_bundle(
+        self,
+        request_id: str,
+        body: bytes,
+        *,
+        size: int,
+        sha256: str,
+    ) -> dict[str, Any]:
+        if len(body) != size or hashlib.sha256(body).hexdigest() != sha256:
+            raise ValueError("runtime admission custom bundle bytes do not match their declaration")
+        return _as_json_dict(
+            self._bytes_upload_request(
+                "PUT",
+                f"/remote-run-admissions/{quote(request_id)}/custom-bundle",
+                body,
+                headers={
+                    "X-SPL-Artifact-Size": str(size),
+                    "X-SPL-Artifact-Sha256": sha256,
+                },
+            )
+        )
+
+    def finalize_remote_run_admission(self, request_id: str) -> dict[str, Any]:
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/remote-run-admissions/{quote(request_id)}/finalize",
+                {},
+                post_send_retry_safe=True,
+            )
+        )
+
+    def cancel_remote_run_admission(self, request_id: str) -> dict[str, Any]:
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/remote-run-admissions/{quote(request_id)}/cancel",
+                {},
+                post_send_retry_safe=True,
+            )
+        )
+
+    def claimed_runtime_input_bytes(
+        self,
+        download_url: str,
+        *,
+        claim_id: str,
+        expected_size: int,
+        expected_sha256: str,
+    ) -> bytes:
+        """Download one claim-fenced input from this exact server origin."""
+
+        parsed = urlsplit(download_url)
+        if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
+            raise ValueError("runtime input download_url must be a relative server path")
+        path = parsed.path
+        parts = path.removeprefix("/").split("/")
+        safe_parts = all(part and part not in {".", ".."} and "%" not in part and "\\" not in part for part in parts)
+        valid_namespace = (len(parts) == 4 and parts[0] == "remote-runs" and parts[2] == "inputs") or (
+            len(parts) == 3 and parts[0] == "remote-runs" and parts[2] == "custom-bundle"
+        )
+        if not safe_parts or not valid_namespace:
+            raise ValueError("runtime input download_url is outside the claim input namespace")
+        body = self._bytes_request(
+            path,
+            extra_headers=_claim_headers(claim_id),
+            max_response_bytes=expected_size,
+        )
+        if len(body) != expected_size or hashlib.sha256(body).hexdigest() != expected_sha256:
+            raise ServerClientError(
+                502,
+                "claimed runtime input failed size/checksum verification",
+                code="runtime_input_integrity_invalid",
+            )
+        return body
+
     def get_remote_run(self, run_id: str) -> dict[str, Any]:
-        return _as_json_dict(self._json_request("GET", f"/remote-runs/{quote(run_id)}"))
+        # A remote Run is created on behalf of the requesting user and may
+        # target a different owner's granted Machine.  Polling it with the
+        # companion's machine credential incorrectly binds the read to that
+        # local Machine and makes legitimate cross-Machine Runs fail with a
+        # machine-subject mismatch.  The central read route is user-scoped,
+        # just like the bounded list/detail/event façades.
+        return _as_json_dict(
+            self._json_request(
+                "GET",
+                f"/remote-runs/{quote(run_id)}",
+                auth="user",
+            )
+        )
+
+    def list_remote_runs(self) -> list[dict[str, Any]]:
+        """Return the current user's remote Runs through a bounded read."""
+
+        return _require_json_dict_list(
+            self._json_request(
+                "GET",
+                "/remote-runs",
+                auth="user",
+                max_response_bytes=MAX_UPSTREAM_RESPONSE_BYTES,
+            )
+        )
+
+    def get_remote_run_detail(self, run_id: str) -> dict[str, Any]:
+        """Return one authorized remote Run detail snapshot."""
+
+        return _require_json_dict(
+            self._json_request(
+                "GET",
+                f"/remote-runs/{quote(run_id)}/detail",
+                auth="user",
+                max_response_bytes=MAX_UPSTREAM_RESPONSE_BYTES,
+            )
+        )
+
+    def list_remote_run_events(self, run_id: str) -> list[dict[str, Any]]:
+        """Return one authorized remote Run event snapshot."""
+
+        return _require_json_dict_list(
+            self._json_request(
+                "GET",
+                f"/remote-runs/{quote(run_id)}/events",
+                auth="user",
+                max_response_bytes=MAX_UPSTREAM_RESPONSE_BYTES,
+            )
+        )
+
+    def get_server_version(self) -> dict[str, Any]:
+        """Return bounded non-secret server release/capability evidence."""
+
+        return _require_json_dict(
+            self._json_request(
+                "GET",
+                "/version",
+                auth="user",
+                max_response_bytes=MAX_UPSTREAM_RESPONSE_BYTES,
+            )
+        )
+
+    def preflight_remote_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Evaluate one read-only, non-reserving remote execution preflight."""
+
+        return _require_json_dict(
+            self._json_request(
+                "POST",
+                "/remote-runs/preflight",
+                payload,
+                auth="user",
+                post_send_retry_safe=True,
+                max_response_bytes=MAX_UPSTREAM_RESPONSE_BYTES,
+            )
+        )
+
+    def get_ai_preview_capabilities(self) -> dict[str, Any]:
+        """Return the central server's closed AI Preview capability document."""
+
+        return _require_json_dict(
+            self._json_request(
+                "GET",
+                "/ai/preview/capabilities",
+                auth="user",
+                allow_transport_retries=False,
+                max_transport_attempts=1,
+                max_response_bytes=MAX_AI_PREVIEW_RESPONSE_BYTES,
+                absolute_deadline_seconds=self.request_timeout_seconds,
+            )
+        )
+
+    def get_ai_assistant_capabilities(self) -> dict[str, Any]:
+        """Return the central server's closed AI assistant capabilities."""
+
+        return _require_json_dict(
+            self._json_request(
+                "GET",
+                AI_ASSISTANT_UPSTREAM_CAPABILITIES_ROUTE,
+                auth="user",
+                allow_transport_retries=False,
+                max_transport_attempts=1,
+                max_response_bytes=MAX_AI_ASSISTANT_RESPONSE_BYTES,
+                absolute_deadline_seconds=self.request_timeout_seconds,
+            )
+        )
+
+    def ai_preview_request_contains_configured_credential(
+        self,
+        payload: dict[str, Any],
+    ) -> bool:
+        """Check notebook evidence against this client's opaque credentials.
+
+        Credential values remain inside the authenticated daemon client;
+        callers receive only the boolean result and cannot retrieve a token
+        through this seam.
+        """
+
+        credentials = tuple(
+            value for value in (self.machine_token, self.user_token) if isinstance(value, str) and value
+        )
+
+        def contains(value: Any) -> bool:
+            if isinstance(value, str):
+                return any(credential in value for credential in credentials)
+            if isinstance(value, list):
+                return any(contains(item) for item in value)
+            if isinstance(value, dict):
+                return any(contains(item) for item in value.values())
+            return False
+
+        return contains(payload)
+
+    def create_ai_preview(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Submit one non-replayed synchronous AI Preview request.
+
+        A timeout or dropped response can occur after the central server has
+        reached the provider.  The operation therefore permits exactly one
+        transport attempt and never infers that a retry would be safe.
+        """
+
+        return _require_json_dict(
+            self._json_request(
+                "POST",
+                "/ai/preview",
+                payload,
+                auth="user",
+                allow_transport_retries=False,
+                max_transport_attempts=1,
+                max_response_bytes=MAX_AI_PREVIEW_RESPONSE_BYTES,
+                compact_json=True,
+                absolute_deadline_seconds=self.request_timeout_seconds,
+            )
+        )
+
+    def create_ai_assistant(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Submit one non-replayed synchronous AI assistant request."""
+
+        return _require_json_dict(
+            self._json_request(
+                "POST",
+                AI_ASSISTANT_UPSTREAM_ROUTE,
+                payload,
+                auth="user",
+                allow_transport_retries=False,
+                max_transport_attempts=1,
+                max_response_bytes=MAX_AI_ASSISTANT_RESPONSE_BYTES,
+                compact_json=True,
+                absolute_deadline_seconds=self.request_timeout_seconds,
+            )
+        )
 
     def list_artifacts(self, run_id: str) -> list[dict[str, Any]]:
         return _as_json_list(self._json_request("GET", f"/remote-runs/{quote(run_id)}/artifacts"))
@@ -807,6 +1626,36 @@ class ServerClient:
 
     def artifact_bytes(self, run_id: str, name: str) -> bytes:
         return self._bytes_request(f"/remote-runs/{quote(run_id)}/artifacts/{quote(name)}")
+
+    def artifact_bytes_verified(
+        self,
+        run_id: str,
+        name: str,
+        *,
+        size: int,
+        sha256: str,
+    ) -> bytes:
+        """Download one artifact under an exact size and digest fence.
+
+        This additive helper is used by browser-safe brokerage.  The existing
+        unrestricted trusted SDK method above remains unchanged.
+        """
+
+        if type(size) is not int or size < 0:
+            raise ValueError("artifact size must be a non-negative integer")
+        if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            raise ValueError("artifact sha256 must be lowercase hexadecimal")
+        data = self._bytes_request(
+            f"/remote-runs/{quote(run_id)}/artifacts/{quote(name)}",
+            max_response_bytes=size,
+        )
+        if len(data) != size or hashlib.sha256(data).hexdigest() != sha256:
+            raise ServerClientError(
+                502,
+                "central SPL daemon server artifact differs from its retained metadata",
+                code="server_response_invalid",
+            )
+        return data
 
     def download_artifact(self, run_id: str, name: str, target: str | Path) -> Path:
         target_path = Path(target)

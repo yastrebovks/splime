@@ -8,6 +8,7 @@ and the ``--json`` renderings.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import warnings
 from dataclasses import replace
@@ -20,7 +21,9 @@ from spl import lift
 from spl.core.adapter_compat import AdapterCompatibilityWarning
 from spl.core.entities.adapter import Adapter, make_key
 from spl.core.ir.utils import spl_export_to_file
+from spl.daemon import docker_environment as docker_environment_module
 from spl.daemon import doctor as doctor_module
+from spl.daemon import server as server_module
 from spl.daemon.doctor import (
     FAIL,
     OK,
@@ -559,10 +562,52 @@ class TestIndividualChecks:
 
 
 class TestDockerCheck:
-    def test_not_installed_is_ok(self) -> None:
+    def test_not_installed_is_ok(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(doctor_module.shutil, "which", lambda name: None)
+        monkeypatch.setattr(doctor_module, "ensure_docker_cli_on_path", lambda: None)
         result = doctor_module.check_docker()
         assert result.status == OK
         assert "not installed" in result.detail
+
+    def test_standard_install_location_is_activated_for_gui_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        empty_bin = tmp_path / "empty-bin"
+        empty_bin.mkdir()
+        docker_bin = tmp_path / "Docker App" / "bin"
+        docker_bin.mkdir(parents=True)
+        docker = docker_bin / "docker"
+        docker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        docker.chmod(0o755)
+        monkeypatch.setenv("PATH", str(empty_bin))
+
+        resolved = docker_environment_module.ensure_docker_cli_on_path(candidates=(docker,))
+
+        assert resolved == str(docker)
+        assert os.environ["PATH"].split(os.pathsep) == [str(docker_bin), str(empty_bin)]
+        assert docker_environment_module.ensure_docker_cli_on_path(candidates=(docker,)) == str(docker)
+        assert os.environ["PATH"].split(os.pathsep).count(str(docker_bin)) == 1
+
+    def test_daemon_runtime_bootstrap_uses_shared_docker_resolution(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        observed: list[bool] = []
+        monkeypatch.setattr(
+            server_module,
+            "ensure_docker_cli_on_path",
+            lambda: observed.append(True) or "/usr/local/bin/docker",
+        )
+        store = RegistryStore(tmp_path)
+        try:
+            runtime = server_module.DaemonRuntime(store, auto_build_envs=False)
+            assert observed == [True]
+            assert runtime._docker_cli_path == "/usr/local/bin/docker"
+        finally:
+            store.close()
 
     def test_unreachable_docker_daemon_is_warn(
         self,
@@ -616,7 +661,9 @@ class TestDockerCheck:
         assert result.status == WARN
         assert result.hint is not None
 
-    def test_node_docker_missing_cli_is_unavailable(self) -> None:
+    def test_node_docker_missing_cli_is_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(doctor_module.shutil, "which", lambda name: None)
+        monkeypatch.setattr(doctor_module, "ensure_docker_cli_on_path", lambda: None)
         result = check_node_docker(daemon_available=True)
 
         assert result.status == WARN

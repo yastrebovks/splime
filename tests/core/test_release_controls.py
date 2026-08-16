@@ -71,7 +71,7 @@ def test_canonical_docker_source_pins_the_exact_release_and_oci_identity() -> No
     publish_text = publish.read_text(encoding="utf-8")
     combined = "\n".join((dockerfile, compose, publish_text, (DOCKER_ROOT / "README.md").read_text(encoding="utf-8")))
 
-    assert version == "0.4.6"
+    assert version == "0.4.7"
     assert f"ARG SPL_VERSION={version}" in dockerfile
     assert 'python -m pip install "splime==${SPL_VERSION}"' in dockerfile
     assert f"image: {manifest['docker']['repository']}:{version}" in compose
@@ -271,6 +271,7 @@ def test_build_main_passes_locked_epoch_to_backend(
 
     def fake_run(command: list[str], *, check: bool, env: dict[str, str]) -> None:
         assert check is True
+        assert command[1:4] == ["-P", "-m", "build"]
         assert env["SOURCE_DATE_EPOCH"] == str(locked_epoch)
         assert env["PATH"] == os.environ["PATH"]
         raw_dir = Path(command[-1])
@@ -452,8 +453,8 @@ def test_verify_github_release_assets_requires_exact_bytes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     asset = b"reviewed release asset"
-    release_url = "https://github.test/releases/tag/v0.4.6"
-    asset_url = "https://github.test/releases/download/v0.4.6/asset.bin"
+    release_url = "https://github.test/releases/tag/v0.4.7"
+    asset_url = "https://github.test/releases/download/v0.4.7/asset.bin"
     manifest = {
         "github_release": {
             "url": release_url,
@@ -474,7 +475,7 @@ def test_verify_github_release_assets_requires_exact_bytes(
 
     verify_published_release.verify_github_release_assets(manifest)
 
-    manifest["github_release"]["assets"][0]["url"] = "https://github.test/releases/download/v0.4.6/other.bin"
+    manifest["github_release"]["assets"][0]["url"] = "https://github.test/releases/download/v0.4.7/other.bin"
     with pytest.raises(SystemExit, match="URL does not end"):
         verify_published_release.verify_github_release_assets(manifest)
     manifest["github_release"]["assets"][0]["url"] = asset_url
@@ -487,11 +488,11 @@ def test_verify_github_release_assets_requires_exact_bytes(
 def test_verify_docker_requires_manifest_and_platform_digests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    verification_url = "https://hub.test/tags/0.4.6"
-    publication_url = "https://hub.test/repository/tags?name=0.4.6"
+    verification_url = "https://hub.test/tags/0.4.7"
+    publication_url = "https://hub.test/repository/tags?name=0.4.7"
     manifest = {
         "docker": {
-            "tag": "0.4.6",
+            "tag": "0.4.7",
             "manifest_digest": f"sha256:{'a' * 64}",
             "platform_digests": {
                 "linux/amd64": f"sha256:{'b' * 64}",
@@ -502,7 +503,7 @@ def test_verify_docker_requires_manifest_and_platform_digests(
         }
     }
     tag = {
-        "name": "0.4.6",
+        "name": "0.4.7",
         "digest": f"sha256:{'a' * 64}",
         "images": [
             {
@@ -587,7 +588,7 @@ def test_declared_v2_manifest_cannot_be_published() -> None:
         verify_published_release.require_publishable_manifest(
             {
                 "schema_version": 2,
-                "release_id": "splime-0.4.6",
+                "release_id": "splime-0.4.7",
                 "evidence": {"state": "declared"},
             }
         )
@@ -598,7 +599,7 @@ def test_v2_publishable_state_still_requires_exact_component_evidence() -> None:
         verify_published_release.require_publishable_manifest(
             {
                 "schema_version": 2,
-                "release_id": "splime-0.4.6",
+                "release_id": "splime-0.4.7",
                 "evidence": {"state": "published"},
                 "components": {
                     "server": {
@@ -615,7 +616,7 @@ def test_v2_publishable_state_still_requires_exact_component_evidence() -> None:
 def test_v2_publishable_guard_rejects_empty_artifact_sets() -> None:
     component = {
         "source_binding": "pinned_commit",
-        "source_ref": "v0.4.6",
+        "source_ref": "v0.4.7",
         "source_commit": "1" * 40,
         "artifact": {"sha256": "2" * 64},
     }
@@ -623,8 +624,8 @@ def test_v2_publishable_guard_rejects_empty_artifact_sets() -> None:
         verify_published_release.require_publishable_manifest(
             {
                 "schema_version": 2,
-                "release_id": "splime-0.4.6",
-                "version": "0.4.6",
+                "release_id": "splime-0.4.7",
+                "version": "0.4.7",
                 "evidence": {"state": "published"},
                 "components": {
                     "framework": {
@@ -648,14 +649,14 @@ def test_v2_publishable_guard_rejects_empty_artifact_sets() -> None:
 def test_v2_publishable_guard_requires_github_and_immutable_docker_evidence() -> None:
     component = {
         "source_binding": "pinned_commit",
-        "source_ref": "v0.4.6",
+        "source_ref": "v0.4.7",
         "source_commit": "1" * 40,
         "artifact": {"sha256": "2" * 64},
     }
     manifest = {
         "schema_version": 2,
-        "release_id": "splime-0.4.6",
-        "version": "0.4.6",
+        "release_id": "splime-0.4.7",
+        "version": "0.4.7",
         "evidence": {"state": "published"},
         "components": {
             "framework": {
@@ -712,7 +713,7 @@ def test_signed_source_tag_must_identify_the_checked_out_commit(
 
     with pytest.raises(SystemExit, match="does not identify"):
         verify_published_release.verify_signed_source_tag(
-            {"version": "0.4.6"},
+            {"version": "0.4.7"},
             repository=tmp_path,
         )
 
@@ -723,11 +724,11 @@ def test_signed_source_tag_must_match_both_external_bom_components(
 ) -> None:
     commit = "1" * 40
     manifest = {
-        "version": "0.4.6",
+        "version": "0.4.7",
         "components": {
             name: {
                 "source_binding": "signed_tag_external_provenance",
-                "source_ref": "v0.4.6",
+                "source_ref": "v0.4.7",
                 "source_commit": commit,
             }
             for name in ("framework", "daemon")
@@ -763,8 +764,8 @@ def test_published_manifest_remote_bytes_must_match_reviewed_bom_exactly(
         json.dumps(
             {
                 "schema_version": 2,
-                "release_id": "splime-0.4.6",
-                "version": "0.4.6",
+                "release_id": "splime-0.4.7",
+                "version": "0.4.7",
                 "manifest_url": "https://release.test/release-manifest.json",
             },
             indent=2,
@@ -806,12 +807,12 @@ def test_published_manifest_remote_bytes_must_match_reviewed_bom_exactly(
 
 def test_console_build_identity_rejects_non_allowlisted_provenance() -> None:
     manifest = {
-        "release_id": "splime-0.4.6",
-        "packages": {"console": "0.4.6"},
+        "release_id": "splime-0.4.7",
+        "packages": {"console": "0.4.7"},
         "components": {
             "console": {
                 "repository": "https://example.invalid/console",
-                "source_ref": "v0.4.6",
+                "source_ref": "v0.4.7",
                 "source_commit": "1" * 40,
                 "contracts": {"console_server": "console-server/v1"},
             }
@@ -820,12 +821,12 @@ def test_console_build_identity_rejects_non_allowlisted_provenance() -> None:
     build = {
         "schema_version": 1,
         "component": "console",
-        "release_id": "splime-0.4.6",
-        "version": "0.4.6",
+        "release_id": "splime-0.4.7",
+        "version": "0.4.7",
         "evidence_state": "built",
         "source": {
             "repository": "https://example.invalid/console",
-            "ref": "v0.4.6",
+            "ref": "v0.4.7",
             "binding": "pinned_commit",
             "commit": "1" * 40,
         },
@@ -847,12 +848,12 @@ def test_server_deployment_verification_separates_receipt_from_readiness(
 ) -> None:
     manifest = {
         "schema_version": 2,
-        "release_id": "splime-0.4.6",
-        "packages": {"server": "0.4.6"},
+        "release_id": "splime-0.4.7",
+        "packages": {"server": "0.4.7"},
         "server": {"schema_target": 32},
         "components": {
             "server": {
-                "source_ref": "v0.4.6",
+                "source_ref": "v0.4.7",
                 "source_commit": "a" * 40,
                 "artifact": {"sha256": "b" * 64},
             }
@@ -863,8 +864,8 @@ def test_server_deployment_verification_separates_receipt_from_readiness(
         "schema_version": 1,
         "release_id": manifest["release_id"],
         "component": "server",
-        "version": "0.4.6",
-        "source_ref": "v0.4.6",
+        "version": "0.4.7",
+        "source_ref": "v0.4.7",
         "source_commit": "a" * 40,
         "artifact_sha256": "b" * 64,
         "release_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),

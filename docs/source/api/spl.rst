@@ -58,6 +58,15 @@ spl.\_process module
    :show-inheritance:
    :undoc-members:
 
+spl.\_runtime\_port\_adapters\_client module
+--------------------------------------------
+
+.. automodule:: spl._runtime_port_adapters_client
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.\_timeout module
 --------------------
 
@@ -71,6 +80,15 @@ spl.\_views module
 ------------------
 
 .. automodule:: spl._views
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.adapters module
+-------------------
+
+.. automodule:: spl.adapters
    :members:
    :private-members:
    :show-inheritance:

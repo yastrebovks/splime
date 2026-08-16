@@ -33,7 +33,7 @@ _SOURCE_FILES = {
     "auth/firebase.js": b"export const auth = true;\n",
     "bootstrap/consoleApp.js": b"export const startConsoleApp = true;\n",
     "components/shell.js": b"export const shell = true;\n",
-    "config.js": b'export const APP_RELEASE_ID = "splime-0.4.6";\n',
+    "config.js": b'export const APP_RELEASE_ID = "splime-0.4.7";\n',
     "controllers/events.js": b"export const events = true;\n",
     "domain/truth.js": b"export const truth = true;\n",
     "downloads/spl-framework-cold-start.ipynb": b'{"cells":[]}\n',
@@ -103,7 +103,7 @@ def test_console_artifact_is_byte_reproducible_exact_and_source_immutable(
         source_date_epoch=SOURCE_DATE_EPOCH,
     )
 
-    assert first.archive_path.name == "splime-console-0.4.6.tar.gz"
+    assert first.archive_path.name == "splime-console-0.4.7.tar.gz"
     assert first.archive_path.read_bytes() == second.archive_path.read_bytes()
     assert repeated.archive_path.read_bytes() == first.archive_path.read_bytes()
     assert _tree_bytes(first.stage_directory) == _tree_bytes(second.stage_directory)
@@ -137,7 +137,7 @@ def test_console_artifact_is_byte_reproducible_exact_and_source_immutable(
     }
     assert integrity == {
         "schema_version": 2,
-        "release_id": "splime-0.4.6",
+        "release_id": "splime-0.4.7",
         "build": "./build.json",
         "assets": {
             path: _sha256(first.stage_directory / path.removeprefix("./")) for path in sorted(expected_integrity_paths)
@@ -147,7 +147,7 @@ def test_console_artifact_is_byte_reproducible_exact_and_source_immutable(
     with tarfile.open(first.archive_path, mode="r:gz") as archive:
         members = archive.getmembers()
         archived_files = {member.name for member in members if member.isfile()}
-        assert archived_files == {f"splime-console-0.4.6/{path}" for path in expected_staged}
+        assert archived_files == {f"splime-console-0.4.7/{path}" for path in expected_staged}
         assert all(
             not member.name.startswith("/")
             and ".." not in PurePosixPath(member.name).parts

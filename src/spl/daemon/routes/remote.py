@@ -60,7 +60,8 @@ def register_remote_routes(
                 HTTPStatus.FORBIDDEN,
             )
         result = await context.run_blocking(
-            runtime.run_remote_node,
+            runtime.run_worker_callback,
+            principal.run_id if principal is not None else None,
             node,
             kwargs=body.get("kwargs") or {},
             timeout_seconds=body.get("timeout_seconds"),

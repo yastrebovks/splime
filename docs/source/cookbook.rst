@@ -11,7 +11,7 @@ Setup
 
 .. code-block:: bash
 
-   python3.13 -m pip install "splime==0.4.6"
+   python3.13 -m pip install "splime==0.4.7"
    spl-daemon serve        # local daemon on http://127.0.0.1:8765
 
 One import is enough:
@@ -53,6 +53,80 @@ receipt; the full daemon document stays in ``.raw``:
    result.mode      # 'local'
    result.output    # 42.0  — the unwrapped value
    result.value     # {'default': 42.0} — the raw port dict
+
+Per-Run value and file adapters
+-------------------------------
+
+Adapter selection belongs to a Run, not to the immutable Object version.
+Input and output choices are independent, and omitting ``adapters`` keeps the
+ordinary JSON request/result shape. For example, the same DataFrame Function
+can use semicolon CSV on input and XLSX on output:
+
+.. code-block:: python
+
+   result = client.call(
+       'cat_encoding',
+       kwargs={'df': frame, 'dict_categories': {}, 'unique_count': 10},
+       adapters={
+           'inputs': {'df': 'dataframe-csv-semicolon'},
+           'outputs': {'default': 'dataframe-xlsx'},
+       },
+       artifacts_dir='./splime-results',
+   )
+   result.output                 # decoded DataFrame
+   result.downloaded_artifacts   # retained XLSX artifact
+
+Use ``FileInput`` to stage existing bytes without opening them in the caller.
+The opaque adapter gives the Function a private ``pathlib.Path``; the binary
+adapter returns byte-identical ``bytes``:
+
+.. code-block:: python
+
+   from spl.adapters import FileInput
+
+   result = client.call(
+       'inspect_file',
+       kwargs={'file': FileInput('./archive.bin')},
+       adapters={
+           'inputs': {'file': 'opaque-file'},
+           'outputs': {'default': 'binary-file'},
+       },
+       artifacts_dir='./splime-results',
+   )
+
+The other registered IDs are ``json``, ``text-file-utf8``,
+``dataframe-json-split``, ``dataframe-xlsx`` and ``png-pillow``. A requested
+adapter never silently falls back to another format. Custom adapters are
+defined through ``spl.adapters`` as plain top-level save/load functions; local
+execution is worker-only, while remote execution additionally requires both
+caller consent and target-machine enablement.
+
+For reusable immutable custom codecs published independently of an Object,
+see :doc:`library-adapters`. A ``LibraryAdapterRef`` can be selected in the
+same per-Run ``adapters`` mapping without changing the called Object version.
+The SDK also resolves concise per-port Library Adapter selectors to an exact
+immutable ref before admission:
+
+.. code-block:: python
+
+   adapters={
+       'inputs': {
+           'left': 'my-table-codec',                    # current version
+           'right': {'name': 'my-table-codec', 'version': 2},
+       },
+       'outputs': {
+           'default': {
+               'name': 'my-result-codec',
+               'version_id': 'immutable-adapter-version-id',
+           },
+       },
+   }
+
+The call-level ``version`` and ``version_id`` always select the Function or
+Pipeline Object, never an Adapter. A selector inherits ``owner``/``library``
+from the Object call; specify them inside the selector when the Adapter lives
+elsewhere. Built-in string IDs retain their established meaning and do not
+have Library Adapter version numbers.
 
 Environment resolution
 ----------------------
@@ -139,6 +213,22 @@ Catalog, async runs, cleanup
 
    client.forget_version('daily_total', 1)   # local cleanup, no server needed
    client.forget('daily_total')
+
+For a reproducible invocation, bind the Run to the exact Object version
+identity returned by publication or discovery instead of resolving the current
+version by name:
+
+.. code-block:: python
+
+   result = client.call(
+       'order_pipeline',
+       version_id='the-exact-object-version-id',
+       kwargs={'amount': 300, 'bonus': 10},
+       output='result',
+   )
+
+Use ``version=2`` when a numbered version is the intended selector. Omitting
+both selectors retains the existing current-version resolution behavior.
 
 Warm the cache, go offline
 --------------------------
@@ -379,6 +469,12 @@ the pipeline, not on the reusable node object:
 
    pipeline = pipeline.with_node_runtime('heavy_step', 'venv-subprocess')
    Deployment(pipeline).run(runtimes={'heavy_step': 'native'})
+   Deployment(pipeline).run(runtimes='docker')  # every local Function node
+
+For daemon-backed calls, the mapping form still overrides only named Pipeline
+Function aliases. The string form applies to the whole target: ``'docker'``
+selects the Object Docker backend for a Function and one Docker node runtime
+per local Function for a Pipeline.
 
 Native and ``venv-subprocess`` runtimes execute trusted code under the
 conductor's OS identity (the daemon user for daemon-managed runs). A virtual

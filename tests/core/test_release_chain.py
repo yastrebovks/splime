@@ -1,4 +1,4 @@
-"""Contracts for the 0.4.6 source-to-deployment release evidence chain."""
+"""Contracts for the 0.4.7 source-to-deployment release evidence chain."""
 
 from __future__ import annotations
 
@@ -70,14 +70,45 @@ def test_old_tracked_commit_identity_cycle_cannot_name_its_final_clean_head(
     assert _git(repository, "status", "--porcelain") == ""
 
 
-def test_declared_release_contract_is_coherent_but_not_built_evidence() -> None:
+def test_declared_release_contract_is_coherent_but_not_built_evidence(tmp_path: Path) -> None:
     contract = load_json(SPL_ROOT / "release-contract.json")
     manifest = load_json(SPL_ROOT / "release-manifest.json")
+
+    # The public package repository is intentionally standalone. Reconstruct
+    # only the declared companion version projections required by the release
+    # contract; do not require private sibling checkouts or credentials.
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "spl").symlink_to(SPL_ROOT, target_is_directory=True)
+    server = workspace / "spl-server"
+    (server / "src" / "daemon_server").mkdir(parents=True)
+    (server / "pyproject.toml").write_text(
+        f'[project]\nname = "spl-server"\nversion = "{contract["version"]}"\n',
+        encoding="utf-8",
+    )
+    (server / "src" / "daemon_server" / "release-identity.json").write_text(
+        f"{json.dumps(server_release_identity(contract), indent=2)}\n",
+        encoding="utf-8",
+    )
+    console = workspace / "spl-frontend"
+    console.mkdir()
+    (console / "package.json").write_text(
+        f'{{"version": "{contract["version"]}"}}\n',
+        encoding="utf-8",
+    )
+    (console / "config.js").write_text(
+        f'export const APP_RELEASE_ID = "{contract["release_id"]}";\n',
+        encoding="utf-8",
+    )
+    (console / "index.html").write_text(
+        f'<script>const releaseId = "{contract["release_id"]}";</script>\n',
+        encoding="utf-8",
+    )
 
     validate_declared_contract(
         contract,
         manifest,
-        workspace_root=WORKSPACE_ROOT,
+        workspace_root=workspace,
     )
     assert manifest["evidence"] == {
         "state": "declared",
@@ -88,7 +119,7 @@ def test_declared_release_contract_is_coherent_but_not_built_evidence() -> None:
     with pytest.raises(ReleaseChainError):
         validate_source_pins(
             contract,
-            workspace_root=WORKSPACE_ROOT,
+            workspace_root=workspace,
             manifest=manifest,
         )
 
@@ -173,8 +204,8 @@ def test_manifest_projection_allows_evidence_to_mature_but_not_identity_to_drift
     mature["source_date_epoch"] = 1785369600
     mature["python"]["artifacts"][0]["sha256"] = "a" * 64
     mature["python"]["artifacts"][1]["sha256"] = "b" * 64
-    mature["python"]["artifacts"][0]["url"] = "https://files.example.invalid/splime-0.4.6-py3-none-any.whl"
-    mature["python"]["artifacts"][1]["url"] = "https://files.example.invalid/splime-0.4.6.tar.gz"
+    mature["python"]["artifacts"][0]["url"] = "https://files.example.invalid/splime-0.4.7-py3-none-any.whl"
+    mature["python"]["artifacts"][1]["url"] = "https://files.example.invalid/splime-0.4.7.tar.gz"
     mature["console"]["integrity_sha256"] = "c" * 64
     for index, (name, component) in enumerate(mature["components"].items()):
         if component["source_binding"] == "pinned_commit":
@@ -266,22 +297,22 @@ def test_built_stage_binds_every_component_and_console_build_identity(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    wheel = workspace / "artifacts" / "python" / "splime-0.4.6-py3-none-any.whl"
+    wheel = workspace / "artifacts" / "python" / "splime-0.4.7-py3-none-any.whl"
     _write_test_wheel(
         wheel,
         distribution="splime",
-        version="0.4.6",
+        version="0.4.7",
     )
-    server_wheel = workspace / "artifacts" / "server" / "spl_server-0.4.6-py3-none-any.whl"
+    server_wheel = workspace / "artifacts" / "server" / "spl_server-0.4.7-py3-none-any.whl"
     _write_test_wheel(
         server_wheel,
         distribution="spl-server",
-        version="0.4.6",
+        version="0.4.7",
     )
     manifest = {
-        "version": "0.4.6",
-        "release_id": "splime-0.4.6",
-        "packages": {"console": "0.4.6"},
+        "version": "0.4.7",
+        "release_id": "splime-0.4.7",
+        "packages": {"console": "0.4.7"},
         "components": {},
         "python": {
             "artifacts": [
@@ -296,7 +327,7 @@ def test_built_stage_binds_every_component_and_console_build_identity(
             "integrity_path": "artifacts/console/static-integrity.json",
         },
     }
-    console_archive = workspace / "artifacts" / "splime-console-0.4.6.tar.gz"
+    console_archive = workspace / "artifacts" / "splime-console-0.4.7.tar.gz"
     component_paths = {
         "framework": wheel,
         "daemon": wheel,
@@ -312,7 +343,7 @@ def test_built_stage_binds_every_component_and_console_build_identity(
     for name in ("framework", "daemon", "server", "console"):
         manifest["components"][name] = {
             "repository": f"https://example.invalid/{name}.git",
-            "source_ref": "v0.4.6",
+            "source_ref": "v0.4.7",
             "source_commit": "1" * 40,
             "contracts": (
                 {
@@ -334,14 +365,14 @@ def test_built_stage_binds_every_component_and_console_build_identity(
         json.dumps(
             {
                 "schema_version": 1,
-                "release_id": "splime-0.4.6",
+                "release_id": "splime-0.4.7",
                 "component": "console",
-                "version": "0.4.6",
+                "version": "0.4.7",
                 "evidence_state": "built",
                 "source": {
                     "repository": "https://example.invalid/console.git",
                     "binding": "pinned_commit",
-                    "ref": "v0.4.6",
+                    "ref": "v0.4.7",
                     "commit": "1" * 40,
                 },
                 "build": {
@@ -360,7 +391,7 @@ def test_built_stage_binds_every_component_and_console_build_identity(
         json.dumps(
             {
                 "schema_version": 2,
-                "release_id": "splime-0.4.6",
+                "release_id": "splime-0.4.7",
                 "build": "./build.json",
                 "assets": {"./build.json": sha256_file(build)},
             }
@@ -371,7 +402,7 @@ def test_built_stage_binds_every_component_and_console_build_identity(
     _write_console_test_archive(
         console_archive,
         stage_root=integrity.parent,
-        version="0.4.6",
+        version="0.4.7",
     )
     for name, path in component_paths.items():
         manifest["components"][name]["artifact"]["sha256"] = sha256_file(path)
@@ -388,11 +419,11 @@ def test_deployment_receipt_is_exact_allowlisted_evidence(tmp_path: Path) -> Non
     manifest_path = workspace / "spl" / "release-manifest.json"
     manifest_path.parent.mkdir(parents=True)
     manifest = {
-        "release_id": "splime-0.4.6",
-        "packages": {"server": "0.4.6"},
+        "release_id": "splime-0.4.7",
+        "packages": {"server": "0.4.7"},
         "components": {
             "server": {
-                "source_ref": "v0.4.6",
+                "source_ref": "v0.4.7",
                 "source_commit": "1" * 40,
                 "artifact": {"sha256": "2" * 64},
             }
@@ -402,10 +433,10 @@ def test_deployment_receipt_is_exact_allowlisted_evidence(tmp_path: Path) -> Non
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     receipt = {
         "schema_version": 1,
-        "release_id": "splime-0.4.6",
+        "release_id": "splime-0.4.7",
         "component": "server",
-        "version": "0.4.6",
-        "source_ref": "v0.4.6",
+        "version": "0.4.7",
+        "source_ref": "v0.4.7",
         "source_commit": "1" * 40,
         "artifact_sha256": "2" * 64,
         "release_manifest_sha256": sha256_file(manifest_path),
@@ -498,7 +529,7 @@ def _component_repository(
     _git(repository, "add", ".")
     _git(repository, "commit", "-m", "immutable component source")
     commit = _git(repository, "rev-parse", "HEAD")
-    _git(repository, "tag", "v0.4.6")
+    _git(repository, "tag", "v0.4.7")
     return repository, commit
 
 
@@ -509,42 +540,42 @@ def _disposable_built_release(tmp_path: Path) -> tuple[Path, dict, dict]:
         workspace,
         "spl-server",
         {
-            "pyproject.toml": '[project]\nname = "spl-server"\nversion = "0.4.6"\n',
+            "pyproject.toml": '[project]\nname = "spl-server"\nversion = "0.4.7"\n',
         },
     )
     frontend_config = (
-        'export const APP_VERSION = "0.4.6";\n'
-        'export const APP_RELEASE_ID = "splime-0.4.6";\n'
+        'export const APP_VERSION = "0.4.7";\n'
+        'export const APP_RELEASE_ID = "splime-0.4.7";\n'
         "export const RELEASE_MANIFEST_URL = "
-        '"https://github.com/yastrebovks/splime/releases/download/v0.4.6/release-manifest.json";\n'
-        'export const PYPI_RELEASE_URL = "https://pypi.org/project/splime/0.4.6/";\n'
+        '"https://github.com/yastrebovks/splime/releases/download/v0.4.7/release-manifest.json";\n'
+        'export const PYPI_RELEASE_URL = "https://pypi.org/project/splime/0.4.7/";\n'
         "export const COMPONENT_VERSIONS = {\n"
-        '  framework: "0.4.6",\n'
-        '  daemon: "0.4.6",\n'
+        '  framework: "0.4.7",\n'
+        '  daemon: "0.4.7",\n'
         "};\n"
     )
     _, frontend_commit = _component_repository(
         workspace,
         "spl-frontend",
         {
-            "package.json": '{\n  "name": "splime-console",\n  "version": "0.4.6",\n  "type": "module"\n}\n',
+            "package.json": '{\n  "name": "splime-console",\n  "version": "0.4.7",\n  "type": "module"\n}\n',
             "config.js": frontend_config,
-            "index.html": '<script>const releaseId = "splime-0.4.6";</script>\n',
+            "index.html": '<script>const releaseId = "splime-0.4.7";</script>\n',
         },
     )
 
     contract = {
         "schema_version": 1,
-        "release_id": "splime-0.4.6",
-        "version": "0.4.6",
-        "source_tag": "v0.4.6",
+        "release_id": "splime-0.4.7",
+        "version": "0.4.7",
+        "source_tag": "v0.4.7",
         "components": {
             "framework": {
                 "repository": "https://example.invalid/framework",
                 "workspace": "spl",
                 "package": "splime",
-                "version": "0.4.6",
-                "source_ref": "v0.4.6",
+                "version": "0.4.7",
+                "source_ref": "v0.4.7",
                 "source_binding": "pinned_commit",
                 "source_commit": None,
                 "artifact": "splime",
@@ -553,8 +584,8 @@ def _disposable_built_release(tmp_path: Path) -> tuple[Path, dict, dict]:
                 "repository": "https://example.invalid/framework",
                 "workspace": "spl",
                 "package": "splime",
-                "version": "0.4.6",
-                "source_ref": "v0.4.6",
+                "version": "0.4.7",
+                "source_ref": "v0.4.7",
                 "source_binding": "pinned_commit",
                 "source_commit": None,
                 "artifact": "splime",
@@ -563,8 +594,8 @@ def _disposable_built_release(tmp_path: Path) -> tuple[Path, dict, dict]:
                 "repository": "https://example.invalid/server",
                 "workspace": "spl-server",
                 "package": "spl-server",
-                "version": "0.4.6",
-                "source_ref": "v0.4.6",
+                "version": "0.4.7",
+                "source_ref": "v0.4.7",
                 "source_binding": "pinned_commit",
                 "source_commit": None,
                 "artifact": "spl-server",
@@ -573,8 +604,8 @@ def _disposable_built_release(tmp_path: Path) -> tuple[Path, dict, dict]:
                 "repository": "https://example.invalid/console",
                 "workspace": "spl-frontend",
                 "package": "splime-console",
-                "version": "0.4.6",
-                "source_ref": "v0.4.6",
+                "version": "0.4.7",
+                "source_ref": "v0.4.7",
                 "source_binding": "pinned_commit",
                 "source_commit": None,
                 "artifact": "splime-console",
@@ -600,11 +631,11 @@ def _disposable_built_release(tmp_path: Path) -> tuple[Path, dict, dict]:
     spl_root = workspace / "spl"
     (spl_root / "docs" / "source").mkdir(parents=True)
     (spl_root / "pyproject.toml").write_text(
-        '[project]\nname = "splime"\nversion = "0.4.6"\n',
+        '[project]\nname = "splime"\nversion = "0.4.7"\n',
         encoding="utf-8",
     )
     (spl_root / "docs" / "source" / "conf.py").write_text(
-        'release = "0.4.6"\n',
+        'release = "0.4.7"\n',
         encoding="utf-8",
     )
     _write_json(spl_root / "release-contract.json", contract)
@@ -612,13 +643,13 @@ def _disposable_built_release(tmp_path: Path) -> tuple[Path, dict, dict]:
         spl_root / "release" / "compatibility-matrix.json",
         {
             "schema_version": 1,
-            "release_id": "splime-0.4.6",
+            "release_id": "splime-0.4.7",
             "rows": [
                 {
                     "path": "daemon_to_server",
                     "status": "tested",
-                    "producer": "daemon 0.4.6",
-                    "consumer": "server 0.4.6",
+                    "producer": "daemon 0.4.7",
+                    "consumer": "server 0.4.7",
                     "required_contract": "spl.execution_manifest.v1",
                     "fallback": "evidence remains unknown",
                     "test_gate": "disposable multi-repository integration",
@@ -633,7 +664,7 @@ def _disposable_built_release(tmp_path: Path) -> tuple[Path, dict, dict]:
     server_root = workspace / "spl-server"
     _git(server_root, "add", "src/daemon_server/release-identity.json")
     _git(server_root, "commit", "--amend", "--no-edit")
-    _git(server_root, "tag", "--force", "v0.4.6")
+    _git(server_root, "tag", "--force", "v0.4.7")
     server_commit = _git(server_root, "rev-parse", "HEAD")
     _write_json(spl_root / "release-manifest.json", release_manifest(contract))
     _git(spl_root, "init")
@@ -642,7 +673,7 @@ def _disposable_built_release(tmp_path: Path) -> tuple[Path, dict, dict]:
     _git(spl_root, "add", ".")
     _git(spl_root, "commit", "-m", "immutable framework source and declarations")
     framework_commit = _git(spl_root, "rev-parse", "HEAD")
-    _git(spl_root, "tag", "v0.4.6")
+    _git(spl_root, "tag", "v0.4.7")
 
     artifacts = workspace / "artifacts"
     manifest = release_manifest(contract)
@@ -659,7 +690,7 @@ def _disposable_built_release(tmp_path: Path) -> tuple[Path, dict, dict]:
             _write_test_wheel(
                 path,
                 distribution="splime",
-                version="0.4.6",
+                version="0.4.7",
             )
         else:
             path.write_bytes(artifact["filename"].encode())
@@ -669,11 +700,11 @@ def _disposable_built_release(tmp_path: Path) -> tuple[Path, dict, dict]:
         for artifact in manifest["python"]["artifacts"]
         if artifact["filename"].endswith(".whl")
     )
-    server_wheel = artifacts / "server" / "spl_server-0.4.6-py3-none-any.whl"
+    server_wheel = artifacts / "server" / "spl_server-0.4.7-py3-none-any.whl"
     _write_test_wheel(
         server_wheel,
         distribution="spl-server",
-        version="0.4.6",
+        version="0.4.7",
     )
 
     build = console_build_identity(
@@ -688,17 +719,17 @@ def _disposable_built_release(tmp_path: Path) -> tuple[Path, dict, dict]:
         integrity_path,
         {
             "schema_version": 2,
-            "release_id": "splime-0.4.6",
+            "release_id": "splime-0.4.7",
             "build": "./build.json",
             "assets": {"./build.json": sha256_file(build_path)},
         },
     )
     manifest["console"]["integrity_sha256"] = sha256_file(integrity_path)
-    console_archive = artifacts / "splime-console-0.4.6.tar.gz"
+    console_archive = artifacts / "splime-console-0.4.7.tar.gz"
     _write_console_test_archive(
         console_archive,
         stage_root=integrity_path.parent,
-        version="0.4.6",
+        version="0.4.7",
     )
     component_paths = {
         "framework": splime_wheel,
@@ -827,7 +858,7 @@ def test_built_evidence_materializer_binds_semantic_component_artifacts(
     }
     assert built["components"]["framework"]["artifact"] == built["components"]["daemon"]["artifact"]
     assert built["components"]["server"]["artifact"]["path"].endswith(".whl")
-    assert built["components"]["console"]["artifact"]["path"].endswith("splime-console-0.4.6.tar.gz")
+    assert built["components"]["console"]["artifact"]["path"].endswith("splime-console-0.4.7.tar.gz")
 
     wrong_components = dict(component_artifacts)
     wrong_components["daemon"] = component_artifacts["server"]
@@ -849,7 +880,7 @@ def test_published_evidence_materializer_is_exact_deterministic_and_external(
 ) -> None:
     workspace, contract, built = _disposable_built_release(tmp_path)
     source_asset = workspace / "artifacts" / "source-release-manifest.json"
-    _write_json(source_asset, {"release_id": "splime-0.4.6", "state": "source"})
+    _write_json(source_asset, {"release_id": "splime-0.4.7", "state": "source"})
     bom_asset = workspace / "artifacts" / "release-artifact-bom.sha256"
     bom_asset.write_text("reviewed external inventory\n", encoding="utf-8")
     github_assets = {asset["name"]: workspace / asset["path"] for asset in built["github_release"]["assets"]}
@@ -936,7 +967,7 @@ def test_published_evidence_materializer_is_exact_deterministic_and_external(
             **{**arguments, "docker_manifest_digest": "b" * 64},
         )
     incomplete_pypi = dict(pypi_artifacts)
-    incomplete_pypi.pop("splime-0.4.6.tar.gz")
+    incomplete_pypi.pop("splime-0.4.7.tar.gz")
     with pytest.raises(ReleaseChainError, match="PyPI artifact inputs must exactly match"):
         materialize_published_evidence(
             contract,
@@ -944,7 +975,7 @@ def test_published_evidence_materializer_is_exact_deterministic_and_external(
             **{**arguments, "pypi_artifacts": incomplete_pypi},
         )
     wrong_pypi_hash = dict(pypi_artifacts)
-    wheel_name = "splime-0.4.6-py3-none-any.whl"
+    wheel_name = "splime-0.4.7-py3-none-any.whl"
     wrong_pypi_hash[wheel_name] = (
         wrong_pypi_hash[wheel_name][0],
         "e" * 64,
@@ -1112,7 +1143,7 @@ def test_real_built_chain_rejects_tampered_artifact_and_build_commit(
     _write_console_test_archive(
         console_archive,
         stage_root=integrity_path.parent,
-        version="0.4.6",
+        version="0.4.7",
     )
     manifest["components"]["console"]["artifact"]["sha256"] = sha256_file(console_archive)
     with pytest.raises(ReleaseChainError, match="source commit does not match"):
@@ -1140,7 +1171,7 @@ def test_built_console_identity_rejects_private_or_local_fields(
     _write_console_test_archive(
         console_archive,
         stage_root=integrity_path.parent,
-        version="0.4.6",
+        version="0.4.7",
     )
     manifest["components"]["console"]["artifact"]["sha256"] = sha256_file(console_archive)
 

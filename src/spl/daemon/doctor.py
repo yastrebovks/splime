@@ -22,9 +22,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from spl.core.adapter_compat import find_pipeline_adapter_compatibility_issues, probe_pipeline_adapters
 from spl.core.entities.pipeline import Pipeline
 from spl.core.ir.utils import spl_import_from_file
-from spl.core.adapter_compat import find_pipeline_adapter_compatibility_issues, probe_pipeline_adapters
+from spl.daemon.docker_environment import ensure_docker_cli_on_path
 from spl.daemon.docker_pool import (
     OBJECT_DOCKER_RUNTIME_ENV,
     OBJECT_DOCKER_RUNTIME_VALUE,
@@ -634,7 +635,7 @@ def _inside_object_docker_worker() -> bool:
 def _probe_docker_daemon() -> _DockerProbeResult:
     """Probe local Docker without raising."""
 
-    docker_path = shutil.which("docker")
+    docker_path = shutil.which("docker") or ensure_docker_cli_on_path()
     if docker_path is None:
         return _DockerProbeResult(
             docker_path=None,

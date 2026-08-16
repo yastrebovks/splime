@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -12,6 +14,11 @@ from spl.core.adapter_compat import _reset_adapter_compatibility_warnings
 
 _REAL_DAEMON_HOME = (Path.home() / ".spl-daemon").resolve()
 _PYTEST_DAEMON_HOME_ENV = "SPL_PYTEST_DAEMON_HOME"
+_RUNTIME_ADAPTER_TEST_FILES = {
+    "test_runtime_port_adapters.py",
+    "test_runtime_port_adapters_local.py",
+    "test_runtime_port_adapters_remote.py",
+}
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -94,3 +101,26 @@ def reset_adapter_compatibility_warnings() -> Iterator[None]:
     _reset_adapter_compatibility_warnings()
     yield
     _reset_adapter_compatibility_warnings()
+
+
+@pytest.fixture(autouse=True)
+def deny_external_network_for_runtime_adapter_corpus(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail any non-loopback socket connection from the focused adapter corpus."""
+
+    test_path = Path(str(request.node.path))
+    if test_path.name not in _RUNTIME_ADAPTER_TEST_FILES and "runtime_port_adapter" not in request.node.name:
+        return
+
+    original_connect = socket.socket.connect
+
+    def guarded_connect(sock: socket.socket, address: object) -> Any:
+        if sock.family not in {socket.AF_INET, socket.AF_INET6}:
+            return original_connect(sock, address)
+        if isinstance(address, tuple) and str(address[0]) in {"127.0.0.1", "::1", "localhost"}:
+            return original_connect(sock, address)
+        raise AssertionError(f"external network access attempted: {address!r}")
+
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)

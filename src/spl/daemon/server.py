@@ -11,6 +11,8 @@ Endpoints:
     POST /envs
     GET  /objects
     POST /objects
+    POST /objects/prepare
+    POST /objects/validate
     GET  /objects/<name-or-id>
     GET  /objects/<name-or-id>/versions
     GET  /objects/search?q=<text>
@@ -40,8 +42,11 @@ Endpoints:
     DELETE /server/libraries/<ref>/entries/<name>
     POST /server/connect
     POST /server/disconnect
+    GET  /server/ai/preview/capabilities
+    POST /server/ai/preview
     GET  /runs
     POST /runs
+    POST /runs/local-admissions
     GET  /runs/<id>
     GET  /runs/<id>/result
     POST /runs/<id>/delivery-ack
@@ -52,37 +57,67 @@ Endpoints:
 from __future__ import annotations
 
 import base64
+import asyncio
 import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
 import time
 from datetime import UTC, datetime
+from http import HTTPStatus
 from importlib import metadata as importlib_metadata
 from pathlib import Path
-from tempfile import NamedTemporaryFile
-from typing import Any, Callable, cast
+from typing import Any, Callable, Literal, cast
 from urllib.parse import unquote, urlparse, urlunparse
 from uuid import uuid4
+
+import yaml
 
 from spl._process import run_process_tree
 from spl._timeout import TimeoutDomain, validate_timeout_seconds
 from spl.core import json_contract as m_json_contract
 from spl.core import manifest as m_manifest
 from spl.core import resume as m_resume
+from spl.core.node_runtime import REMOTE_RUN_RUNTIME_OVERRIDES_CAPABILITY
+from spl.core.runtime_port_adapters import (
+    RUNTIME_ADAPTER_SEMANTIC_OVERRIDE_CAPABILITY,
+    RUNTIME_PORT_ADAPTERS_CAPABILITY,
+    RuntimePortAdapterContractError,
+    normalize_adapter_policy,
+    normalize_runtime_adapter_semantic_advisories,
+    normalize_runtime_output_record,
+    normalize_wire_document,
+    runtime_adapter_semantic_category,
+    runtime_adapter_semantic_state,
+)
+from spl.core.library_adapters import (
+    LIBRARY_ADAPTER_PUBLISH_CAPABILITY,
+    MAX_ENVIRONMENT_DISTRIBUTIONS,
+    RUNTIME_LIBRARY_ADAPTER_REF_CAPABILITY,
+    canonical_package_name,
+    environment_fingerprint,
+    library_adapter_semantic_advisory,
+    normalize_environment_distributions,
+    normalize_library_adapter_ref,
+    normalize_publish_request,
+    normalize_runtime_library_adapter_refs,
+)
+from spl._runtime_port_adapters_client import server_admission_document
 from spl.core.node_runtime import (
     DOCKER_NODE_RUNTIME,
     NODE_RUNTIME_BACKENDS,
     RUNTIME_TAG_NAME,
     explicit_docker_image_spec_hash,
 )
-from spl.core.entities.pipeline import Pipeline
-from spl.core.ir.utils import spl_import_from_file
+from spl.core.entities.pipeline import DPipeline, Pipeline
+from spl.core.ir.utils import SPLSafeLoader, spl_import_from_file
 from spl.daemon.callback_capability import (
     CALLBACK_CAPABILITY_ENV,
     CallbackCapabilityAuthority,
@@ -92,7 +127,8 @@ from spl.daemon.artifact_access import (
     LOCAL_ARTIFACT_SCAN_MAX_ENTRIES,
     ArtifactDirectory,
 )
-from spl.daemon.docker_environment import DockerEnvironmentManager
+from spl.daemon.browser_adapter_run import BrowserAdapterRunBroker
+from spl.daemon.docker_environment import DockerEnvironmentManager, ensure_docker_cli_on_path
 from spl.daemon.docker_pool import DockerPool
 from spl.daemon.environment import EnvironmentBuildError
 from spl.daemon.environment import EnvironmentManager as VenvEnvironmentManager
@@ -104,8 +140,30 @@ from spl.daemon.environment_base import (
     EnvironmentManagerProtocol,
 )
 from spl.daemon.heartbeat_service import HeartbeatService
+from spl.daemon.guarded_local_run import (
+    GuardedLocalRunAdmission,
+    GuardedLocalRunError,
+    build_guarded_local_run_receipt,
+    retention_to_keep,
+    timeout_ms_to_seconds,
+    validate_signature_arguments,
+)
 from spl.daemon.home_lock import DaemonHomeLock, DaemonInstanceIdentity
 from spl.daemon.interpreter_visibility import environment_record_interpreter_substitution
+from spl.daemon.lifecycle import (
+    LifecycleAdmissionClosed,
+    LifecycleController,
+    LifecycleError,
+    LifecycleWorkLease,
+    validate_deployed_no_claim_capability,
+)
+from spl.daemon.lifecycle_startup import (
+    StartupBinding,
+    StartupBindingError,
+    load_startup_binding,
+    revalidate_startup_binding,
+)
+from spl.daemon.library_adapters import library_adapter_sync_payload
 from spl.daemon.repositories.server_connection import SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
 from spl.daemon.remote_client import (
     RUN_CLAIM_FENCING_CAPABILITY,
@@ -119,14 +177,38 @@ from spl.daemon.remote_client import (
     is_sync_event_identity_collision_error,
 )
 from spl.daemon.routes._helpers import RouteContext
+from spl.daemon.routes.ai_assistant import register_ai_assistant_routes
+from spl.daemon.routes.ai_preview import register_ai_preview_routes
 from spl.daemon.routes.artifacts import register_artifact_routes
+from spl.daemon.routes.adapter_runs import (
+    install_adapter_run_request_limit,
+    register_adapter_run_routes,
+)
 from spl.daemon.routes.diagnostics import register_diagnostics_routes
 from spl.daemon.routes.envs import register_env_routes
+from spl.daemon.routes.guarded_runs import install_guarded_run_request_limit, register_guarded_run_routes
 from spl.daemon.routes.libraries import register_library_routes
+from spl.daemon.routes.lifecycle import (
+    install_lifecycle_request_limit,
+    register_lifecycle_routes,
+)
+from spl.daemon.routes.library_adapters import (
+    install_library_adapter_request_limit,
+    register_library_adapter_routes,
+)
+from spl.daemon.routes.meta import register_meta_routes
 from spl.daemon.routes.objects import register_object_routes
+from spl.daemon.routes.prepared_validation import (
+    install_prepared_validation_request_limit,
+    register_prepared_validation_routes,
+)
 from spl.daemon.routes.remote import register_remote_routes
 from spl.daemon.routes.runs import register_run_routes
 from spl.daemon.routes.server_connections import register_server_connection_routes
+from spl.daemon.routes.source_analysis import (
+    install_source_analysis_request_limit,
+    register_source_analysis_routes,
+)
 from spl.daemon.runtime_backend import (
     RUNTIME_BACKENDS,
     RunContext,
@@ -134,6 +216,11 @@ from spl.daemon.runtime_backend import (
     RuntimeBackendServices,
 )
 from spl.daemon.runtime_config import normalize_runtime_config
+from spl.daemon.runtime_library_adapters import (
+    materialize_claimed_runtime_library_adapters,
+)
+from spl.daemon.runtime_port_adapters import materialize_claimed_runtime_port_adapters
+from spl.daemon.signature import build_signature
 from spl.daemon.spl_free_generator import (
     LEGACY_WORKER_RUNTIME,
     read_worker_runtime_marker,
@@ -185,7 +272,13 @@ from spl.daemon_client import (
     generate_daemon_api_token,
     write_daemon_endpoint,
 )
-from spl.daemon.worker_runtime_marker import WORKER_MANIFEST_HANDOFF_FILE, WORKER_RUNTIME_MARKER_FILE
+from spl.daemon.worker_runtime_marker import (
+    WORKER_MANIFEST_HANDOFF_FILE,
+    WORKER_RUNTIME_ADAPTER_FAILURE_EXIT_CODE,
+    WORKER_RUNTIME_ADAPTER_FAILURE_FILE,
+    WORKER_RUNTIME_CUSTOM_ADAPTER_USED_FILE,
+    WORKER_RUNTIME_MARKER_FILE,
+)
 
 LOCAL_RUN_TEXT_ARTIFACT_MAX_BYTES = 256 * 1024
 LOCAL_RUN_TEXT_ARTIFACT_MAX_COUNT = 100
@@ -245,6 +338,372 @@ EXECUTION_MANIFEST_CAPABILITY_VERSION = 1
 WORKER_BUILD_CAPABILITY = "spl.worker_build.v1"
 WORKER_BUILD_SCHEMA_VERSION = 1
 LOGGER = logging.getLogger(__name__)
+
+_RUNTIME_ADAPTER_FAILURE_MAX_BYTES = 2048
+
+
+def _read_worker_runtime_adapter_failure(
+    path: Path,
+    *,
+    returncode: int,
+) -> dict[str, Any] | None:
+    """Read one closed failure record emitted by the worker adapter wrapper."""
+
+    if returncode != WORKER_RUNTIME_ADAPTER_FAILURE_EXIT_CODE:
+        return None
+    try:
+        before = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > _RUNTIME_ADAPTER_FAILURE_MAX_BYTES
+        ):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            body = os.read(descriptor, _RUNTIME_ADAPTER_FAILURE_MAX_BYTES + 1)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        current = path.lstat()
+    except OSError:
+        return None
+    identity = (before.st_dev, before.st_ino)
+    stable_file = (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+    if not (
+        stat.S_ISREG(opened.st_mode)
+        and identity == (opened.st_dev, opened.st_ino)
+        and identity == (after.st_dev, after.st_ino)
+        and identity == (current.st_dev, current.st_ino)
+        and stable_file == (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+        and stable_file == (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        and stable_file == (current.st_size, current.st_mtime_ns, current.st_ctime_ns)
+        and len(body) == before.st_size
+    ):
+        return None
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return None
+    stage = payload.get("stage")
+    if stage not in {"worker_load", "worker_save"}:
+        return None
+    kind = payload.get("kind")
+    if kind == "stage":
+        if set(payload) != {"schema_version", "kind", "stage"}:
+            return None
+        return {"stage": stage, "reason": "runtime adapter worker stage failed"}
+    if kind != "operation" or set(payload) != {
+        "schema_version",
+        "kind",
+        "stage",
+        "direction",
+        "port",
+        "adapter_id",
+    }:
+        return None
+    direction = payload.get("direction")
+    if direction != ("input" if stage == "worker_load" else "output"):
+        return None
+    port = payload.get("port")
+    adapter_id = payload.get("adapter_id")
+    if (
+        not isinstance(port, str)
+        or not port
+        or len(port) > 256
+        or not isinstance(adapter_id, str)
+        or not adapter_id
+        or len(adapter_id) > 256
+    ):
+        return None
+    input_failure = stage == "worker_load"
+    return {
+        "schema_version": 1,
+        "code": "input_adapter_load_failed" if input_failure else "output_adapter_save_failed",
+        "stage": stage,
+        "direction": direction,
+        "port": port,
+        "adapter_id": adapter_id,
+        "adapter_ref": None,
+        "message": (
+            "The selected input Adapter could not load this value."
+            if input_failure
+            else "The selected output Adapter could not save this value."
+        ),
+        "retryable": False,
+        "fallback_used": False,
+    }
+
+
+def _validated_runtime_adapter_failure(
+    failure: dict[str, Any] | None,
+    initial_manifest: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Bind parsed operation evidence to exactly one admitted adapter binding."""
+
+    if failure is None or failure.get("schema_version") != 1:
+        return failure
+    section = initial_manifest.get("runtime_port_adapters")
+    bindings = section.get("bindings") if isinstance(section, dict) else None
+    if not isinstance(bindings, list):
+        return None
+    matches = [
+        item
+        for item in bindings
+        if isinstance(item, dict)
+        and item.get("direction") == failure.get("direction")
+        and item.get("port") == failure.get("port")
+    ]
+    if len(matches) != 1:
+        return None
+    expected_adapter_ids = {matches[0].get("adapter_id")}
+    ref_document = initial_manifest.get("runtime_library_adapter_refs")
+    if isinstance(ref_document, dict):
+        refs = [
+            item
+            for item in ref_document.get("bindings") or []
+            if isinstance(item, dict)
+            and item.get("direction") == failure.get("direction")
+            and item.get("port") == failure.get("port")
+        ]
+        if len(refs) > 1:
+            return None
+        if refs:
+            expected_adapter_ids = {
+                refs[0].get("adapter_id"),
+                f"library:{refs[0].get('content_hash')}",
+            }
+    if failure.get("adapter_id") not in expected_adapter_ids:
+        return None
+    return failure
+
+
+def _manifest_with_runtime_adapter_failure(
+    manifest: dict[str, Any],
+    initial_manifest: dict[str, Any],
+    failure: dict[str, Any],
+    *,
+    custom_used: bool = False,
+) -> dict[str, Any]:
+    """Retain admitted adapter evidence and attach one closed failure."""
+
+    initial_section = initial_manifest.get("runtime_port_adapters")
+    if not isinstance(initial_section, dict):
+        return manifest
+    section = _runtime_adapter_section_with_usage(initial_section, custom_used=custom_used)
+    closed_failure = dict(failure)
+    if closed_failure.get("schema_version") == 1:
+        ref_document = initial_manifest.get("runtime_library_adapter_refs")
+        if isinstance(ref_document, dict):
+            exact_ref = next(
+                (
+                    item
+                    for item in ref_document.get("bindings") or []
+                    if isinstance(item, dict)
+                    and item.get("direction") == closed_failure.get("direction")
+                    and item.get("port") == closed_failure.get("port")
+                ),
+                None,
+            )
+            if exact_ref is not None:
+                closed_failure["adapter_ref"] = {
+                    key: exact_ref[key]
+                    for key in (
+                        "owner",
+                        "library",
+                        "name",
+                        "version",
+                        "adapter_id",
+                        "adapter_version_id",
+                        "content_hash",
+                        "signature_hash",
+                    )
+                }
+    section["failure"] = closed_failure
+    result = {**manifest, "runtime_port_adapters": section}
+    for key in (
+        "runtime_library_adapter_refs",
+        "runtime_library_adapter_metadata",
+        "runtime_adapter_semantic_advisories",
+    ):
+        value = initial_manifest.get(key)
+        if isinstance(value, dict):
+            result[key] = value
+    return result
+
+
+def _manifest_with_runtime_adapter_outputs(
+    manifest: dict[str, Any],
+    initial_manifest: dict[str, Any],
+    runtime_document: dict[str, Any],
+    raw_records: Any,
+    runtime_library_adapters: dict[str, Any] | None = None,
+    *,
+    custom_used: bool = False,
+) -> dict[str, Any]:
+    """Bind terminal output artifacts to admitted descriptor evidence."""
+
+    initial_section = initial_manifest.get("runtime_port_adapters")
+    if not isinstance(initial_section, dict):
+        raise RuntimeError("runtime adapter manifest evidence is missing")
+    document = normalize_wire_document(runtime_document, allow_content=False)
+    expected = {
+        binding["port"]: binding
+        for binding in document["bindings"]
+        if binding["direction"] == "output" and binding["transport"] == "artifact"
+    }
+    library_by_port = {
+        str(item.get("port")): item
+        for item in (runtime_library_adapters or {}).get("bindings", [])
+        if isinstance(item, dict) and item.get("direction") == "output"
+    }
+    if not isinstance(raw_records, list):
+        raise RuntimeError("runtime adapter output metadata is missing")
+    records = [normalize_runtime_output_record(record) for record in raw_records]
+    by_port = {record["port"]: record for record in records}
+    if (
+        len(by_port) != len(records)
+        or len({record["name"] for record in records}) != len(records)
+        or set(by_port) != set(expected)
+    ):
+        raise RuntimeError("runtime adapter output metadata does not match admitted output ports")
+    for port, record in by_port.items():
+        binding = expected[port]
+        adapter = binding["adapter"]
+        library = library_by_port.get(port)
+        expected_adapter_id = adapter["id"] if library is None else f"library:{library['content_hash']}"
+        expected_format_tag = adapter["format_tag"] if library is None else library.get("format_tag")
+        expected_media_type = adapter["presentation"]["media_type"] if library is None else library.get("media_type")
+        if (
+            record["adapter_id"] != expected_adapter_id
+            or record["format_tag"] != expected_format_tag
+            or record["media_type"] != expected_media_type
+            or record["result_path"] != binding["result_path"]
+        ):
+            raise RuntimeError("runtime adapter output metadata contradicts its admitted descriptor")
+
+    bindings = []
+    for raw_binding in initial_section.get("bindings") or []:
+        binding = dict(raw_binding)
+        if binding.get("direction") == "output" and binding.get("port") in by_port:
+            record = by_port[str(binding["port"])]
+            binding.update(
+                {
+                    "artifact_name": record["name"],
+                    "artifact_size": record["size"],
+                    "artifact_sha256": record["sha256"],
+                    "media_type": record["media_type"],
+                    "result_path": record["result_path"],
+                }
+            )
+        bindings.append(binding)
+    section = _runtime_adapter_section_with_usage(initial_section, custom_used=custom_used)
+    section["bindings"] = bindings
+    result = {**manifest, "runtime_port_adapters": section}
+    for key in (
+        "runtime_library_adapter_refs",
+        "runtime_library_adapter_metadata",
+        "runtime_adapter_semantic_advisories",
+    ):
+        value = initial_manifest.get(key)
+        if isinstance(value, dict):
+            result[key] = value
+    return result
+
+
+def _runtime_adapter_section_with_usage(
+    initial_section: dict[str, Any],
+    *,
+    custom_used: bool,
+) -> dict[str, Any]:
+    section = dict(initial_section)
+    custom = section.get("custom_remote")
+    if not isinstance(custom, dict):
+        raise RuntimeError("runtime adapter custom execution evidence is missing")
+    requested = custom.get("requested") is True
+    allowed = custom.get("allowed") is True
+    section["custom_remote"] = {
+        "requested": requested,
+        "allowed": allowed,
+        "used": bool(custom_used and requested and allowed),
+    }
+    return section
+
+
+def _worker_runtime_custom_adapter_used(run_dir: Path) -> bool:
+    marker = run_dir / WORKER_RUNTIME_CUSTOM_ADAPTER_USED_FILE
+    try:
+        before = marker.lstat()
+        if not stat.S_ISREG(before.st_mode) or before.st_size != len(b"used\n"):
+            return False
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(marker, flags)
+        try:
+            opened = os.fstat(descriptor)
+            body = os.read(descriptor, len(b"used\n") + 1)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        current = marker.lstat()
+    except OSError:
+        return False
+    identity = (before.st_dev, before.st_ino)
+    return (
+        stat.S_ISREG(opened.st_mode)
+        and identity == (opened.st_dev, opened.st_ino)
+        and identity == (after.st_dev, after.st_ino)
+        and identity == (current.st_dev, current.st_ino)
+        and body == b"used\n"
+    )
+
+
+def _verify_terminal_runtime_output_files(artifacts_dir: Path, raw_records: Any) -> None:
+    """Re-prove canonical output bytes after the isolated worker has exited."""
+
+    if not isinstance(raw_records, list):
+        raise RuntimeError("runtime adapter output metadata is missing")
+    for raw_record in raw_records:
+        record = normalize_runtime_output_record(raw_record)
+        path = artifacts_dir / record["name"]
+        try:
+            before = path.lstat()
+            if not stat.S_ISREG(before.st_mode):
+                raise RuntimeError("runtime adapter output is not a regular file")
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            try:
+                opened = os.fstat(descriptor)
+                remaining = record["size"] + 1
+                chunks: list[bytes] = []
+                while remaining:
+                    chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                after = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            current = path.lstat()
+        except OSError:
+            raise RuntimeError("runtime adapter output could not be verified after worker exit") from None
+        body = b"".join(chunks)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)
+            or (current.st_dev, current.st_ino) != (after.st_dev, after.st_ino)
+            or len(body) != record["size"]
+            or after.st_size != record["size"]
+            or current.st_size != record["size"]
+            or hashlib.sha256(body).hexdigest() != record["sha256"]
+        ):
+            raise RuntimeError("runtime adapter output failed terminal size/checksum verification")
 
 
 EnvironmentManagerFactory = Callable[..., EnvironmentManagerProtocol]
@@ -413,6 +872,7 @@ class DaemonRuntime:
         docker_pool_size: int = 0,
         docker_idle_timeout_seconds: float = 300.0,
         docker_prewarm: bool = False,
+        allow_remote_custom_adapters: bool = False,
         telemetry: TelemetryLevel = DEFAULT_TELEMETRY_LEVEL,
         telemetry_sensitive_fields: tuple[str, ...] | list[str] = (),
         environment_manager: EnvironmentManagerProtocol | None = None,
@@ -424,6 +884,8 @@ class DaemonRuntime:
         heartbeat_service: HeartbeatsProtocol | None = None,
         daemon_identity: DaemonInstanceIdentity | None = None,
         daemon_home_lock: DaemonHomeLock | None = None,
+        startup_binding: StartupBinding | None = None,
+        startup_supervisor_proof: str | None = None,
         server_client_factory: ServerClientFactoryProtocol = (_default_server_client_factory),
         environment_manager_factory: EnvironmentManagerFactory = (_default_environment_manager_factory),
         docker_environment_manager_factory: DockerEnvironmentManagerFactory = (
@@ -437,8 +899,20 @@ class DaemonRuntime:
         ),
         heartbeat_service_factory: HeartbeatServiceFactory = (_default_heartbeat_service_factory),
     ):
+        # Desktop/GUI launchers can provide a system-only PATH.  Activate an
+        # exact standard Docker installation before managers perform startup
+        # cleanup, environment builds, or worker command construction.
+        self._docker_cli_path = ensure_docker_cli_on_path()
         self.store = store
         self.daemon_identity = daemon_identity
+        self.daemon_home_lock = daemon_home_lock
+        self.startup_binding = startup_binding
+        self.lifecycle = LifecycleController(
+            daemon_identity,
+            supervisor_id=(startup_binding.supervisor_id if startup_binding is not None else None),
+            supervisor_proof=startup_supervisor_proof,
+            binding_id=(startup_binding.binding_id if startup_binding is not None else None),
+        )
         self.callback_capabilities = CallbackCapabilityAuthority(self._callback_run_status)
         self.telemetry_policy = TelemetryPolicy(
             telemetry,
@@ -456,6 +930,8 @@ class DaemonRuntime:
             extra={"spl_event": "daemon_telemetry_policy"},
         )
         self.auto_build_envs = auto_build_envs
+        self.allow_remote_custom_adapters = bool(allow_remote_custom_adapters)
+        self.browser_adapter_runs = BrowserAdapterRunBroker(self)
         self.daemon_base_url = daemon_base_url.rstrip("/")
         self.server_client_factory = server_client_factory
         manager_kwargs = {}
@@ -487,6 +963,14 @@ class DaemonRuntime:
             docker_pool=self.docker_pool,
         )
         self.runtime_backends = runtime_backends or runtime_backend_registry_factory(backend_services)
+        for manager in (
+            self.environment_manager,
+            self.docker_environment_manager,
+            self.docker_pool,
+        ):
+            bind_lifecycle = getattr(manager, "bind_lifecycle", None)
+            if callable(bind_lifecycle):
+                bind_lifecycle(self.lifecycle)
         self.sync_visibility = sync_visibility or sync_visibility_factory(store)
         self._server_sync_lock = threading.Lock()
         self._server_channel_lock = threading.Lock()
@@ -500,6 +984,11 @@ class DaemonRuntime:
         self._superseded_server_attempts: set[tuple[str, str | None]] = set()
         self._run_threads_lock = threading.Lock()
         self._run_threads: list[threading.Thread] = []
+        self._lifecycle_run_leases_lock = threading.Lock()
+        self._lifecycle_run_leases: dict[str, LifecycleWorkLease] = {}
+        self._lifecycle_run_lineages: dict[str, str] = {}
+        self._lifecycle_drain_threads_lock = threading.Lock()
+        self._lifecycle_drain_threads: dict[str, threading.Thread] = {}
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
         self._retention_condition = threading.Condition()
@@ -533,6 +1022,119 @@ class DaemonRuntime:
         """Return the active nonsecret central telemetry policy summary."""
 
         return self.telemetry_policy.status()
+
+    def lifecycle_status(self) -> dict[str, Any]:
+        """Return exact live lifecycle truth without granting control."""
+
+        home_lock = self.daemon_home_lock
+        identity = self.daemon_identity
+        if identity is None or home_lock is None or not home_lock.is_acquired or home_lock.identity is not identity:
+            raise LifecycleError(
+                "live_identity_unavailable",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                operation="status",
+            )
+        return self.lifecycle.status_document()
+
+    def run_registry_mutation(
+        self,
+        operation: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Run one existing durable/configuration mutation under admission."""
+
+        lease = self.lifecycle.reserve_current_or_root("registry_mutation")
+        with lease:
+            return operation(*args, **kwargs)
+
+    def consume_lifecycle_startup_receipt(self, supervisor_proof: str | None) -> dict[str, Any]:
+        """Consume the one server-only direct-child readiness receipt."""
+
+        binding = self.startup_binding
+        identity = self.daemon_identity
+        home_lock = self.daemon_home_lock
+        if (
+            binding is None
+            or identity is None
+            or home_lock is None
+            or not home_lock.is_acquired
+            or home_lock.identity is not identity
+        ):
+            raise StartupBindingError("startup binding is unavailable")
+        return binding.consume_receipt(
+            identity,
+            proof=supervisor_proof,
+            observed_at=datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        )
+
+    def request_lifecycle_drain(
+        self,
+        document: dict[str, Any],
+        *,
+        supervisor_proof: str | None,
+    ) -> dict[str, Any]:
+        """Close root admission and establish the central no-claim boundary."""
+
+        receipt = self.lifecycle.request_drain(
+            document,
+            supervisor_proof=supervisor_proof,
+        )
+        drain_id = str(receipt["drain_id"])
+        with self._lifecycle_drain_threads_lock:
+            existing = self._lifecycle_drain_threads.get(drain_id)
+            if existing is None or not existing.is_alive():
+                thread = threading.Thread(
+                    target=self._establish_lifecycle_claim_boundary,
+                    args=(drain_id,),
+                    name=f"spl-lifecycle-drain-{drain_id}",
+                    daemon=True,
+                )
+                self._lifecycle_drain_threads[drain_id] = thread
+                thread.start()
+        return receipt
+
+    def cancel_lifecycle_drain(
+        self,
+        document: dict[str, Any],
+        *,
+        supervisor_proof: str | None,
+    ) -> dict[str, Any]:
+        """Cancel the exact current schedule before stop commit."""
+
+        return self.lifecycle.cancel_drain(
+            document,
+            supervisor_proof=supervisor_proof,
+        )
+
+    def _establish_lifecycle_claim_boundary(self, drain_id: str) -> None:
+        """Run one serialized draining sync or prove no central lease exists."""
+
+        try:
+            credentials = self.store.current_server_connection_credentials()
+            if credentials is None:
+                self.lifecycle.mark_claim_boundary_not_required()
+                return
+            self.sync_once(
+                connection_id=str(credentials["id"]),
+                probe_server_channel=True,
+            )
+        except LifecycleError:
+            # The sync wrapper records whether capability evidence or a sent
+            # request failed.  Cancellation can also remove the drain while
+            # this bounded coordinator is still returning.
+            return
+        except Exception:
+            try:
+                self.lifecycle.mark_claim_boundary_failed(outcome_unknown=False)
+            except LifecycleError:
+                pass
+        finally:
+            with self._lifecycle_drain_threads_lock:
+                thread = self._lifecycle_drain_threads.get(drain_id)
+                if thread is threading.current_thread():
+                    self._lifecycle_drain_threads.pop(drain_id, None)
 
     def _normalize_persisted_run_telemetry(self) -> None:
         """Apply the active privacy policy before any restored sync can run."""
@@ -638,6 +1240,87 @@ class DaemonRuntime:
                 compacted,
                 quarantined,
                 extra={"spl_event": "run_telemetry_queue_normalized"},
+            )
+
+    def _bind_lifecycle_run_lease(
+        self,
+        run_id: str,
+        lease: LifecycleWorkLease,
+    ) -> None:
+        """Bind one process-local admission lease to an exact durable Run."""
+
+        with self._lifecycle_run_leases_lock:
+            if run_id in self._lifecycle_run_leases:
+                self.lifecycle.record_unknown_work()
+                raise LifecycleError(
+                    "run_admission_already_bound",
+                    HTTPStatus.CONFLICT,
+                    operation="admit_work",
+                )
+            self._lifecycle_run_leases[run_id] = lease
+            self._lifecycle_run_lineages[run_id] = lease.lineage_id
+
+    def _release_lifecycle_run_lease(
+        self,
+        run_id: str,
+        *,
+        seal_lineage: bool | None = None,
+    ) -> None:
+        """Release one exact Run lease after all terminal descendants finish."""
+
+        with self._lifecycle_run_leases_lock:
+            lease = self._lifecycle_run_leases.pop(run_id, None)
+            self._lifecycle_run_lineages.pop(run_id, None)
+        if lease is not None:
+            lease.complete(
+                seal_lineage=lease.root if seal_lineage is None else seal_lineage,
+            )
+
+    def _release_unbound_lifecycle_lease(self, lease: LifecycleWorkLease) -> None:
+        """Close a reservation that failed before an exact Run was bound."""
+
+        with self._lifecycle_run_leases_lock:
+            bound = any(candidate is lease for candidate in self._lifecycle_run_leases.values())
+        if not bound:
+            lease.complete(seal_lineage=lease.root)
+
+    def _reserve_run_descendant(
+        self,
+        run_id: str,
+        kind: str,
+        *,
+        queued: bool = False,
+    ) -> LifecycleWorkLease | None:
+        """Reserve a known descendant without reconstructing a lineage."""
+
+        with self._lifecycle_run_leases_lock:
+            lineage_id = self._lifecycle_run_lineages.get(run_id)
+        if lineage_id is None:
+            return None
+        return self.lifecycle.reserve_descendant(
+            kind,
+            lineage_id,
+            queued=queued,
+        )
+
+    def run_worker_callback(
+        self,
+        parent_run_id: str | None,
+        node: dict[str, Any],
+        *,
+        kwargs: dict[str, Any],
+        timeout_seconds: float | None,
+    ) -> dict[str, Any]:
+        """Retain callback work under its exact parent Run when available."""
+
+        lease = self._reserve_run_descendant(parent_run_id, "callback") if parent_run_id is not None else None
+        if lease is None:
+            lease = self.lifecycle.reserve_root("callback", queued=False)
+        with lease:
+            return self.run_remote_node(
+                node,
+                kwargs=kwargs,
+                timeout_seconds=timeout_seconds,
             )
 
     def _server_client(
@@ -765,6 +1448,16 @@ class DaemonRuntime:
             return status
 
     def _probe_server_channel(
+        self,
+        credentials: dict[str, Any],
+    ) -> tuple[bool, str | None]:
+        """Admit the side-effecting liveness probe before network or storage."""
+
+        lease = self.lifecycle.reserve_current_or_root("registry_mutation")
+        with lease:
+            return self._probe_server_channel_admitted(credentials)
+
+    def _probe_server_channel_admitted(
         self,
         credentials: dict[str, Any],
     ) -> tuple[bool, str | None]:
@@ -1004,13 +1697,13 @@ class DaemonRuntime:
                 state["detail"] = probe_detail
         return state
 
-    def sync_status(self) -> dict[str, Any]:
+    def sync_status(self, *, include_identity_scope: bool = False) -> dict[str, Any]:
         """Return bounded queue and heartbeat diagnostics for operators."""
 
         connection_state = self.server_connection_state(probe=False)
         connection = connection_state.get("connection") or {}
         queue = self.store.sync_event_status_summary()
-        return {
+        result = {
             **connection_state,
             "by_status": queue["by_status"],
             "oldest_event": queue["oldest_event"],
@@ -1018,6 +1711,24 @@ class DaemonRuntime:
             "heartbeat": self.heartbeat_service.status(connection.get("id")),
             "telemetry": self.telemetry_status(),
         }
+        if include_identity_scope:
+            current_owner_id = connection.get("owner_id")
+            identity = self.store.pending_sync_event_identity_summary(
+                str(current_owner_id) if current_owner_id else None
+            )
+            current_owner_pending = identity["pre_enrollment_pending"]
+            if current_owner_id:
+                current_owner_pending += identity["pending_by_owner"].get(str(current_owner_id), 0)
+            total_pending = int(queue["by_status"].get("pending", 0))
+            # Opt-in, aggregate-only evidence lets optional IDE clients
+            # distinguish work sendable by the current connection from rows
+            # intentionally held for another stored identity. Existing callers
+            # keep the byte-compatible legacy response unless they opt in.
+            result["identity_scope"] = {
+                "current_owner_pending": current_owner_pending,
+                "held_for_other_identities": max(0, total_pending - current_owner_pending),
+            }
+        return result
 
     def prune_sync_events(
         self,
@@ -1029,11 +1740,15 @@ class DaemonRuntime:
     ) -> dict[str, Any]:
         """Prune a bounded queue slice, protecting non-telemetry events."""
 
-        return self.store.prune_sync_events(
-            status=status,
-            older_than_days=older_than_days,
-            include_protected=include_protected,
-            limit=limit,
+        return cast(
+            dict[str, Any],
+            self.run_registry_mutation(
+                self.store.prune_sync_events,
+                status=status,
+                older_than_days=older_than_days,
+                include_protected=include_protected,
+                limit=limit,
+            ),
         )
 
     def _local_sync_status(self) -> dict[str, Any]:
@@ -1249,7 +1964,67 @@ class DaemonRuntime:
         advertised[WORKER_OPERATIONS_CAPABILITY] = self._worker_operations_capability()
         advertised[EXECUTION_MANIFEST_CAPABILITY] = self._execution_manifest_capability()
         advertised[WORKER_BUILD_CAPABILITY] = self._worker_build_capability()
+        advertised[RUNTIME_PORT_ADAPTERS_CAPABILITY] = {
+            "schema_version": 1,
+            "transport": True,
+            "custom_adapter_execution": {
+                "implemented": True,
+                "enabled": self.allow_remote_custom_adapters,
+            },
+        }
+        advertised[RUNTIME_ADAPTER_SEMANTIC_OVERRIDE_CAPABILITY] = {
+            "schema_version": 1,
+            "advisory": True,
+        }
+        library_environment = self._runtime_library_adapter_environment()
+        advertised[RUNTIME_LIBRARY_ADAPTER_REF_CAPABILITY] = {
+            "schema_version": 1,
+            "execution": True,
+            "custom_adapter_execution": {
+                "implemented": True,
+                "enabled": self.allow_remote_custom_adapters,
+            },
+            "environment": library_environment,
+        }
         return advertised
+
+    @staticmethod
+    def _runtime_library_adapter_environment() -> dict[str, Any]:
+        """Return bounded, path-free exact distribution evidence.
+
+        Distribution metadata is inspected without importing optional
+        packages.  Invalid or ambiguously duplicated records are omitted, so
+        central availability can only produce a conservative false negative.
+        """
+
+        candidates: dict[str, dict[str, str]] = {}
+        ambiguous: set[str] = set()
+        try:
+            installed = importlib_metadata.distributions()
+        except Exception:
+            installed = ()
+        for distribution in installed:
+            try:
+                name = distribution.metadata.get("Name")
+                version = distribution.version
+                [record] = normalize_environment_distributions([{"package": name, "version": version}])
+            except (AttributeError, KeyError, TypeError, ValueError):
+                continue
+            key = canonical_package_name(record["package"])
+            prior = candidates.get(key)
+            if prior is not None and prior != record:
+                ambiguous.add(key)
+                candidates.pop(key, None)
+                continue
+            if key not in ambiguous:
+                candidates[key] = record
+        distributions = [candidates[key] for key in sorted(candidates) if key not in ambiguous][
+            :MAX_ENVIRONMENT_DISTRIBUTIONS
+        ]
+        return {
+            "fingerprint": environment_fingerprint(distributions),
+            "distributions": distributions,
+        }
 
     def connect_server(
         self,
@@ -1263,6 +2038,33 @@ class DaemonRuntime:
         heartbeat_interval_seconds: float | None,
     ) -> dict[str, Any]:
         """Connect to the central daemon server and start lease heartbeats."""
+
+        return cast(
+            dict[str, Any],
+            self.run_registry_mutation(
+                self._connect_server_admitted,
+                server_url=server_url,
+                machine_token=machine_token,
+                user_token=user_token,
+                machine_id=machine_id,
+                display_name=display_name,
+                capabilities=capabilities,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+            ),
+        )
+
+    def _connect_server_admitted(
+        self,
+        *,
+        server_url: str,
+        machine_token: str,
+        user_token: str,
+        machine_id: str | None,
+        display_name: str | None,
+        capabilities: dict[str, Any],
+        heartbeat_interval_seconds: float | None,
+    ) -> dict[str, Any]:
+        """Perform one already-admitted central connection mutation."""
 
         result = self.server_connections.connect_server(
             server_url=server_url,
@@ -1351,6 +2153,14 @@ class DaemonRuntime:
     def disconnect_server(self) -> dict[str, Any]:
         """Gracefully disconnect the current central-server lease."""
 
+        return cast(
+            dict[str, Any],
+            self.run_registry_mutation(self._disconnect_server_admitted),
+        )
+
+    def _disconnect_server_admitted(self) -> dict[str, Any]:
+        """Perform one already-admitted central disconnect mutation."""
+
         credentials = self.store.current_server_connection_credentials()
         if credentials is None:
             raise KeyError("active server connection is not found")
@@ -1387,6 +2197,68 @@ class DaemonRuntime:
         library_display_name: str | None = None,
     ) -> dict[str, Any]:
         """Queue a freshly registered local object version for server sync."""
+
+        return cast(
+            dict[str, Any],
+            self.run_registry_mutation(
+                self._enqueue_object_sync_admitted,
+                record,
+                library=library,
+                create_library=create_library,
+                library_display_name=library_display_name,
+            ),
+        )
+
+    def enqueue_library_adapter_sync(self, ref: dict[str, Any]) -> dict[str, Any]:
+        """Capability-gate and send one source-bearing Adapter publication.
+
+        The existing generic sync event is intentionally not the primary path:
+        its 256 KiB bound is smaller than the established 512 KiB custom-code
+        bundle bound.  This direct mutation disables transport retries; an
+        ambiguous response is reported as deferred and is never replayed by
+        this call.
+        """
+
+        credentials = self.store.current_server_connection_credentials()
+        if credentials is None or not credentials.get("remote_connection_id"):
+            return {"state": "deferred", "reason": "server_connection_unavailable"}
+        if not self._server_channel_is_live(credentials, supervise_heartbeat=False):
+            return {"state": "deferred", "reason": "server_connection_offline"}
+        server = self._server_client_for_credentials(credentials)
+        version = server.get_server_version()
+        declared = version.get("declared")
+        contracts = declared.get("contracts") if isinstance(declared, dict) else None
+        capabilities = contracts.get("daemon_server_capabilities") if isinstance(contracts, dict) else None
+        if not isinstance(capabilities, list) or LIBRARY_ADAPTER_PUBLISH_CAPABILITY not in capabilities:
+            return {"state": "unsupported", "reason": "server_capability_not_advertised"}
+        payload = library_adapter_sync_payload(self.store, ref)
+        owner = str(ref["owner"])
+        library = str(payload.pop("library"))
+        remote = server.publish_library_adapter(owner, library, payload)
+        remote_ref = remote.get("ref") if isinstance(remote.get("ref"), dict) else remote.get("version")
+        if isinstance(remote_ref, dict):
+            prepared = normalize_publish_request(payload)
+            self.store.publish_library_adapter(
+                prepared,
+                owner_id=ref["owner"],
+                library=ref["library"],
+                publisher_id=ref["owner"],
+                adapter_id=ref["adapter_id"],
+                remote_owner_id=remote_ref.get("owner"),
+                remote_adapter_id=remote_ref.get("adapter_id"),
+                remote_version_id=remote_ref.get("adapter_version_id"),
+            )
+        return {"state": "synced", "reason": None, "remote": remote}
+
+    def _enqueue_object_sync_admitted(
+        self,
+        record: dict[str, Any],
+        *,
+        library: str | None = None,
+        create_library: bool = False,
+        library_display_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist one already-admitted Object sync event."""
 
         version = self.store.get_object(
             record["id"],
@@ -1799,6 +2671,24 @@ class DaemonRuntime:
         env: str,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Admit one durable Object/descendant registration mutation."""
+
+        lease = self.lifecycle.reserve_current_or_root("registry_mutation")
+        with lease:
+            return self._register_object_admitted(
+                name,
+                entrypoint,
+                env,
+                **kwargs,
+            )
+
+    def _register_object_admitted(
+        self,
+        name: str,
+        entrypoint: str,
+        env: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         """Register an object and resolve remote-node signatures if needed."""
 
         kwargs = dict(kwargs)
@@ -1933,10 +2823,14 @@ class DaemonRuntime:
         import can proceed without repeatedly asking the server.
         """
 
-        return self._resolve_remote_signature(
-            ref,
-            force=force,
-            cache_updates=None,
+        return cast(
+            dict[str, Any],
+            self.run_registry_mutation(
+                self._resolve_remote_signature,
+                ref,
+                force=force,
+                cache_updates=None,
+            ),
         )
 
     def _resolve_remote_signature(
@@ -2218,8 +3112,74 @@ class DaemonRuntime:
         parent_run_id: str | None = None,
         context: dict[str, Any] | None = None,
         offline_policy: str | None = None,
+        runtimes: str | dict[str, str] | None = None,
+        runtime_port_adapters: dict[str, Any] | None = None,
+        runtime_library_adapter_refs: dict[str, Any] | None = None,
+        runtime_adapter_semantic_advisories: dict[str, Any] | None = None,
+        adapter_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Create a server-side run through the idempotent direct route."""
+
+        # Preserve the legacy pure-input preflight before consulting runtime
+        # state.  Admission still occurs before any external work or mutation.
+        validate_timeout_seconds(
+            timeout_seconds,
+            name="timeout_seconds",
+            domain=TimeoutDomain.NON_NEGATIVE,
+            allow_none=True,
+        )
+        return cast(
+            dict[str, Any],
+            self.run_registry_mutation(
+                self._start_remote_run_admitted,
+                object_name,
+                target_machine=target_machine,
+                object_owner_id=object_owner_id,
+                library=library,
+                args=args,
+                kwargs=kwargs,
+                output=output,
+                timeout_seconds=timeout_seconds,
+                version=version,
+                object_version_id=object_version_id,
+                function=function,
+                correlation_id=correlation_id,
+                parent_run_id=parent_run_id,
+                context=context,
+                offline_policy=offline_policy,
+                runtimes=runtimes,
+                runtime_port_adapters=runtime_port_adapters,
+                runtime_library_adapter_refs=runtime_library_adapter_refs,
+                runtime_adapter_semantic_advisories=runtime_adapter_semantic_advisories,
+                adapter_policy=adapter_policy,
+            ),
+        )
+
+    def _start_remote_run_admitted(
+        self,
+        object_name: str,
+        *,
+        target_machine: str | None = None,
+        object_owner_id: str | None = None,
+        library: str | None = None,
+        args: list[Any] | None = None,
+        kwargs: dict[str, Any] | None = None,
+        output: str | None = None,
+        timeout_seconds: float | None = None,
+        version: int | None = None,
+        object_version_id: str | None = None,
+        function: str | None = None,
+        correlation_id: str | None = None,
+        parent_run_id: str | None = None,
+        context: dict[str, Any] | None = None,
+        offline_policy: str | None = None,
+        runtimes: str | dict[str, str] | None = None,
+        runtime_port_adapters: dict[str, Any] | None = None,
+        runtime_library_adapter_refs: dict[str, Any] | None = None,
+        runtime_adapter_semantic_advisories: dict[str, Any] | None = None,
+        adapter_policy: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Perform one already-admitted central Run creation."""
 
         validate_timeout_seconds(
             timeout_seconds,
@@ -2259,6 +3219,8 @@ class DaemonRuntime:
             payload["parent_run_id"] = parent_run_id
         if context:
             payload["context"] = context
+        if runtimes is not None:
+            payload["runtimes"] = runtimes
 
         idempotency_key = (
             "remote_run_request_"
@@ -2269,15 +3231,571 @@ class DaemonRuntime:
         if resolved_offline_policy == "fail_fast" and target_machine and target_machine != credentials["machine_id"]:
             self._raise_if_target_machine_offline(credentials, target_machine)
         server = self._server_client_for_credentials(credentials)
-        run = server.create_remote_run(
-            payload,
-            idempotency_key=idempotency_key,
-        )
+        if runtimes is not None:
+            self._require_server_runtime_override_capability(server)
+        if runtime_port_adapters is None:
+            if runtime_adapter_semantic_advisories is not None:
+                raise RuntimePortAdapterContractError(
+                    "semantic_advisory_transport_missing",
+                    "runtime adapter semantic advisories require runtime port transport",
+                    stage="admission",
+                )
+            run = server.create_remote_run(
+                payload,
+                idempotency_key=idempotency_key,
+            )
+        else:
+            document = normalize_wire_document(runtime_port_adapters, allow_content=True)
+            policy = normalize_adapter_policy(adapter_policy)
+            semantic_advisories = (
+                None
+                if runtime_adapter_semantic_advisories is None
+                else normalize_runtime_adapter_semantic_advisories(runtime_adapter_semantic_advisories)
+            )
+            semantic_supported = self._require_server_runtime_port_adapter_capability(
+                server,
+                require_library_refs=runtime_library_adapter_refs is not None,
+                require_semantic_override=bool(
+                    semantic_advisories is not None
+                    and any(item["state"] != "recommended" for item in semantic_advisories["bindings"])
+                ),
+            )
+            remote_library_refs = (
+                None
+                if runtime_library_adapter_refs is None
+                else self._translate_remote_library_adapter_refs(
+                    server,
+                    runtime_library_adapter_refs,
+                )
+            )
+            remote_semantic_advisories = None
+            if semantic_supported:
+                remote_semantic_advisories = (
+                    self._synthesize_remote_runtime_adapter_semantic_advisories(
+                        server,
+                        document,
+                        remote_library_refs=remote_library_refs,
+                    )
+                    if semantic_advisories is None
+                    else self._translate_remote_runtime_adapter_semantic_advisories(
+                        semantic_advisories,
+                        local_library_refs=runtime_library_adapter_refs,
+                        remote_library_refs=remote_library_refs,
+                    )
+                )
+            if (
+                remote_semantic_advisories is not None
+                and any(item["state"] != "recommended" for item in remote_semantic_advisories["bindings"])
+                and not semantic_supported
+            ):
+                raise RuntimePortAdapterContractError(
+                    "remote_semantic_override_unsupported",
+                    "the connected SPL server does not support explicit runtime adapter semantic advisories",
+                    stage="admission",
+                )
+            run = self._create_remote_runtime_adapter_run(
+                server,
+                request_id=idempotency_key,
+                payload=payload,
+                document=document,
+                adapter_policy=policy,
+                runtime_library_adapter_refs=remote_library_refs,
+                runtime_adapter_semantic_advisories=remote_semantic_advisories,
+            )
         # A separate sync may claim the new job for this machine. The keyed
         # POST and all of its retries have completed before the sync lock is
         # acquired by this background kick.
         self._kick_server_sync(credentials["id"])
         return run
+
+    @staticmethod
+    def _require_server_runtime_override_capability(server: ServerClientProtocol) -> None:
+        """Reject remote runtime overrides before mutation on an older server."""
+
+        version = server.get_server_version()
+        declared = version.get("declared")
+        contracts = declared.get("contracts") if isinstance(declared, dict) else None
+        capabilities = contracts.get("daemon_server_capabilities") if isinstance(contracts, dict) else None
+        if not isinstance(capabilities, list) or REMOTE_RUN_RUNTIME_OVERRIDES_CAPABILITY not in capabilities:
+            raise RuntimeError(
+                "the connected SPL server does not support remote Run runtime overrides; upgrade the server first"
+            )
+
+    @staticmethod
+    def _require_server_runtime_port_adapter_capability(
+        server: ServerClientProtocol,
+        *,
+        require_library_refs: bool = False,
+        require_semantic_override: bool = False,
+    ) -> bool:
+        """Fail before central mutation unless the server advertises v1."""
+
+        version = server.get_server_version()
+        declared = version.get("declared")
+        contracts = declared.get("contracts") if isinstance(declared, dict) else None
+        capabilities = contracts.get("daemon_server_capabilities") if isinstance(contracts, dict) else None
+        if not isinstance(capabilities, list) or RUNTIME_PORT_ADAPTERS_CAPABILITY not in capabilities:
+            raise RuntimePortAdapterContractError(
+                "remote_server_unsupported",
+                "the connected SPL server does not support runtime port adapter admissions",
+                stage="admission",
+            )
+        if require_library_refs and RUNTIME_LIBRARY_ADAPTER_REF_CAPABILITY not in capabilities:
+            raise RuntimePortAdapterContractError(
+                "remote_library_adapter_server_unsupported",
+                "the connected SPL server does not support exact Library Adapter Run references",
+                stage="admission",
+            )
+        semantic_supported = RUNTIME_ADAPTER_SEMANTIC_OVERRIDE_CAPABILITY in capabilities
+        if require_semantic_override and not semantic_supported:
+            raise RuntimePortAdapterContractError(
+                "remote_semantic_override_unsupported",
+                "the connected SPL server does not support explicit runtime adapter semantic advisories",
+                stage="admission",
+            )
+        return semantic_supported
+
+    def _translate_remote_library_adapter_refs(
+        self,
+        server: ServerClientProtocol,
+        value: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Re-read central identities and translate proven synced local refs."""
+
+        refs = normalize_runtime_library_adapter_refs(value)
+        translated: list[dict[str, Any]] = []
+        for binding in refs["bindings"]:
+            local_ref = {
+                key: binding[key]
+                for key in (
+                    "owner",
+                    "library",
+                    "name",
+                    "version",
+                    "adapter_id",
+                    "adapter_version_id",
+                    "content_hash",
+                    "signature_hash",
+                )
+            }
+            try:
+                link = self.store.library_adapter_remote_link(local_ref)
+            except KeyError:
+                link = None
+            try:
+                if link is None:
+                    central = server.get_library_adapter_version(
+                        local_ref["owner"],
+                        local_ref["library"],
+                        local_ref["adapter_id"],
+                        local_ref["adapter_version_id"],
+                        include_source=False,
+                    )
+                else:
+                    central = server.get_library_adapter_version(
+                        link["owner"],
+                        link["library"],
+                        link["adapter_id"],
+                        link["adapter_version_id"],
+                        include_source=False,
+                    )
+                central_ref = normalize_library_adapter_ref(
+                    {
+                        key: central[key]
+                        for key in (
+                            "owner",
+                            "library",
+                            "name",
+                            "version",
+                            "adapter_id",
+                            "adapter_version_id",
+                            "content_hash",
+                            "signature_hash",
+                        )
+                    }
+                )
+            except Exception:
+                raise RuntimePortAdapterContractError(
+                    "remote_library_adapter_identity_unavailable",
+                    "the exact central Library Adapter version is unavailable",
+                    stage="admission",
+                ) from None
+            if link is None:
+                matches = central_ref == local_ref
+            else:
+                matches = (
+                    central_ref["owner"] == link["owner"]
+                    and central_ref["library"] == link["library"]
+                    and central_ref["adapter_id"] == link["adapter_id"]
+                    and central_ref["adapter_version_id"] == link["adapter_version_id"]
+                    and central_ref["name"] == local_ref["name"]
+                    and central_ref["content_hash"] == local_ref["content_hash"]
+                    and central_ref["signature_hash"] == local_ref["signature_hash"]
+                )
+            if not matches:
+                raise RuntimePortAdapterContractError(
+                    "remote_library_adapter_identity_mismatch",
+                    "the central Library Adapter identity contradicts the exact local version",
+                    stage="admission",
+                )
+            translated.append(
+                {
+                    "direction": binding["direction"],
+                    "port": binding["port"],
+                    **central_ref,
+                }
+            )
+        return normalize_runtime_library_adapter_refs({"schema_version": 1, "bindings": translated})
+
+    @staticmethod
+    def _translate_remote_runtime_adapter_semantic_advisories(
+        value: dict[str, Any],
+        *,
+        local_library_refs: dict[str, Any] | None,
+        remote_library_refs: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Translate only proven Library adapter identities in advisory evidence."""
+
+        advisories = normalize_runtime_adapter_semantic_advisories(value)
+        if local_library_refs is None:
+            return advisories
+        if remote_library_refs is None:
+            raise RuntimePortAdapterContractError(
+                "remote_semantic_advisory_identity",
+                "remote Library Adapter advisory identity is unavailable",
+                stage="admission",
+            )
+        local_refs = normalize_runtime_library_adapter_refs(local_library_refs)
+        remote_refs = normalize_runtime_library_adapter_refs(remote_library_refs)
+        local_by_identity = {(item["direction"], item["port"]): item for item in local_refs["bindings"]}
+        remote_by_identity = {(item["direction"], item["port"]): item for item in remote_refs["bindings"]}
+        if set(local_by_identity) != set(remote_by_identity):
+            raise RuntimePortAdapterContractError(
+                "remote_semantic_advisory_identity",
+                "remote Library Adapter advisory bindings changed during translation",
+                stage="admission",
+            )
+        translated = []
+        for item in advisories["bindings"]:
+            identity = (item["direction"], item["port"])
+            local_ref = local_by_identity.get(identity)
+            if local_ref is None:
+                translated.append(item)
+                continue
+            if item["adapter_id"] != local_ref["adapter_id"]:
+                raise RuntimePortAdapterContractError(
+                    "remote_semantic_advisory_identity",
+                    "Library Adapter advisory does not match its exact local reference",
+                    stage="admission",
+                )
+            translated.append({**item, "adapter_id": remote_by_identity[identity]["adapter_id"]})
+        return normalize_runtime_adapter_semantic_advisories({"schema_version": 1, "bindings": translated})
+
+    @staticmethod
+    def _synthesize_remote_runtime_adapter_semantic_advisories(
+        server: ServerClientProtocol,
+        document: dict[str, Any],
+        *,
+        remote_library_refs: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Re-read exact remote facts and synthesize explicit API/embedded intent."""
+
+        refs: dict[str, Any] = (
+            {"schema_version": 1, "bindings": []}
+            if remote_library_refs is None
+            else normalize_runtime_library_adapter_refs(remote_library_refs)
+        )
+        refs_by_identity = {(item["direction"], item["port"]): item for item in refs["bindings"]}
+        exact_versions: dict[str, dict[str, Any]] = {}
+        advisories: list[dict[str, Any]] = []
+        for binding in document["bindings"]:
+            source = binding["resolution_source"]
+            if source == "system_default":
+                continue
+            identity = (binding["direction"], binding["port"])
+            ref = refs_by_identity.get(identity)
+            if ref is None:
+                adapter = binding["adapter"]
+                adapter_id = str(adapter["id"])
+                adapter_type = str(adapter["key"]).rpartition("@")[0]
+                category = runtime_adapter_semantic_category(adapter_id)
+                state = runtime_adapter_semantic_state(
+                    binding.get("semantic_type"),
+                    adapter_type,
+                    adapter_id=adapter_id,
+                )
+            else:
+                version_id = str(ref["adapter_version_id"])
+                exact = exact_versions.get(version_id)
+                if exact is None:
+                    raw = server.get_library_adapter_version(
+                        ref["owner"],
+                        ref["library"],
+                        ref["adapter_id"],
+                        ref["adapter_version_id"],
+                        include_source=False,
+                    )
+                    if not isinstance(raw, dict) or any(
+                        raw.get(key) != ref[key]
+                        for key in (
+                            "owner",
+                            "library",
+                            "name",
+                            "version",
+                            "adapter_id",
+                            "adapter_version_id",
+                            "content_hash",
+                            "signature_hash",
+                        )
+                    ):
+                        raise RuntimePortAdapterContractError(
+                            "remote_library_adapter_identity_mismatch",
+                            "the exact central Library Adapter facts are unavailable for semantic review",
+                            stage="admission",
+                        )
+                    exact = raw
+                    exact_versions[version_id] = exact
+                adapter_type_value = exact.get("semantic_type")
+                if not isinstance(adapter_type_value, str) or not adapter_type_value:
+                    raise RuntimePortAdapterContractError(
+                        "remote_library_adapter_semantic_type",
+                        "the exact central Library Adapter semantic type is unavailable",
+                        stage="admission",
+                    )
+                adapter_type = adapter_type_value
+                category_value = exact.get("semantic_category")
+                category = category_value if isinstance(category_value, str) else None
+                adapter_id = str(ref["adapter_id"])
+                state = library_adapter_semantic_advisory(
+                    binding.get("semantic_type"),
+                    adapter_type,
+                    category,
+                )
+            acknowledgement_source = (
+                None
+                if state == "recommended"
+                else ("embedded_contract" if source == "preset" else "api_explicit_selection")
+            )
+            advisories.append(
+                {
+                    "direction": binding["direction"],
+                    "port": binding["port"],
+                    "adapter_id": adapter_id,
+                    "port_semantic_type": binding.get("semantic_type"),
+                    "adapter_semantic_type": adapter_type,
+                    "adapter_semantic_category": category,
+                    "state": state,
+                    "acknowledged": acknowledgement_source is not None,
+                    "acknowledgement_source": acknowledgement_source,
+                }
+            )
+        if not advisories:
+            return None
+        return normalize_runtime_adapter_semantic_advisories({"schema_version": 1, "bindings": advisories})
+
+    @staticmethod
+    def _runtime_admission_projection_matches(
+        admission: dict[str, Any],
+        *,
+        request_id: str,
+        request_digest_sha256: str,
+        document: dict[str, Any],
+        adapter_policy: dict[str, str],
+        runtime_library_adapter_refs: dict[str, Any] | None,
+        runtime_adapter_semantic_advisories: dict[str, Any] | None,
+    ) -> bool:
+        expected_schema = (
+            3
+            if runtime_adapter_semantic_advisories is not None
+            else (2 if runtime_library_adapter_refs is not None else 1)
+        )
+        return (
+            admission.get("schema_version") == expected_schema
+            and admission.get("request_id") == request_id
+            and admission.get("request_digest_sha256") == request_digest_sha256
+            and admission.get("runtime_port_adapters") == document
+            and admission.get("adapter_policy") == adapter_policy
+            and (
+                runtime_library_adapter_refs is None
+                or admission.get(
+                    "runtime_library_adapter_refs",
+                    {"schema_version": 1, "bindings": []},
+                )
+                == runtime_library_adapter_refs
+            )
+            and (
+                runtime_adapter_semantic_advisories is None
+                or admission.get("runtime_adapter_semantic_advisories") == runtime_adapter_semantic_advisories
+            )
+        )
+
+    def _create_remote_runtime_adapter_run(
+        self,
+        server: ServerClientProtocol,
+        *,
+        request_id: str,
+        payload: dict[str, Any],
+        document: dict[str, Any],
+        adapter_policy: dict[str, str],
+        runtime_library_adapter_refs: dict[str, Any] | None = None,
+        runtime_adapter_semantic_advisories: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create, upload and atomically finalize one adapted remote Run."""
+
+        flat_document = server_admission_document(document)
+        normalized_library_refs = (
+            None
+            if runtime_library_adapter_refs is None
+            else normalize_runtime_library_adapter_refs(runtime_library_adapter_refs)
+        )
+        normalized_semantic_advisories = (
+            None
+            if runtime_adapter_semantic_advisories is None
+            else normalize_runtime_adapter_semantic_advisories(runtime_adapter_semantic_advisories)
+        )
+        schema_version = (
+            3 if normalized_semantic_advisories is not None else (2 if normalized_library_refs is not None else 1)
+        )
+        admission_library_refs = (
+            normalized_library_refs
+            if normalized_library_refs is not None
+            else ({"schema_version": 1, "bindings": []} if schema_version in {2, 3} else None)
+        )
+        request = {
+            "schema_version": schema_version,
+            "request_id": request_id,
+            "run": payload,
+            "runtime_port_adapters": flat_document,
+            "adapter_policy": adapter_policy,
+        }
+        if admission_library_refs is not None:
+            request["runtime_library_adapter_refs"] = admission_library_refs
+        if normalized_semantic_advisories is not None:
+            request["runtime_adapter_semantic_advisories"] = normalized_semantic_advisories
+        canonical_request = {
+            "schema_version": schema_version,
+            "run": {key: value for key, value in payload.items() if key != "access_token"},
+            "runtime_port_adapters": flat_document,
+            "adapter_policy": adapter_policy,
+        }
+        if admission_library_refs is not None:
+            canonical_request["runtime_library_adapter_refs"] = admission_library_refs
+        if normalized_semantic_advisories is not None:
+            canonical_request["runtime_adapter_semantic_advisories"] = normalized_semantic_advisories
+        request_digest_sha256 = hashlib.sha256(m_json_contract.dumps(canonical_request).encode("utf-8")).hexdigest()
+        input_bodies = {
+            item["name"]: base64.b64decode(item["content_base64"], validate=True) for item in document["inputs"]
+        }
+        bundle = document["custom_bundle"]
+        bundle_body = None if bundle is None else base64.b64decode(bundle["content_base64"], validate=True)
+
+        admission: dict[str, Any] | None = None
+        try:
+            try:
+                admission = server.create_remote_run_admission(request)
+            except ServerClientError as original:
+                if original.status_code not in {502, 503, 504}:
+                    raise
+                try:
+                    admission = server.get_remote_run_admission(request_id)
+                except Exception:
+                    raise original
+            if not self._runtime_admission_projection_matches(
+                admission,
+                request_id=request_id,
+                request_digest_sha256=request_digest_sha256,
+                document=flat_document,
+                adapter_policy=adapter_policy,
+                runtime_library_adapter_refs=admission_library_refs,
+                runtime_adapter_semantic_advisories=normalized_semantic_advisories,
+            ):
+                raise RuntimePortAdapterContractError(
+                    "remote_admission_mismatch",
+                    "central server returned a different runtime adapter admission",
+                    stage="admission",
+                )
+            if admission.get("state") in {"cancelled", "expired"}:
+                raise RuntimePortAdapterContractError(
+                    "remote_admission_inactive",
+                    "runtime adapter admission is no longer active",
+                    stage="admission",
+                )
+
+            if admission.get("state") != "finalized":
+                items = admission.get("items")
+                if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+                    raise RuntimePortAdapterContractError(
+                        "remote_admission_shape",
+                        "central server returned invalid runtime admission items",
+                        stage="admission",
+                    )
+                for item in items:
+                    if item.get("uploaded") is True:
+                        continue
+                    role = item.get("role")
+                    name = item.get("name")
+                    try:
+                        if role == "input" and isinstance(name, str) and name in input_bodies:
+                            server.upload_remote_run_admission_input(
+                                request_id,
+                                name,
+                                input_bodies[name],
+                                size=item["size"],
+                                sha256=item["sha256"],
+                            )
+                        elif role == "custom_bundle" and bundle is not None and bundle_body is not None:
+                            server.upload_remote_run_admission_custom_bundle(
+                                request_id,
+                                bundle_body,
+                                size=item["size"],
+                                sha256=item["sha256"],
+                            )
+                        else:
+                            raise RuntimePortAdapterContractError(
+                                "remote_admission_item",
+                                "central server requested an undeclared runtime admission item",
+                                stage="upload",
+                            )
+                    except ServerClientError as original:
+                        if original.status_code not in {502, 503, 504}:
+                            raise
+                        recovered = server.get_remote_run_admission(request_id)
+                        recovered_items = recovered.get("items")
+                        uploaded = isinstance(recovered_items, list) and any(
+                            isinstance(candidate, dict)
+                            and candidate.get("role") == role
+                            and candidate.get("name") == name
+                            and candidate.get("uploaded") is True
+                            for candidate in recovered_items
+                        )
+                        if not uploaded:
+                            raise original
+                try:
+                    admission = server.finalize_remote_run_admission(request_id)
+                except ServerClientError as original:
+                    if original.status_code not in {502, 503, 504}:
+                        raise
+                    recovered = server.get_remote_run_admission(request_id)
+                    if recovered.get("state") != "finalized":
+                        raise original
+                    admission = recovered
+            run_id = admission.get("run_id")
+            if admission.get("state") != "finalized" or not isinstance(run_id, str) or not run_id:
+                raise RuntimePortAdapterContractError(
+                    "remote_admission_not_finalized",
+                    "central server did not prove atomic runtime admission finalization",
+                    stage="admission",
+                )
+            return server.get_remote_run(run_id)
+        except Exception:
+            if admission is not None and admission.get("state") == "staging":
+                try:
+                    current = server.get_remote_run_admission(request_id)
+                    if current.get("state") == "staging":
+                        server.cancel_remote_run_admission(request_id)
+                except Exception:
+                    pass
+            raise
 
     def _raise_if_target_machine_offline(
         self,
@@ -2448,6 +3966,40 @@ class DaemonRuntime:
         dry_run: bool = False,
     ) -> dict[str, Any]:
         """Mirror one accessible server object into the local registry."""
+
+        if dry_run:
+            return self._pull_server_object_admitted(
+                object_name,
+                version=version,
+                owner_id=owner_id,
+                library=library,
+                all_versions=all_versions,
+                dry_run=True,
+            )
+        return cast(
+            dict[str, Any],
+            self.run_registry_mutation(
+                self._pull_server_object_admitted,
+                object_name,
+                version=version,
+                owner_id=owner_id,
+                library=library,
+                all_versions=all_versions,
+                dry_run=False,
+            ),
+        )
+
+    def _pull_server_object_admitted(
+        self,
+        object_name: str,
+        *,
+        version: int | None = None,
+        owner_id: str | None = None,
+        library: str | None = None,
+        all_versions: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Perform one read-only plan or already-admitted mirror mutation."""
 
         credentials = self.store.current_server_connection_credentials()
         try:
@@ -2696,7 +4248,14 @@ class DaemonRuntime:
                 raise KeyError("default environment python is missing")
         except KeyError:
             base_python = sys.executable
-        return self.store.register_env(name, base_python)
+        return self.register_env(name, base_python)
+
+    def register_env(self, name: str, python: str | None = None) -> dict[str, Any]:
+        """Admit one exact environment registry mutation."""
+
+        lease = self.lifecycle.reserve_current_or_root("registry_mutation")
+        with lease:
+            return self.store.register_env(name, python)
 
     def refresh_server_object_if_available(
         self,
@@ -2752,6 +4311,59 @@ class DaemonRuntime:
         connection_id: str | None = None,
         extra_events: list[dict[str, Any]] | None = None,
         probe_server_channel: bool = False,
+    ) -> dict[str, Any]:
+        """Run one lifecycle-coordinated sync or draining no-claim flush."""
+
+        lease, claim_jobs = self.lifecycle.begin_sync()
+        lease.activate()
+        lease.attach_current_thread()
+        request_state = {"sent": False}
+        try:
+            result = self._sync_once_admitted(
+                connection_id=connection_id,
+                extra_events=extra_events,
+                probe_server_channel=probe_server_channel,
+                claim_jobs=claim_jobs,
+                sync_lease=lease,
+                note_request_sent=lambda: request_state.__setitem__("sent", True),
+            )
+            if not claim_jobs:
+                if result.get("connected") is False or result.get("partial"):
+                    raise LifecycleError(
+                        "server_no_claim_boundary_unproven",
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        operation="sync_flush",
+                        retryable=True,
+                    )
+                self.lifecycle.mark_claim_boundary_proven()
+            return result
+        except LifecycleError:
+            if not claim_jobs:
+                try:
+                    self.lifecycle.mark_claim_boundary_failed(outcome_unknown=request_state["sent"])
+                except LifecycleError:
+                    pass
+            raise
+        except Exception:
+            if not claim_jobs:
+                try:
+                    self.lifecycle.mark_claim_boundary_failed(outcome_unknown=request_state["sent"])
+                except LifecycleError:
+                    pass
+            raise
+        finally:
+            lease.detach_current_thread()
+            lease.complete(seal_lineage=True)
+
+    def _sync_once_admitted(
+        self,
+        *,
+        connection_id: str | None = None,
+        extra_events: list[dict[str, Any]] | None = None,
+        probe_server_channel: bool = False,
+        claim_jobs: bool,
+        sync_lease: LifecycleWorkLease,
+        note_request_sent: Callable[[], None],
     ) -> dict[str, Any]:
         """Renew the lease, then exchange bounded event batches and jobs."""
 
@@ -2822,6 +4434,17 @@ class DaemonRuntime:
                 credentials,
                 request_timeout_seconds=SYNC_REQUEST_TIMEOUT_SECONDS,
             )
+            if not claim_jobs:
+                try:
+                    validate_deployed_no_claim_capability(server.get_server_version())
+                except LifecycleError:
+                    raise
+                except Exception as exc:
+                    raise LifecycleError(
+                        "server_no_claim_capability_unproven",
+                        HTTPStatus.PRECONDITION_FAILED,
+                        operation="sync_flush",
+                    ) from exc
             credentials = self._renew_server_lease(server, credentials)
             credentials_owner_id = str(credentials.get("owner_id") or DEFAULT_OBJECT_OWNER_ID)
             sync_before = self.sync_visibility.summary()
@@ -2880,14 +4503,21 @@ class DaemonRuntime:
                 try:
                     if batches:
                         credentials = self._renew_server_lease(server, credentials)
-                    response = server.sync(
-                        connection_id=credentials["remote_connection_id"],
-                        machine_id=credentials["machine_id"],
-                        heartbeat_interval_seconds=self._safe_heartbeat_interval(credentials),
-                        events=wire_events,
-                        capabilities=self._authoritative_server_capabilities(credentials.get("capabilities")),
-                        claim_id=claim_id,
-                    )
+                    note_request_sent()
+                    sync_kwargs = {
+                        "connection_id": credentials["remote_connection_id"],
+                        "machine_id": credentials["machine_id"],
+                        "heartbeat_interval_seconds": self._safe_heartbeat_interval(credentials),
+                        "events": wire_events,
+                        "capabilities": self._authoritative_server_capabilities(credentials.get("capabilities")),
+                        "claim_id": claim_id,
+                    }
+                    if claim_jobs:
+                        # Exact legacy wire behavior: an old client omits the
+                        # additive field and may claim one job.
+                        response = server.sync(**sync_kwargs)
+                    else:
+                        response = server.sync(**sync_kwargs, claim_jobs=False)
                 except ServerClientError as exc:
                     collision_event = (
                         next(
@@ -3017,7 +4647,11 @@ class DaemonRuntime:
                 )
 
         for job in jobs:
-            self.accept_server_job(job, credentials["id"])
+            self.accept_server_job(
+                job,
+                credentials["id"],
+                parent_sync_lease=sync_lease,
+            )
         self.sweep_run_retention()
         response = {
             "connection": self._remote_connection_snapshot(credentials),
@@ -3400,16 +5034,61 @@ class DaemonRuntime:
             return None
         return snapshot.get("snapshot_hash")
 
-    def accept_server_job(self, job: dict[str, Any], connection_id: str) -> None:
+    def accept_server_job(
+        self,
+        job: dict[str, Any],
+        connection_id: str,
+        *,
+        parent_sync_lease: LifecycleWorkLease | None = None,
+    ) -> None:
         """Run one server job in a background thread."""
 
-        thread = threading.Thread(
-            target=self._execute_server_job,
-            args=(job, connection_id),
-            name=f"spl-server-job-{job['run']['id']}",
-            daemon=True,
+        lease = (
+            self.lifecycle.admit_remote_claim(parent_sync_lease)
+            if parent_sync_lease is not None
+            else self.lifecycle.reserve_root("remote_claim", queued=True)
         )
-        thread.start()
+        try:
+            remote_run_id = validate_name(str(job["run"]["id"]))
+            thread = threading.Thread(
+                target=self._execute_server_job_with_lifecycle,
+                args=(job, connection_id, lease),
+                name=f"spl-server-job-{remote_run_id}",
+                daemon=True,
+            )
+            thread.start()
+        except Exception:
+            # The central server has already assigned this job.  If its exact
+            # identity cannot be retained locally, Stop must fail closed.
+            self.lifecycle.record_unknown_work()
+            lease.complete(seal_lineage=lease.root)
+            raise
+
+    def _execute_server_job_with_lifecycle(
+        self,
+        job: dict[str, Any],
+        connection_id: str,
+        lease: LifecycleWorkLease,
+    ) -> None:
+        """Retain a pre-boundary remote claim through terminal handoff."""
+
+        lease.activate()
+        lease.attach_current_thread()
+        try:
+            self._execute_server_job(job, connection_id)
+        except Exception:
+            # The server has already assigned this work.  If an unexpected
+            # failure escapes the normal terminal-handoff path, its outcome
+            # cannot be proven and Stop must remain blocked.  Keep the log
+            # fixed so neither the job payload nor an exception value leaks.
+            self.lifecycle.record_unknown_work()
+            LOGGER.error(
+                "accepted server job escaped its terminal handoff",
+                extra={"spl_event": "remote_run_outcome_unproven"},
+            )
+        finally:
+            lease.detach_current_thread()
+            lease.complete(seal_lineage=lease.root)
 
     @staticmethod
     def _job_claim_id(job: dict[str, Any]) -> str | None:
@@ -3430,9 +5109,13 @@ class DaemonRuntime:
         run_id = run["id"]
         local_name = version["name"]
         local_run: dict[str, Any] | None = None
+        runtime_claim = job.get("runtime_port_adapters")
+        runtime_library_claim = job.get("runtime_library_adapter_refs")
+        runtime_semantic_claim = job.get("runtime_adapter_semantic_advisories")
         try:
             claim_id = self._job_claim_id(job)
         except ValueError:
+            self.lifecycle.record_unknown_work()
             LOGGER.error(
                 "server job was refused because its claim metadata is invalid for run %s",
                 run_id,
@@ -3444,7 +5127,33 @@ class DaemonRuntime:
             return
 
         try:
-            if not self._send_server_run_update(
+            if runtime_library_claim is not None and runtime_claim is None:
+                raise RuntimePortAdapterContractError(
+                    "library_adapter_transport_missing",
+                    "claimed Library Adapter refs require runtime port transport",
+                    stage="admission",
+                )
+            if runtime_semantic_claim is not None and runtime_claim is None:
+                raise RuntimePortAdapterContractError(
+                    "semantic_advisory_transport_missing",
+                    "claimed semantic advisories require runtime port transport",
+                    stage="admission",
+                )
+            if runtime_claim is not None:
+                if claim_id is None:
+                    raise RuntimePortAdapterContractError(
+                        "remote_claim_missing",
+                        "an adapted remote Run requires a claim-fencing identity",
+                        stage="admission",
+                    )
+                self._send_claim_bound_runtime_progress_now(
+                    connection_id,
+                    run_id=run_id,
+                    status="fetching_object",
+                    message="registering object bundle in local daemon",
+                    claim_id=claim_id,
+                )
+            elif not self._send_server_run_update(
                 connection_id,
                 run_id=run_id,
                 status="fetching_object",
@@ -3469,7 +5178,7 @@ class DaemonRuntime:
                 source_object_name=version["name"],
                 runtime_config=version.get("runtime_config"),
             )
-            if not self._send_server_run_update(
+            if runtime_claim is None and not self._send_server_run_update(
                 connection_id,
                 run_id=run_id,
                 status="running",
@@ -3481,6 +5190,73 @@ class DaemonRuntime:
                 if run.get("entrypoint") and run.get("entrypoint") != version["entrypoint"]
                 else None
             )
+            runtime_document = None
+            runtime_policy = None
+            runtime_library_refs = None
+            runtime_library_sources = None
+            runtime_semantic_advisories = None
+            if runtime_claim is not None:
+                if claim_id is None:
+                    raise RuntimePortAdapterContractError(
+                        "remote_claim_missing",
+                        "an adapted remote Run requires a claim-fencing identity",
+                        stage="admission",
+                    )
+                credentials = self.store.get_server_connection_credentials(connection_id)
+                server = self._server_client_for_credentials(credentials)
+                signature = build_signature(object_record, function=function)
+
+                def download_claimed_input(
+                    download_url: str,
+                    expected_size: int,
+                    expected_sha256: str,
+                ) -> bytes:
+                    return server.claimed_runtime_input_bytes(
+                        download_url,
+                        claim_id=claim_id,
+                        expected_size=expected_size,
+                        expected_sha256=expected_sha256,
+                    )
+
+                runtime_document, runtime_policy = materialize_claimed_runtime_port_adapters(
+                    runtime_claim,
+                    signature=signature,
+                    args=run.get("args"),
+                    kwargs=run.get("kwargs"),
+                    allow_remote_custom_adapters=self.allow_remote_custom_adapters,
+                    download=download_claimed_input,
+                )
+                if runtime_semantic_claim is not None:
+                    runtime_semantic_advisories = normalize_runtime_adapter_semantic_advisories(runtime_semantic_claim)
+                if runtime_library_claim is not None:
+                    (
+                        runtime_library_refs,
+                        runtime_library_sources,
+                    ) = materialize_claimed_runtime_library_adapters(runtime_library_claim)
+                try:
+                    self._send_claim_bound_runtime_progress_now(
+                        connection_id,
+                        run_id=run_id,
+                        status="running",
+                        message="runtime adapter inputs verified",
+                        claim_id=claim_id,
+                    )
+                except Exception:
+                    for item in runtime_document.get("inputs") or []:
+                        if isinstance(item, dict):
+                            item["content_base64"] = None
+                    runtime_bundle = runtime_document.get("custom_bundle")
+                    if isinstance(runtime_bundle, dict):
+                        runtime_bundle["content_base64"] = None
+                    runtime_document.clear()
+                    raise
+            library_run_arguments: dict[str, Any] = {}
+            if runtime_library_refs is not None:
+                library_run_arguments = {
+                    "runtime_library_adapter_refs": runtime_library_refs,
+                    "runtime_library_adapter_sources": runtime_library_sources,
+                    "_runtime_library_adapter_execution_target": "remote",
+                }
             local_run = self.start_run(
                 local_name,
                 args=run.get("args"),
@@ -3490,8 +5266,20 @@ class DaemonRuntime:
                 object_version_id=object_record["version_id"],
                 function=function,
                 source="local",
+                runtimes=(run.get("context") or {}).get("_spl_runtime_overrides"),
                 report_local_run=False,
                 keep="on_failure",
+                runtime_port_adapters=runtime_document,
+                runtime_adapter_semantic_advisories=runtime_semantic_advisories,
+                _runtime_adapter_semantic_claim=True,
+                adapter_policy=runtime_policy,
+                custom_remote_allowed=(
+                    runtime_document is not None
+                    and runtime_policy is not None
+                    and runtime_policy["custom_remote"] == "allow"
+                    and self.allow_remote_custom_adapters
+                ),
+                **library_run_arguments,
             )
             credentials = self.store.get_server_connection_credentials(connection_id)
             progress_interval = max(
@@ -3526,6 +5314,18 @@ class DaemonRuntime:
                 }
                 if manifest_evidence is not None:
                     terminal_payload["manifest_evidence"] = manifest_evidence
+                execution_telemetry = self._claim_bound_execution_telemetry(
+                    final_state,
+                    claim_id=claim_id,
+                )
+                if execution_telemetry is not None:
+                    terminal_payload["execution_telemetry"] = execution_telemetry
+                if runtime_claim is not None:
+                    terminal_payload["runtime_port_adapters_terminal"] = self._runtime_adapter_terminal_evidence(
+                        final_state,
+                        runtime_claim=runtime_claim,
+                        result=None,
+                    )
                 queued = self._send_server_run_update(
                     connection_id,
                     run_id=run_id,
@@ -3564,11 +5364,28 @@ class DaemonRuntime:
                 claim_id=claim_id,
                 **artifact_evidence_kwargs,
             )
+            if runtime_claim is not None:
+                result = self._path_free_runtime_adapter_remote_result(
+                    result,
+                    artifacts=artifacts,
+                )
             terminal_payload = {
                 "local_run": self._local_run_delivery_proof(final_state),
             }
             if manifest_evidence is not None:
                 terminal_payload["manifest_evidence"] = manifest_evidence
+            execution_telemetry = self._claim_bound_execution_telemetry(
+                {**final_state, **completed_state},
+                claim_id=claim_id,
+            )
+            if execution_telemetry is not None:
+                terminal_payload["execution_telemetry"] = execution_telemetry
+            if runtime_claim is not None:
+                terminal_payload["runtime_port_adapters_terminal"] = self._runtime_adapter_terminal_evidence(
+                    completed_state,
+                    runtime_claim=runtime_claim,
+                    result=result,
+                )
             queued = self._send_server_run_update(
                 connection_id,
                 run_id=run_id,
@@ -3605,11 +5422,23 @@ class DaemonRuntime:
                 terminal_payload["local_run"] = self._local_run_delivery_proof(local_state)
             if manifest_evidence is not None:
                 terminal_payload["manifest_evidence"] = manifest_evidence
+            execution_telemetry = self._claim_bound_execution_telemetry(
+                local_state,
+                claim_id=claim_id,
+            )
+            if execution_telemetry is not None:
+                terminal_payload["execution_telemetry"] = execution_telemetry
+            if runtime_claim is not None:
+                terminal_payload["runtime_port_adapters_terminal"] = self._runtime_adapter_terminal_evidence(
+                    local_state,
+                    runtime_claim=runtime_claim,
+                    result=None,
+                )
             queued = self._send_server_run_update(
                 connection_id,
                 run_id=run_id,
                 status="failed",
-                error=repr(exc),
+                error=("runtime adapter remote execution failed safely" if runtime_claim is not None else repr(exc)),
                 payload=terminal_payload,
                 claim_id=claim_id,
             )
@@ -3623,6 +5452,30 @@ class DaemonRuntime:
                         "server-handoff-failed" if local_status == "succeeded" else "local-execution-failed"
                     ),
                 )
+
+    def _claim_bound_execution_telemetry(
+        self,
+        state: dict[str, Any] | None,
+        *,
+        claim_id: str | None,
+    ) -> dict[str, Any] | None:
+        """Return per-execution evidence only for a negotiated run attempt."""
+
+        if claim_id is None or state is None:
+            return None
+        artifact_count, scan_truncated, directory_available = count_local_artifacts_bounded(state)
+        omissions: list[str] = []
+        if scan_truncated:
+            omissions.append("artifact_scan_limit")
+        if not directory_available:
+            omissions.append("artifact_directory_unavailable")
+        return self.telemetry_policy.build_execution_telemetry_envelope(
+            state,
+            observed_at=utc_now(),
+            artifact_count=artifact_count,
+            artifact_count_truncated=scan_truncated or not directory_available,
+            preflight_omissions=tuple(omissions),
+        )
 
     def _mark_remote_local_terminal_queued(
         self,
@@ -3687,6 +5540,60 @@ class DaemonRuntime:
             self.store.enqueue_sync_event("run_update", event_payload)
         self._kick_server_sync(connection_id)
         return True
+
+    def _send_claim_bound_runtime_progress_now(
+        self,
+        connection_id: str,
+        *,
+        run_id: str,
+        status: str,
+        message: str,
+        claim_id: str,
+    ) -> None:
+        """Synchronously fence an adapted attempt before local code admission."""
+
+        credentials = self.store.get_server_connection_credentials(connection_id)
+        server = self._server_client_for_credentials(
+            credentials,
+            request_timeout_seconds=SYNC_REQUEST_TIMEOUT_SECONDS,
+        )
+        event_payload: dict[str, Any] = {
+            "run_id": run_id,
+            "status": status,
+            "error": None,
+            "message": message,
+            "payload": {},
+            "artifacts": [],
+        }
+        if credentials.get("owner_id"):
+            event_payload["owner_id"] = credentials["owner_id"]
+        event_id = (
+            "runtime_adapter_fence_" + hashlib.sha256(f"{run_id}\0{claim_id}\0{status}".encode("utf-8")).hexdigest()
+        )
+        try:
+            response = server.sync(
+                connection_id=credentials["remote_connection_id"],
+                machine_id=credentials["machine_id"],
+                heartbeat_interval_seconds=self._safe_heartbeat_interval(credentials),
+                events=[{"id": event_id, "kind": "run_update", "payload": event_payload}],
+                capabilities=self._authoritative_server_capabilities(credentials.get("capabilities")),
+                claim_id=claim_id,
+                claim_jobs=False,
+            )
+        except ServerClientError as exc:
+            if is_stale_run_claim_error(exc):
+                self._mark_server_attempt_superseded(run_id, claim_id)
+                raise _ServerRunSuperseded(run_id) from exc
+            raise
+        results = response.get("event_results")
+        if (
+            not isinstance(results, list)
+            or len(results) != 1
+            or not isinstance(results[0], dict)
+            or results[0].get("event_id") != event_id
+            or results[0].get("status") != "ok"
+        ):
+            raise RuntimeError("central server did not confirm the claim-bound runtime progress fence")
 
     def _wait_local_run(
         self,
@@ -3892,6 +5799,166 @@ class DaemonRuntime:
         """Return the only local-run fields required by durable handoff proof."""
 
         return {"id": str(state["id"]), "status": str(state["status"])}
+
+    @staticmethod
+    def _path_free_runtime_adapter_remote_result(
+        value: Any,
+        *,
+        artifacts: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Project an adapted worker result without target-local filesystem paths."""
+
+        if not isinstance(value, dict):
+            raise RuntimeError("adapted worker result is not a JSON object")
+        artifact_names = {
+            validate_name(str(item["name"]))
+            for item in artifacts
+            if isinstance(item, dict) and item.get("name") is not None
+        }
+        projected: dict[str, Any] = {
+            "result": value.get("result"),
+            "artifacts": {name: name for name in sorted(artifact_names)},
+        }
+        raw_outputs = value.get("runtime_port_adapter_outputs")
+        if raw_outputs is not None:
+            if not isinstance(raw_outputs, list):
+                raise RuntimeError("adapted worker output metadata is not a list")
+            outputs = [normalize_runtime_output_record(item) for item in raw_outputs]
+            if (
+                len({item["port"] for item in outputs}) != len(outputs)
+                or len({item["name"] for item in outputs}) != len(outputs)
+                or any(item["name"] not in artifact_names for item in outputs)
+            ):
+                raise RuntimeError("adapted worker output metadata is not bound to uploaded artifacts")
+            projected["runtime_port_adapter_outputs"] = outputs
+        return projected
+
+    def _runtime_adapter_terminal_evidence(
+        self,
+        state: dict[str, Any] | None,
+        *,
+        runtime_claim: Any,
+        result: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Return the closed, claim-safe adapter evidence retained centrally."""
+
+        manifest = state.get("manifest") if isinstance(state, dict) else None
+        section = manifest.get("runtime_port_adapters") if isinstance(manifest, dict) else None
+        custom = section.get("custom_remote") if isinstance(section, dict) else None
+        if (
+            isinstance(custom, dict)
+            and set(custom) == {"requested", "allowed", "used"}
+            and all(isinstance(custom.get(key), bool) for key in ("requested", "allowed", "used"))
+        ):
+            custom_execution = {
+                "requested": custom["requested"],
+                "allowed": custom["allowed"],
+                "used": custom["used"],
+            }
+        else:
+            policy = (
+                normalize_adapter_policy(runtime_claim.get("adapter_policy"))
+                if isinstance(runtime_claim, dict)
+                else {"custom_remote": "deny"}
+            )
+            requested = policy["custom_remote"] == "allow"
+            custom_execution = {
+                "requested": requested,
+                "allowed": requested and self.allow_remote_custom_adapters,
+                "used": False,
+            }
+
+        outputs: list[dict[str, Any]] = []
+        raw_outputs = result.get("runtime_port_adapter_outputs") if isinstance(result, dict) else None
+        manifest_bindings = section.get("bindings") if isinstance(section, dict) else None
+        if raw_outputs is not None:
+            if not isinstance(raw_outputs, list) or not isinstance(manifest_bindings, list):
+                raise RuntimeError("terminal runtime adapter evidence is incomplete")
+            records = [normalize_runtime_output_record(item) for item in raw_outputs]
+            for record in records:
+                matches = [
+                    binding
+                    for binding in manifest_bindings
+                    if isinstance(binding, dict)
+                    and binding.get("direction") == "output"
+                    and binding.get("port") == record["port"]
+                ]
+                if len(matches) != 1:
+                    raise RuntimeError("terminal runtime adapter binding is missing or duplicated")
+                binding = matches[0]
+                if (
+                    binding.get("adapter_id") != record["adapter_id"]
+                    or binding.get("format_tag") != record["format_tag"]
+                    or binding.get("artifact_name") != record["name"]
+                    or binding.get("artifact_size") != record["size"]
+                    or binding.get("artifact_sha256") != record["sha256"]
+                    or binding.get("media_type") != record["media_type"]
+                    or binding.get("result_path") != record["result_path"]
+                ):
+                    raise RuntimeError("terminal runtime adapter output differs from its local manifest")
+                outputs.append(
+                    {
+                        "port": record["port"],
+                        "adapter_id": record["adapter_id"],
+                        "format_tag": record["format_tag"],
+                        "semantic_type": binding.get("semantic_type"),
+                        "artifact_name": record["name"],
+                        "size": record["size"],
+                        "sha256": record["sha256"],
+                        "media_type": record["media_type"],
+                        "result_path": record["result_path"],
+                    }
+                )
+            outputs.sort(key=lambda item: item["port"])
+
+        failure = None
+        terminal_schema_version = 1
+        if not isinstance(state, dict) or state.get("status") != "succeeded":
+            raw_failure = section.get("failure") if isinstance(section, dict) else None
+            typed_failure = _validated_runtime_adapter_failure(
+                dict(raw_failure) if isinstance(raw_failure, dict) else None,
+                manifest if isinstance(manifest, dict) else {},
+            )
+            if isinstance(typed_failure, dict) and typed_failure.get("schema_version") == 1:
+                failure = dict(typed_failure)
+                ref_document = manifest.get("runtime_library_adapter_refs") if isinstance(manifest, dict) else None
+                refs = [
+                    item
+                    for item in (ref_document or {}).get("bindings", [])
+                    if isinstance(item, dict)
+                    and item.get("direction") == failure["direction"]
+                    and item.get("port") == failure["port"]
+                ]
+                if len(refs) > 1:
+                    raise RuntimeError("terminal runtime Library Adapter failure binding is duplicated")
+                if refs:
+                    exact_ref = {
+                        key: refs[0][key]
+                        for key in (
+                            "owner",
+                            "library",
+                            "name",
+                            "version",
+                            "adapter_id",
+                            "adapter_version_id",
+                            "content_hash",
+                            "signature_hash",
+                        )
+                    }
+                    failure["adapter_id"] = exact_ref["adapter_id"]
+                    failure["adapter_ref"] = exact_ref
+                terminal_schema_version = 2
+            else:
+                stage = raw_failure.get("stage") if isinstance(raw_failure, dict) else "admission"
+                if not isinstance(stage, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", stage):
+                    stage = "admission"
+                failure = {"stage": stage, "reason_code": "adapter_stage_failed"}
+        return {
+            "schema_version": terminal_schema_version,
+            "custom_execution": custom_execution,
+            "outputs": outputs,
+            "failure": failure,
+        }
 
     def _claim_bound_manifest_evidence(
         self,
@@ -4111,8 +6178,174 @@ class DaemonRuntime:
         library: str | None = None,
         source: str = "auto",
         report_local_run: bool = True,
-        runtimes: dict[str, str] | None = None,
+        runtimes: str | dict[str, str] | None = None,
         keep: Any = True,
+        runtime_port_adapters: dict[str, Any] | None = None,
+        runtime_library_adapter_refs: dict[str, Any] | None = None,
+        runtime_adapter_semantic_advisories: dict[str, Any] | None = None,
+        runtime_library_adapter_sources: list[dict[str, Any]] | None = None,
+        _runtime_library_adapter_execution_target: Literal["local", "remote"] = "local",
+        adapter_policy: dict[str, Any] | None = None,
+        custom_remote_allowed: bool = False,
+        _browser_adapter_admission: dict[str, Any] | None = None,
+        _runtime_adapter_semantic_claim: bool = False,
+    ) -> dict[str, Any]:
+        """Atomically admit then create one legacy-compatible local Run."""
+
+        # Keep the established pure-input failure boundary ahead of runtime
+        # lookup while retaining admission before every durable side effect.
+        validate_timeout_seconds(
+            timeout_seconds,
+            name="timeout_seconds",
+            domain=TimeoutDomain.NON_NEGATIVE,
+            allow_none=True,
+        )
+        if (
+            runtime_port_adapters is not None
+            and runtime_library_adapter_refs is not None
+            and runtime_library_adapter_sources is None
+            and _runtime_library_adapter_execution_target == "local"
+        ):
+            # Direct SDK Runs do not have the browser broker's preflight
+            # record. Resolve source through the same purpose-specific,
+            # no-retry central contract before reserving lifecycle/mutation
+            # authority. Local versions remain a store-only read.
+            runtime_library_adapter_sources = self._resolve_local_library_adapter_sources(runtime_library_adapter_refs)
+        lease = self.lifecycle.reserve_current_or_root("local_run", queued=True)
+        lease.activate()
+        lease.attach_current_thread()
+        try:
+            return self._start_run_admitted(
+                object_name,
+                args=args,
+                kwargs=kwargs,
+                output=output,
+                timeout_seconds=timeout_seconds,
+                version=version,
+                object_version_id=object_version_id,
+                function=function,
+                object_owner_id=object_owner_id,
+                library=library,
+                source=source,
+                report_local_run=report_local_run,
+                runtimes=runtimes,
+                keep=keep,
+                runtime_port_adapters=runtime_port_adapters,
+                runtime_library_adapter_refs=runtime_library_adapter_refs,
+                runtime_adapter_semantic_advisories=runtime_adapter_semantic_advisories,
+                runtime_library_adapter_sources=runtime_library_adapter_sources,
+                _runtime_library_adapter_execution_target=(_runtime_library_adapter_execution_target),
+                adapter_policy=adapter_policy,
+                custom_remote_allowed=custom_remote_allowed,
+                _browser_adapter_admission=_browser_adapter_admission,
+                _runtime_adapter_semantic_claim=_runtime_adapter_semantic_claim,
+                lifecycle_lease=lease,
+            )
+        except Exception:
+            self._release_unbound_lifecycle_lease(lease)
+            raise
+        finally:
+            lease.detach_current_thread()
+
+    def _resolve_local_library_adapter_sources(
+        self,
+        value: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Resolve exact local/shared source before a direct SDK Run mutation."""
+
+        refs = normalize_runtime_library_adapter_refs(value)
+        source_by_version: dict[str, dict[str, Any]] = {}
+        credentials: dict[str, Any] | None = None
+        server: Any | None = None
+        for binding in refs["bindings"]:
+            ref = {
+                key: binding[key]
+                for key in (
+                    "owner",
+                    "library",
+                    "name",
+                    "version",
+                    "adapter_id",
+                    "adapter_version_id",
+                    "content_hash",
+                    "signature_hash",
+                )
+            }
+            version_id = str(ref["adapter_version_id"])
+            if version_id in source_by_version:
+                continue
+            try:
+                record = self.store.resolve_library_adapter_ref(
+                    ref,
+                    include_source=True,
+                )
+            except KeyError:
+                if credentials is None:
+                    credentials = self._require_live_server_channel_credentials()
+                    server = self._server_client_for_credentials(credentials)
+                assert server is not None
+                response = server.resolve_local_library_adapter_source(
+                    ref,
+                    target_machine_id=str(credentials["machine_id"]),
+                )
+                if (
+                    not isinstance(response, dict)
+                    or set(response)
+                    != {
+                        "schema",
+                        "schema_version",
+                        "execution_target",
+                        "target_machine_id",
+                        "adapter",
+                    }
+                    or response.get("schema") != "spl.library-adapter-local-execution-source"
+                    or response.get("schema_version") != 1
+                    or response.get("execution_target") != "local"
+                    or response.get("target_machine_id") != credentials["machine_id"]
+                    or not isinstance(response.get("adapter"), dict)
+                ):
+                    raise RuntimePortAdapterContractError(
+                        "library_adapter_source_response",
+                        "shared Library Adapter source response is invalid",
+                        stage="admission",
+                    )
+                record = dict(response["adapter"])
+            if any(record.get(key) != expected for key, expected in ref.items()):
+                raise RuntimePortAdapterContractError(
+                    "library_adapter_ref_unverified",
+                    "Library Adapter source does not match the exact immutable Run ref",
+                    stage="admission",
+                )
+            source_by_version[version_id] = dict(record)
+        return [source_by_version[key] for key in sorted(source_by_version)]
+
+    def _start_run_admitted(
+        self,
+        object_name: str,
+        *,
+        args: list[Any] | None = None,
+        kwargs: dict[str, Any] | None = None,
+        output: str | None = None,
+        timeout_seconds: float | None = None,
+        version: int | None = None,
+        object_version_id: str | None = None,
+        function: str | None = None,
+        object_owner_id: str | None = None,
+        library: str | None = None,
+        source: str = "auto",
+        report_local_run: bool = True,
+        runtimes: str | dict[str, str] | None = None,
+        keep: Any = True,
+        runtime_port_adapters: dict[str, Any] | None = None,
+        runtime_library_adapter_refs: dict[str, Any] | None = None,
+        runtime_adapter_semantic_advisories: dict[str, Any] | None = None,
+        runtime_library_adapter_sources: list[dict[str, Any]] | None = None,
+        _runtime_library_adapter_execution_target: Literal["local", "remote"] = "local",
+        adapter_policy: dict[str, Any] | None = None,
+        custom_remote_allowed: bool = False,
+        _browser_adapter_admission: dict[str, Any] | None = None,
+        _runtime_adapter_semantic_claim: bool = False,
+        lifecycle_lease: LifecycleWorkLease,
     ) -> dict[str, Any]:
         """Create a run and execute it in a background worker thread."""
 
@@ -4153,7 +6386,16 @@ class DaemonRuntime:
                 library=library,
                 runtimes=runtimes,
                 keep=keep,
+                runtime_port_adapters=runtime_port_adapters,
+                runtime_library_adapter_refs=runtime_library_adapter_refs,
+                runtime_adapter_semantic_advisories=runtime_adapter_semantic_advisories,
+                runtime_library_adapter_sources=runtime_library_adapter_sources,
+                _runtime_library_adapter_execution_target=(_runtime_library_adapter_execution_target),
+                adapter_policy=adapter_policy,
+                custom_remote_allowed=custom_remote_allowed,
                 report_local_run=report_local_run,
+                _browser_adapter_admission=_browser_adapter_admission,
+                _runtime_adapter_semantic_claim=_runtime_adapter_semantic_claim,
             )
         except KeyError as exc:
             can_import = source == "auto" and resolved_version_id is None and "object is not registered" in str(exc)
@@ -4185,8 +6427,18 @@ class DaemonRuntime:
                 library=library,
                 runtimes=runtimes,
                 keep=keep,
+                runtime_port_adapters=runtime_port_adapters,
+                runtime_library_adapter_refs=runtime_library_adapter_refs,
+                runtime_adapter_semantic_advisories=runtime_adapter_semantic_advisories,
+                runtime_library_adapter_sources=runtime_library_adapter_sources,
+                _runtime_library_adapter_execution_target=(_runtime_library_adapter_execution_target),
+                adapter_policy=adapter_policy,
+                custom_remote_allowed=custom_remote_allowed,
                 report_local_run=report_local_run,
+                _browser_adapter_admission=_browser_adapter_admission,
+                _runtime_adapter_semantic_claim=_runtime_adapter_semantic_claim,
             )
+        self._bind_lifecycle_run_lease(str(state["id"]), lifecycle_lease)
         try:
             state = self._prepare_node_runtime_environments_for_run(state, report_local_run=report_local_run)
         except Exception as exc:
@@ -4199,6 +6451,239 @@ class DaemonRuntime:
         self._start_run_thread(state["id"], report_local_run)
         return self.store.get_run(state["id"])
 
+    def start_guarded_local_run(
+        self,
+        admission: GuardedLocalRunAdmission,
+    ) -> dict[str, Any]:
+        """Atomically close lifecycle admission around an exact guarded Run."""
+
+        try:
+            lease = self.lifecycle.reserve_current_or_root(
+                "guarded_local_run",
+                queued=True,
+            )
+        except LifecycleAdmissionClosed as exc:
+            raise GuardedLocalRunError(
+                "daemon_draining",
+                HTTPStatus.CONFLICT,
+            ) from exc
+        lease.activate()
+        lease.attach_current_thread()
+        try:
+            return self._start_guarded_local_run_admitted(
+                admission,
+                lifecycle_lease=lease,
+            )
+        except Exception:
+            self._release_unbound_lifecycle_lease(lease)
+            raise
+        finally:
+            lease.detach_current_thread()
+
+    def _start_guarded_local_run_admitted(
+        self,
+        admission: GuardedLocalRunAdmission,
+        *,
+        lifecycle_lease: LifecycleWorkLease,
+    ) -> dict[str, Any]:
+        """Atomically admit one exact current local Object call.
+
+        The shared registry lock is retained from the first authoritative
+        comparison through Run insertion. Object publication uses the same
+        reentrant lock, so it cannot advance the current pointer inside this
+        admission decision.
+        """
+
+        try:
+            with self.store._storage._lock:
+                home_lock = self.daemon_home_lock
+                identity = self.daemon_identity
+                if (
+                    identity is None
+                    or home_lock is None
+                    or not home_lock.is_acquired
+                    or home_lock.identity is not identity
+                ):
+                    raise GuardedLocalRunError(
+                        "live_identity_unavailable",
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                if admission.daemon_instance_id != identity.instance_id:
+                    raise GuardedLocalRunError(
+                        "daemon_instance_mismatch",
+                        HTTPStatus.PRECONDITION_FAILED,
+                    )
+                if admission.daemon_generation != identity.generation:
+                    raise GuardedLocalRunError(
+                        "daemon_generation_mismatch",
+                        HTTPStatus.PRECONDITION_FAILED,
+                    )
+
+                try:
+                    object_record = self.store.get_object_version(
+                        admission.object.selected_version_id,
+                        include_yaml=False,
+                    )
+                except KeyError as exc:
+                    raise GuardedLocalRunError(
+                        "object_not_found",
+                        HTTPStatus.PRECONDITION_FAILED,
+                    ) from exc
+
+                expected_object_identity = (
+                    admission.object.owner_id,
+                    admission.object.library,
+                    admission.object.object_name,
+                    admission.object.object_id,
+                    admission.object.origin,
+                )
+                authoritative_object_identity = (
+                    object_record.get("owner_id"),
+                    object_record.get("library"),
+                    object_record.get("name"),
+                    object_record.get("id"),
+                    object_record.get("origin"),
+                )
+                if authoritative_object_identity != expected_object_identity:
+                    raise GuardedLocalRunError(
+                        "object_identity_mismatch",
+                        HTTPStatus.PRECONDITION_FAILED,
+                    )
+                if object_record.get("current_version_id") != admission.object.expected_current_version_id:
+                    raise GuardedLocalRunError(
+                        "current_version_mismatch",
+                        HTTPStatus.PRECONDITION_FAILED,
+                    )
+                if (
+                    object_record.get("version_id") != admission.object.selected_version_id
+                    or object_record.get("version") != admission.object.selected_version
+                ):
+                    raise GuardedLocalRunError(
+                        "object_version_mismatch",
+                        HTTPStatus.PRECONDITION_FAILED,
+                    )
+                if f"sha256:{object_record.get('content_hash')}" != admission.content_hash:
+                    raise GuardedLocalRunError(
+                        "content_binding_mismatch",
+                        HTTPStatus.PRECONDITION_FAILED,
+                    )
+                validate_signature_arguments(admission, object_record)
+
+                receipt: dict[str, Any] | None = None
+                admitted_state: dict[str, Any] | None = None
+                admission_committed = False
+
+                def bind_receipt_before_commit(candidate: dict[str, Any]) -> None:
+                    nonlocal admitted_state, receipt
+                    if (
+                        candidate.get("status") != "queued"
+                        or candidate.get("object_id") != admission.object.object_id
+                        or candidate.get("object_version_id") != admission.object.selected_version_id
+                    ):
+                        raise GuardedLocalRunError(
+                            "admission_failed",
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                        )
+                    receipt = build_guarded_local_run_receipt(
+                        admission,
+                        object_record=object_record,
+                        run_state=candidate,
+                    )
+                    admitted_state = candidate
+
+                def confirm_admission_commit() -> None:
+                    nonlocal admission_committed
+                    admission_committed = True
+
+                try:
+                    self.store.create_run(
+                        str(object_record["name"]),
+                        kwargs=admission.keyword_arguments(),
+                        output=admission.output_selector,
+                        timeout_seconds=timeout_ms_to_seconds(admission.timeout_ms),
+                        object_version_id=admission.object.selected_version_id,
+                        function=None,
+                        owner_id=admission.object.owner_id,
+                        library=admission.object.library,
+                        keep=retention_to_keep(admission.retention),
+                        report_local_run=True,
+                        _precommit_check=bind_receipt_before_commit,
+                        _postcommit_confirm=confirm_admission_commit,
+                    )
+                except Exception as exc:
+                    if not admission_committed or receipt is None or admitted_state is None:
+                        raise GuardedLocalRunError(
+                            "admission_failed",
+                            HTTPStatus.SERVICE_UNAVAILABLE,
+                        ) from exc
+                if not admission_committed or receipt is None or admitted_state is None:
+                    raise GuardedLocalRunError(
+                        "admission_failed",
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                self._bind_lifecycle_run_lease(
+                    str(admitted_state["id"]),
+                    lifecycle_lease,
+                )
+        except GuardedLocalRunError:
+            raise
+        except Exception as exc:
+            raise GuardedLocalRunError(
+                "admission_failed",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            ) from exc
+
+        try:
+            self._continue_guarded_local_run(admitted_state)
+        except Exception:
+            LOGGER.error(
+                "accepted guarded local Run continuation failed",
+                extra={"spl_event": "guarded_local_run_continuation_failure"},
+            )
+        return receipt
+
+    def _continue_guarded_local_run(self, state: dict[str, Any]) -> None:
+        """Prepare and schedule an already accepted Run without changing its receipt."""
+
+        try:
+            prepared = self._prepare_node_runtime_environments_for_run(
+                state,
+                report_local_run=True,
+            )
+        except Exception as exc:
+            try:
+                self._fail_run_before_worker(
+                    state,
+                    report_local_run=True,
+                    error=str(exc) or repr(exc),
+                )
+            except Exception:
+                LOGGER.exception(
+                    "accepted guarded local Run could not record preparation failure",
+                    extra={"spl_event": "guarded_local_run_preparation_failure"},
+                )
+            return
+
+        try:
+            self._update_local_run(
+                prepared["id"],
+                report_local_run=True,
+                status="starting",
+            )
+            self._start_run_thread(prepared["id"], True)
+        except Exception:
+            try:
+                self._fail_run_before_worker(
+                    prepared,
+                    report_local_run=True,
+                    error="accepted local Run could not be scheduled",
+                )
+            except Exception:
+                LOGGER.exception(
+                    "accepted guarded local Run could not record scheduling failure",
+                    extra={"spl_event": "guarded_local_run_scheduling_failure"},
+                )
+
     def resume_run(
         self,
         run_id: str,
@@ -4208,9 +6693,53 @@ class DaemonRuntime:
         output: str | None = None,
         timeout_seconds: float | None = None,
         adapters: dict[str, Any] | None = None,
-        runtimes: dict[str, str] | None = None,
+        runtimes: str | dict[str, str] | None = None,
         keep: Any = True,
         report_local_run: bool = True,
+    ) -> dict[str, Any]:
+        """Atomically admit one local resume lineage."""
+
+        validate_timeout_seconds(
+            timeout_seconds,
+            name="timeout_seconds",
+            domain=TimeoutDomain.NON_NEGATIVE,
+            allow_none=True,
+        )
+        lease = self.lifecycle.reserve_current_or_root("local_run", queued=True)
+        lease.activate()
+        lease.attach_current_thread()
+        try:
+            return self._resume_run_admitted(
+                run_id,
+                from_=from_,
+                kwargs=kwargs,
+                output=output,
+                timeout_seconds=timeout_seconds,
+                adapters=adapters,
+                runtimes=runtimes,
+                keep=keep,
+                report_local_run=report_local_run,
+                lifecycle_lease=lease,
+            )
+        except Exception:
+            self._release_unbound_lifecycle_lease(lease)
+            raise
+        finally:
+            lease.detach_current_thread()
+
+    def _resume_run_admitted(
+        self,
+        run_id: str,
+        *,
+        from_: Any,
+        kwargs: dict[str, Any] | None = None,
+        output: str | None = None,
+        timeout_seconds: float | None = None,
+        adapters: dict[str, Any] | None = None,
+        runtimes: str | dict[str, str] | None = None,
+        keep: Any = True,
+        report_local_run: bool = True,
+        lifecycle_lease: LifecycleWorkLease,
     ) -> dict[str, Any]:
         """Create a child run that resumes one retained daemon pipeline run."""
 
@@ -4293,6 +6822,7 @@ class DaemonRuntime:
             resume=resume_payload,
             report_local_run=report_local_run,
         )
+        self._bind_lifecycle_run_lease(str(state["id"]), lifecycle_lease)
         state = self._stage_object_docker_resume_parent(
             state,
             object_record=object_record,
@@ -4313,7 +6843,7 @@ class DaemonRuntime:
 
     def _start_run_thread(self, run_id: str, report_local_run: bool) -> None:
         thread = threading.Thread(
-            target=self._execute_run,
+            target=self._execute_run_with_lifecycle,
             args=(run_id, report_local_run),
             name=f"spl-run-{run_id}",
             daemon=True,
@@ -4321,7 +6851,40 @@ class DaemonRuntime:
         with self._run_threads_lock:
             self._run_threads = [candidate for candidate in self._run_threads if candidate.is_alive()]
             self._run_threads.append(thread)
-        thread.start()
+        try:
+            thread.start()
+        except Exception:
+            self._release_lifecycle_run_lease(run_id)
+            raise
+
+    def _execute_run_with_lifecycle(
+        self,
+        run_id: str,
+        report_local_run: bool,
+    ) -> None:
+        """Run the worker while retaining exact process-local admission."""
+
+        with self._lifecycle_run_leases_lock:
+            lease = self._lifecycle_run_leases.get(run_id)
+        if lease is None:
+            self.lifecycle.record_unknown_work()
+            return
+        lease.activate()
+        lease.attach_current_thread()
+        try:
+            self._execute_run(run_id, report_local_run)
+        except Exception:
+            # An accepted local Run that escapes its normal terminal-state
+            # write is not safe to classify as idle.  Do not log the exception
+            # value because it can contain user arguments or paths.
+            self.lifecycle.record_unknown_work()
+            LOGGER.error(
+                "accepted local Run escaped its terminal commit",
+                extra={"spl_event": "local_run_outcome_unproven", "run_id": run_id},
+            )
+        finally:
+            lease.detach_current_thread()
+            self._release_lifecycle_run_lease(run_id)
 
     def _fail_run_before_worker(
         self,
@@ -4331,14 +6894,17 @@ class DaemonRuntime:
         error: str,
     ) -> dict[str, Any]:
         run_id = str(state["id"])
-        final_state = self._update_local_run_terminal(
-            run_id,
-            report_local_run=report_local_run,
-            status="failed",
-            finished_at=utc_now(),
-            error=error,
-        )
-        return final_state if final_state is not None else self.store.get_run(run_id)
+        try:
+            final_state = self._update_local_run_terminal(
+                run_id,
+                report_local_run=report_local_run,
+                status="failed",
+                finished_at=utc_now(),
+                error=error,
+            )
+            return final_state if final_state is not None else self.store.get_run(run_id)
+        finally:
+            self._release_lifecycle_run_lease(run_id)
 
     def _stage_object_docker_resume_parent(
         self,
@@ -4402,18 +6968,37 @@ class DaemonRuntime:
             input=input_payload,
         )
 
-    def _load_optional_pipeline_entrypoint(self, object_record: dict[str, Any], entrypoint: str) -> Pipeline | None:
-        namespace = self._pipeline_import_namespace()
-        with NamedTemporaryFile("w", encoding="utf-8", suffix=".yaml") as handle:
-            handle.write(str(object_record["yaml"]))
-            handle.flush()
-            spl_import_from_file(Path(handle.name), namespace)
-        target = namespace.get(entrypoint)
-        return target if isinstance(target, Pipeline) else None
+    def _load_optional_pipeline_entrypoint(
+        self,
+        object_record: dict[str, Any],
+        entrypoint: str,
+    ) -> DPipeline | None:
+        """Read pipeline runtime tags without executing Object imports.
+
+        Run admission happens in the daemon's deliberately dependency-light
+        process, while Object imports belong to the selected worker
+        environment.  Importing the YAML bundle here made an ordinary
+        Function fail before its worker started whenever a user dependency
+        (for example pandas) was absent from the daemon environment.
+
+        The safe loader constructs only SPL IR dataclasses.  That is enough to
+        inspect ``DPipeline.tags`` for per-node Docker selection and keeps
+        every user import behind the worker boundary.
+        """
+
+        if object_record.get("kind") != "pipeline":
+            return None
+        for document in yaml.load_all(str(object_record["yaml"]), Loader=SPLSafeLoader):
+            if not isinstance(document, list) or not document:
+                continue
+            target = document[0]
+            if isinstance(target, DPipeline) and target.name == entrypoint:
+                return target
+        return None
 
     def _run_selects_node_docker(
         self,
-        pipeline: Pipeline | None,
+        pipeline: Pipeline | DPipeline | None,
         *,
         runtime_config: Any,
         runtimes: Any,
@@ -4421,6 +7006,8 @@ class DaemonRuntime:
         config = runtime_config if isinstance(runtime_config, dict) else {}
         if config.get("node_runtime") == DOCKER_NODE_RUNTIME:
             return True
+        if runtimes == DOCKER_NODE_RUNTIME:
+            return pipeline is not None
         if isinstance(runtimes, dict) and any(value == DOCKER_NODE_RUNTIME for value in runtimes.values()):
             return True
         if pipeline is None:
@@ -4477,6 +7064,24 @@ class DaemonRuntime:
 
         state = self.store.get_run(run_id)
         object_record = self.store.get_object_version(state["object_version_id"])
+        raw_run_input = state.get("input")
+        run_input: dict[str, Any] = raw_run_input if isinstance(raw_run_input, dict) else {}
+        effective_runtime_config = run_input.get("runtime_config")
+        if isinstance(effective_runtime_config, dict):
+            object_record = {
+                **object_record,
+                "runtime_config": effective_runtime_config,
+            }
+        runtime_port_adapters = run_input.get("runtime_port_adapters")
+        if isinstance(runtime_port_adapters, dict):
+            merged_distributions = run_input.get("runtime_adapter_distributions")
+            if not isinstance(merged_distributions, list):
+                raise RuntimeError("runtime adapter environment preflight metadata is missing")
+            object_record = {
+                **object_record,
+                "distributions": merged_distributions,
+                "runtime_port_adapters": True,
+            }
         run_dir = Path(state["run_dir"])
         result_path = Path(state["result_path"])
         artifacts_dir = Path(state["artifacts_dir"])
@@ -4489,6 +7094,7 @@ class DaemonRuntime:
         worker_path = Path(__file__).with_name("worker.py")
         spl_free_runner_path = Path(__file__).with_name("spl_free_runner.py")
         worker_runtime_marker_path = run_dir / WORKER_RUNTIME_MARKER_FILE
+        worker_runtime_adapter_failure_path = run_dir / WORKER_RUNTIME_ADAPTER_FAILURE_FILE
 
         object_yaml_path.write_text(object_record["yaml"], encoding="utf-8")
         write_json(env_spec_path, object_record["distributions"])
@@ -4530,6 +7136,7 @@ class DaemonRuntime:
             daemon_base_url=self.daemon_base_url,
         )
 
+        adapter_failure_stage = "environment_preflight"
         try:
             timeout = self._read_timeout(input_path)
             backend = self.runtime_backends.backend_for(object_record)
@@ -4576,6 +7183,8 @@ class DaemonRuntime:
                     runtime_build_hash=environment_record["spec_hash"],
                     **backend.run_state_fields(),
                 )
+                adapter_failure_stage = "object_execution"
+                worker_runtime_adapter_failure_path.unlink(missing_ok=True)
                 try:
                     try:
                         completed = run_process_tree(
@@ -4607,6 +7216,7 @@ class DaemonRuntime:
                         raise
                 finally:
                     env.pop(CALLBACK_CAPABILITY_ENV, None)
+                adapter_failure_stage = "worker_save"
                 stdout_path.write_text(completed.stdout, encoding="utf-8")
                 stderr_path.write_text(completed.stderr, encoding="utf-8")
                 after_run = backend.after_run(ctx)
@@ -4620,6 +7230,11 @@ class DaemonRuntime:
                 if completed.returncode == 0 and result_path.exists():
                     result_payload = json.loads(result_path.read_text(encoding="utf-8"))
                     manifest_payload = result_payload.pop("manifest", None)
+                    if isinstance(runtime_port_adapters, dict):
+                        _verify_terminal_runtime_output_files(
+                            artifacts_dir,
+                            result_payload.get("runtime_port_adapter_outputs", []),
+                        )
                     if backend.process_result(ctx, result_payload):
                         write_json(result_path, result_payload)
                     elif manifest_payload is not None:
@@ -4639,6 +7254,30 @@ class DaemonRuntime:
                             parent_run_id=state.get("parent_run_id"),
                             object_record=object_record,
                         )
+                    initial_runtime_section = (state.get("manifest") or {}).get("runtime_port_adapters")
+                    if (
+                        isinstance(initial_runtime_section, dict)
+                        and not isinstance(runtime_port_adapters, dict)
+                        and "manifest" in success_changes
+                    ):
+                        success_changes["manifest"] = {
+                            **success_changes["manifest"],
+                            "runtime_port_adapters": initial_runtime_section,
+                        }
+                    if isinstance(runtime_port_adapters, dict):
+                        success_manifest = dict(success_changes.get("manifest") or state.get("manifest") or {})
+                        success_changes["manifest"] = _manifest_with_runtime_adapter_outputs(
+                            success_manifest,
+                            dict(state.get("manifest") or {}),
+                            runtime_port_adapters,
+                            result_payload.get("runtime_port_adapter_outputs", []),
+                            runtime_library_adapters=(
+                                run_input.get("runtime_library_adapters")
+                                if isinstance(run_input.get("runtime_library_adapters"), dict)
+                                else None
+                            ),
+                            custom_used=_worker_runtime_custom_adapter_used(run_dir),
+                        )
                     # Terminal writes are the final store access in the run thread.
                     self._update_local_run_terminal(
                         run_id,
@@ -4649,21 +7288,63 @@ class DaemonRuntime:
                     error = completed.stderr.strip() or completed.stdout.strip()
                     if completed.returncode == 0:
                         error = "worker finished without writing result.json"
+                    adapter_failure = _validated_runtime_adapter_failure(
+                        _read_worker_runtime_adapter_failure(
+                            worker_runtime_adapter_failure_path,
+                            returncode=completed.returncode,
+                        ),
+                        dict(state.get("manifest") or {}),
+                    )
+                    if adapter_failure is None and isinstance(runtime_port_adapters, dict):
+                        adapter_failure = {
+                            "stage": "object_execution",
+                            "reason": "adapted worker failed",
+                        }
+                    safe_stdout = completed.stdout
+                    safe_stderr = completed.stderr
+                    if adapter_failure is not None:
+                        error = (
+                            f"{adapter_failure['code']}: {adapter_failure['message']}"
+                            if adapter_failure.get("schema_version") == 1
+                            else f"{adapter_failure['stage']}: {adapter_failure['reason']}"
+                        )
+                        safe_stdout = ""
+                        safe_stderr = error
+                        stdout_path.write_text(safe_stdout, encoding="utf-8")
+                        stderr_path.write_text(safe_stderr, encoding="utf-8")
                     manifest_payload = self._read_worker_manifest(run_dir)
                     failure_changes: dict[str, Any] = {
                         "status": "failed",
                         "finished_at": utc_now(),
                         "returncode": completed.returncode,
                         "error": error,
-                        "stdout_text": completed.stdout,
-                        "stderr_text": completed.stderr,
+                        "stdout_text": safe_stdout,
+                        "stderr_text": safe_stderr,
                     }
-                    if manifest_payload is not None:
-                        failure_changes["manifest"] = self._daemon_manifest_payload(
+                    projected_manifest = (
+                        self._daemon_manifest_payload(
                             manifest_payload,
                             run_id=run_id,
                             parent_run_id=state.get("parent_run_id"),
                             object_record=object_record,
+                        )
+                        if manifest_payload is not None
+                        else dict(state.get("manifest") or {})
+                    )
+                    initial_runtime_section = (state.get("manifest") or {}).get("runtime_port_adapters")
+                    if isinstance(initial_runtime_section, dict):
+                        projected_manifest = {
+                            **projected_manifest,
+                            "runtime_port_adapters": initial_runtime_section,
+                        }
+                    if manifest_payload is not None:
+                        failure_changes["manifest"] = projected_manifest
+                    if adapter_failure is not None:
+                        failure_changes["manifest"] = _manifest_with_runtime_adapter_failure(
+                            projected_manifest,
+                            dict(state.get("manifest") or {}),
+                            adapter_failure,
+                            custom_used=_worker_runtime_custom_adapter_used(run_dir),
                         )
                     # Terminal writes are the final store access in the run thread.
                     self._update_local_run_terminal(
@@ -4674,6 +7355,14 @@ class DaemonRuntime:
         except subprocess.TimeoutExpired as exc:
             stdout = self._subprocess_text(exc.stdout)
             stderr = self._subprocess_text(exc.stderr)
+            timeout_adapter_failure = None
+            if isinstance(runtime_port_adapters, dict):
+                timeout_adapter_failure = {
+                    "stage": "object_execution",
+                    "reason": "adapted worker timed out",
+                }
+                stdout = ""
+                stderr = "object_execution: adapted worker timed out"
             stdout_path.write_text(stdout, encoding="utf-8")
             stderr_path.write_text(stderr, encoding="utf-8")
             timeout_changes: dict[str, Any] = {
@@ -4691,13 +7380,21 @@ class DaemonRuntime:
                     parent_run_id=state.get("parent_run_id"),
                     object_record=object_record,
                 )
+            if timeout_adapter_failure is not None:
+                timeout_changes["manifest"] = _manifest_with_runtime_adapter_failure(
+                    dict(timeout_changes.get("manifest") or state.get("manifest") or {}),
+                    dict(state.get("manifest") or {}),
+                    timeout_adapter_failure,
+                    custom_used=_worker_runtime_custom_adapter_used(run_dir),
+                )
             # Terminal writes are the final store access in the run thread.
             self._update_local_run_terminal(run_id, report_local_run=report_local_run, **timeout_changes)
         except Exception as exc:
+            adapted_error = isinstance(runtime_port_adapters, dict)
             error_changes: dict[str, Any] = {
                 "status": "failed",
                 "finished_at": utc_now(),
-                "error": repr(exc),
+                "error": (f"{adapter_failure_stage}: adapted run failed safely" if adapted_error else repr(exc)),
             }
             manifest_payload = self._read_worker_manifest(run_dir)
             if manifest_payload is not None:
@@ -4706,6 +7403,13 @@ class DaemonRuntime:
                     run_id=run_id,
                     parent_run_id=state.get("parent_run_id"),
                     object_record=object_record,
+                )
+            if adapted_error:
+                error_changes["manifest"] = _manifest_with_runtime_adapter_failure(
+                    dict(error_changes.get("manifest") or state.get("manifest") or {}),
+                    dict(state.get("manifest") or {}),
+                    {"stage": adapter_failure_stage, "reason": "adapted run failed safely"},
+                    custom_used=_worker_runtime_custom_adapter_used(run_dir),
                 )
             # Terminal writes are the final store access in the run thread.
             self._update_local_run_terminal(run_id, report_local_run=report_local_run, **error_changes)
@@ -4783,6 +7487,17 @@ class DaemonRuntime:
     def renew_run_delivery(self, run_id: str) -> dict[str, Any]:
         """Renew the bounded compatibility lease before serving run data."""
 
+        return cast(
+            dict[str, Any],
+            self.run_registry_mutation(
+                self._renew_run_delivery_admitted,
+                run_id,
+            ),
+        )
+
+    def _renew_run_delivery_admitted(self, run_id: str) -> dict[str, Any]:
+        """Renew one already-admitted delivery lease."""
+
         state = self.store.renew_run_delivery(
             validate_name(run_id),
             lease_seconds=DEFAULT_RUN_DELIVERY_LEASE_SECONDS,
@@ -4792,6 +7507,17 @@ class DaemonRuntime:
 
     def acknowledge_run_delivery(self, run_id: str) -> dict[str, Any]:
         """Record client consumption and immediately retry safe cleanup."""
+
+        return cast(
+            dict[str, Any],
+            self.run_registry_mutation(
+                self._acknowledge_run_delivery_admitted,
+                run_id,
+            ),
+        )
+
+    def _acknowledge_run_delivery_admitted(self, run_id: str) -> dict[str, Any]:
+        """Acknowledge one already-admitted delivery mutation."""
 
         result = self.store.acknowledge_run_delivery(validate_name(run_id))
         self._cancel_run_retention_deadline(validate_name(run_id))
@@ -4879,9 +7605,19 @@ class DaemonRuntime:
 
             for run_id in due:
                 try:
-                    outcome = self.store.enforce_run_retention(run_id)
+                    outcome = cast(
+                        dict[str, Any],
+                        self.run_registry_mutation(
+                            self.store.enforce_run_retention,
+                            run_id,
+                        ),
+                    )
                     if outcome.get("reason") == "consumer-delivery-pending":
                         self._schedule_run_retention(self.store.get_run(run_id))
+                except LifecycleAdmissionClosed:
+                    # Drain owns shutdown. A later standalone startup sweep can
+                    # recover the untouched durable retention decision.
+                    continue
                 except (KeyError, OSError, RuntimeError, ValueError) as exc:
                     LOGGER.error(
                         "run retention scheduler skipped %s: %s",
@@ -4899,6 +7635,36 @@ class DaemonRuntime:
         report_local_run: bool,
         **changes: Any,
     ) -> dict[str, Any] | None:
+        lease = self._reserve_run_descendant(run_id, "terminal_commit")
+        attached = False
+        if lease is not None:
+            lease.activate()
+            if self.lifecycle.current_lineage_id is None:
+                lease.attach_current_thread()
+                attached = True
+        try:
+            return self._update_local_run_terminal_admitted(
+                run_id,
+                report_local_run=report_local_run,
+                **changes,
+            )
+        finally:
+            if lease is not None:
+                if attached:
+                    lease.detach_current_thread()
+                lease.complete()
+
+    def _update_local_run_terminal_admitted(
+        self,
+        run_id: str,
+        *,
+        report_local_run: bool,
+        **changes: Any,
+    ) -> dict[str, Any] | None:
+        # Revoke the worker callback authority before publishing a terminal
+        # status so a concurrent reader cannot observe terminal truth while a
+        # capability for the completed Run is still usable.
+        self.callback_capabilities.revoke_run(run_id)
         try:
             self._update_local_run(
                 run_id,
@@ -4922,11 +7688,17 @@ class DaemonRuntime:
                 raise
             LOGGER.warning("run state write skipped: store closed during shutdown")
             return None
-        finally:
-            self.callback_capabilities.revoke_run(run_id)
 
     def sweep_run_retention(self) -> dict[str, Any]:
         """Recover and enforce safe terminal run cleanup after a restart or sync."""
+
+        return cast(
+            dict[str, Any],
+            self.run_registry_mutation(self._sweep_run_retention_admitted),
+        )
+
+    def _sweep_run_retention_admitted(self) -> dict[str, Any]:
+        """Run one already-admitted retention recovery sweep."""
 
         results: list[dict[str, Any]] = []
         for state in self.store.list_runs():
@@ -5464,6 +8236,7 @@ class DaemonRuntime:
                 return
             self._shutdown_complete = True
         self.callback_capabilities.clear()
+        self.browser_adapter_runs.shutdown()
         with self._retention_condition:
             self._retention_scheduler_stopped = True
             self._retention_deadlines.clear()
@@ -5540,6 +8313,7 @@ def create_app(
     docker_pool_size: int = 0,
     docker_idle_timeout_seconds: float = 300.0,
     docker_prewarm: bool = False,
+    allow_remote_custom_adapters: bool = False,
     telemetry: TelemetryLevel = DEFAULT_TELEMETRY_LEVEL,
     telemetry_sensitive_fields: tuple[str, ...] | list[str] = (),
     api_token: str | None = None,
@@ -5551,11 +8325,19 @@ def create_app(
     server_client_factory: ServerClientFactoryProtocol = _default_server_client_factory,
     daemon_identity: DaemonInstanceIdentity | None = None,
     daemon_home_lock: DaemonHomeLock | None = None,
+    startup_binding: StartupBinding | None = None,
+    startup_supervisor_proof: str | None = None,
 ) -> Any:
     """Create a Quart application bound to one registry store."""
 
     Quart, Response, request = _load_quart()
     app = Quart(__name__)
+    install_adapter_run_request_limit(app)
+    install_guarded_run_request_limit(app)
+    install_lifecycle_request_limit(app)
+    install_library_adapter_request_limit(app)
+    install_prepared_validation_request_limit(app)
+    install_source_analysis_request_limit(app)
     local_api_token = api_token or generate_daemon_api_token()
     app.api_token = local_api_token
     runtime = DaemonRuntime(
@@ -5568,6 +8350,7 @@ def create_app(
         docker_pool_size=docker_pool_size,
         docker_idle_timeout_seconds=docker_idle_timeout_seconds,
         docker_prewarm=docker_prewarm,
+        allow_remote_custom_adapters=allow_remote_custom_adapters,
         telemetry=telemetry,
         telemetry_sensitive_fields=telemetry_sensitive_fields,
         environment_manager=environment_manager,
@@ -5578,6 +8361,8 @@ def create_app(
         server_client_factory=server_client_factory,
         daemon_identity=daemon_identity,
         daemon_home_lock=daemon_home_lock,
+        startup_binding=startup_binding,
+        startup_supervisor_proof=startup_supervisor_proof,
     )
     app.runtime = runtime
 
@@ -5590,6 +8375,8 @@ def create_app(
     )
     app.before_request(context.require_local_api_auth)
 
+    register_meta_routes(app, runtime=runtime, context=context)
+    register_lifecycle_routes(app, runtime=runtime, context=context)
     register_diagnostics_routes(
         app,
         runtime=runtime,
@@ -5597,11 +8384,18 @@ def create_app(
         route_errors=context.route_errors,
     )
     register_server_connection_routes(app, runtime=runtime, context=context)
+    register_ai_preview_routes(app, runtime=runtime, context=context)
+    register_ai_assistant_routes(app, runtime=runtime, context=context)
     register_library_routes(app, runtime=runtime, context=context)
+    register_library_adapter_routes(app, runtime=runtime, context=context)
     register_object_routes(app, runtime=runtime, context=context)
+    register_source_analysis_routes(app, runtime=runtime, context=context)
+    register_prepared_validation_routes(app, runtime=runtime, context=context)
     register_env_routes(app, runtime=runtime, context=context)
     register_remote_routes(app, runtime=runtime, context=context)
     register_run_routes(app, runtime=runtime, context=context)
+    register_guarded_run_routes(app, runtime=runtime, context=context)
+    register_adapter_run_routes(app, runtime=runtime, context=context)
     register_artifact_routes(app, runtime=runtime, context=context)
 
     return app
@@ -5664,6 +8458,28 @@ def _client_host_for_bind_host(host: str) -> str:
     return host
 
 
+def _run_daemon_app(app: Any, *, host: str, port: int) -> None:
+    """Serve until interruption or the daemon-owned self-exit trigger fires."""
+
+    run_task = getattr(app, "run_task", None)
+    if not callable(run_task):
+        # Backward-compatible seam used by existing startup/lock tests.
+        app.run(host=host, port=port)
+        return
+
+    async def run_until_exit() -> None:
+        shutdown_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        app.runtime.lifecycle.bind_exit_callback(lambda: loop.call_soon_threadsafe(shutdown_event.set))
+        await run_task(
+            host=host,
+            port=port,
+            shutdown_trigger=shutdown_event.wait,
+        )
+
+    asyncio.run(run_until_exit())
+
+
 def serve(
     host: str = "127.0.0.1",
     port: int = 8765,
@@ -5678,6 +8494,7 @@ def serve(
     docker_pool_size: int = 0,
     docker_idle_timeout_seconds: float = 300.0,
     docker_prewarm: bool = False,
+    allow_remote_custom_adapters: bool = False,
     telemetry: TelemetryLevel = DEFAULT_TELEMETRY_LEVEL,
     telemetry_sensitive_fields: tuple[str, ...] | list[str] = (),
     environment_manager: EnvironmentManagerProtocol | None = None,
@@ -5686,15 +8503,22 @@ def serve(
     runtime_backends: RuntimeBackendRegistry | None = None,
     sync_visibility: SyncVisibilityProtocol | None = None,
     server_client_factory: ServerClientFactoryProtocol = _default_server_client_factory,
+    startup_binding_fd: int | None = None,
 ) -> None:
     """Run the local daemon until interrupted."""
 
     home_lock = DaemonHomeLock(home)
+    startup_binding, startup_supervisor_proof = load_startup_binding(
+        startup_binding_fd,
+        home=home_lock.home,
+    )
     daemon_identity = home_lock.acquire()
     store: RegistryStore | None = None
     published_base_url: str | None = None
     app: Any | None = None
     try:
+        if startup_binding is not None:
+            revalidate_startup_binding(startup_binding, home=home_lock.home)
         store = RegistryStore(home_lock.home)
         selected_port = select_daemon_port(
             host,
@@ -5715,6 +8539,7 @@ def serve(
             docker_pool_size=docker_pool_size,
             docker_idle_timeout_seconds=docker_idle_timeout_seconds,
             docker_prewarm=docker_prewarm,
+            allow_remote_custom_adapters=allow_remote_custom_adapters,
             telemetry=telemetry,
             telemetry_sensitive_fields=telemetry_sensitive_fields,
             api_token=api_token,
@@ -5726,6 +8551,8 @@ def serve(
             server_client_factory=server_client_factory,
             daemon_identity=daemon_identity,
             daemon_home_lock=home_lock,
+            startup_binding=startup_binding,
+            startup_supervisor_proof=startup_supervisor_proof,
         )
         endpoint = write_daemon_endpoint(
             store.home,
@@ -5741,7 +8568,7 @@ def serve(
         print(f"SPL daemon listening on {daemon_url(host, selected_port)}")
         print(f"SPL daemon client endpoint: {published_base_url}")
         print(f"SPL daemon home: {store.home}")
-        app.run(host=host, port=selected_port)
+        _run_daemon_app(app, host=host, port=selected_port)
     except KeyboardInterrupt:
         print("\nSPL daemon stopped")
     finally:

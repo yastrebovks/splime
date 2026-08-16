@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import threading
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
 
 from spl.daemon.heartbeat_service import HeartbeatService
+from spl.core.library_adapters import (
+    RUNTIME_LIBRARY_ADAPTER_REF_CAPABILITY,
+    environment_fingerprint,
+)
+import spl.daemon.server as daemon_server
 from spl.daemon.repositories.server_connection import SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
 from spl.daemon.remote_client import ServerClientError
 from spl.daemon.server import DaemonRuntime
@@ -66,6 +72,7 @@ class ClientFactory:
 class FakeServerConnections:
     def __init__(self):
         self.connected = False
+        self.connect_kwargs: dict[str, Any] | None = None
         self.disconnected_with: dict[str, Any] | None = None
 
     def server_client(
@@ -82,9 +89,13 @@ class FakeServerConnections:
 
     def connect_server(self, **kwargs: Any) -> dict[str, Any]:
         self.connected = True
+        self.connect_kwargs = kwargs
         return {
             "connected": True,
-            "connection": {"id": "local-connection-1"},
+            "connection": {
+                "id": "local-connection-1",
+                "capabilities": kwargs["capabilities"],
+            },
             "remote_connection": {"id": "remote-connection-1"},
         }
 
@@ -127,6 +138,7 @@ class FakeHeartbeatService:
     def __init__(self):
         self.restored = False
         self.started: list[tuple[str, str]] = []
+        self.started_capabilities: list[dict[str, Any]] = []
         self.stopped: list[str] = []
         self.shutdown_called = False
 
@@ -140,6 +152,7 @@ class FakeHeartbeatService:
         token: str,
     ) -> None:
         self.started.append((connection["id"], token))
+        self.started_capabilities.append(dict(connection.get("capabilities") or {}))
 
     def ensure_server_heartbeat(self, connection: dict[str, Any] | None = None) -> None:
         pass
@@ -560,6 +573,7 @@ def test_connect_server_reconnects_reused_needs_reconnect_identity(
 
 def test_daemon_runtime_reconnect_restores_live_sync_channel(
     store: RegistryStore,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connection = store.save_server_connection(
         server_url="https://splime.io/api",
@@ -579,6 +593,15 @@ def test_daemon_runtime_reconnect_restores_live_sync_channel(
         heartbeat_service=FakeHeartbeatService(),
         server_client_factory=ClientFactory(client),
     )
+    distributions = [
+        SimpleNamespace(metadata={"Name": "Pillow"}, version="11.0.0"),
+        SimpleNamespace(metadata={"Name": "pandas"}, version="2.3.1"),
+    ]
+    monkeypatch.setattr(
+        daemon_server.importlib_metadata,
+        "distributions",
+        lambda: distributions,
+    )
 
     result = runtime.connect_server(
         server_url="https://splime.io/api",
@@ -594,6 +617,23 @@ def test_daemon_runtime_reconnect_restores_live_sync_channel(
     assert result["connected"] is True
     assert result["reconcile"]["owner_id"] == "admin1"
     assert runtime._server_channel_is_live(credentials) is True  # noqa: SLF001
+    capability = client.connect_kwargs[0]["capabilities"][RUNTIME_LIBRARY_ADAPTER_REF_CAPABILITY]
+    expected_distributions = [
+        {"package": "pandas", "version": "2.3.1"},
+        {"package": "Pillow", "version": "11.0.0"},
+    ]
+    assert capability == {
+        "schema_version": 1,
+        "execution": True,
+        "custom_adapter_execution": {
+            "implemented": True,
+            "enabled": False,
+        },
+        "environment": {
+            "fingerprint": environment_fingerprint(expected_distributions),
+            "distributions": expected_distributions,
+        },
+    }
     runtime.shutdown()
 
 
@@ -659,6 +699,24 @@ def test_daemon_runtime_delegates_connection_and_heartbeat(
     assert heartbeats.restored is True
     assert connect_result["connected"] is True
     assert heartbeats.started == [("local-connection-1", "machine-token-secret")]
+    assert server_connections.connect_kwargs is not None
+    library_capability = server_connections.connect_kwargs["capabilities"][RUNTIME_LIBRARY_ADAPTER_REF_CAPABILITY]
+    assert heartbeats.started_capabilities[0][RUNTIME_LIBRARY_ADAPTER_REF_CAPABILITY] == library_capability
+    assert set(library_capability) == {
+        "schema_version",
+        "execution",
+        "custom_adapter_execution",
+        "environment",
+    }
+    assert library_capability["schema_version"] == 1
+    assert library_capability["execution"] is True
+    assert library_capability["custom_adapter_execution"] == {
+        "implemented": True,
+        "enabled": False,
+    }
+    assert library_capability["environment"]["fingerprint"] == environment_fingerprint(
+        library_capability["environment"]["distributions"]
+    )
     assert heartbeats.stopped == [existing["id"]]
     assert server_connections.disconnected_with is not None
     assert server_connections.disconnected_with["id"] == existing["id"]

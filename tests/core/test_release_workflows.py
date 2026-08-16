@@ -140,7 +140,7 @@ def test_published_verification_downloads_an_explicit_external_manifest() -> Non
         "server-ready-url",
     }
     assert all(value["required"] == "true" for value in inputs.values())
-    checkout = jobs["verify-urls"]["steps"][0]["with"]
+    checkout = workflow["jobs"]["verify-urls"]["steps"][0]["with"]
     assert checkout["repository"] == "${{ inputs.source-repository }}"
     assert checkout["ref"] == "${{ inputs.release-tag }}"
     assert "RELEASE_MANIFEST_URL" in text

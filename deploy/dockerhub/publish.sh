@@ -6,13 +6,21 @@
 #   docker buildx create --use --name splime-builder
 #
 # Usage:
-#   ./publish.sh            # builds and pushes the configured version + latest
-#   ./publish.sh <version>  # builds and pushes a specific version + latest
+#   SPLIME_CONFIRM_DOCKER=yastrebovks/spl-daemon:0.4.7 ./publish.sh 0.4.7
+#
+# Prefer release/0.4.7/update-docker.sh, which also verifies PyPI and runs an
+# exact-image smoke test. This bounded context helper retains the historical
+# direct buildx entry point but never pushes without an exact confirmation.
 set -euo pipefail
 
-VERSION="${1:-0.4.6}"
+VERSION="${1:-0.4.7}"
 IMAGE="yastrebovks/spl-daemon"
 PLATFORMS="linux/amd64,linux/arm64"
+
+if [[ "${SPLIME_CONFIRM_DOCKER:-}" != "${IMAGE}:${VERSION}" ]]; then
+  echo "Refusing to push. Set SPLIME_CONFIRM_DOCKER=${IMAGE}:${VERSION}." >&2
+  exit 2
+fi
 
 cd "$(dirname "$0")"
 

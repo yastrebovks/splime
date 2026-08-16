@@ -60,11 +60,17 @@ def _prefer_runtime_env_over_pythonpath_site_packages() -> None:
 _prefer_runtime_env_over_pythonpath_site_packages()
 
 import argparse
+import ast
+import __future__
+import hashlib
 import importlib.metadata
 import json
 import re
 import shutil
+import stat
+import tempfile
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import redirect_stderr, redirect_stdout
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from typing import Any, Literal, cast, overload
@@ -73,20 +79,107 @@ from urllib.parse import urlparse
 from urllib.request import Request
 
 from spl._http import urlopen_verified
+from spl.adapters import get_builtin_adapter
 from spl.core import json_contract as m_json_contract
 from spl.core import manifest as m_manifest
 from spl.core import node_runtime as m_node_runtime
 from spl.core.entities.adapter import Adapter
 from spl.core.entities.distribution import DDistribution
+from spl.core.library_adapters import (
+    LIBRARY_ADAPTER_CONTENT_HASH_DOMAIN,
+    LIBRARY_ADAPTER_SIGNATURE_HASH_DOMAIN,
+    domain_hash,
+    library_adapter_execution_payload,
+    library_adapter_signature_payload,
+    normalize_dependencies,
+    normalize_runtime_library_adapter_refs,
+)
+from spl.core.runtime_port_adapters import (
+    MAX_CUSTOM_BUNDLE_BYTES,
+    MAX_RUNTIME_INPUT_BYTES,
+    RuntimePortAdapterContractError,
+    normalize_wire_document,
+    runtime_port_adapter_fingerprint,
+    validate_custom_adapter_source,
+    validate_custom_bundle_dependencies,
+)
 from spl.daemon.callback_capability import CALLBACK_CAPABILITY_ENV
 from spl.daemon.store import validate_name
-from spl.daemon.worker_runtime_marker import WORKER_MANIFEST_HANDOFF_FILE
+from spl.daemon.worker_runtime_marker import (
+    WORKER_MANIFEST_HANDOFF_FILE,
+    WORKER_RUNTIME_ADAPTER_FAILURE_EXIT_CODE,
+    WORKER_RUNTIME_ADAPTER_FAILURE_FILE,
+    WORKER_RUNTIME_CUSTOM_ADAPTER_USED_FILE,
+)
 
 ARTIFACTS_KEY = "__spl_artifacts__"
 ARTIFACT_REF_KEY = "__spl_artifact_ref__"
 RESULT_KEY = "__spl_result__"
 _ARTIFACT_NAME_TOKEN_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
+_RUNTIME_ADAPTER_REF_KEY = "__spl_runtime_adapter_artifact__"
 DEFAULT_REMOTE_NODE_HTTP_TIMEOUT_SECONDS: float | None = None
+_RUNTIME_CUSTOM_ADAPTER_USED_PATH: Path | None = None
+_RUNTIME_LIBRARY_ADAPTERS_DIRECTORY = "runtime-library-adapters"
+
+
+class _WorkerRuntimeAdapterFailure(RuntimeError):
+    """Internal-only failure carrying closed adapter-stage evidence."""
+
+    def __init__(self, message: str, evidence: Mapping[str, Any]):
+        super().__init__(message)
+        self.evidence = dict(evidence)
+
+
+def _runtime_adapter_operation_failure(
+    stage: Literal["worker_load", "worker_save"],
+    binding: Mapping[str, Any],
+) -> _WorkerRuntimeAdapterFailure:
+    direction = "input" if stage == "worker_load" else "output"
+    adapter_id = str(binding["adapter"]["id"])
+    port = str(binding["port"])
+    return _WorkerRuntimeAdapterFailure(
+        f"{stage}: adapter {adapter_id!r} failed for port {port!r}",
+        {
+            "schema_version": 1,
+            "kind": "operation",
+            "stage": stage,
+            "direction": direction,
+            "port": port,
+            "adapter_id": adapter_id,
+        },
+    )
+
+
+def _runtime_adapter_stage_failure(
+    stage: Literal["worker_load", "worker_save"],
+    error: Exception,
+) -> _WorkerRuntimeAdapterFailure:
+    prefix = f"{stage}: "
+    raw_message = str(error)
+    message = (
+        raw_message if raw_message.startswith(prefix) and "\n" not in raw_message else f"{stage}: adapter stage failed"
+    )
+    return _WorkerRuntimeAdapterFailure(
+        message,
+        {
+            "schema_version": 1,
+            "kind": "stage",
+            "stage": stage,
+        },
+    )
+
+
+class _DiscardAdapterOutput:
+    """Non-buffering sink for untrusted custom adapter console output."""
+
+    def write(self, value: str) -> int:
+        return len(value)
+
+    def flush(self) -> None:
+        return None
+
+
+_DISCARD_ADAPTER_OUTPUT = _DiscardAdapterOutput()
 
 
 def read_json(path: Path) -> Any:
@@ -413,16 +506,794 @@ def _chmod_artifact_tree(path: Path) -> None:
         _chmod_owner_file(path)
 
 
+def _read_verified_runtime_file(
+    path: Path,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+) -> bytes:
+    """Read one no-follow regular file and bind its admitted identity."""
+
+    body = _read_bounded_regular_file(path)
+    if len(body) != expected_size or hashlib.sha256(body).hexdigest() != expected_sha256:
+        raise RuntimeError("worker_load: runtime adapter input failed size/checksum verification")
+    return body
+
+
+def _read_bounded_regular_file(path: Path) -> bytes:
+    """Return bytes from one identity-pinned, bounded, no-follow file."""
+
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode) or path.is_symlink():
+        raise RuntimeError("worker_load: runtime adapter input is not a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise RuntimeError("worker_load: runtime adapter input changed before loading")
+        chunks: list[bytes] = []
+        remaining = MAX_RUNTIME_INPUT_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        body = b"".join(chunks)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        current = path.lstat()
+    except OSError:
+        raise RuntimeError("worker_load: runtime adapter file changed while it was read") from None
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+        or (current.st_dev, current.st_ino) != (after.st_dev, after.st_ino)
+        or after.st_size != len(body)
+        or current.st_size != len(body)
+    ):
+        raise RuntimeError("worker_load: runtime adapter file changed while it was read")
+    if len(body) > MAX_RUNTIME_INPUT_BYTES:
+        raise RuntimeError("worker_load: runtime adapter file exceeds the size limit")
+    return body
+
+
+def _load_runtime_custom_namespace(
+    document: Mapping[str, Any],
+    *,
+    input_path: Path,
+) -> dict[str, Any]:
+    """Verify and define custom adapter functions only in this worker."""
+
+    bundle = document.get("custom_bundle")
+    if not isinstance(bundle, Mapping):
+        return {}
+    bundle_path = input_path.parent / "runtime-inputs" / str(bundle["staged_name"])
+    try:
+        body = _read_verified_runtime_file(
+            bundle_path,
+            expected_size=int(bundle["size"]),
+            expected_sha256=str(bundle["sha256"]),
+        )
+    except OSError:
+        raise RuntimeError("worker_load: custom adapter bundle is unavailable") from None
+    try:
+        validate_custom_bundle_dependencies(
+            body,
+            document,
+            allow_content=False,
+            verify_installed_environment=True,
+        )
+    except RuntimePortAdapterContractError:
+        raise RuntimeError("worker_load: custom adapter dependency verification failed") from None
+    try:
+        source = body.decode("utf-8")
+        tree = ast.parse(source, filename="<runtime-custom-adapters>", mode="exec")
+    except (UnicodeDecodeError, SyntaxError):
+        raise RuntimeError("worker_load: custom adapter bundle is not valid UTF-8 Python source") from None
+    definitions = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or node.decorator_list:
+            raise RuntimeError("worker_load: custom adapter bundle may contain only plain function definitions")
+        definitions.append(node.name)
+    if sorted(definitions) != sorted(bundle["functions"]) or len(definitions) != len(set(definitions)):
+        raise RuntimeError("worker_load: custom adapter bundle symbols do not match its descriptor")
+    namespace: dict[str, Any] = {
+        "__builtins__": __builtins__,
+        "__name__": "_spl_runtime_custom_adapters",
+    }
+    try:
+        code = compile(
+            tree,
+            "<runtime-custom-adapters>",
+            "exec",
+            flags=__future__.annotations.compiler_flag,
+            dont_inherit=True,
+        )
+        with redirect_stdout(_DISCARD_ADAPTER_OUTPUT), redirect_stderr(_DISCARD_ADAPTER_OUTPUT):
+            exec(code, namespace, namespace)  # noqa: S102 - worker is the sole authorized execution boundary.
+    except BaseException:
+        raise RuntimeError("worker_load: custom adapter bundle could not be defined safely") from None
+    for name in definitions:
+        if not callable(namespace.get(name)):
+            raise RuntimeError("worker_load: custom adapter bundle did not define every declared function")
+    return namespace
+
+
+def _runtime_adapter_functions(
+    binding: Mapping[str, Any],
+    custom_namespace: Mapping[str, Any],
+) -> tuple[Any, Any]:
+    descriptor = binding["adapter"]
+    if descriptor["kind"] == "builtin":
+        adapter = get_builtin_adapter(str(descriptor["id"]))
+        return adapter.save, adapter.load
+    save = custom_namespace.get(str(descriptor["save_symbol"]))
+    load = custom_namespace.get(str(descriptor["load_symbol"]))
+    if descriptor["kind"] == "library":
+        if save is not None and not callable(save):
+            raise RuntimeError("worker_load: trusted Library Adapter save symbol is unavailable")
+        if load is not None and not callable(load):
+            raise RuntimeError("worker_load: trusted Library Adapter load symbol is unavailable")
+        return save, load
+    if not callable(save) or not callable(load):
+        raise RuntimeError("worker_load: trusted custom adapter symbols are unavailable")
+    return save, load
+
+
+def _write_runtime_input_snapshot(directory: Path, name: str, body: bytes) -> Path:
+    """Materialize verified bytes under a worker-owned no-follow path."""
+
+    target = directory / name
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(target, flags, 0o400)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(descriptor)
+    return target
+
+
+def _invoke_runtime_adapter(binding: Mapping[str, Any], function: Any, *args: Any) -> Any:
+    """Call custom code with non-buffering console redaction inside the worker."""
+
+    if binding["adapter"]["kind"] in {"custom", "library"}:
+        marker_path = _RUNTIME_CUSTOM_ADAPTER_USED_PATH
+        if marker_path is None:
+            raise RuntimeError("custom adapter execution marker is unavailable")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(marker_path, flags, 0o400)
+        except FileExistsError:
+            descriptor = None
+        except OSError:
+            raise RuntimeError("custom adapter execution marker could not be retained") from None
+        if descriptor is not None:
+            try:
+                os.write(descriptor, b"used\n")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        try:
+            with redirect_stdout(_DISCARD_ADAPTER_OUTPUT), redirect_stderr(_DISCARD_ADAPTER_OUTPUT):
+                return function(*args)
+        except BaseException:
+            raise RuntimeError("custom adapter invocation failed") from None
+    return function(*args)
+
+
+def _canonical_distribution_name(value: str) -> str:
+    return re.sub(r"[-_.]+", "-", value).casefold()
+
+
+def _load_runtime_library_adapters(
+    payload: Mapping[str, Any],
+    *,
+    input_path: Path,
+    runtime_document: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Verify staged immutable source, then compile it only in this worker."""
+
+    raw = payload.get("runtime_library_adapters")
+    if raw is None:
+        return dict(runtime_document), {}
+    if not isinstance(raw, Mapping) or set(raw) != {"schema_version", "bindings"}:
+        raise RuntimeError("worker_load: runtime Library Adapter document is malformed")
+    raw_bindings = raw.get("bindings")
+    if raw.get("schema_version") != 1 or not isinstance(raw_bindings, list) or len(raw_bindings) > 1_024:
+        raise RuntimeError("worker_load: runtime Library Adapter document is malformed")
+    ref_keys = {
+        "direction",
+        "port",
+        "owner",
+        "library",
+        "name",
+        "version",
+        "adapter_id",
+        "adapter_version_id",
+        "content_hash",
+        "signature_hash",
+    }
+    execution_keys = ref_keys | {
+        "semantic_type",
+        "semantic_category",
+        "format_tag",
+        "media_type",
+        "preferred_extension",
+        "dependencies",
+        "policy",
+        "symbol",
+        "symbols",
+        "source_name",
+        "source_size",
+        "source_sha256",
+        "argument",
+        "input_name",
+        "result_path",
+    }
+    if any(not isinstance(item, Mapping) or set(item) != execution_keys for item in raw_bindings):
+        raise RuntimeError("worker_load: runtime Library Adapter binding is malformed")
+    try:
+        normalized_refs = normalize_runtime_library_adapter_refs(
+            {
+                "schema_version": 1,
+                "bindings": [{key: item[key] for key in ref_keys} for item in raw_bindings],
+            }
+        )
+    except ValueError:
+        raise RuntimeError("worker_load: runtime Library Adapter reference is malformed") from None
+    ref_by_identity = {(item["direction"], item["port"]): item for item in normalized_refs["bindings"]}
+    binding_by_identity = {(item["direction"], item["port"]): item for item in runtime_document.get("bindings", [])}
+    if not ref_by_identity or not set(ref_by_identity) <= set(binding_by_identity):
+        raise RuntimeError("worker_load: runtime Library Adapter port is unavailable")
+
+    installed_owners = importlib.metadata.packages_distributions()
+    source_groups: dict[str, list[Mapping[str, Any]]] = {}
+    dependencies_by_source: dict[str, list[dict[str, Any]]] = {}
+    total_source_bytes = 0
+    for raw_binding in raw_bindings:
+        identity = (raw_binding["direction"], raw_binding["port"])
+        transport_binding = binding_by_identity[identity]
+        if (
+            transport_binding.get("transport") != "artifact"
+            or raw_binding.get("argument") != transport_binding.get("argument")
+            or raw_binding.get("input_name") != transport_binding.get("input_name")
+            or raw_binding.get("result_path") != transport_binding.get("result_path")
+        ):
+            raise RuntimeError("worker_load: runtime Library Adapter transport identity changed")
+        source_name = raw_binding.get("source_name")
+        source_size = raw_binding.get("source_size")
+        source_sha256 = raw_binding.get("source_sha256")
+        symbol = raw_binding.get("symbol")
+        if (
+            not isinstance(source_name, str)
+            or validate_name(source_name) != source_name
+            or type(source_size) is not int
+            or not 1 <= source_size <= MAX_CUSTOM_BUNDLE_BYTES
+            or not isinstance(source_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", source_sha256)
+            or not isinstance(symbol, str)
+            or not symbol.isidentifier()
+        ):
+            raise RuntimeError("worker_load: runtime Library Adapter source identity is malformed")
+        try:
+            dependencies = normalize_dependencies(raw_binding.get("dependencies"))
+        except ValueError:
+            raise RuntimeError("worker_load: runtime Library Adapter dependencies are malformed") from None
+        previous = dependencies_by_source.setdefault(source_name, dependencies)
+        if previous != dependencies:
+            raise RuntimeError("worker_load: runtime Library Adapter dependency evidence conflicts")
+        source_groups.setdefault(source_name, []).append(raw_binding)
+
+    functions: dict[str, Any] = {}
+    for source_name, bindings in source_groups.items():
+        first = bindings[0]
+        expected_size = int(first["source_size"])
+        expected_sha256 = str(first["source_sha256"])
+        if any(
+            item["source_size"] != expected_size
+            or item["source_sha256"] != expected_sha256
+            or item["adapter_version_id"] != first["adapter_version_id"]
+            for item in bindings
+        ):
+            raise RuntimeError("worker_load: runtime Library Adapter source evidence conflicts")
+        total_source_bytes += expected_size
+        if total_source_bytes > MAX_CUSTOM_BUNDLE_BYTES:
+            raise RuntimeError("worker_load: runtime Library Adapter sources exceed the Run bound")
+        source_path = input_path.parent / _RUNTIME_LIBRARY_ADAPTERS_DIRECTORY / source_name
+        try:
+            body = _read_verified_runtime_file(
+                source_path,
+                expected_size=expected_size,
+                expected_sha256=expected_sha256,
+            )
+            source = body.decode("utf-8")
+            tree = ast.parse(source, filename="<runtime-library-adapter>", mode="exec")
+        except (OSError, UnicodeDecodeError, SyntaxError):
+            raise RuntimeError("worker_load: runtime Library Adapter source failed verification") from None
+        definitions = {
+            node.name: node for node in tree.body if isinstance(node, ast.FunctionDef) and not node.decorator_list
+        }
+        expected_roles: dict[str, str] = {}
+        for item in bindings:
+            symbols = item.get("symbols")
+            if not isinstance(symbols, Mapping) or set(symbols) != {"save", "load"}:
+                raise RuntimeError("worker_load: runtime Library Adapter symbols are malformed")
+            for role in ("save", "load"):
+                symbol = symbols[role]
+                if symbol is None:
+                    continue
+                if not isinstance(symbol, str) or not symbol.isidentifier():
+                    raise RuntimeError("worker_load: runtime Library Adapter symbols are malformed")
+                previous_role = expected_roles.setdefault(symbol, role)
+                if previous_role != role:
+                    raise RuntimeError("worker_load: runtime Library Adapter symbol roles conflict")
+        if len(definitions) != len(tree.body) or set(definitions) != set(expected_roles):
+            raise RuntimeError("worker_load: runtime Library Adapter functions do not match admission")
+        dependencies = dependencies_by_source[source_name]
+        installed_packages: dict[str, tuple[str, str]] = {}
+        for dependency in dependencies:
+            package = dependency["package"]
+            expected_version = dependency["version"]
+            try:
+                actual_version = importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError:
+                raise RuntimeError("worker_load: runtime Library Adapter dependency is unavailable") from None
+            if actual_version != expected_version:
+                raise RuntimeError("worker_load: runtime Library Adapter dependency version changed")
+            installed_packages[_canonical_distribution_name(package)] = (package, expected_version)
+            for module in dependency["modules"]:
+                owners = {_canonical_distribution_name(owner) for owner in installed_owners.get(module, [])}
+                if owners != {_canonical_distribution_name(package)}:
+                    raise RuntimeError("worker_load: runtime Library Adapter module ownership is unproven")
+        validated_by_role: dict[str, Mapping[str, Any]] = {}
+        for symbol, role in expected_roles.items():
+            canonical_source = ast.unparse(definitions[symbol]).strip() + "\n"
+            try:
+                validated = validate_custom_adapter_source(
+                    canonical_source,
+                    role=role,
+                    distributions=dependencies,
+                )
+            except RuntimePortAdapterContractError:
+                raise RuntimeError("worker_load: runtime Library Adapter callable failed revalidation") from None
+            if validated["symbol"] != symbol:
+                raise RuntimeError("worker_load: runtime Library Adapter callable identity changed")
+            validated_by_role[role] = validated
+        policy = first.get("policy")
+        if not isinstance(policy, Mapping) or set(policy) != {
+            "local_custom_code",
+            "remote_custom_code",
+        }:
+            raise RuntimeError("worker_load: runtime Library Adapter policy evidence is malformed")
+        canonical = {
+            "schema_version": 1,
+            "semantic_type": first["semantic_type"],
+            "semantic_category": first["semantic_category"],
+            "save_source": (None if "save" not in validated_by_role else validated_by_role["save"]["source"]),
+            "load_source": (None if "load" not in validated_by_role else validated_by_role["load"]["source"]),
+            "dependencies": dependencies,
+            "format_tag": first["format_tag"],
+            "media_type": first["media_type"],
+            "preferred_extension": first["preferred_extension"],
+            "policy": dict(policy),
+        }
+        computed_content_hash = domain_hash(
+            LIBRARY_ADAPTER_CONTENT_HASH_DOMAIN,
+            library_adapter_execution_payload(canonical),
+        )
+        computed_signature_hash = domain_hash(
+            LIBRARY_ADAPTER_SIGNATURE_HASH_DOMAIN,
+            library_adapter_signature_payload(
+                canonical,
+                save=validated_by_role.get("save"),
+                load=validated_by_role.get("load"),
+            ),
+        )
+        if any(
+            item["content_hash"] != computed_content_hash
+            or item["signature_hash"] != computed_signature_hash
+            or item["policy"] != dict(policy)
+            for item in bindings
+        ):
+            raise RuntimeError("worker_load: runtime Library Adapter immutable hash evidence changed")
+        namespace: dict[str, Any] = {
+            "__builtins__": __builtins__,
+            "__name__": "_spl_runtime_library_adapter",
+        }
+        try:
+            code = compile(
+                tree,
+                "<runtime-library-adapter>",
+                "exec",
+                flags=__future__.annotations.compiler_flag,
+                dont_inherit=True,
+            )
+            with redirect_stdout(_DISCARD_ADAPTER_OUTPUT), redirect_stderr(_DISCARD_ADAPTER_OUTPUT):
+                exec(code, namespace, namespace)  # noqa: S102 - isolated worker-only boundary.
+        except BaseException:
+            raise RuntimeError("worker_load: runtime Library Adapter could not be defined safely") from None
+        for symbol in expected_roles:
+            function = namespace.get(symbol)
+            if not callable(function):
+                raise RuntimeError("worker_load: runtime Library Adapter callable is unavailable")
+            functions[f"{source_name}\0{symbol}"] = function
+
+    overlaid = {**runtime_document, "bindings": [dict(item) for item in runtime_document["bindings"]]}
+    for raw_binding in raw_bindings:
+        identity = (raw_binding["direction"], raw_binding["port"])
+        index = next(
+            index for index, item in enumerate(overlaid["bindings"]) if (item["direction"], item["port"]) == identity
+        )
+        prior = overlaid["bindings"][index]
+        callable_key = f"{raw_binding['source_name']}\0{raw_binding['symbol']}"
+        overlaid["bindings"][index] = {
+            **prior,
+            "transport": "artifact",
+            "adapter": {
+                "kind": "library",
+                "id": f"library:{raw_binding['content_hash']}",
+                "key": f"{raw_binding['semantic_type']}@{raw_binding['format_tag'] or ('exact-' + raw_binding['content_hash'])}",
+                "format_tag": raw_binding["format_tag"],
+                "accepted_tags": ([] if raw_binding["format_tag"] is None else [raw_binding["format_tag"]]),
+                "distributions": [
+                    {"package": item["package"], "version": item["version"]} for item in raw_binding["dependencies"]
+                ],
+                "save_symbol": callable_key if raw_binding["direction"] == "output" else None,
+                "load_symbol": callable_key if raw_binding["direction"] == "input" else None,
+                "bundle_sha256": raw_binding["content_hash"],
+                "presentation": {
+                    "media_type": raw_binding["media_type"],
+                    "preferred_extension": raw_binding["preferred_extension"],
+                },
+            },
+        }
+    return overlaid, functions
+
+
+def _apply_runtime_adapter_inputs_unchecked(
+    payload: Mapping[str, Any],
+    *,
+    input_path: Path,
+    args: list[Any],
+    kwargs: dict[str, Any],
+) -> tuple[list[Any], dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
+    """Verify and decode staged built-in inputs only inside this worker."""
+
+    raw_document = payload.get("runtime_port_adapters")
+    if raw_document is None:
+        return args, kwargs, None, {}
+    document = normalize_wire_document(raw_document, allow_content=False)
+    custom_namespace = _load_runtime_custom_namespace(document, input_path=input_path)
+    document, library_namespace = _load_runtime_library_adapters(
+        payload,
+        input_path=input_path,
+        runtime_document=document,
+    )
+    custom_namespace.update(library_namespace)
+    inputs = {item["name"]: item for item in document["inputs"]}
+    artifact_bindings = [
+        binding
+        for binding in document["bindings"]
+        if binding["direction"] == "input" and binding["transport"] == "artifact"
+    ]
+    snapshot_dir = input_path.parent / "runtime-loaded-inputs"
+    if artifact_bindings:
+        snapshot_dir.mkdir(mode=0o700, exist_ok=False)
+    loaded_values: dict[tuple[Any, Any, Any], Any] = {}
+    for binding in document["bindings"]:
+        if binding["direction"] != "input" or binding["transport"] != "artifact":
+            continue
+        item = inputs[binding["input_name"]]
+        staged_path = input_path.parent / "runtime-inputs" / item["staged_name"]
+        try:
+            verified_body = _read_verified_runtime_file(
+                staged_path,
+                expected_size=item["size"],
+                expected_sha256=item["sha256"],
+            )
+        except OSError:
+            raise RuntimeError("worker_load: runtime adapter input is unavailable") from None
+        try:
+            staged_path.chmod(0o400)
+        except OSError:
+            pass
+        snapshot_path = _write_runtime_input_snapshot(snapshot_dir, item["name"], verified_body)
+        location = binding["argument"]
+        location_key = (location["kind"], location["name"], location["index"])
+        try:
+            if location_key in loaded_values:
+                value = loaded_values[location_key]
+            else:
+                _, load = _runtime_adapter_functions(binding, custom_namespace)
+                value = _invoke_runtime_adapter(binding, load, str(snapshot_path))
+                loaded_values[location_key] = value
+            _read_verified_runtime_file(
+                snapshot_path,
+                expected_size=item["size"],
+                expected_sha256=item["sha256"],
+            )
+        except Exception:
+            raise _runtime_adapter_operation_failure("worker_load", binding) from None
+        if location["kind"] == "positional":
+            index = int(location["index"])
+            if index >= len(args):
+                raise RuntimeError("worker_load: positional runtime adapter target is missing")
+            args[index] = value
+        else:
+            kwargs[str(location["name"])] = value
+    return args, kwargs, document, custom_namespace
+
+
+def apply_runtime_adapter_inputs(
+    payload: Mapping[str, Any],
+    *,
+    input_path: Path,
+    args: list[Any],
+    kwargs: dict[str, Any],
+) -> tuple[list[Any], dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
+    """Verify and decode staged inputs with worker-owned failure evidence."""
+
+    try:
+        return _apply_runtime_adapter_inputs_unchecked(
+            payload,
+            input_path=input_path,
+            args=args,
+            kwargs=kwargs,
+        )
+    except _WorkerRuntimeAdapterFailure:
+        raise
+    except Exception as exc:
+        raise _runtime_adapter_stage_failure("worker_load", exc) from None
+
+
+def _runtime_output_name(binding: Mapping[str, Any], used: set[str]) -> str:
+    token = _artifact_name_token(str(binding["port"]))
+    extension = binding["adapter"]["presentation"].get("preferred_extension") or ""
+    base = safe_artifact_name(f"runtime-{token}{extension}")
+    candidate = base
+    index = 2
+    while candidate in used:
+        candidate = safe_artifact_name(_with_numeric_suffix(base, index))
+        index += 1
+    used.add(candidate)
+    return candidate
+
+
+def _materialize_runtime_output_unchecked(
+    value: Any,
+    binding: Mapping[str, Any],
+    *,
+    artifacts_dir: Path,
+    used_names: set[str],
+    custom_namespace: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+    adapter_id = str(binding["adapter"]["id"])
+    save, _ = _runtime_adapter_functions(binding, custom_namespace or {})
+    name = _runtime_output_name(binding, used_names)
+    target = artifacts_dir / name
+    _ensure_private_dir(artifacts_dir)
+    with tempfile.TemporaryDirectory(prefix=".spl-runtime-save-", dir=artifacts_dir) as raw_stage_dir:
+        stage_dir = Path(raw_stage_dir)
+        stage_target = stage_dir / "adapter-output"
+        try:
+            _invoke_runtime_adapter(binding, save, str(stage_target), value)
+        except Exception:
+            raise _runtime_adapter_operation_failure("worker_save", binding) from None
+        try:
+            identity = stage_target.lstat()
+            entries = list(stage_dir.iterdir())
+        except OSError:
+            raise RuntimeError("worker_save: adapter did not produce a regular output file") from None
+        if (
+            entries != [stage_target]
+            or not stat.S_ISREG(identity.st_mode)
+            or identity.st_size > MAX_RUNTIME_INPUT_BYTES
+        ):
+            raise RuntimeError("worker_save: adapter output must be one bounded regular file")
+        try:
+            body = _read_bounded_regular_file(stage_target)
+        except (OSError, RuntimeError):
+            raise RuntimeError("worker_save: adapter output could not be verified") from None
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(target, flags, 0o600)
+            try:
+                with os.fdopen(descriptor, "wb", closefd=False) as handle:
+                    handle.write(body)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                os.close(descriptor)
+            canonical_body = _read_bounded_regular_file(target)
+        except (OSError, RuntimeError):
+            target.unlink(missing_ok=True)
+            raise RuntimeError("worker_save: canonical adapter output could not be retained") from None
+        if canonical_body != body:
+            target.unlink(missing_ok=True)
+            raise RuntimeError("worker_save: canonical adapter output changed before retention")
+    _chmod_owner_file(target)
+    digest = hashlib.sha256(body).hexdigest()
+    record = {
+        "port": binding["port"],
+        "name": name,
+        "size": len(body),
+        "sha256": digest,
+        "format_tag": binding["adapter"]["format_tag"],
+        "adapter_id": adapter_id,
+        "media_type": binding["adapter"]["presentation"].get("media_type"),
+        "result_path": binding["result_path"],
+    }
+    reference = {
+        _RUNTIME_ADAPTER_REF_KEY: True,
+        "port": binding["port"],
+        "name": name,
+        "sha256": digest,
+    }
+    return reference, {name: str(target)}, record
+
+
+def _materialize_runtime_output(
+    value: Any,
+    binding: Mapping[str, Any],
+    *,
+    artifacts_dir: Path,
+    used_names: set[str],
+    custom_namespace: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+    """Materialize one output and retain only closed worker-owned failure facts."""
+
+    try:
+        return _materialize_runtime_output_unchecked(
+            value,
+            binding,
+            artifacts_dir=artifacts_dir,
+            used_names=used_names,
+            custom_namespace=custom_namespace,
+        )
+    except _WorkerRuntimeAdapterFailure:
+        raise
+    except Exception as exc:
+        raise _runtime_adapter_stage_failure("worker_save", exc) from None
+
+
+def _materialize_runtime_outputs_unchecked(
+    value: Any,
+    document: Mapping[str, Any] | None,
+    *,
+    artifacts_dir: Path,
+    custom_namespace: Mapping[str, Any] | None = None,
+) -> tuple[Any, dict[str, str], list[dict[str, Any]]]:
+    """Apply artifact output bindings to a callable result."""
+
+    if document is None:
+        return value, {}, []
+    result = value
+    artifacts: dict[str, str] = {}
+    records: list[dict[str, Any]] = []
+    used: set[str] = set()
+    for binding in document["bindings"]:
+        if binding["direction"] != "output" or binding["transport"] != "artifact":
+            continue
+        path = list(binding["result_path"])
+        if not path:
+            selected = result
+        else:
+            cursor = result
+            for part in path:
+                if not isinstance(cursor, Mapping) or part not in cursor:
+                    raise RuntimeError("worker_save: runtime output result path is missing")
+                cursor = cursor[part]
+            selected = cursor
+        reference, copied, record = _materialize_runtime_output(
+            selected,
+            binding,
+            artifacts_dir=artifacts_dir,
+            used_names=used,
+            custom_namespace=custom_namespace,
+        )
+        if not path:
+            result = reference
+        else:
+            result = _replace_mapping_path(result, path, reference)
+        artifacts.update(copied)
+        records.append(record)
+    return result, artifacts, records
+
+
+def materialize_runtime_outputs(
+    value: Any,
+    document: Mapping[str, Any] | None,
+    *,
+    artifacts_dir: Path,
+    custom_namespace: Mapping[str, Any] | None = None,
+) -> tuple[Any, dict[str, str], list[dict[str, Any]]]:
+    """Apply output bindings with worker-owned adapter-stage evidence."""
+
+    try:
+        return _materialize_runtime_outputs_unchecked(
+            value,
+            document,
+            artifacts_dir=artifacts_dir,
+            custom_namespace=custom_namespace,
+        )
+    except _WorkerRuntimeAdapterFailure:
+        raise
+    except Exception as exc:
+        raise _runtime_adapter_stage_failure("worker_save", exc) from None
+
+
+def _replace_mapping_path(value: Any, path: list[str], replacement: Any) -> Any:
+    if not isinstance(value, Mapping):
+        raise RuntimeError("worker_save: runtime output path does not address a mapping")
+    result = dict(value)
+    cursor = result
+    for part in path[:-1]:
+        child = cursor.get(part)
+        if not isinstance(child, Mapping):
+            raise RuntimeError("worker_save: runtime output path is missing")
+        copied = dict(child)
+        cursor[part] = copied
+        cursor = copied
+    cursor[path[-1]] = replacement
+    return result
+
+
 class PipelineResultNormalizer:
     """Convert final pipeline values into the daemon's JSON/artifact protocol."""
 
-    def __init__(self, pipeline: Any, artifacts_dir: Path):
+    def __init__(
+        self,
+        pipeline: Any,
+        artifacts_dir: Path,
+        *,
+        runtime_adapter_document: Mapping[str, Any] | None = None,
+        runtime_custom_namespace: Mapping[str, Any] | None = None,
+        runtime_output_records: list[dict[str, Any]] | None = None,
+        runtime_result_prefix: Sequence[str] = (),
+    ):
         self.pipeline = pipeline
         self.artifacts_dir = artifacts_dir
         self.artifacts: dict[str, str] = {}
         self._used_artifact_names: set[str] = set()
+        self._runtime_custom_namespace = dict(runtime_custom_namespace or {})
+        self._runtime_output_records = runtime_output_records
+        self._runtime_result_prefix = tuple(runtime_result_prefix)
+        self._runtime_output_bindings = {
+            tuple(binding["result_path"]): binding
+            for binding in (runtime_adapter_document or {}).get("bindings", [])
+            if binding["direction"] == "output" and binding["transport"] == "artifact"
+        }
 
     def normalize(self, value: Any, path: tuple[str, ...] = ("result",)) -> Any:
+        result_path = tuple(path[1:])
+        if (
+            self._runtime_result_prefix
+            and result_path[: len(self._runtime_result_prefix)] == self._runtime_result_prefix
+        ):
+            result_path = result_path[len(self._runtime_result_prefix) :]
+        runtime_binding = self._runtime_output_bindings.get(result_path)
+        if runtime_binding is not None:
+            reference, copied, record = _materialize_runtime_output(
+                value,
+                runtime_binding,
+                artifacts_dir=self.artifacts_dir,
+                used_names=self._used_artifact_names,
+                custom_namespace=self._runtime_custom_namespace,
+            )
+            self.artifacts.update(copied)
+            if self._runtime_output_records is not None:
+                self._runtime_output_records.append(record)
+            return reference
         if type(value) in m_json_contract.JSON_SCALARS:
             m_json_contract.validate_json_value(value, path=_json_path(path))
             return value
@@ -553,9 +1424,13 @@ def run_pipeline(
     runtime_config: dict[str, Any] | None = None,
     runtime_env_spec: list[dict[str, Any]] | None = None,
     node_runtime_environments: Mapping[str, Any] | None = None,
-    runtimes: dict[str, str] | None = None,
+    runtimes: str | dict[str, str] | None = None,
     resume: Mapping[str, Any] | None = None,
     keep: m_manifest.KeepPolicy = True,
+    runtime_adapter_document: Mapping[str, Any] | None = None,
+    runtime_custom_namespace: Mapping[str, Any] | None = None,
+    runtime_output_records: list[dict[str, Any]] | None = None,
+    runtime_adapter_fingerprint_sha256: str | None = None,
     include_manifest: Literal[False] = False,
 ) -> tuple[Any, dict[str, str]]: ...
 
@@ -574,9 +1449,13 @@ def run_pipeline(
     runtime_config: dict[str, Any] | None = None,
     runtime_env_spec: list[dict[str, Any]] | None = None,
     node_runtime_environments: Mapping[str, Any] | None = None,
-    runtimes: dict[str, str] | None = None,
+    runtimes: str | dict[str, str] | None = None,
     resume: Mapping[str, Any] | None = None,
     keep: m_manifest.KeepPolicy = True,
+    runtime_adapter_document: Mapping[str, Any] | None = None,
+    runtime_custom_namespace: Mapping[str, Any] | None = None,
+    runtime_output_records: list[dict[str, Any]] | None = None,
+    runtime_adapter_fingerprint_sha256: str | None = None,
     include_manifest: Literal[True],
 ) -> tuple[Any, dict[str, str], dict[str, Any] | None]: ...
 
@@ -594,9 +1473,13 @@ def run_pipeline(
     runtime_config: dict[str, Any] | None = None,
     runtime_env_spec: list[dict[str, Any]] | None = None,
     node_runtime_environments: Mapping[str, Any] | None = None,
-    runtimes: dict[str, str] | None = None,
+    runtimes: str | dict[str, str] | None = None,
     resume: Mapping[str, Any] | None = None,
     keep: m_manifest.KeepPolicy = True,
+    runtime_adapter_document: Mapping[str, Any] | None = None,
+    runtime_custom_namespace: Mapping[str, Any] | None = None,
+    runtime_output_records: list[dict[str, Any]] | None = None,
+    runtime_adapter_fingerprint_sha256: str | None = None,
     include_manifest: bool = False,
 ) -> tuple[Any, dict[str, str]] | tuple[Any, dict[str, str], dict[str, Any] | None]:
     """Run a ``spl.core`` pipeline without changing the existing core files.
@@ -626,6 +1509,7 @@ def run_pipeline(
             runtime_config=runtime_config,
             node_environment_provider=node_environment_provider,
             runtime_env_spec=runtime_env_spec,
+            _runtime_adapter_fingerprint_sha256=runtime_adapter_fingerprint_sha256,
         )
     except TypeError:
         # Older framework builds did not require a client for local-only
@@ -636,8 +1520,16 @@ def run_pipeline(
             runtime_config=runtime_config,
             node_environment_provider=node_environment_provider,
             runtime_env_spec=runtime_env_spec,
+            _runtime_adapter_fingerprint_sha256=runtime_adapter_fingerprint_sha256,
         )
-    normalizer = PipelineResultNormalizer(pipeline, artifacts_dir)
+    normalizer = PipelineResultNormalizer(
+        pipeline,
+        artifacts_dir,
+        runtime_adapter_document=runtime_adapter_document,
+        runtime_custom_namespace=runtime_custom_namespace,
+        runtime_output_records=runtime_output_records,
+        runtime_result_prefix=(() if output is None else (output,)),
+    )
     previous_runs_home = os.environ.get("SPL_RUNS_HOME")
     os.environ["SPL_RUNS_HOME"] = str(artifacts_dir.parent / "pipeline-state")
     try:
@@ -669,6 +1561,15 @@ def run_pipeline(
                     result = run[node]
                 else:
                     raise ValueError("pipeline has multiple nodes and no aliases; pass output or register aliases")
+
+                # ``output`` selects the value returned by the daemon; it does
+                # not turn a pipeline run into a partial graph evaluation.
+                # Run.close() deliberately requires every pipeline node to
+                # have a terminal manifest record, so execute any disconnected
+                # or downstream nodes that were not needed to obtain the
+                # selected value before leaving the context manager.
+                for node in sorted(pipeline.nodes, key=lambda item: str(item.uuid)):
+                    run[node]
         except BaseException:
             snapshot = run.manifest_snapshot if "run" in locals() else None
             if snapshot is not None and run.manifest_path is None:
@@ -933,10 +1834,13 @@ def execute(
 ) -> dict[str, Any]:
     """Load, call, and persist one function or pipeline result."""
 
+    global _RUNTIME_CUSTOM_ADAPTER_USED_PATH
+
     callback_capability = os.environ.pop(CALLBACK_CAPABILITY_ENV, None)
+    _RUNTIME_CUSTOM_ADAPTER_USED_PATH = input_path.parent / WORKER_RUNTIME_CUSTOM_ADAPTER_USED_FILE
     payload = read_json(input_path)
-    args = payload.get("args", [])
-    kwargs = payload.get("kwargs", {})
+    args = list(payload.get("args", []))
+    kwargs = dict(payload.get("kwargs", {}))
     output = payload.get("output")
     runtime_config = payload.get("runtime_config")
     runtimes = payload.get("runtimes")
@@ -947,6 +1851,22 @@ def execute(
         runtime_env_spec = read_json(env_spec_path)
         validate_environment(runtime_env_spec)
 
+    args, kwargs, runtime_adapter_document, runtime_custom_namespace = apply_runtime_adapter_inputs(
+        payload,
+        input_path=input_path,
+        args=args,
+        kwargs=kwargs,
+    )
+    raw_runtime_fingerprint_document = payload.get("runtime_port_adapters")
+    runtime_adapter_fingerprint_sha256 = (
+        None
+        if raw_runtime_fingerprint_document is None
+        else runtime_port_adapter_fingerprint(
+            normalize_wire_document(raw_runtime_fingerprint_document, allow_content=False),
+            adapter_policy=payload.get("adapter_policy", {"custom_remote": "deny"}),
+        )
+    )
+
     target, namespace = load_entrypoint_with_namespace(
         object_yaml,
         entrypoint,
@@ -955,6 +1875,7 @@ def execute(
 
     from spl.core.entities.pipeline import Pipeline
 
+    runtime_outputs: list[dict[str, Any]] = []
     if isinstance(target, Pipeline):
         result_without_artifacts, artifacts, manifest = run_pipeline(
             target,
@@ -972,14 +1893,25 @@ def execute(
                 if isinstance(payload.get("node_runtime_environments"), Mapping)
                 else None
             ),
-            runtimes=runtimes if isinstance(runtimes, dict) else None,
+            runtimes=runtimes if isinstance(runtimes, (str, dict)) else None,
             resume=payload.get("resume") if isinstance(payload.get("resume"), Mapping) else None,
             keep=keep,
+            runtime_adapter_document=runtime_adapter_document,
+            runtime_custom_namespace=runtime_custom_namespace,
+            runtime_output_records=runtime_outputs,
+            runtime_adapter_fingerprint_sha256=runtime_adapter_fingerprint_sha256,
             include_manifest=True,
         )
     elif callable(target):
         raw_result = target(*args, **kwargs)
-        result_without_artifacts, artifacts = collect_artifacts(raw_result, artifacts_dir)
+        adapted_result, runtime_artifacts, runtime_outputs = materialize_runtime_outputs(
+            raw_result,
+            runtime_adapter_document,
+            artifacts_dir=artifacts_dir,
+            custom_namespace=runtime_custom_namespace,
+        )
+        result_without_artifacts, artifacts = collect_artifacts(adapted_result, artifacts_dir)
+        artifacts.update(runtime_artifacts)
         manifest = None
     else:
         raise TypeError(f"entrypoint is not callable or Pipeline: {entrypoint}")
@@ -988,6 +1920,8 @@ def execute(
         "result": to_jsonable(result_without_artifacts),
         "artifacts": artifacts,
     }
+    if runtime_outputs:
+        result_payload["runtime_port_adapter_outputs"] = runtime_outputs
     if manifest is not None:
         result_payload["manifest"] = manifest
     write_json(result_path, result_payload)
@@ -1013,16 +1947,26 @@ def main(argv: list[str] | None = None) -> int:
     """Run the worker from the command line."""
 
     args = build_parser().parse_args(argv)
-    execute(
-        object_yaml=args.object_yaml,
-        entrypoint=args.entrypoint,
-        input_path=args.input,
-        result_path=args.result,
-        artifacts_dir=args.artifacts_dir,
-        env_spec_path=args.env_spec,
-        remote_signatures_path=args.remote_signatures,
-        daemon_url=args.daemon_url,
-    )
+    try:
+        execute(
+            object_yaml=args.object_yaml,
+            entrypoint=args.entrypoint,
+            input_path=args.input,
+            result_path=args.result,
+            artifacts_dir=args.artifacts_dir,
+            env_spec_path=args.env_spec,
+            remote_signatures_path=args.remote_signatures,
+            daemon_url=args.daemon_url,
+        )
+    except _WorkerRuntimeAdapterFailure as exc:
+        failure_path = args.input.parent / WORKER_RUNTIME_ADAPTER_FAILURE_FILE
+        try:
+            write_json(failure_path, exc.evidence)
+        except OSError:
+            pass
+        stage = exc.evidence.get("stage")
+        print(f"{stage}: runtime adapter stage failed", file=sys.stderr, flush=True)
+        return WORKER_RUNTIME_ADAPTER_FAILURE_EXIT_CODE
     return 0
 
 

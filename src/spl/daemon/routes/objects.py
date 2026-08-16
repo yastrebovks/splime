@@ -82,7 +82,8 @@ def register_object_routes(
     async def prune_stale_mirrors() -> Any:
         owner_id = context.first_query_value("owner", "owner_id")
         return json_response(
-            runtime.store.prune_stale_mirrors(
+            runtime.run_registry_mutation(
+                runtime.store.prune_stale_mirrors,
                 owner_id=runtime.resolve_user_ref(owner_id) if owner_id is not None else None,
                 library=context.first_query_value("library"),
             )
@@ -108,7 +109,8 @@ def register_object_routes(
         library = context.first_query_value("library")
         if version is not None and version != "":
             return json_response(
-                runtime.store.forget_object_version(
+                runtime.run_registry_mutation(
+                    runtime.store.forget_object_version,
                     validate_name(name_or_id),
                     version,
                     owner_id=owner_id,
@@ -116,7 +118,8 @@ def register_object_routes(
                 )
             )
         return json_response(
-            runtime.store.forget_object(
+            runtime.run_registry_mutation(
+                runtime.store.forget_object,
                 validate_name(name_or_id),
                 owner_id=owner_id,
                 library=library,
@@ -189,7 +192,8 @@ def register_object_routes(
     async def forget_object_version(name_or_id: str, version_ref: str) -> Any:
         owner_id = context.first_query_value("owner", "owner_id")
         return json_response(
-            runtime.store.forget_object_version(
+            runtime.run_registry_mutation(
+                runtime.store.forget_object_version,
                 validate_name(name_or_id),
                 version_ref,
                 owner_id=runtime.resolve_user_ref(owner_id) if owner_id is not None else None,

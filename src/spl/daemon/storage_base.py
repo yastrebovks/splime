@@ -43,6 +43,8 @@ RUN_RETENTION_DELIVERY_MIGRATION_ID = "20260715_run_retention_delivery_v2"
 RUN_RETENTION_DELIVERY_SCHEMA_VERSION = 3
 SYNC_EVENT_TELEMETRY_MIGRATION_ID = "20260715_sync_event_telemetry_v1"
 SYNC_EVENT_TELEMETRY_SCHEMA_VERSION = 4
+LIBRARY_ADAPTER_MIGRATION_ID = "20260810_library_adapters_v1"
+LIBRARY_ADAPTER_SCHEMA_VERSION = 5
 DEFAULT_RUN_DELIVERY_LEASE_SECONDS = 15 * 60.0
 
 
@@ -625,6 +627,7 @@ class StorageBase:
             self._conn.execute(f"PRAGMA user_version = {OBJECT_IDENTITY_SCHEMA_VERSION}")
             self._migrate_run_retention_schema_locked()
             self._migrate_sync_event_telemetry_schema_locked()
+            self._migrate_library_adapter_schema_locked()
             self._conn.commit()
 
     def close(self) -> None:
@@ -798,6 +801,141 @@ class StorageBase:
             self._conn.execute("RELEASE sync_event_telemetry_migration")
             raise
         self._conn.execute("RELEASE sync_event_telemetry_migration")
+
+    def _migrate_library_adapter_schema_locked(self) -> None:
+        """Install the separate immutable Library Adapter aggregate.
+
+        This migration is intentionally additive.  It creates empty tables for
+        an old database and never enrolls, rewrites, or annotates historical
+        Objects, Runs, manifests, or sync events.
+        """
+
+        required = {"library_adapters", "library_adapter_versions"}
+        tables = {
+            str(row["name"])
+            for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        applied = self._conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE id = ?",
+            (LIBRARY_ADAPTER_MIGRATION_ID,),
+        ).fetchone()
+        if applied is not None:
+            missing = required - tables
+            if missing:
+                raise RuntimeError(
+                    "library adapter migration is recorded but required tables are missing: "
+                    + ", ".join(sorted(missing))
+                )
+            current_version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+            self._conn.execute(f"PRAGMA user_version = {max(current_version, LIBRARY_ADAPTER_SCHEMA_VERSION)}")
+            return
+
+        self._conn.execute("SAVEPOINT library_adapter_migration")
+        try:
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS library_adapters (
+                    id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    library TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    origin TEXT NOT NULL DEFAULT 'local',
+                    remote_owner_id TEXT,
+                    remote_adapter_id TEXT,
+                    current_version_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(owner_id, library, name),
+                    CHECK(origin IN ('local', 'server')),
+                    FOREIGN KEY(current_version_id) REFERENCES library_adapter_versions(id)
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS library_adapter_versions (
+                    id TEXT PRIMARY KEY,
+                    adapter_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    content_hash TEXT NOT NULL,
+                    signature_hash TEXT NOT NULL,
+                    semantic_type TEXT NOT NULL,
+                    semantic_category TEXT,
+                    save_source TEXT,
+                    load_source TEXT,
+                    save_symbol TEXT,
+                    load_symbol TEXT,
+                    dependencies_json TEXT NOT NULL,
+                    format_tag TEXT,
+                    media_type TEXT,
+                    preferred_extension TEXT,
+                    policy_json TEXT NOT NULL,
+                    publication_environment_json TEXT NOT NULL,
+                    signature_json TEXT NOT NULL,
+                    availability_json TEXT NOT NULL,
+                    compatibility_json TEXT NOT NULL,
+                    publisher_id TEXT NOT NULL,
+                    remote_owner_id TEXT,
+                    remote_adapter_id TEXT,
+                    remote_version_id TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(adapter_id) REFERENCES library_adapters(id),
+                    UNIQUE(adapter_id, version),
+                    UNIQUE(adapter_id, content_hash),
+                    CHECK(version > 0),
+                    CHECK(length(content_hash) = 64 AND content_hash NOT GLOB '*[^0-9a-f]*'),
+                    CHECK(length(signature_hash) = 64 AND signature_hash NOT GLOB '*[^0-9a-f]*'),
+                    CHECK(save_source IS NOT NULL OR load_source IS NOT NULL)
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_library_adapters_catalog
+                    ON library_adapters(owner_id, library, name)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_library_adapter_versions_adapter
+                    ON library_adapter_versions(adapter_id, version DESC)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_library_adapters_remote_adapter
+                    ON library_adapters(remote_adapter_id)
+                    WHERE remote_adapter_id IS NOT NULL
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_library_adapter_versions_remote_version
+                    ON library_adapter_versions(remote_version_id)
+                    WHERE remote_version_id IS NOT NULL
+                """
+            )
+            self._conn.execute(
+                "INSERT INTO schema_migrations(id, applied_at) VALUES(?, ?)",
+                (LIBRARY_ADAPTER_MIGRATION_ID, utc_now()),
+            )
+            current_version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+            self._conn.execute(f"PRAGMA user_version = {max(current_version, LIBRARY_ADAPTER_SCHEMA_VERSION)}")
+            violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                details = "; ".join(str(tuple(row)) for row in violations)
+                raise RuntimeError(f"library adapter migration produced foreign-key violations: {details}")
+            integrity = self._conn.execute("PRAGMA integrity_check").fetchall()
+            if [str(row[0]) for row in integrity] != ["ok"]:
+                details = "; ".join(str(row[0]) for row in integrity)
+                raise RuntimeError(f"library adapter migration failed integrity_check: {details}")
+        except Exception:
+            self._conn.execute("ROLLBACK TO library_adapter_migration")
+            self._conn.execute("RELEASE library_adapter_migration")
+            raise
+        self._conn.execute("RELEASE library_adapter_migration")
 
     def _rebuild_sync_events_for_telemetry_locked(self) -> None:
         rows = self._conn.execute("SELECT * FROM sync_events ORDER BY created_at, id").fetchall()

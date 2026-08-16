@@ -19,9 +19,14 @@ dependencies imported yet.
 from __future__ import annotations
 
 import builtins
+import hashlib
+import os
 import re
+import stat
+import tempfile
 import warnings
 from collections.abc import Mapping
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field, replace
 from html import escape
 from pathlib import Path
@@ -49,8 +54,27 @@ from spl._views import (
     wrap_action,
 )
 from spl._owner_ref import normalize_owner_ref
+from spl._runtime_port_adapters_client import (
+    PreparedClientRuntimeAdapters,
+    prepare_client_runtime_adapters,
+    requires_runtime_adapter_path,
+    server_admission_document,
+)
+from spl.adapters import BUILTIN_ADAPTER_IDS, ArtifactHandle, OPAQUE_FILE, get_builtin_adapter
 from spl.core import manifest as m_manifest
 from spl.core.entities.node import DEFAULT_PORT
+from spl.core.library_adapters import (
+    LIBRARY_ADAPTER_CATALOG_CAPABILITY,
+    RUNTIME_LIBRARY_ADAPTER_REF_CAPABILITY,
+    LibraryAdapterRef,
+    normalize_library_adapter_ref,
+)
+from spl.core.runtime_port_adapters import (
+    RuntimePortAdapterContractError,
+    normalize_adapter_policy,
+    normalize_public_adapter_mapping,
+    normalize_runtime_output_record,
+)
 from spl.daemon_client import (
     DEFAULT_DAEMON_HOST,
     DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
@@ -64,6 +88,7 @@ from spl.server_client import SPLServerClient
 
 OfflinePolicy = Literal["queue", "wait", "fail_fast"]
 ObjectScope = Literal["auto", "local", "server", "all"]
+REMOTE_RUN_POLL_INTERVAL_SECONDS = 1.0
 RunSource = Literal["auto", "local"]
 RunIdNamespace = Literal["local", "daemon", "unknown"]
 ProgressOption = bool | RunStateCallback
@@ -83,11 +108,146 @@ _LOCAL_RUN_ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-fA-F]{12}")
 _DAEMON_RUN_ID_RE = re.compile(r"[0-9a-fA-F]{32}")
 
 
+class _DiscardAdapterOutput:
+    def write(self, value: str) -> int:
+        return len(value)
+
+    def flush(self) -> None:
+        return None
+
+
+_DISCARD_ADAPTER_OUTPUT = _DiscardAdapterOutput()
+
+
 def _preview(value: Any, *, limit: int = 80) -> str:
     preview = repr(value)
     if len(preview) <= limit:
         return preview
     return f"{preview[: limit - 3]}..."
+
+
+def _replace_result_path(result: Any, raw_path: Any, value: Any) -> Any:
+    """Replace one closed result path without accepting arbitrary traversal."""
+
+    if not isinstance(raw_path, list) or any(not isinstance(item, str) or not item for item in raw_path):
+        raise RuntimeError("client_load: malformed runtime adapter result path")
+    if not raw_path:
+        return value
+    if not isinstance(result, dict):
+        raise RuntimeError("client_load: runtime adapter result path does not address a mapping")
+    output = dict(result)
+    cursor = output
+    for part in raw_path[:-1]:
+        child = cursor.get(part)
+        if not isinstance(child, dict):
+            raise RuntimeError("client_load: runtime adapter result path is missing")
+        copied = dict(child)
+        cursor[part] = copied
+        cursor = copied
+    if raw_path[-1] not in cursor:
+        raise RuntimeError("client_load: runtime adapter result path is missing")
+    cursor[raw_path[-1]] = value
+    return output
+
+
+def _adapter_distribution_rows(adapter: Any) -> list[dict[str, str]]:
+    return sorted(
+        [{"package": distribution.package, "version": distribution.version} for distribution in adapter.distributions],
+        key=lambda item: (re.sub(r"[-_.]+", "-", item["package"]).casefold(), item["version"]),
+    )
+
+
+def _library_adapter_refs_from_mapping(value: Any) -> list[LibraryAdapterRef]:
+    """Collect explicit immutable refs without treating arbitrary mappings as code."""
+
+    if not isinstance(value, Mapping):
+        return []
+    result: list[LibraryAdapterRef] = []
+    for section_name in ("inputs", "outputs"):
+        section = value.get(section_name)
+        if not isinstance(section, Mapping):
+            continue
+        result.extend(item for item in section.values() if isinstance(item, LibraryAdapterRef))
+    return result
+
+
+def _library_adapter_ref_from_record(value: Mapping[str, Any]) -> LibraryAdapterRef:
+    """Build the exact immutable Run ref from a code-free version record."""
+
+    try:
+        return LibraryAdapterRef(
+            owner=value["owner"],
+            library=value["library"],
+            name=value["name"],
+            version=value["version"],
+            adapter_id=value["adapter_id"],
+            adapter_version_id=value["adapter_version_id"],
+            content_hash=value["content_hash"],
+            signature_hash=value["signature_hash"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimePortAdapterContractError(
+            "library_adapter_record_invalid",
+            "Library Adapter version metadata is incomplete or invalid",
+            stage="admission",
+        ) from exc
+
+
+def _read_downloaded_artifact(path: Path, *, expected_size: Any, expected_sha256: Any) -> bytes:
+    if type(expected_size) is not int or expected_size < 0:
+        raise RuntimeError("download: runtime adapter output size is invalid")
+    try:
+        before = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(before.st_mode):
+            raise RuntimeError("download: runtime adapter output is not a regular file")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            chunks: list[bytes] = []
+            remaining = expected_size + 1
+            while remaining:
+                chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        current = path.lstat()
+    except OSError:
+        raise RuntimeError("download: runtime adapter output could not be opened safely") from None
+    data = b"".join(chunks)
+    if (
+        (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+        or not stat.S_ISREG(current.st_mode)
+        or (current.st_dev, current.st_ino) != (after.st_dev, after.st_ino)
+        or after.st_size != expected_size
+        or current.st_size != expected_size
+        or len(data) != expected_size
+        or hashlib.sha256(data).hexdigest() != expected_sha256
+    ):
+        raise RuntimeError("download: runtime adapter output failed size/checksum verification")
+    return data
+
+
+def _write_adapter_decode_snapshot(directory: Path, data: bytes) -> Path:
+    """Create one private immutable-by-convention decoder input snapshot."""
+
+    path = directory / "verified-output"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o400)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(descriptor)
+    return path
 
 
 def _is_missing_server_connection(exc: Exception) -> bool:
@@ -471,7 +631,7 @@ def _preserve_run_resolution(
     """Carry immediate D1 annotations through later run polling responses."""
 
     merged = dict(current)
-    for key in ("resolution", "resolved_from"):
+    for key in ("resolution", "resolved_from", "runtime_port_adapters"):
         if key not in merged and key in previous:
             merged[key] = previous[key]
     return merged
@@ -634,10 +794,12 @@ class RemoteRun:
         state: dict[str, Any],
         *,
         server_side: bool = False,
+        runtime_adapter_plan: PreparedClientRuntimeAdapters | None = None,
     ):
         self._client = client
         self.state = RunRecordView(state)
         self.server_side = server_side
+        self._runtime_adapter_plan = runtime_adapter_plan
 
     @property
     def id(self) -> str:
@@ -704,7 +866,13 @@ class RemoteRun:
         """Return the daemon result payload for this run."""
 
         if self.server_side:
-            self.refresh()
+            # ``wait_remote_run`` returns the complete terminal snapshot. Do
+            # not perform a redundant status GET after success: the central
+            # lease may be briefly reconnecting even though this exact Run
+            # and its result are already known. Direct pre-terminal ``result``
+            # calls still refresh as before.
+            if self.status not in {"succeeded", "failed", "cancelled", "stale"} or "result" not in self.state:
+                self.refresh()
             return self.state.get("result") or {}
         return self._client._daemon.result(self.id)
 
@@ -719,6 +887,8 @@ class RemoteRun:
         """Download all run artifacts into ``target_dir``."""
 
         target_path = Path(target_dir)
+        if target_path.is_symlink():
+            raise ValueError("artifact target directory must not be a symbolic link")
         target_path.mkdir(parents=True, exist_ok=True)
         downloaded: dict[str, Path] = {}
         for name in self.artifact_names():
@@ -787,7 +957,23 @@ class RemoteRun:
             raise RuntimeError(f"{self.mode} run {self.id!r} ended as {final_state.get('status')!r}: {error}")
 
         payload = self.result()
+        raw_runtime_outputs = payload.get("runtime_port_adapter_outputs")
+        if isinstance(raw_runtime_outputs, list):
+            try:
+                prevalidated = [normalize_runtime_output_record(record) for record in raw_runtime_outputs]
+            except RuntimePortAdapterContractError:
+                raise RuntimeError("download: malformed runtime adapter output metadata") from None
+            if len({record["port"] for record in prevalidated}) != len(prevalidated) or len(
+                {record["name"] for record in prevalidated}
+            ) != len(prevalidated):
+                raise RuntimeError("download: runtime adapter output metadata is duplicated")
         downloaded = self.download_artifacts(artifacts_dir) if artifacts_dir is not None else {}
+        if isinstance(payload.get("runtime_port_adapter_outputs"), list):
+            payload, downloaded = self._decode_runtime_adapter_outputs(
+                payload,
+                downloaded=downloaded,
+                artifacts_dir=artifacts_dir,
+            )
         result = RemoteResult(
             run=final_state,
             payload=payload,
@@ -797,6 +983,355 @@ class RemoteRun:
         if transient:
             self._acknowledge_transient_delivery()
         return result
+
+    def _decode_runtime_adapter_outputs(
+        self,
+        payload: dict[str, Any],
+        *,
+        downloaded: dict[str, Path],
+        artifacts_dir: str | Path | None,
+    ) -> tuple[dict[str, Any], dict[str, Path]]:
+        """Verify, decode, and splice trusted adapter-backed outputs."""
+
+        records = payload.get("runtime_port_adapter_outputs")
+        if not isinstance(records, list) or not records:
+            return payload, downloaded
+        try:
+            normalized_records = [normalize_runtime_output_record(record) for record in records]
+        except RuntimePortAdapterContractError:
+            raise RuntimeError("download: malformed runtime adapter output metadata") from None
+        if len({record["port"] for record in normalized_records}) != len(normalized_records) or len(
+            {record["name"] for record in normalized_records}
+        ) != len(normalized_records):
+            raise RuntimeError("download: runtime adapter output metadata is duplicated")
+        temporary = (
+            tempfile.TemporaryDirectory(
+                prefix="spl-runtime-output-",
+                # Resolve only the framework-selected temp root.  User-supplied
+                # artifact destinations remain untrusted and unresolved.
+                dir=Path(tempfile.gettempdir()).resolve(strict=True),
+            )
+            if artifacts_dir is None
+            else None
+        )
+        target_dir = Path(temporary.name) if temporary is not None else Path(artifacts_dir)  # type: ignore[arg-type]
+        result_payload = dict(payload)
+        try:
+            for record in normalized_records:
+                port = record["port"]
+                name = record["name"]
+                decoder = (
+                    None if self._runtime_adapter_plan is None else self._runtime_adapter_plan.output_decoders.get(port)
+                )
+                adapter_id = record["adapter_id"]
+                manifest_binding = self._verify_recovered_output_identity(port, adapter_id, record)
+                recovery_reason: str | None = None
+                expected_distributions = manifest_binding.get("distributions")
+                if decoder is not None and _adapter_distribution_rows(decoder.adapter) != expected_distributions:
+                    recovery_reason = "the trusted decoder distribution set does not match the admitted Run"
+                    decoder = None
+                if decoder is None and adapter_id in BUILTIN_ADAPTER_IDS:
+                    from spl._runtime_port_adapters_client import OutputDecoder
+
+                    candidate = get_builtin_adapter(adapter_id)
+                    if _adapter_distribution_rows(candidate) == expected_distributions:
+                        decoder = OutputDecoder(port, adapter_id, candidate)
+                    else:
+                        recovery_reason = "install the exact admitted adapter distributions before decoding"
+                path = downloaded.get(name)
+                if path is None:
+                    if self.server_side:
+                        path = self._client._daemon.download_remote_artifact(self.id, name, target_dir)
+                    else:
+                        path = self._client._daemon.download_artifact(self.id, name, target_dir)
+                    if artifacts_dir is not None:
+                        downloaded[name] = path
+                data = _read_downloaded_artifact(
+                    path,
+                    expected_size=record.get("size"),
+                    expected_sha256=record.get("sha256"),
+                )
+                if decoder is None or decoder.adapter_id == OPAQUE_FILE:
+                    if decoder is None:
+                        recovery = recovery_reason or (
+                            "supply an explicitly trusted matching custom adapter and collect again with "
+                            "artifacts_dir=..."
+                            if adapter_id.startswith("custom:")
+                            else "install the exact admitted adapter distributions before decoding"
+                        )
+                    elif artifacts_dir is None:
+                        recovery = "call collect(artifacts_dir=...) to retain this opaque artifact"
+                    else:
+                        recovery = None
+                    value: Any = ArtifactHandle(
+                        name=name,
+                        size=len(data),
+                        sha256=record["sha256"],
+                        adapter_id=adapter_id,
+                        format_tag=record["format_tag"],
+                        path=path if artifacts_dir is not None else None,
+                        media_type=record.get("media_type"),
+                        recovery=recovery,
+                    )
+                else:
+                    try:
+                        with tempfile.TemporaryDirectory(prefix="spl-runtime-decode-") as raw_decode_dir:
+                            snapshot = _write_adapter_decode_snapshot(Path(raw_decode_dir), data)
+                            if decoder.adapter_id.startswith("custom:"):
+                                with redirect_stdout(_DISCARD_ADAPTER_OUTPUT), redirect_stderr(_DISCARD_ADAPTER_OUTPUT):
+                                    value = decoder.adapter.load(str(snapshot))
+                            else:
+                                value = decoder.adapter.load(str(snapshot))
+                    except BaseException:
+                        raise RuntimeError(
+                            f"client_load: adapter {decoder.adapter_id!r} failed to decode output {port!r}"
+                        ) from None
+                result_payload["result"] = _replace_result_path(
+                    result_payload.get("result"),
+                    record["result_path"],
+                    value,
+                )
+        finally:
+            if temporary is not None:
+                temporary.cleanup()
+        return result_payload, downloaded
+
+    def _verify_recovered_output_identity(
+        self,
+        port: str,
+        adapter_id: str,
+        record: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Bind recovered result metadata to the admitted manifest descriptor."""
+
+        manifest = self.state.get("manifest")
+        if adapter_id.startswith("library:") and isinstance(manifest, Mapping):
+            metadata = manifest.get("runtime_library_adapter_metadata")
+            metadata_bindings = metadata.get("bindings") if isinstance(metadata, Mapping) else None
+            library_binding = next(
+                (
+                    item
+                    for item in metadata_bindings or []
+                    if isinstance(item, Mapping) and item.get("direction") == "output" and item.get("port") == port
+                ),
+                None,
+            )
+            transport = manifest.get("runtime_port_adapters")
+            transport_bindings = transport.get("bindings") if isinstance(transport, Mapping) else None
+            transport_binding = next(
+                (
+                    item
+                    for item in transport_bindings or []
+                    if isinstance(item, Mapping) and item.get("direction") == "output" and item.get("port") == port
+                ),
+                None,
+            )
+            if (
+                library_binding is None
+                or transport_binding is None
+                or adapter_id != f"library:{library_binding.get('content_hash')}"
+                or library_binding.get("format_tag") != record.get("format_tag")
+                or library_binding.get("media_type") != record.get("media_type")
+                or transport_binding.get("artifact_name") != record.get("name")
+                or transport_binding.get("artifact_size") != record.get("size")
+                or transport_binding.get("artifact_sha256") != record.get("sha256")
+                or transport_binding.get("result_path") != record.get("result_path")
+            ):
+                raise RuntimeError("client_load: Library Adapter output identity does not match its Run manifest")
+            return library_binding
+        section = manifest.get("runtime_port_adapters") if isinstance(manifest, Mapping) else None
+        bindings = section.get("bindings") if isinstance(section, Mapping) else None
+        if not isinstance(bindings, list):
+            return self._verify_remote_admission_output_identity(port, adapter_id, record)
+        match = next(
+            (
+                binding
+                for binding in bindings
+                if isinstance(binding, Mapping) and binding.get("direction") == "output" and binding.get("port") == port
+            ),
+            None,
+        )
+        if (
+            match is None
+            or match.get("adapter_id") != adapter_id
+            or match.get("format_tag") != record.get("format_tag")
+            or match.get("artifact_name") != record.get("name")
+            or match.get("artifact_size") != record.get("size")
+            or match.get("artifact_sha256") != record.get("sha256")
+            or match.get("media_type") != record.get("media_type")
+            or match.get("result_path") != record.get("result_path")
+        ):
+            raise RuntimeError("client_load: runtime adapter output identity does not match its Run manifest")
+        return match
+
+    def _verify_remote_admission_output_identity(
+        self,
+        port: str,
+        adapter_id: str,
+        record: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Bind a recovered remote output to immutable admission evidence."""
+
+        evidence = self.state.get("runtime_port_adapters")
+        evidence_keys = {
+            "schema_version",
+            "bindings",
+            "inputs",
+            "custom_bundle",
+            "adapter_policy",
+            "admission_digest_sha256",
+        }
+        if not isinstance(evidence, Mapping) or set(evidence) != evidence_keys | {"terminal"}:
+            raise RuntimeError("client_load: runtime adapter admission evidence is missing")
+        digest = evidence.get("admission_digest_sha256")
+        if (
+            evidence.get("schema_version") != 1
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise RuntimeError("client_load: runtime adapter admission evidence is malformed")
+        bindings = evidence.get("bindings")
+        inputs = evidence.get("inputs")
+        if not isinstance(bindings, list) or not isinstance(inputs, list):
+            raise RuntimeError("client_load: runtime adapter admission evidence is malformed")
+        if self._runtime_adapter_plan is not None:
+            expected = server_admission_document(self._runtime_adapter_plan.document)
+            observed = {
+                "schema_version": evidence["schema_version"],
+                "bindings": bindings,
+                "inputs": inputs,
+                "custom_bundle": evidence["custom_bundle"],
+            }
+            if observed != expected or evidence.get("adapter_policy") != self._runtime_adapter_plan.adapter_policy:
+                raise RuntimeError("client_load: remote admission differs from the submitted adapter plan")
+
+        terminal = evidence.get("terminal")
+        if not isinstance(terminal, Mapping) or set(terminal) != {
+            "schema_version",
+            "custom_execution",
+            "outputs",
+            "failure",
+        }:
+            raise RuntimeError("client_load: runtime adapter terminal evidence is missing")
+        custom_execution = terminal.get("custom_execution")
+        terminal_outputs = terminal.get("outputs")
+        if (
+            terminal.get("schema_version") != 1
+            or terminal.get("failure") is not None
+            or not isinstance(custom_execution, Mapping)
+            or set(custom_execution) != {"requested", "allowed", "used"}
+            or any(type(custom_execution.get(key)) is not bool for key in ("requested", "allowed", "used"))
+            or not isinstance(terminal_outputs, list)
+        ):
+            raise RuntimeError("client_load: runtime adapter terminal evidence is malformed")
+        requested = evidence.get("adapter_policy") == {"custom_remote": "allow"}
+        has_custom_bundle = evidence.get("custom_bundle") is not None
+        if (
+            custom_execution["requested"] is not requested
+            or (custom_execution["used"] and not custom_execution["allowed"])
+            or (custom_execution["used"] and not has_custom_bundle)
+            or (has_custom_bundle and not all(custom_execution[key] for key in ("requested", "allowed", "used")))
+        ):
+            raise RuntimeError("client_load: runtime adapter custom execution evidence is contradictory")
+
+        binding_keys = {
+            "direction",
+            "port",
+            "external_name",
+            "semantic_type",
+            "adapter_kind",
+            "adapter_id",
+            "key",
+            "format_tag",
+            "accepted_tags",
+            "distributions",
+            "save_symbol",
+            "load_symbol",
+            "bundle_sha256",
+            "resolution_source",
+            "transport",
+            "input_name",
+            "result_path",
+            "presentation",
+        }
+        matches = [
+            binding
+            for binding in bindings
+            if isinstance(binding, Mapping)
+            and set(binding) == binding_keys
+            and binding.get("direction") == "output"
+            and binding.get("port") == port
+        ]
+        if len(matches) != 1:
+            raise RuntimeError("client_load: remote output binding is missing or duplicated")
+        match = matches[0]
+        expected_output_ports = {
+            binding.get("port")
+            for binding in bindings
+            if isinstance(binding, Mapping)
+            and set(binding) == binding_keys
+            and binding.get("direction") == "output"
+            and binding.get("transport") == "artifact"
+        }
+        terminal_output_keys = {
+            "port",
+            "adapter_id",
+            "format_tag",
+            "semantic_type",
+            "artifact_name",
+            "size",
+            "sha256",
+            "media_type",
+            "result_path",
+        }
+        if (
+            any(not isinstance(item, Mapping) or set(item) != terminal_output_keys for item in terminal_outputs)
+            or len({item.get("port") for item in terminal_outputs}) != len(terminal_outputs)
+            or {item.get("port") for item in terminal_outputs} != expected_output_ports
+        ):
+            raise RuntimeError("client_load: runtime adapter terminal outputs are malformed")
+        terminal_matches = [item for item in terminal_outputs if item.get("port") == port]
+        if len(terminal_matches) != 1:
+            raise RuntimeError("client_load: runtime adapter terminal output is missing or duplicated")
+        terminal_output = terminal_matches[0]
+        distributions = match.get("distributions")
+        presentation = match.get("presentation")
+        valid_distributions = isinstance(distributions, list) and all(
+            isinstance(item, Mapping)
+            and set(item) == {"package", "version"}
+            and isinstance(item.get("package"), str)
+            and isinstance(item.get("version"), str)
+            for item in distributions
+        )
+        if (
+            not valid_distributions
+            or not isinstance(presentation, Mapping)
+            or set(presentation) != {"media_type", "preferred_extension"}
+            or match.get("adapter_id") != adapter_id
+            or match.get("format_tag") != record.get("format_tag")
+            or match.get("result_path") != record.get("result_path")
+            or presentation.get("media_type") != record.get("media_type")
+            or terminal_output.get("adapter_id") != match.get("adapter_id")
+            or terminal_output.get("format_tag") != match.get("format_tag")
+            or terminal_output.get("semantic_type") != match.get("semantic_type")
+            or terminal_output.get("artifact_name") != record.get("name")
+            or terminal_output.get("size") != record.get("size")
+            or terminal_output.get("sha256") != record.get("sha256")
+            or terminal_output.get("media_type") != record.get("media_type")
+            or terminal_output.get("result_path") != record.get("result_path")
+        ):
+            raise RuntimeError("client_load: runtime adapter output identity does not match remote admission")
+        return {
+            "adapter_id": match["adapter_id"],
+            "format_tag": match["format_tag"],
+            "distributions": distributions,
+            "result_path": match["result_path"],
+            "media_type": presentation["media_type"],
+            "artifact_name": terminal_output["artifact_name"],
+            "artifact_size": terminal_output["size"],
+            "artifact_sha256": terminal_output["sha256"],
+        }
 
 
 class _LibraryAdmin:
@@ -1206,6 +1741,93 @@ class SPLClient:
                 include_accessible=include_accessible,
             )
         return LibraryListView(libraries)
+
+    def library_adapters(
+        self,
+        *,
+        owner: str | None = None,
+        library: str | None = None,
+        query: str | None = None,
+        direction: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Return one bounded, source-free Library Adapter catalog page."""
+
+        return self._daemon.list_library_adapters(
+            owner_id=normalize_owner_ref(owner),
+            library=library,
+            query=query,
+            direction=direction,
+            limit=limit,
+            cursor=cursor,
+        )
+
+    def library_adapter(
+        self,
+        adapter_id: str,
+        *,
+        owner: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        """Return one code-free current Library Adapter version."""
+
+        return self._daemon.get_library_adapter(
+            adapter_id,
+            owner_id=normalize_owner_ref(owner),
+            library=library,
+        )
+
+    def library_adapter_versions(
+        self,
+        adapter_id: str,
+        *,
+        limit: int = 100,
+        cursor: str | None = None,
+        owner: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        """Return bounded immutable version history for one Adapter."""
+
+        return self._daemon.library_adapter_versions(
+            adapter_id,
+            limit=limit,
+            cursor=cursor,
+            owner_id=normalize_owner_ref(owner),
+            library=library,
+        )
+
+    def preflight_library_adapter(
+        self,
+        publication: Mapping[str, Any],
+        *,
+        owner: str | None = None,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        """Statically validate reviewed Adapter source without executing it."""
+
+        return self._daemon.preflight_library_adapter(
+            publication,
+            owner_id=normalize_owner_ref(owner),
+            library=library,
+        )
+
+    def publish_library_adapter(
+        self,
+        publication: Mapping[str, Any],
+        *,
+        owner: str | None = None,
+        library: str | None = None,
+        local_only: bool = False,
+    ) -> dict[str, Any]:
+        """Publish or exact-deduplicate one immutable Library Adapter version."""
+
+        return self._daemon.publish_library_adapter(
+            publication,
+            owner_id=normalize_owner_ref(owner),
+            library=library,
+            local_only=local_only,
+        )
 
     # The flat library aliases (create_library, get_library, update_library,
     # delete_library, grant_library, revoke_library_grant, add_reference,
@@ -1775,32 +2397,29 @@ class SPLClient:
         name: str,
         *,
         version: int | None,
+        version_id: str | None = None,
         owner: str | None,
         library: str | None,
         function: str | None,
     ) -> dict[str, Any]:
         owner_ref = normalize_owner_ref(owner)
+        signature_options: dict[str, Any] = {
+            "version": version,
+            "owner_id": owner_ref,
+            "library": library,
+            "function": function,
+        }
+        if version_id is not None:
+            signature_options["version_id"] = version_id
         try:
-            return self._daemon.signature(
-                name,
-                version=version,
-                owner_id=owner_ref,
-                library=library,
-                function=function,
-            )
+            return self._daemon.signature(name, **signature_options)
         except ClientError as exc:
             if owner_ref is not None or library is not None or not _local_object_missing(exc):
                 raise
             ref = self._resolve_bare_server_ref(name)
-            signature = dict(
-                self._daemon.signature(
-                    ref.name,
-                    version=version,
-                    owner_id=ref.owner_id,
-                    library=ref.library,
-                    function=function,
-                )
-            )
+            signature_options["owner_id"] = ref.owner_id
+            signature_options["library"] = ref.library
+            signature = dict(self._daemon.signature(ref.name, **signature_options))
             signature["resolved_from_server"] = _resolved_from_server_record(ref)
             return signature
 
@@ -2259,7 +2878,7 @@ class SPLClient:
         output: str | None = None,
         timeout_seconds: float | None = None,
         adapters: dict[str, Any] | None = None,
-        runtimes: dict[str, str] | None = None,
+        runtimes: str | dict[str, str] | None = None,
         keep: bool | str | None = None,
         wait: bool = False,
         artifacts_dir: str | Path | None = None,
@@ -2322,6 +2941,245 @@ class SPLClient:
         )
         return wrap_action(result, "runs pruned")
 
+    def _resolve_run_adapter_selectors(
+        self,
+        adapters: Any,
+        *,
+        owner: str | None,
+        library: str | None,
+    ) -> Any:
+        """Resolve short Library Adapter selectors to immutable exact refs.
+
+        Built-in string IDs retain precedence.  Every Library Adapter selector
+        is re-read before Run admission and becomes a full ``LibraryAdapterRef``;
+        no mutable name or numeric version crosses the execution boundary.
+        """
+
+        mapping = normalize_public_adapter_mapping(adapters)
+        if mapping is None:
+            return None
+        resolved: dict[str, dict[str, Any]] = {"inputs": {}, "outputs": {}}
+        for section in ("inputs", "outputs"):
+            for port, value in mapping[section].items():
+                if isinstance(value, LibraryAdapterRef):
+                    resolved[section][port] = value
+                    continue
+                if isinstance(value, str) and value in BUILTIN_ADAPTER_IDS:
+                    resolved[section][port] = value
+                    continue
+                if isinstance(value, str):
+                    selector: Mapping[str, Any] = {"name": value}
+                elif isinstance(value, Mapping):
+                    selector = value
+                else:
+                    resolved[section][port] = value
+                    continue
+                resolved[section][port] = self._resolve_library_adapter_selector(
+                    selector,
+                    owner=owner,
+                    library=library,
+                )
+        return resolved
+
+    def _resolve_library_adapter_selector(
+        self,
+        selector: Mapping[str, Any],
+        *,
+        owner: str | None,
+        library: str | None,
+    ) -> LibraryAdapterRef:
+        capability_check = getattr(self._daemon, "require_library_adapter_capability", None)
+        if not callable(capability_check):
+            raise ClientError(
+                "local SPL daemon does not support Library Adapter name/version selectors; "
+                "upgrade and restart the daemon"
+            )
+        capability_check(LIBRARY_ADAPTER_CATALOG_CAPABILITY)
+        allowed = {"name", "version", "version_id", "owner", "library"}
+        unknown = sorted(set(selector) - allowed)
+        if unknown:
+            raise RuntimePortAdapterContractError(
+                "library_adapter_selector_fields",
+                "Library Adapter selector contains unknown field(s): " + ", ".join(map(str, unknown)),
+                stage="admission",
+            )
+        name = selector.get("name")
+        if not isinstance(name, str) or not name:
+            raise RuntimePortAdapterContractError(
+                "library_adapter_selector_name",
+                "Library Adapter selector requires a non-empty name",
+                stage="admission",
+            )
+        version = selector.get("version")
+        version_id = selector.get("version_id")
+        if version is not None and version_id is not None:
+            raise RuntimePortAdapterContractError(
+                "library_adapter_selector_version",
+                "Library Adapter selector accepts either version or version_id, not both",
+                stage="admission",
+            )
+        if version is not None and (isinstance(version, bool) or not isinstance(version, int) or version < 1):
+            raise RuntimePortAdapterContractError(
+                "library_adapter_selector_version",
+                "Library Adapter version must be a positive integer",
+                stage="admission",
+            )
+        if version_id is not None and (not isinstance(version_id, str) or not version_id):
+            raise RuntimePortAdapterContractError(
+                "library_adapter_selector_version_id",
+                "Library Adapter version_id must be a non-empty string",
+                stage="admission",
+            )
+        selector_owner = selector.get("owner", owner)
+        selector_library = selector.get("library", library)
+        if selector_owner is not None and not isinstance(selector_owner, str):
+            raise RuntimePortAdapterContractError(
+                "library_adapter_selector_owner",
+                "Library Adapter owner must be a string",
+                stage="admission",
+            )
+        if selector_library is not None and (not isinstance(selector_library, str) or not selector_library):
+            raise RuntimePortAdapterContractError(
+                "library_adapter_selector_library",
+                "Library Adapter library must be a non-empty string",
+                stage="admission",
+            )
+
+        current = self._find_library_adapter_by_name(
+            name,
+            owner=selector_owner,
+            library=selector_library,
+        )
+        selected: Mapping[str, Any]
+        if version_id is not None:
+            try:
+                selected = self._daemon.get_library_adapter_version(
+                    current["adapter_id"],
+                    version_id,
+                    owner_id=current["owner"],
+                    library=current["library"],
+                )
+            except ClientError:
+                raise RuntimePortAdapterContractError(
+                    "library_adapter_version_not_found",
+                    f"Library Adapter {name!r} has no accessible version_id {version_id!r}",
+                    stage="admission",
+                ) from None
+        elif version is not None:
+            selected = self._find_library_adapter_version(
+                current,
+                version=version,
+            )
+        else:
+            selected = current
+        if selected.get("name") != name:
+            raise RuntimePortAdapterContractError(
+                "library_adapter_identity_mismatch",
+                "resolved Library Adapter version does not belong to the requested name",
+                stage="admission",
+            )
+        return _library_adapter_ref_from_record(selected)
+
+    def _find_library_adapter_by_name(
+        self,
+        name: str,
+        *,
+        owner: str | None,
+        library: str | None,
+    ) -> Mapping[str, Any]:
+        cursor: str | None = None
+        matches: list[Mapping[str, Any]] = []
+        for _page in range(20):
+            page = self._daemon.list_library_adapters(
+                owner_id=owner,
+                library=library,
+                query=name,
+                limit=100,
+                cursor=cursor,
+            )
+            items = page.get("items")
+            if not isinstance(items, list):
+                raise RuntimePortAdapterContractError(
+                    "library_adapter_catalog_invalid",
+                    "Library Adapter catalog response is invalid",
+                    stage="admission",
+                )
+            matches.extend(item for item in items if isinstance(item, Mapping) and item.get("name") == name)
+            cursor_value = page.get("next_cursor")
+            if cursor_value is None:
+                break
+            if not isinstance(cursor_value, str) or not cursor_value:
+                raise RuntimePortAdapterContractError(
+                    "library_adapter_catalog_invalid",
+                    "Library Adapter catalog cursor is invalid",
+                    stage="admission",
+                )
+            cursor = cursor_value
+        else:
+            raise RuntimePortAdapterContractError(
+                "library_adapter_catalog_bounded",
+                "Library Adapter name resolution exceeded the bounded catalog scan",
+                stage="admission",
+            )
+        identities = {(item.get("owner"), item.get("library"), item.get("adapter_id")): item for item in matches}
+        if not identities:
+            raise RuntimePortAdapterContractError(
+                "library_adapter_not_found",
+                f"Library Adapter {name!r} is not available in the selected owner/Library scope",
+                stage="admission",
+            )
+        if len(identities) != 1:
+            choices = ", ".join(
+                sorted(f"{item.get('owner')}/{item.get('library')}/{name}" for item in identities.values())
+            )
+            raise RuntimePortAdapterContractError(
+                "library_adapter_ambiguous",
+                f"Library Adapter {name!r} is ambiguous; specify owner and library ({choices})",
+                stage="admission",
+            )
+        return next(iter(identities.values()))
+
+    def _find_library_adapter_version(
+        self,
+        current: Mapping[str, Any],
+        *,
+        version: int,
+    ) -> Mapping[str, Any]:
+        cursor: str | None = None
+        for _page in range(20):
+            page = self._daemon.library_adapter_versions(
+                current["adapter_id"],
+                owner_id=current["owner"],
+                library=current["library"],
+                limit=100,
+                cursor=cursor,
+            )
+            items = page.get("items")
+            if not isinstance(items, list):
+                raise RuntimePortAdapterContractError(
+                    "library_adapter_versions_invalid",
+                    "Library Adapter version response is invalid",
+                    stage="admission",
+                )
+            for item in items:
+                if isinstance(item, Mapping) and item.get("version") == version:
+                    return item
+            cursor_value = page.get("next_cursor")
+            if cursor_value is None:
+                break
+            if not isinstance(cursor_value, str) or not cursor_value:
+                raise RuntimePortAdapterContractError(
+                    "library_adapter_versions_invalid",
+                    "Library Adapter version cursor is invalid",
+                    stage="admission",
+                )
+            cursor = cursor_value
+        raise RuntimePortAdapterContractError(
+            "library_adapter_version_not_found",
+            f"Library Adapter {current.get('name')!r} has no accessible version {version}",
+            stage="admission",
+        )
+
     def _start_run(
         self,
         name: str,
@@ -2330,6 +3188,8 @@ class SPLClient:
         kwargs: dict[str, Any] | None = None,
         output: str | None = None,
         timeout_seconds: float | None = None,
+        version: int | None = None,
+        version_id: str | None = None,
         target_machine: str | None = None,
         owner: str | None = None,
         library: str | None = None,
@@ -2337,20 +3197,115 @@ class SPLClient:
         function: str | None = None,
         source: RunSource = "auto",
         adapters: Any | None = None,
-        runtimes: dict[str, str] | None = None,
+        adapter_policy: Mapping[str, Any] | None = None,
+        runtimes: str | dict[str, str] | None = None,
         keep: bool | str | None = None,
     ) -> RemoteRun:
         """Shared implementation behind ``submit``/``call`` (and legacy aliases)."""
 
-        if adapters is not None:
+        if isinstance(adapters, Mapping) and any(not isinstance(key, str) for key in adapters):
             raise NotImplementedError(
-                "run-level adapter overrides are supported only by local Deployment.run in 0.4.0; "
-                "SPLClient daemon runs cannot serialize Python adapter callables yet"
+                "tuple-key adapter overrides belong to local Deployment.run; "
+                "SPLClient.call/submit adapters must use closed inputs/outputs sections"
             )
 
+        normalize_adapter_policy(adapter_policy)
         owner_ref = normalize_owner_ref(owner)
+        adapters = self._resolve_run_adapter_selectors(
+            adapters,
+            owner=owner_ref,
+            library=library,
+        )
+        runtime_plan: PreparedClientRuntimeAdapters | None = None
+        send_runtime_semantic_advisories = False
+        if requires_runtime_adapter_path(args=args, kwargs=kwargs, adapters=adapters):
+            capability_check = getattr(self._daemon, "require_runtime_port_adapters_capability", None)
+            if not callable(capability_check):
+                raise ClientError(
+                    "local SPL daemon does not support runtime port adapters; "
+                    "upgrade and restart the daemon before using adapters or FileInput"
+                )
+            capability_check()
+            library_adapter_versions: dict[str, Mapping[str, Any]] = {}
+            library_refs = _library_adapter_refs_from_mapping(adapters)
+            if library_refs:
+                library_capability_check = getattr(
+                    self._daemon,
+                    "require_library_adapter_capability",
+                    None,
+                )
+                if not callable(library_capability_check):
+                    raise ClientError(
+                        "local SPL daemon does not support exact Library Adapter Run references; "
+                        "upgrade and restart the daemon"
+                    )
+                library_capability_check(RUNTIME_LIBRARY_ADAPTER_REF_CAPABILITY)
+                for ref_value in library_refs:
+                    ref = normalize_library_adapter_ref(ref_value)
+                    if ref["adapter_version_id"] in library_adapter_versions:
+                        continue
+                    version_record = self._daemon.get_library_adapter_version(
+                        ref["adapter_id"],
+                        ref["adapter_version_id"],
+                        owner_id=ref["owner"],
+                        library=ref["library"],
+                    )
+                    if any(version_record.get(key) != expected for key, expected in ref.items()):
+                        raise RuntimePortAdapterContractError(
+                            "library_adapter_ref_unverified",
+                            "Library Adapter reference does not match the exact immutable daemon version",
+                            stage="admission",
+                        )
+                    library_adapter_versions[ref["adapter_version_id"]] = version_record
+            signature = self._signature_payload(
+                name,
+                version=version,
+                version_id=version_id,
+                owner=owner,
+                library=library,
+                function=function,
+            )
+            runtime_plan = prepare_client_runtime_adapters(
+                signature=signature,
+                args=args,
+                kwargs=kwargs,
+                output=output,
+                adapters=adapters,
+                adapter_policy=adapter_policy,
+                library_adapter_versions=library_adapter_versions,
+            )
+            args = runtime_plan.args
+            kwargs = runtime_plan.kwargs
+            semantic_advisories = runtime_plan.runtime_adapter_semantic_advisories
+            if semantic_advisories is not None:
+                requires_override = any(item.get("state") != "recommended" for item in semantic_advisories["bindings"])
+                semantic_capability_check = getattr(
+                    self._daemon,
+                    "require_runtime_adapter_semantic_override_capability",
+                    None,
+                )
+                if callable(semantic_capability_check):
+                    try:
+                        semantic_capability_check()
+                    except ClientError:
+                        if requires_override:
+                            raise
+                    else:
+                        send_runtime_semantic_advisories = True
+                elif requires_override:
+                    raise ClientError(
+                        "local SPL daemon does not support explicit runtime adapter semantic advisories; "
+                        "upgrade and restart the daemon before selecting this adapter"
+                    )
+
         scoped = owner_ref is not None or library is not None
         remote = target_machine is not None or (source != "local" and scoped and self._has_server_connection())
+        # ``daemon_client.Client.run`` retains a legacy convenience fallback
+        # that treats owner/library selectors as a remote-run request when the
+        # caller omits ``remote``.  Preserve an explicit local (or offline
+        # scoped) decision as ``False`` so that fallback cannot silently change
+        # the route after this layer has selected the matching result namespace.
+        remote_override = remote if remote or source == "local" or scoped else None
         run_kwargs: dict[str, Any] = {
             "args": args,
             "kwargs": kwargs,
@@ -2362,14 +3317,30 @@ class SPLClient:
             "offline_policy": offline_policy,
             "function": function,
             "source": source,
-            "remote": remote or None,
+            "remote": remote_override,
         }
+        if version is not None:
+            run_kwargs["version"] = version
+        if version_id is not None:
+            run_kwargs["version_id"] = version_id
         if runtimes is not None:
             run_kwargs["runtimes"] = runtimes
         if keep is not None:
             run_kwargs["keep"] = keep
+        if runtime_plan is not None:
+            run_kwargs["runtime_port_adapters"] = runtime_plan.document
+            run_kwargs["adapter_policy"] = runtime_plan.adapter_policy
+            if runtime_plan.runtime_library_adapter_refs is not None:
+                run_kwargs["runtime_library_adapter_refs"] = runtime_plan.runtime_library_adapter_refs
+            if send_runtime_semantic_advisories:
+                run_kwargs["runtime_adapter_semantic_advisories"] = runtime_plan.runtime_adapter_semantic_advisories
         state = self._daemon.run(name, **run_kwargs)
-        return RemoteRun(self, state, server_side=remote)
+        return RemoteRun(
+            self,
+            state,
+            server_side=remote,
+            runtime_adapter_plan=runtime_plan,
+        )
 
     # ``start()`` warned through 0.1.4/0.1.5 and was removed in 0.2.0 — use
     # :meth:`submit` (same signature and behavior).
@@ -2382,6 +3353,8 @@ class SPLClient:
         kwargs: dict[str, Any] | None = None,
         output: str | None = None,
         timeout_seconds: float | None = None,
+        version: int | None = None,
+        version_id: str | None = None,
         target_machine: str | None = None,
         owner: str | None = None,
         library: str | None = None,
@@ -2389,19 +3362,27 @@ class SPLClient:
         function: str | None = None,
         source: RunSource = "auto",
         adapters: Any | None = None,
-        runtimes: dict[str, str] | None = None,
+        adapter_policy: Mapping[str, Any] | None = None,
+        runtimes: str | dict[str, str] | None = None,
         keep: bool | str | None = None,
     ) -> RemoteRun:
         """Canonical async entry point: start a run, return a handle immediately.
 
         The default path is local daemon execution.  Passing ``target_machine``,
         or passing ``owner``/``library`` while connected selects central-server
-        remote execution through the daemon. Offline scoped calls remain local
+        remote execution through the daemon. Pass ``version`` to select a
+        numbered Object version, or ``version_id`` to bind the Run to an exact
+        Object version identity. Offline scoped calls remain local
         first; a canonical owner id can address a local mirror, while an
         ``@handle`` is rejected by the daemon with the actionable offline
-        handle message. The SDK never resolves the handle. ``adapters`` is
-        reserved for run-level adapter overrides and currently raises because
-        daemon runs do not serialize Python adapter callables.
+        handle message. The SDK never resolves the handle. ``adapters`` accepts
+        closed per-Run ``inputs``/``outputs`` bindings. Library Adapter values
+        may be a name (current version) or a closed ``name`` plus ``version``
+        or ``version_id`` selector; the call-level ``version_id`` continues to
+        select the Object. ``runtimes`` accepts either per-Pipeline-alias
+        overrides or one runtime name for the whole Function/Pipeline.
+        ``adapter_policy``
+        controls explicit custom execution consent without changing the Object.
         """
 
         return self._start_run(
@@ -2410,6 +3391,8 @@ class SPLClient:
             kwargs=kwargs,
             output=output,
             timeout_seconds=timeout_seconds,
+            version=version,
+            version_id=version_id,
             target_machine=target_machine,
             owner=owner,
             library=library,
@@ -2417,6 +3400,7 @@ class SPLClient:
             function=function,
             source=source,
             adapters=adapters,
+            adapter_policy=adapter_policy,
             runtimes=runtimes,
             keep=keep,
         )
@@ -2432,6 +3416,8 @@ class SPLClient:
         kwargs: dict[str, Any] | None = None,
         output: str | None = None,
         timeout_seconds: float | None = None,
+        version: int | None = None,
+        version_id: str | None = None,
         artifacts_dir: str | Path | None = None,
         target_machine: str | None = None,
         owner: str | None = None,
@@ -2440,7 +3426,8 @@ class SPLClient:
         function: str | None = None,
         source: RunSource = "auto",
         adapters: Any | None = None,
-        runtimes: dict[str, str] | None = None,
+        adapter_policy: Mapping[str, Any] | None = None,
+        runtimes: str | dict[str, str] | None = None,
         keep: bool | str | None = None,
         progress: ProgressOption = True,
     ) -> RemoteResult:
@@ -2452,13 +3439,17 @@ class SPLClient:
         ``owner`` accepts a canonical user id or ``@handle`` and is forwarded
         unchanged for daemon/server resolution. The returned
         ``RemoteResult.mode`` is therefore either ``"local"`` or ``"server"``.
+        Pass ``version`` to select a numbered Object version, or ``version_id``
+        to bind the Run to an exact Object version identity.
 
         While waiting, slow phases (a first-run environment build, a queued
         server-side run) print short progress lines to stderr.  Pass
         ``progress=False`` to wait silently, or a callable to receive every
-        polled run state instead.  ``adapters`` is reserved for run-level
-        adapter overrides and currently raises because daemon runs do not
-        serialize Python adapter callables.
+        polled run state instead. ``adapters`` accepts independent per-Run
+        ``inputs``/``outputs`` bindings, including independent Library Adapter
+        version selectors for every port. ``runtimes`` accepts a Pipeline alias
+        mapping or one whole-target runtime name. Custom remote execution additionally
+        requires ``adapter_policy={"custom_remote": "allow"}``.
         """
 
         run = self._start_run(
@@ -2467,6 +3458,8 @@ class SPLClient:
             kwargs=kwargs,
             output=output,
             timeout_seconds=timeout_seconds,
+            version=version,
+            version_id=version_id,
             target_machine=target_machine,
             owner=owner,
             library=library,
@@ -2474,11 +3467,17 @@ class SPLClient:
             function=function,
             source=source,
             adapters=adapters,
+            adapter_policy=adapter_policy,
             runtimes=runtimes,
             keep=keep,
         )
         return run.collect(
             artifacts_dir=artifacts_dir,
+            # Central Run snapshots may contain bounded inline inputs and
+            # results. Polling those documents four times per second creates
+            # avoidable load during batch workloads; local Runs stay at the
+            # established low-latency default.
+            poll_interval=(REMOTE_RUN_POLL_INTERVAL_SECONDS if run.server_side else 0.25),
             timeout_seconds=timeout_seconds,
             progress=progress,
         )

@@ -21,6 +21,7 @@ import spl.core._common
 import spl.core.entities.node
 
 EXPECTED_ALL = {
+    "AdapterCatalogEntry",
     "SPLClient",
     "SPLServerClient",
     "RemoteRun",
@@ -33,6 +34,13 @@ EXPECTED_ALL = {
     "InputPort",
     "OutputPort",
     "DDistribution",
+    "LibraryAdapterContractError",
+    "LibraryAdapterDependency",
+    "LibraryAdapterRef",
+    "LibraryAdapterVersion",
+    "analyze_selected_code",
+    "inspect_active_kernel_environment",
+    "prepare_source",
     "spl_export_to_file",
     "spl_export_to_dir",
     "spl_import_from_file",
@@ -66,12 +74,26 @@ SHIM_FACADES = (
             ),
             CanonicalExports("spl.server_client", ("SPLServerClient",)),
             CanonicalExports("spl.core.entities.node_remote", ("NodeRemote",)),
+            CanonicalExports(
+                "spl.core",
+                ("analyze_selected_code", "inspect_active_kernel_environment", "prepare_source"),
+            ),
             CanonicalExports("spl.core._common", ("Deployment", "lift")),
             CanonicalExports(
                 "spl.core.entities.node",
                 ("DEFAULT_PORT", "InputPort", "OutputPort"),
             ),
             CanonicalExports("spl.core.entities.distribution", ("DDistribution",)),
+            CanonicalExports(
+                "spl.core.library_adapters",
+                (
+                    "AdapterCatalogEntry",
+                    "LibraryAdapterContractError",
+                    "LibraryAdapterDependency",
+                    "LibraryAdapterRef",
+                    "LibraryAdapterVersion",
+                ),
+            ),
             CanonicalExports(
                 "spl.core.ir.utils",
                 (
@@ -128,6 +150,23 @@ SHIM_FACADES = (
         module="spl.core",
         canonical_exports=(
             CanonicalExports("spl.core.entities.node_remote", ("NodeRemote",)),
+            CanonicalExports(
+                "spl.core.source_analysis",
+                (
+                    "SourceAnalysisContractError",
+                    "analyze_selected_code",
+                    "inspect_active_kernel_environment",
+                ),
+            ),
+            CanonicalExports(
+                "spl.core.source_preparation",
+                (
+                    "PreparationCancelled",
+                    "PrepareSourceContractError",
+                    "prepare_source",
+                    "validate_prepared_object",
+                ),
+            ),
             CanonicalExports(
                 "spl.core.ir.utils",
                 (
@@ -193,6 +232,10 @@ SHIM_FACADES = (
         canonical_exports=(
             CanonicalExports("spl.daemon.repositories.env", ("EnvRepository",)),
             CanonicalExports("spl.daemon.repositories.library", ("LibraryRepository",)),
+            CanonicalExports(
+                "spl.daemon.repositories.library_adapter",
+                ("LibraryAdapterRepository",),
+            ),
             CanonicalExports("spl.daemon.repositories.object", ("ObjectRepository",)),
             CanonicalExports("spl.daemon.repositories.run", ("RunRepository",)),
             CanonicalExports(
@@ -294,8 +337,23 @@ def test_facade_symbols_are_canonical() -> None:
 
 def test_call_signature_keeps_expected_parameters() -> None:
     params = inspect.signature(spl.SPLClient.call).parameters
-    for name in ("name", "kwargs", "output", "function", "target_machine", "adapters"):
+    for name in (
+        "name",
+        "kwargs",
+        "output",
+        "version",
+        "version_id",
+        "function",
+        "target_machine",
+        "adapters",
+    ):
         assert name in params
+
+
+def test_submit_signature_exposes_exact_object_version_selectors() -> None:
+    params = inspect.signature(spl.SPLClient.submit).parameters
+    assert "version" in params
+    assert "version_id" in params
 
 
 def test_objects_signature_keeps_expected_parameters() -> None:

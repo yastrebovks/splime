@@ -8,10 +8,11 @@ import sqlite3
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, Literal, Mapping, cast
 from uuid import uuid4
 
 from spl._timeout import TimeoutDomain, validate_timeout_seconds
+from spl.core import json_contract as m_json_contract
 from spl.core import manifest as m_manifest
 from spl.core.manifest import (
     ACTIVE_RUN_STATUSES,
@@ -23,7 +24,32 @@ from spl.core.manifest import (
     normalize_keep,
     retention_record,
 )
-from spl.daemon.runtime_config import normalize_runtime_config
+from spl.core.runtime_port_adapters import (
+    RuntimePortAdapterContractError,
+    implicit_json_manifest_section,
+    normalize_runtime_adapter_semantic_advisories,
+    runtime_adapter_semantic_category,
+    runtime_adapter_semantic_state,
+)
+from spl.core.library_adapters import (
+    library_adapter_semantic_advisory,
+    normalize_runtime_library_adapter_refs,
+)
+from spl.daemon.runtime_config import normalize_runtime_config, runtime_config_for_run
+from spl.daemon.runtime_port_adapters import (
+    PreparedRuntimePortAdapters,
+    prepare_runtime_port_adapters,
+    runtime_adapter_manifest,
+    stage_runtime_port_adapters,
+)
+from spl.daemon.runtime_library_adapters import (
+    PreparedRuntimeLibraryAdapters,
+    prepare_runtime_library_adapters,
+    runtime_library_adapter_manifest,
+    runtime_library_adapter_metadata,
+    stage_runtime_library_adapters,
+)
+from spl.daemon.signature import build_signature
 from spl.daemon.run_lifecycle import (
     LOCAL_RUN_STATUSES,
     TERMINAL_RUN_STATUSES,
@@ -47,6 +73,167 @@ from spl.daemon.worker_runtime_marker import WORKER_RUNTIME_MARKER_FILE
 LOGGER = logging.getLogger(__name__)
 
 
+def _prepare_runtime_adapter_semantic_advisories(
+    runtime_document: Mapping[str, Any],
+    supplied: Mapping[str, Any] | None,
+    library_document: Mapping[str, Any] | None,
+    *,
+    browser_admission: bool,
+    trusted_claim: bool,
+) -> dict[str, Any] | None:
+    """Build authoritative per-explicit-binding advisory evidence."""
+
+    library_by_identity = {
+        (str(item.get("direction")), str(item.get("port"))): item
+        for item in (library_document or {}).get("bindings", [])
+        if isinstance(item, Mapping)
+    }
+    authoritative: list[dict[str, Any]] = []
+    sources_by_identity: dict[tuple[str, str], str] = {}
+    for binding in runtime_document.get("bindings", []):
+        if not isinstance(binding, Mapping) or binding.get("resolution_source") == "system_default":
+            continue
+        direction = str(binding["direction"])
+        port = str(binding["port"])
+        identity = (direction, port)
+        source = str(binding["resolution_source"])
+        sources_by_identity[identity] = source
+        library = library_by_identity.get(identity)
+        if library is None:
+            adapter = cast(Mapping[str, Any], binding["adapter"])
+            adapter_id = str(adapter["id"])
+            adapter_type = str(adapter["key"]).rpartition("@")[0]
+            category = runtime_adapter_semantic_category(adapter_id)
+            state = runtime_adapter_semantic_state(
+                cast(str | None, binding.get("semantic_type")),
+                adapter_type,
+                adapter_id=adapter_id,
+            )
+        else:
+            adapter_id = str(library["adapter_id"])
+            adapter_type = str(library["semantic_type"])
+            category_value = library.get("semantic_category")
+            category = category_value if isinstance(category_value, str) else None
+            state = library_adapter_semantic_advisory(
+                cast(str | None, binding.get("semantic_type")),
+                adapter_type,
+                category,
+            )
+        authoritative.append(
+            {
+                "direction": direction,
+                "port": port,
+                "adapter_id": adapter_id,
+                "port_semantic_type": binding.get("semantic_type"),
+                "adapter_semantic_type": adapter_type,
+                "adapter_semantic_category": category,
+                "state": state,
+                "acknowledged": False,
+                "acknowledgement_source": None,
+            }
+        )
+    if not authoritative:
+        if supplied is not None:
+            normalized_empty = normalize_runtime_adapter_semantic_advisories(supplied)
+            if normalized_empty["bindings"]:
+                raise RuntimePortAdapterContractError(
+                    "semantic_advisory_unbound",
+                    "semantic advisories contain bindings that are not explicit selections",
+                    stage="admission",
+                )
+        return None
+
+    authoritative_document = normalize_runtime_adapter_semantic_advisories(
+        {"schema_version": 1, "bindings": authoritative}
+    )
+    expected_by_identity = {(item["direction"], item["port"]): item for item in authoritative_document["bindings"]}
+    if supplied is None:
+        if browser_admission and any(item["state"] != "recommended" for item in authoritative_document["bindings"]):
+            raise RuntimePortAdapterContractError(
+                "semantic_advisory_confirmation_required",
+                "an explicit adapter semantic mismatch or unproven compatibility requires browser confirmation",
+                stage="admission",
+            )
+        result = []
+        for item in authoritative_document["bindings"]:
+            identity = (item["direction"], item["port"])
+            source = sources_by_identity[identity]
+            acknowledgement_source = (
+                None
+                if browser_admission or item["state"] == "recommended"
+                else ("embedded_contract" if source == "preset" else "api_explicit_selection")
+            )
+            result.append(
+                {
+                    **item,
+                    "acknowledged": acknowledgement_source is not None,
+                    "acknowledgement_source": acknowledgement_source,
+                }
+            )
+        return normalize_runtime_adapter_semantic_advisories({"schema_version": 1, "bindings": result})
+
+    normalized = normalize_runtime_adapter_semantic_advisories(supplied)
+    supplied_by_identity = {(item["direction"], item["port"]): item for item in normalized["bindings"]}
+    if set(supplied_by_identity) != set(expected_by_identity):
+        raise RuntimePortAdapterContractError(
+            "semantic_advisory_binding_authority",
+            "semantic advisories do not match every explicit runtime adapter binding",
+            stage="admission",
+        )
+    result = []
+    immutable_fields = (
+        "direction",
+        "port",
+        "adapter_id",
+        "port_semantic_type",
+        "adapter_semantic_type",
+        "adapter_semantic_category",
+        "state",
+    )
+    for identity, expected in expected_by_identity.items():
+        observed = supplied_by_identity[identity]
+        if any(observed[key] != expected[key] for key in immutable_fields):
+            raise RuntimePortAdapterContractError(
+                "semantic_advisory_authority",
+                f"semantic advisory facts contradict explicit {identity[0]} port {identity[1]!r}",
+                stage="admission",
+            )
+        expected_state = str(expected["state"])
+        source = sources_by_identity[identity]
+        acknowledgement_source = observed["acknowledgement_source"]
+        if browser_admission:
+            valid_ack = (
+                expected_state == "recommended" and observed["acknowledged"] is False and acknowledgement_source is None
+            ) or (
+                expected_state != "recommended"
+                and observed["acknowledged"] is True
+                and acknowledgement_source == "plugin_confirmation"
+            )
+        elif expected_state == "recommended":
+            valid_ack = observed["acknowledged"] is False and acknowledgement_source is None
+        elif trusted_claim and source == "run_override":
+            valid_ack = observed["acknowledged"] is True and acknowledgement_source in {
+                "plugin_confirmation",
+                "sdk_explicit_selection",
+                "api_explicit_selection",
+            }
+        elif source == "preset":
+            valid_ack = observed["acknowledged"] is True and acknowledgement_source == "embedded_contract"
+        else:
+            valid_ack = observed["acknowledged"] is True and acknowledgement_source in {
+                "sdk_explicit_selection",
+                "api_explicit_selection",
+            }
+        if not valid_ack:
+            raise RuntimePortAdapterContractError(
+                "semantic_advisory_acknowledgement_required",
+                f"semantic advisory acknowledgement is invalid for explicit {identity[0]} port {identity[1]!r}",
+                stage="admission",
+            )
+        result.append(dict(observed))
+    return normalize_runtime_adapter_semantic_advisories({"schema_version": 1, "bindings": result})
+
+
 class RunTransitionError(RuntimeError):
     """Raised when a stale local writer attempts an illegal transition."""
 
@@ -67,13 +254,47 @@ class RunRepository(RepositoryBase):
         function: str | None = None,
         owner_id: str | None = None,
         library: str | None = None,
-        runtimes: dict[str, str] | None = None,
+        runtimes: str | dict[str, str] | None = None,
         keep: KeepPolicy = True,
         parent_run_id: str | None = None,
         resume: dict[str, Any] | None = None,
+        runtime_port_adapters: dict[str, Any] | None = None,
+        runtime_library_adapter_refs: dict[str, Any] | None = None,
+        runtime_adapter_semantic_advisories: dict[str, Any] | None = None,
+        runtime_library_adapter_sources: list[dict[str, Any]] | None = None,
+        _runtime_library_adapter_execution_target: Literal["local", "remote"] = "local",
+        adapter_policy: dict[str, Any] | None = None,
+        custom_remote_allowed: bool = False,
         report_local_run: bool = True,
+        _precommit_check: Callable[[dict[str, Any]], None] | None = None,
+        _postcommit_confirm: Callable[[], None] | None = None,
+        _browser_adapter_admission: dict[str, Any] | None = None,
+        _runtime_adapter_semantic_claim: bool = False,
     ) -> dict[str, Any]:
-        """Create a run for an exact object version and persist initial state."""
+        """Create a run for an exact object version and persist initial state.
+
+        ``_precommit_check`` and ``_postcommit_confirm`` are reserved for the
+        additive guarded-admission path. Legacy callers omit both and retain
+        the existing creation path. The check sees the inserted authoritative
+        row while the transaction and shared registry lock are still held; a
+        failure rolls back the row and removes only its newly-created
+        directory. Confirmation runs only after the transaction commits.
+        """
+
+        if (_precommit_check is None) != (_postcommit_confirm is None):
+            raise ValueError("guarded Run commit callbacks must be provided together")
+        if _browser_adapter_admission is not None:
+            if (
+                not isinstance(_browser_adapter_admission, dict)
+                or set(_browser_adapter_admission)
+                != {"schema_version", "request_id", "request_digest_sha256", "target"}
+                or _browser_adapter_admission.get("schema_version") != 1
+            ):
+                raise ValueError("browser adapter admission marker is invalid")
+            m_json_contract.validate_json_value(
+                _browser_adapter_admission,
+                path="$.browser_adapter_admission",
+            )
 
         validate_timeout_seconds(
             timeout_seconds,
@@ -96,94 +317,254 @@ class RunRepository(RepositoryBase):
                 library=library,
             )
         entrypoint = self._run_entrypoint_for(object_record, function)
-        runtime_config = normalize_runtime_config(object_record.get("runtime_config"))
+        signature = build_signature(object_record, function=function)
+        runtime_config = runtime_config_for_run(
+            "function" if function is not None else str(object_record.get("kind") or "unknown"),
+            object_record.get("runtime_config"),
+            runtimes,
+        )
+        prepared_runtime_adapters: PreparedRuntimePortAdapters | None = None
+        prepared_library_adapters: PreparedRuntimeLibraryAdapters | None = None
+        prepared_semantic_advisories: dict[str, Any] | None = None
+        implicit_runtime_manifest: dict[str, Any] | None = None
+        if runtime_port_adapters is not None:
+            prepared_runtime_adapters = prepare_runtime_port_adapters(
+                runtime_port_adapters,
+                adapter_policy=adapter_policy,
+                object_distributions=object_record.get("distributions") or [],
+                signature=signature,
+                args=args,
+                kwargs=kwargs,
+                output=output,
+            )
+            if runtime_library_adapter_refs is not None:
+                normalized_library_refs = normalize_runtime_library_adapter_refs(runtime_library_adapter_refs)
+                expected_version_ids = {str(item["adapter_version_id"]) for item in normalized_library_refs["bindings"]}
+                source_by_version: dict[str, Mapping[str, Any]] = {}
+                for item in runtime_library_adapter_sources or []:
+                    if not isinstance(item, Mapping):
+                        raise RuntimePortAdapterContractError(
+                            "library_adapter_source_shape",
+                            "Library Adapter source evidence must be an object",
+                            stage="admission",
+                        )
+                    version_id = str(item.get("adapter_version_id") or "")
+                    if version_id not in expected_version_ids:
+                        raise RuntimePortAdapterContractError(
+                            "library_adapter_source_unbound",
+                            "Library Adapter source evidence is not bound to this Run",
+                            stage="admission",
+                        )
+                    prior = source_by_version.get(version_id)
+                    if prior is not None and dict(prior) != dict(item):
+                        raise RuntimePortAdapterContractError(
+                            "library_adapter_source_conflict",
+                            "Library Adapter source evidence conflicts for one immutable version",
+                            stage="admission",
+                        )
+                    source_by_version[version_id] = item
+
+                def resolve_library_ref(ref: Mapping[str, Any]) -> Mapping[str, Any]:
+                    source = source_by_version.get(str(ref["adapter_version_id"]))
+                    if source is not None:
+                        if any(source.get(key) != value for key, value in ref.items()):
+                            raise KeyError("exact Library Adapter source reference is unavailable")
+                        return source
+                    if _runtime_library_adapter_execution_target == "remote":
+                        raise KeyError("claimed Library Adapter source evidence is unavailable")
+                    return cast(
+                        Mapping[str, Any],
+                        self.resolve_library_adapter_ref(ref, include_source=True),
+                    )
+
+                prepared_library_adapters = prepare_runtime_library_adapters(
+                    normalized_library_refs,
+                    runtime_document=prepared_runtime_adapters.document,
+                    object_distributions=prepared_runtime_adapters.merged_distributions,
+                    resolve_exact=resolve_library_ref,
+                    execution_target=_runtime_library_adapter_execution_target,
+                )
+            elif runtime_library_adapter_sources:
+                raise RuntimePortAdapterContractError(
+                    "library_adapter_source_unbound",
+                    "Library Adapter source was supplied without an exact Run reference",
+                    stage="admission",
+                )
+            prepared_semantic_advisories = _prepare_runtime_adapter_semantic_advisories(
+                prepared_runtime_adapters.document,
+                runtime_adapter_semantic_advisories,
+                None if prepared_library_adapters is None else prepared_library_adapters.document,
+                browser_admission=_browser_adapter_admission is not None,
+                trusted_claim=_runtime_adapter_semantic_claim,
+            )
+        elif runtime_library_adapter_refs is not None:
+            raise RuntimePortAdapterContractError(
+                "library_adapter_transport_missing",
+                "Library Adapter refs require the guarded runtime port transport",
+                stage="admission",
+            )
+        elif runtime_library_adapter_sources:
+            raise RuntimePortAdapterContractError(
+                "library_adapter_source_unbound",
+                "Library Adapter source was supplied without an exact Run reference",
+                stage="admission",
+            )
+        elif runtime_adapter_semantic_advisories is not None:
+            raise RuntimePortAdapterContractError(
+                "semantic_advisory_transport_missing",
+                "runtime adapter semantic advisories require the guarded runtime port transport",
+                stage="admission",
+            )
+        else:
+            implicit_runtime_manifest = implicit_json_manifest_section(
+                signature=signature,
+                args=args,
+                kwargs=kwargs,
+                output=output,
+            )
 
         run_id = uuid4().hex
         run_dir = self.runs_dir / run_id
-        run_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+        run_directory_created = False
+        transaction_committed = False
         try:
-            run_dir.chmod(0o700)
-        except OSError:
-            pass
+            run_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+            run_directory_created = True
+            try:
+                run_dir.chmod(0o700)
+            except OSError:
+                pass
 
-        input_payload = {
-            "args": args or [],
-            "kwargs": kwargs or {},
-            "output": output,
-            "timeout_seconds": timeout_seconds,
-            "runtime_config": runtime_config,
-            "keep": keep_policy,
-            "report_local_run": bool(report_local_run),
-        }
-        if function is not None:
-            input_payload["function"] = function
-        if runtimes is not None:
-            input_payload["runtimes"] = runtimes
-        if resume is not None:
-            input_payload["resume"] = resume
-        write_json(run_dir / "input.json", input_payload)
-
-        now = utc_now()
-        manifest = build_initial_manifest(
-            run_id=run_id,
-            keep=keep_policy,
-            pipeline_name=object_record["name"],
-            parent_run_id=parent_run_id,
-            created_at=now,
-        )
-        manifest["pipeline"].update(
-            {
-                "entrypoint": entrypoint,
-                "object_version_id": object_record["version_id"],
-                "content_hash": object_record.get("content_hash"),
-            }
-        )
-        with self._lock, self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO runs(
-                    id, object_id, object_version_id, object_name, object_version,
-                    entrypoint, env, env_python, status, created_at, run_dir,
-                    input_json, result_path, artifacts_dir, env_build_hash,
-                    runtime_config_json, keep, manifest_json,
-                    retention_enforced, retention_report_mode,
-                    retention_sync_required, retention_terminal_queued,
-                    retention_delivery_required, retention_delivery_acked,
-                    retention_delivery_expires_at, retention_effective_status,
-                    retention_outcome_reason
+            staged_runtime_document = None
+            if prepared_runtime_adapters is not None:
+                staged_runtime_document = stage_runtime_port_adapters(run_dir, prepared_runtime_adapters)
+            staged_library_document = None
+            if prepared_library_adapters is not None:
+                staged_library_document = stage_runtime_library_adapters(
+                    run_dir,
+                    prepared_library_adapters,
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    object_record["id"],
-                    object_record["version_id"],
-                    object_record["name"],
-                    object_record["version"],
-                    entrypoint,
-                    object_record["env"],
-                    object_record["env_python"],
-                    "queued",
-                    now,
-                    str(run_dir),
-                    json_dumps(input_payload),
-                    str(run_dir / "result.json"),
-                    str(run_dir / "artifacts"),
-                    object_record.get("environment_spec_hash"),
-                    json_dumps(runtime_config),
-                    keep_to_storage(keep_policy),
-                    json_dumps(manifest),
-                    1,
-                    "local" if report_local_run else "remote",
-                    0,
-                    0,
-                    int(report_local_run),
-                    int(not report_local_run),
-                    None,
-                    None,
-                    None,
-                ),
+
+            input_payload = {
+                "args": args or [],
+                "kwargs": kwargs or {},
+                "output": output,
+                "timeout_seconds": timeout_seconds,
+                "runtime_config": runtime_config,
+                "keep": keep_policy,
+                "report_local_run": bool(report_local_run),
+            }
+            if function is not None:
+                input_payload["function"] = function
+            if runtimes is not None:
+                input_payload["runtimes"] = runtimes
+            if resume is not None:
+                input_payload["resume"] = resume
+            if prepared_runtime_adapters is not None:
+                input_payload["runtime_port_adapters"] = staged_runtime_document
+                input_payload["adapter_policy"] = prepared_runtime_adapters.adapter_policy
+                input_payload["runtime_adapter_distributions"] = (
+                    prepared_runtime_adapters.merged_distributions
+                    if prepared_library_adapters is None
+                    else prepared_library_adapters.merged_distributions
+                )
+            if staged_library_document is not None:
+                input_payload["runtime_library_adapters"] = staged_library_document
+            if prepared_semantic_advisories is not None:
+                input_payload["runtime_adapter_semantic_advisories"] = prepared_semantic_advisories
+            write_json(run_dir / "input.json", input_payload)
+
+            now = utc_now()
+            manifest = build_initial_manifest(
+                run_id=run_id,
+                keep=keep_policy,
+                pipeline_name=object_record["name"],
+                parent_run_id=parent_run_id,
+                created_at=now,
             )
+            manifest["pipeline"].update(
+                {
+                    "entrypoint": entrypoint,
+                    "object_version_id": object_record["version_id"],
+                    "content_hash": object_record.get("content_hash"),
+                }
+            )
+            if prepared_runtime_adapters is not None:
+                runtime_manifest = runtime_adapter_manifest(
+                    prepared_runtime_adapters,
+                    custom_remote_allowed=custom_remote_allowed,
+                )
+                if prepared_library_adapters is not None:
+                    manifest["runtime_library_adapter_refs"] = runtime_library_adapter_manifest(
+                        prepared_library_adapters
+                    )
+                    manifest["runtime_library_adapter_metadata"] = runtime_library_adapter_metadata(
+                        prepared_library_adapters
+                    )
+                if prepared_semantic_advisories is not None:
+                    manifest["runtime_adapter_semantic_advisories"] = prepared_semantic_advisories
+                manifest["runtime_port_adapters"] = runtime_manifest
+            elif implicit_runtime_manifest is not None:
+                manifest["runtime_port_adapters"] = implicit_runtime_manifest
+            if _browser_adapter_admission is not None:
+                manifest["browser_adapter_admission"] = dict(_browser_adapter_admission)
+            with self._lock, self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO runs(
+                        id, object_id, object_version_id, object_name, object_version,
+                        entrypoint, env, env_python, status, created_at, run_dir,
+                        input_json, result_path, artifacts_dir, env_build_hash,
+                        runtime_config_json, keep, manifest_json,
+                        retention_enforced, retention_report_mode,
+                        retention_sync_required, retention_terminal_queued,
+                        retention_delivery_required, retention_delivery_acked,
+                        retention_delivery_expires_at, retention_effective_status,
+                        retention_outcome_reason
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        object_record["id"],
+                        object_record["version_id"],
+                        object_record["name"],
+                        object_record["version"],
+                        entrypoint,
+                        object_record["env"],
+                        object_record["env_python"],
+                        "queued",
+                        now,
+                        str(run_dir),
+                        json_dumps(input_payload),
+                        str(run_dir / "result.json"),
+                        str(run_dir / "artifacts"),
+                        object_record.get("environment_spec_hash"),
+                        json_dumps(runtime_config),
+                        keep_to_storage(keep_policy),
+                        json_dumps(manifest),
+                        1,
+                        "local" if report_local_run else "remote",
+                        0,
+                        0,
+                        int(report_local_run),
+                        int(not report_local_run),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                if _precommit_check is not None:
+                    _precommit_check(self.get_run(run_id))
+            transaction_committed = True
+            if _postcommit_confirm is not None:
+                _postcommit_confirm()
+        except Exception:
+            if run_directory_created and not transaction_committed and run_dir.exists():
+                safe_run_dir = self._validated_run_directory(run_id, str(run_dir))
+                if safe_run_dir is not None:
+                    shutil.rmtree(safe_run_dir)
+            raise
 
         state = self.get_run(run_id)
         self._write_run_state_file(state)
@@ -633,7 +1014,7 @@ class RunRepository(RepositoryBase):
         pipeline: dict[str, Any] = raw_pipeline if isinstance(raw_pipeline, dict) else {}
         raw_retention = manifest.get("retention")
         retention: dict[str, Any] = raw_retention if isinstance(raw_retention, dict) else {}
-        return {
+        compact = {
             "schema_version": manifest.get("schema_version", m_manifest.RUN_MANIFEST_SCHEMA_VERSION),
             "run_id": state["id"],
             "parent_run_id": manifest.get("parent_run_id"),
@@ -655,6 +1036,10 @@ class RunRepository(RepositoryBase):
                 "edge_count": len(edges),
             },
         }
+        browser_adapter_admission = manifest.get("browser_adapter_admission")
+        if isinstance(browser_adapter_admission, dict):
+            compact["browser_adapter_admission"] = dict(browser_adapter_admission)
+        return compact
 
     def _validated_run_directory(self, run_id: str, raw_path: Any) -> Path | None:
         if not raw_path:

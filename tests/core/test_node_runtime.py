@@ -25,7 +25,7 @@ from spl.core.entities.pipeline import DPipeline, Pipeline
 from spl.core.ir.parse import ir_parse
 from spl.core.ir.utils import SPLSafeLoader
 from spl.daemon.canonical import _canonical_spl_documents
-from spl.daemon.runtime_config import normalize_runtime_config
+from spl.daemon.runtime_config import normalize_runtime_config, runtime_config_for_run
 from spl.daemon.spl_free_generator import filter_spl_runtime_scaffolding
 
 
@@ -221,6 +221,46 @@ def test_node_runtime_run_override_wins_and_unknown_alias_fails_early(
     consumer = _node_by_alias(_read_manifest(run), "consumer")
     assert consumer["runtime"]["name"] == "venv-subprocess"
     assert consumer["runtime"]["source"] == "run-override"
+
+
+def test_string_runtime_override_applies_to_every_function_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SPL_RUNS_HOME", str(tmp_path / "runs"))
+    run = Deployment(_runtime_pipeline(tag_consumer=False)).run(
+        keep=True,
+        runtimes="venv-subprocess",
+    )
+
+    with run:
+        assert run.value("consumer") == "SEED"
+
+    manifest = _read_manifest(run)
+    producer = _node_by_alias(manifest, "producer")
+    consumer = _node_by_alias(manifest, "consumer")
+    assert producer["runtime"]["name"] == "venv-subprocess"
+    assert producer["runtime"]["source"] == "run-override"
+    assert consumer["runtime"]["name"] == "venv-subprocess"
+    assert consumer["runtime"]["source"] == "run-override"
+
+
+def test_pipeline_node_docker_override_uses_non_docker_conductor() -> None:
+    object_runtime = {
+        "mode": "docker",
+        "base_image": "python:3.13-slim-trixie",
+        "docker": {"network": "none"},
+    }
+
+    effective = runtime_config_for_run(
+        "pipeline",
+        object_runtime,
+        {"heavy_step": "docker"},
+    )
+
+    assert effective == {
+        "mode": "venv",
+        "docker": {"network": "none"},
+    }
 
 
 def test_object_runtime_config_node_runtime_is_between_default_and_tag(

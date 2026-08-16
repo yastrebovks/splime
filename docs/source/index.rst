@@ -11,6 +11,11 @@ reused across projects and executed locally or remotely.
    cookbook
    owners-libraries-handles
    daemon-security-telemetry
+   daemon-ide-metadata
+   daemon-guarded-local-runs
+   library-adapters
+   static-source-preparation
+   daemon-prepared-validation
    release-evidence
 
 .. toctree::

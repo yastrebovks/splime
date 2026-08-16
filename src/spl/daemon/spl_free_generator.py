@@ -25,6 +25,7 @@ REASON_ASYNC_FUNCTION = "async_function"
 REASON_DECORATED_FUNCTION = "decorated_function"
 REASON_IMPORTS_SPL = "imports_spl"
 REASON_DOCKER_RUNTIME = "docker_runtime"
+REASON_RUNTIME_PORT_ADAPTERS = "runtime_port_adapters"
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,9 @@ def prepare_worker_runtime(
     marker_path: Path,
 ) -> WorkerRuntimePlan:
     """Prepare the SPL-free path when stage-1 supports this object."""
+
+    if object_record.get("runtime_port_adapters"):
+        return _legacy_plan(marker_path, REASON_RUNTIME_PORT_ADAPTERS)
 
     if object_record.get("kind") != "function":
         return _legacy_plan(marker_path, REASON_PIPELINE)

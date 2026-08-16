@@ -31,6 +31,7 @@ def node_fingerprint(
     adapter_identities: AdapterIdentityItems | None = None,
     artifact_inputs: ArtifactInputItems | None = None,
     inline_inputs: InlineInputItems | None = None,
+    execution_context_sha256: str | None = None,
 ) -> str:
     """Return the SHA-256 fingerprint for a node execution boundary."""
 
@@ -45,6 +46,7 @@ def node_fingerprint(
                 adapter_identities=adapter_identities,
                 artifact_inputs=artifact_inputs,
                 inline_inputs=inline_inputs,
+                execution_context_sha256=execution_context_sha256,
             )
         )
     )
@@ -60,12 +62,13 @@ def node_fingerprint_payload(
     adapter_identities: AdapterIdentityItems | None = None,
     artifact_inputs: ArtifactInputItems | None = None,
     inline_inputs: InlineInputItems | None = None,
+    execution_context_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Return the canonical payload that is hashed for a node fingerprint."""
 
     if node_content is None and node_identity is None:
         raise ValueError("node fingerprint requires node_content or node_identity")
-    return {
+    payload = {
         "fingerprint_format_version": FINGERPRINT_FORMAT_VERSION,
         "node": {
             "content_sha256": None if node_content is None else _sha256(node_content),
@@ -82,6 +85,10 @@ def node_fingerprint_payload(
             "inline": _inline_input_entries(inline_inputs),
         },
     }
+    if execution_context_sha256 is not None:
+        _validate_sha256(execution_context_sha256)
+        payload["execution_context_sha256"] = execution_context_sha256.lower()
+    return payload
 
 
 def canonical_fingerprint_bytes(payload: Mapping[str, Any]) -> bytes:

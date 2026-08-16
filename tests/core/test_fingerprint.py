@@ -1,8 +1,14 @@
+import copy
+import hashlib
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from spl import Deployment, lift
+from spl.adapters import TEXT_FILE_UTF8
+from spl.core._common import Run
 from spl.core.entities.adapter import Adapter, adapter_identity, make_key
 from spl.core.entities.distribution import DDistribution
 from spl.core.fingerprint import (
@@ -12,10 +18,15 @@ from spl.core.fingerprint import (
     node_fingerprint,
     node_fingerprint_payload,
 )
+from spl.core.runtime_port_adapters import built_in_descriptor, runtime_port_adapter_fingerprint
 
 
 class Box:
     pass
+
+
+def _identity(value: int) -> int:
+    return value
 
 
 def _save_box(path: str, obj: Box) -> None:
@@ -57,6 +68,7 @@ def _fingerprint(
     output_ports: tuple[str, ...] = ("default",),
     node_content: bytes = b'{"function":"normalize","body":"return value"}\n',
     node_version: str = "v1",
+    execution_context_sha256: str | None = None,
 ) -> str:
     return node_fingerprint(
         node_content=node_content,
@@ -68,6 +80,7 @@ def _fingerprint(
         else {"rows": _adapter_identity(), "default": _adapter_identity(format="json")},
         artifact_inputs=artifact_inputs if artifact_inputs is not None else {"rows": "a" * 64, "metadata": "b" * 64},
         inline_inputs=inline_inputs if inline_inputs is not None else {"kwargs": {"b": 2, "a": 1}},
+        execution_context_sha256=execution_context_sha256,
     )
 
 
@@ -111,6 +124,83 @@ def test_adapter_change_changes_fingerprint() -> None:
 
 def test_input_sha_change_changes_fingerprint() -> None:
     assert _fingerprint(artifact_inputs={"rows": "a" * 64}) != _fingerprint(artifact_inputs={"rows": "b" * 64})
+
+
+def test_run_adapter_context_changes_node_fingerprint_without_changing_legacy_payload() -> None:
+    legacy_payload = node_fingerprint_payload(node_content=b"node")
+
+    assert "execution_context_sha256" not in legacy_payload
+    assert _fingerprint(execution_context_sha256="a" * 64) != _fingerprint(execution_context_sha256="b" * 64)
+
+
+def test_pipeline_node_fingerprint_binds_runtime_adapter_document_without_changing_node_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SPL_RUNS_HOME", str(tmp_path / "runs"))
+    _, descriptor = built_in_descriptor(TEXT_FILE_UTF8)
+    document: dict[str, Any] = {
+        "schema_version": 1,
+        "bindings": [
+            {
+                "direction": "input",
+                "port": "value",
+                "external_name": "value",
+                "semantic_type": "str",
+                "adapter": descriptor,
+                "resolution_source": "run_override",
+                "transport": "artifact",
+                "argument": {"kind": "keyword", "name": "value", "index": None},
+                "input_name": "input-value.txt",
+                "result_path": [],
+            }
+        ],
+        "inputs": [
+            {
+                "name": "input-value.txt",
+                "port": "value",
+                "size": 1,
+                "sha256": hashlib.sha256(b"x").hexdigest(),
+                "format_tag": descriptor["format_tag"],
+                "semantic_type": "str",
+                "adapter_id": descriptor["id"],
+                "media_type": descriptor["presentation"]["media_type"],
+                "content_base64": None,
+                "staged_name": "input-value.txt",
+            }
+        ],
+        "custom_bundle": None,
+    }
+    changed_digest = copy.deepcopy(document)
+    changed_digest["inputs"][0]["sha256"] = hashlib.sha256(b"y").hexdigest()
+    changed_binding = copy.deepcopy(document)
+    changed_binding["bindings"][0]["resolution_source"] = "preset"
+    policy = {"custom_remote": "deny"}
+    contexts = [
+        runtime_port_adapter_fingerprint(document, adapter_policy=policy),
+        runtime_port_adapter_fingerprint(copy.deepcopy(document), adapter_policy=policy),
+        runtime_port_adapter_fingerprint(changed_digest, adapter_policy=policy),
+        runtime_port_adapter_fingerprint(changed_binding, adapter_policy=policy),
+    ]
+    pipeline = lift(_identity).alias("identity").render("runtime_fingerprint_pipeline")
+    node = pipeline.aliases["identity"]
+    node_content_sha256: set[str] = set()
+    node_fingerprints: list[str] = []
+    for context in contexts:
+        run = Deployment(pipeline, _runtime_adapter_fingerprint_sha256=context).run(keep=True, value=7)
+        assert isinstance(run, Run)
+        with run:
+            assert run.value("identity") == 7
+        manifest = run.manifest_snapshot
+        assert manifest is not None
+        [record] = manifest["nodes"].values()
+        node_fingerprints.append(record["fingerprint"]["sha256"])
+        node_content_sha256.add(hashlib.sha256(run._node_content(node)).hexdigest())  # noqa: SLF001
+
+    assert len(node_content_sha256) == 1
+    assert node_fingerprints[0] == node_fingerprints[1]
+    assert node_fingerprints[0] != node_fingerprints[2]
+    assert node_fingerprints[0] != node_fingerprints[3]
 
 
 def test_inline_value_change_changes_fingerprint() -> None:

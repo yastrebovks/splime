@@ -1,0 +1,54 @@
+{
+  "schema": "splime.generated-plan/v1",
+  "schema_version": 1,
+  "kind": "pipeline",
+  "name": "xgb_experiment",
+  "nodes": [
+    {"id": "data", "function": "mk_random_data", "runtime": "native"},
+    {"id": "formula", "function": "mk_random_formula", "runtime": "native"},
+    {"id": "target", "function": "mk_target", "runtime": "native"},
+    {"id": "fit", "function": "fit_xgboost_model", "runtime": "native"},
+    {"id": "predict", "function": "run_model", "runtime": "native"},
+    {"id": "metrics", "function": "mk_metrics", "runtime": "native"},
+    {"id": "plot", "function": "plot_errors", "runtime": "native"},
+    {"id": "report", "function": "mk_report", "runtime": "native"}
+  ],
+  "edges": [
+    {"from": {"kind": "input", "name": "n_features"}, "to": {"node_id": "data", "port": "n_features"}, "adapter": null},
+    {"from": {"kind": "input", "name": "n_samples"}, "to": {"node_id": "data", "port": "n_samples"}, "adapter": null},
+    {"from": {"kind": "input", "name": "seed"}, "to": {"node_id": "data", "port": "seed"}, "adapter": null},
+    {"from": {"kind": "input", "name": "n_features"}, "to": {"node_id": "formula", "port": "n_features"}, "adapter": null},
+    {"from": {"kind": "input", "name": "formula_depth"}, "to": {"node_id": "formula", "port": "formula_depth"}, "adapter": null},
+    {"from": {"kind": "input", "name": "seed"}, "to": {"node_id": "formula", "port": "seed"}, "adapter": null},
+    {"from": {"kind": "node", "node_id": "data", "port": "default"}, "to": {"node_id": "target", "port": "xs"}, "adapter": "numpy.ndarray@npy"},
+    {"from": {"kind": "node", "node_id": "formula", "port": "default"}, "to": {"node_id": "target", "port": "formula"}, "adapter": "sympy.core.expr.Expr@pickle"},
+    {"from": {"kind": "node", "node_id": "data", "port": "default"}, "to": {"node_id": "fit", "port": "xs"}, "adapter": "numpy.ndarray@npy"},
+    {"from": {"kind": "node", "node_id": "target", "port": "default"}, "to": {"node_id": "fit", "port": "ys"}, "adapter": "numpy.ndarray@npy"},
+    {"from": {"kind": "node", "node_id": "fit", "port": "default"}, "to": {"node_id": "predict", "port": "model"}, "adapter": "xgboost.sklearn.XGBRegressor@xgboost-ubj"},
+    {"from": {"kind": "node", "node_id": "data", "port": "default"}, "to": {"node_id": "predict", "port": "xs"}, "adapter": "numpy.ndarray@npy"},
+    {"from": {"kind": "node", "node_id": "target", "port": "default"}, "to": {"node_id": "metrics", "port": "ys"}, "adapter": "numpy.ndarray@npy"},
+    {"from": {"kind": "node", "node_id": "predict", "port": "default"}, "to": {"node_id": "metrics", "port": "ys_pred"}, "adapter": "numpy.ndarray@npy"},
+    {"from": {"kind": "node", "node_id": "data", "port": "default"}, "to": {"node_id": "plot", "port": "xs"}, "adapter": "numpy.ndarray@npy"},
+    {"from": {"kind": "node", "node_id": "target", "port": "default"}, "to": {"node_id": "plot", "port": "ys"}, "adapter": "numpy.ndarray@npy"},
+    {"from": {"kind": "node", "node_id": "predict", "port": "default"}, "to": {"node_id": "plot", "port": "ys_pred"}, "adapter": "numpy.ndarray@npy"},
+    {"from": {"kind": "node", "node_id": "metrics", "port": "default"}, "to": {"node_id": "report", "port": "metrics"}, "adapter": null},
+    {"from": {"kind": "node", "node_id": "plot", "port": "default"}, "to": {"node_id": "report", "port": "img_errors"}, "adapter": "builtins.bytes@png"}
+  ],
+  "outputs": [
+    {"name": "metrics", "node_id": "metrics", "port": "default"},
+    {"name": "report", "node_id": "report", "port": "default"}
+  ],
+  "dependencies": [
+    {"package": "dominate", "version": "2.9.1", "modules": ["dominate"]},
+    {"package": "numpy", "version": "2.5.0", "modules": ["numpy"]},
+    {"package": "scikit-learn", "version": "1.9.0", "modules": ["sklearn"]},
+    {"package": "sympy", "version": "1.14.0", "modules": ["sympy"]},
+    {"package": "xgboost", "version": "3.3.0", "modules": ["xgboost"]}
+  ],
+  "adapters": [
+    {"key": "builtins.bytes@png", "python_type": "builtins.bytes", "format": "png", "save_symbol": "save_png_bytes", "load_symbol": "load_png_bytes"},
+    {"key": "numpy.ndarray@npy", "python_type": "numpy.ndarray", "format": "npy", "save_symbol": "save_numpy_npy", "load_symbol": "load_numpy_npy"},
+    {"key": "sympy.core.expr.Expr@pickle", "python_type": "sympy.core.expr.Expr", "format": "pickle", "save_symbol": "save_sympy_pickle", "load_symbol": "load_sympy_pickle"},
+    {"key": "xgboost.sklearn.XGBRegressor@xgboost-ubj", "python_type": "xgboost.sklearn.XGBRegressor", "format": "xgboost-ubj", "save_symbol": "save_xgboost_model_ubj", "load_symbol": "load_xgboost_model_ubj"}
+  ]
+}

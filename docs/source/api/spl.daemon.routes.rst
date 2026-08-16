@@ -13,6 +13,33 @@ spl.daemon.routes.\_helpers module
    :show-inheritance:
    :undoc-members:
 
+spl.daemon.routes.adapter\_runs module
+--------------------------------------
+
+.. automodule:: spl.daemon.routes.adapter_runs
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.routes.ai\_assistant module
+--------------------------------------
+
+.. automodule:: spl.daemon.routes.ai_assistant
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.routes.ai\_preview module
+------------------------------------
+
+.. automodule:: spl.daemon.routes.ai_preview
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.daemon.routes.artifacts module
 ----------------------------------
 
@@ -40,6 +67,15 @@ spl.daemon.routes.envs module
    :show-inheritance:
    :undoc-members:
 
+spl.daemon.routes.guarded\_runs module
+--------------------------------------
+
+.. automodule:: spl.daemon.routes.guarded_runs
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.daemon.routes.libraries module
 ----------------------------------
 
@@ -49,10 +85,46 @@ spl.daemon.routes.libraries module
    :show-inheritance:
    :undoc-members:
 
+spl.daemon.routes.library\_adapters module
+------------------------------------------
+
+.. automodule:: spl.daemon.routes.library_adapters
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.routes.lifecycle module
+----------------------------------
+
+.. automodule:: spl.daemon.routes.lifecycle
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.routes.meta module
+-----------------------------
+
+.. automodule:: spl.daemon.routes.meta
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.daemon.routes.objects module
 --------------------------------
 
 .. automodule:: spl.daemon.routes.objects
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.routes.prepared\_validation module
+---------------------------------------------
+
+.. automodule:: spl.daemon.routes.prepared_validation
    :members:
    :private-members:
    :show-inheritance:
@@ -80,6 +152,15 @@ spl.daemon.routes.server\_connections module
 --------------------------------------------
 
 .. automodule:: spl.daemon.routes.server_connections
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.routes.source\_analysis module
+-----------------------------------------
+
+.. automodule:: spl.daemon.routes.source_analysis
    :members:
    :private-members:
    :show-inheritance:

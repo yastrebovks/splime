@@ -14,7 +14,7 @@ import keyword
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -40,10 +40,12 @@ from spl.core.entities.pipeline import DPipeline, validate_pipeline_ir
 from spl.core.entities.scalar import DScalar, scalar_value_expression
 from spl.core.ir.utils import SPLSafeLoader
 from spl.core.node_runtime import NODE_RUNTIME_BACKENDS, RUNTIME_TAG_NAME
+from spl.core.source_preparation import validate_static_function_ast
 
 RemoteSignatureResolver = Callable[[dict[str, Any]], dict[str, Any]]
 ObjectDocument = tuple[Any, tuple[Any, ...]]
 RemoteSignatureKey = tuple[str, str]
+SyntaxValidationMode = Literal["legacy_compile", "static_ast"]
 
 
 @dataclass(frozen=True)
@@ -147,16 +149,31 @@ def load_object_ir(
     )
 
 
-def validate_object_ir(ir: ObjectIR) -> None:
+def validate_object_ir(
+    ir: ObjectIR,
+    *,
+    syntax_mode: SyntaxValidationMode = "legacy_compile",
+) -> None:
     """Validate complete object IR semantics without reading or mutating repository state."""
 
-    _validate_object_ir(ir, require_remote_signatures=True)
+    _validate_object_ir(
+        ir,
+        require_remote_signatures=True,
+        syntax_mode=syntax_mode,
+    )
 
 
-def _validate_object_ir(ir: ObjectIR, *, require_remote_signatures: bool) -> None:
+def _validate_object_ir(
+    ir: ObjectIR,
+    *,
+    require_remote_signatures: bool,
+    syntax_mode: SyntaxValidationMode = "legacy_compile",
+) -> None:
+    if syntax_mode not in {"legacy_compile", "static_ast"}:
+        raise ValueError("object IR syntax validation mode is not recognized")
     _validate_document_roots(ir)
     _validate_unique_root_symbols(ir)
-    functions = _validate_function_definitions(ir)
+    functions = _validate_function_definitions(ir, syntax_mode=syntax_mode)
     _validate_executable_symbols(ir)
     _validate_declared_symbol_references(ir)
     _validate_scalar_values(ir)
@@ -180,10 +197,14 @@ def _validate_object_ir(ir: ObjectIR, *, require_remote_signatures: bool) -> Non
         _validate_pipeline_links(ir, pipeline, interfaces)
 
 
-def extract_object_ir_metadata(ir: ObjectIR) -> dict[str, Any]:
+def extract_object_ir_metadata(
+    ir: ObjectIR,
+    *,
+    syntax_mode: SyntaxValidationMode = "legacy_compile",
+) -> dict[str, Any]:
     """Return registry metadata for object IR that passed semantic validation."""
 
-    validate_object_ir(ir)
+    validate_object_ir(ir, syntax_mode=syntax_mode)
     documents = [(root, list(dependencies)) for root, dependencies in ir.documents]
     functions = _collect_functions(documents)
     distributions = _collect_distributions(documents)
@@ -315,7 +336,11 @@ def _validate_unique_root_symbols(ir: ObjectIR) -> None:
             )
 
 
-def _validate_function_definitions(ir: ObjectIR) -> dict[str, DFunction]:
+def _validate_function_definitions(
+    ir: ObjectIR,
+    *,
+    syntax_mode: SyntaxValidationMode,
+) -> dict[str, DFunction]:
     definitions: dict[str, tuple[DFunction, str]] = {}
     for item, location in _iter_object_items(ir):
         if not isinstance(item, DFunction):
@@ -333,7 +358,11 @@ def _validate_function_definitions(ir: ObjectIR) -> dict[str, DFunction]:
             )
         _validate_declared_ports(item.inputs, kind="input", owner=f"function `{item.name}`", location=location)
         _validate_declared_ports(item.outputs or [], kind="output", owner=f"function `{item.name}`", location=location)
-        _validate_function_syntax(item, location=location)
+        _validate_function_syntax(
+            item,
+            location=location,
+            syntax_mode=syntax_mode,
+        )
         definitions[item.name] = (item, location)
     return {name: definition for name, (definition, _) in definitions.items()}
 
@@ -424,7 +453,12 @@ def _validate_declared_ports(
         seen.add(port.name)
 
 
-def _validate_function_syntax(function: DFunction, *, location: str) -> None:
+def _validate_function_syntax(
+    function: DFunction,
+    *,
+    location: str,
+    syntax_mode: SyntaxValidationMode,
+) -> None:
     """Prove serialized function syntax is importable without executing it."""
 
     _validate_identifier(function.name, description="function name", location=location)
@@ -464,11 +498,29 @@ def _validate_function_syntax(function: DFunction, *, location: str) -> None:
             returns=(ast.parse(outputs[0].typ_, mode="eval").body if outputs and outputs[0].typ_ is not None else None),
         )
         module = ast.fix_missing_locations(ast.Module(body=[function_node], type_ignores=[]))
-        compile(module, location, "exec")
+        if syntax_mode == "legacy_compile":
+            # Existing registration semantics intentionally retain the Python
+            # compiler check.  Prepared-object validation selects the pure
+            # ``static_ast`` branch and never reaches this call.
+            compile(module, location, "exec")
+        else:
+            _validate_static_function_ast(function_node)
     except (SyntaxError, TypeError, ValueError) as exc:
         raise ValueError(
             f"function `{function.name}` contains invalid serialized Python syntax (location: `{location}`): {exc}"
         ) from exc
+
+
+def _validate_static_function_ast(function: ast.FunctionDef) -> None:
+    """Apply the prepared-source subset without bytecode compilation.
+
+    The source-preparation compiler has already checked this subset.  The
+    daemon repeats the security-relevant restrictions independently before it
+    accepts canonical IR.  Walking an AST does not import or execute any name
+    represented by that AST.
+    """
+
+    validate_static_function_ast(function)
 
 
 def _validate_object_runtime(ir: ObjectIR) -> None:

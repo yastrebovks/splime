@@ -392,6 +392,7 @@ class Deployment:
         runtime_config: Mapping[str, Any] | None = None,
         node_environment_provider: m_node_runtime.NodeEnvironmentProvider | None = None,
         runtime_env_spec: Sequence[Mapping[str, Any]] | None = None,
+        _runtime_adapter_fingerprint_sha256: str | None = None,
     ) -> None:
         """Create a deployment.
 
@@ -407,6 +408,7 @@ class Deployment:
         self._runtime_config = dict(runtime_config or {})
         self._node_environment_provider = node_environment_provider
         self._runtime_env_spec = list(runtime_env_spec or [])
+        self._runtime_adapter_fingerprint_sha256 = _runtime_adapter_fingerprint_sha256
 
     def setup(self) -> None:
         pass
@@ -469,6 +471,7 @@ class Deployment:
             runtime_config=self._runtime_config,
             node_environment_provider=self._node_environment_provider,
             runtime_env_spec=self._runtime_env_spec,
+            runtime_adapter_fingerprint_sha256=self._runtime_adapter_fingerprint_sha256,
             **kwargs,
         )
         if output is None:
@@ -563,6 +566,7 @@ class Deployment:
             runtime_config=self._runtime_config,
             node_environment_provider=self._node_environment_provider,
             runtime_env_spec=self._runtime_env_spec,
+            runtime_adapter_fingerprint_sha256=self._runtime_adapter_fingerprint_sha256,
             **base_kwargs,
         )
         if output is None:
@@ -615,6 +619,7 @@ class Run:
         runtime_config: Mapping[str, Any] | None = None,
         node_environment_provider: m_node_runtime.NodeEnvironmentProvider | None = None,
         runtime_env_spec: Sequence[Mapping[str, Any]] | None = None,
+        runtime_adapter_fingerprint_sha256: str | None = None,
         **kwargs: Any,
     ) -> None:
         self._callback = callback
@@ -633,6 +638,7 @@ class Run:
         self._runtime_config = m_node_runtime.validate_node_runtime_config(runtime_config)
         self._node_environment_provider = node_environment_provider or m_node_runtime.CurrentPythonEnvironmentProvider()
         self._runtime_env_spec = list(runtime_env_spec or [])
+        self._runtime_adapter_fingerprint_sha256 = runtime_adapter_fingerprint_sha256
         self._node_runtime_registry = m_node_runtime.NodeRuntimeRegistry()
         self._has_runtime_selection = bool(
             self._runtime_overrides
@@ -756,6 +762,7 @@ class Run:
             runtime_config=self._runtime_config,
             node_environment_provider=self._node_environment_provider,
             runtime_env_spec=self._runtime_env_spec,
+            runtime_adapter_fingerprint_sha256=self._runtime_adapter_fingerprint_sha256,
             **merged_kwargs,
         )
         if output is None:
@@ -1842,6 +1849,7 @@ class Run:
             adapter_identities=adapter_identities,
             artifact_inputs=artifact_inputs,
             inline_inputs=inline_inputs,
+            execution_context_sha256=self._runtime_adapter_fingerprint_sha256,
         )
 
     def _node_content(self, node: Node) -> bytes:

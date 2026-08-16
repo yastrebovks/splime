@@ -16,7 +16,6 @@ def register_library_routes(
     runtime: Any,
     context: RouteContext,
 ) -> None:
-    del runtime
     route_errors = context.route_errors
     json_response = context.json_response
 
@@ -42,7 +41,11 @@ def register_library_routes(
     async def create_server_library() -> Any:
         _, server = await context.connected_server_client_async()
         return json_response(
-            await context.run_blocking(server.create_library, await context.read_json_body()),
+            await context.run_blocking(
+                runtime.run_registry_mutation,
+                server.create_library,
+                await context.read_json_body(),
+            ),
             HTTPStatus.CREATED,
         )
 
@@ -67,6 +70,7 @@ def register_library_routes(
         _, server = await context.connected_server_client_async()
         return json_response(
             await context.run_blocking(
+                runtime.run_registry_mutation,
                 server.update_library,
                 validate_name(library_ref),
                 await context.read_json_body(),
@@ -108,6 +112,7 @@ def register_library_routes(
         _, server = await context.connected_server_client_async()
         return json_response(
             await context.run_blocking(
+                runtime.run_registry_mutation,
                 server.grant_library,
                 validate_name(library_ref),
                 await context.read_json_body(),
@@ -121,6 +126,7 @@ def register_library_routes(
         _, server = await context.connected_server_client_async()
         return json_response(
             await context.run_blocking(
+                runtime.run_registry_mutation,
                 server.revoke_library_grant,
                 validate_name(library_ref),
                 grantee,
@@ -133,6 +139,7 @@ def register_library_routes(
         _, server = await context.connected_server_client_async()
         return json_response(
             await context.run_blocking(
+                runtime.run_registry_mutation,
                 server.add_library_reference,
                 validate_name(library_ref),
                 await context.read_json_body(),
@@ -146,6 +153,7 @@ def register_library_routes(
         _, server = await context.connected_server_client_async()
         return json_response(
             await context.run_blocking(
+                runtime.run_registry_mutation,
                 server.copy_object_into_library,
                 validate_name(library_ref),
                 await context.read_json_body(),
@@ -159,6 +167,7 @@ def register_library_routes(
         _, server = await context.connected_server_client_async()
         return json_response(
             await context.run_blocking(
+                runtime.run_registry_mutation,
                 server.remove_library_entry,
                 validate_name(library_ref),
                 validate_name(name),

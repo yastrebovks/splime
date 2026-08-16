@@ -10,12 +10,13 @@ from typing import Any
 
 import pytest
 
+from spl.core import json_contract as m_json_contract
 from spl.core.redaction import redact_text
 from spl.daemon import artifact_access
 from spl.daemon.cli import build_parser
 from spl.daemon.storage_base import (
+    LIBRARY_ADAPTER_SCHEMA_VERSION,
     SYNC_EVENT_TELEMETRY_MIGRATION_ID,
-    SYNC_EVENT_TELEMETRY_SCHEMA_VERSION,
 )
 from spl.daemon.server import (
     LOCAL_RUN_TEXT_ARTIFACT_COLLECTION_MAX_BYTES,
@@ -24,6 +25,7 @@ from spl.daemon.server import (
 )
 from spl.daemon.store import RegistryStore
 from spl.daemon.telemetry import (
+    EXECUTION_TELEMETRY_MAX_BYTES,
     SYNC_EVENT_MAX_BYTES,
     SYNC_EVENT_PAYLOAD_BUDGET,
     TelemetryPolicy,
@@ -149,6 +151,150 @@ def test_metadata_default_has_an_exact_raw_value_denylist() -> None:
         "duration_ms": 1000,
         "source_result_present": True,
     }
+
+
+@pytest.mark.parametrize(
+    ("level", "error_details"),
+    (
+        ("metadata", False),
+        ("diagnostic", True),
+        ("full", True),
+    ),
+)
+def test_remote_execution_telemetry_is_bounded_body_free_evidence(
+    level: str,
+    error_details: bool,
+) -> None:
+    secret = "REMOTE_EXECUTION_SECRET_MARKER"
+    envelope = TelemetryPolicy(
+        level,  # type: ignore[arg-type]
+        ("/input/kwargs/explicit_private",),
+    ).build_execution_telemetry_envelope(
+        _state(secret),
+        observed_at="2026-07-31T01:00:00Z",
+        artifact_count=2,
+    )
+    wire = json.dumps(envelope, sort_keys=True)
+
+    assert set(envelope) == {
+        "schema_version",
+        "level",
+        "observed_at",
+        "redaction",
+        "functional_delivery",
+        "source_result_present",
+        "availability",
+        "summary",
+        "nodes",
+        "hashes",
+        "error",
+        "omissions",
+    }
+    assert envelope["schema_version"] == 1
+    assert envelope["level"] == level
+    assert envelope["observed_at"] == "2026-07-31T01:00:00+00:00"
+    assert envelope["redaction"] == "best_effort"
+    assert envelope["functional_delivery"] == "independent"
+    assert envelope["source_result_present"] is True
+    assert envelope["summary"]["source_result_present"] is True
+    assert envelope["availability"] == {
+        "input": False,
+        "result": False,
+        "streams": False,
+        "artifact_bodies": False,
+        "error_details": error_details,
+    }
+    assert secret not in wire
+    assert (
+        not {
+            "input",
+            "result",
+            "result_json",
+            "stdout",
+            "stderr",
+            "artifacts",
+        }
+        & envelope.keys()
+    )
+    if error_details:
+        assert "[REDACTED]" in envelope["error"]["message"]
+    else:
+        assert envelope["error"]["message"] == "[details withheld by metadata telemetry]"
+
+
+def test_remote_execution_telemetry_trims_optional_details_to_64_kib() -> None:
+    state = _state("ordinary-value")
+    state["error"] = "ValueError: " + ("x" * (EXECUTION_TELEMETRY_MAX_BYTES * 2))
+    state["manifest"]["nodes"] = {
+        f"node-{index:03}": {
+            "id": f"node-{index:03}-" + ("i" * 500),
+            "alias": "a" * 500,
+            "name": "n" * 500,
+            "kind": "function-" + ("k" * 500),
+            "status": "failed-" + ("s" * 500),
+            "fingerprint": {"sha256": "h" * 500},
+        }
+        for index in range(200)
+    }
+
+    envelope = TelemetryPolicy("full").build_execution_telemetry_envelope(
+        state,
+        observed_at="2026-07-31T01:00:00+00:00",
+    )
+
+    assert len(
+        m_json_contract.dumps(
+            envelope,
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode()
+    ) <= (EXECUTION_TELEMETRY_MAX_BYTES)
+    assert envelope["summary"]["node_count"] == 200
+    assert envelope["summary"]["node_detail_count"] == len(envelope["nodes"])
+    assert envelope["summary"]["node_detail_count_truncated"] is True
+    assert "execution_telemetry_node_limit" in envelope["omissions"]
+    assert len(envelope["error"]["message"].encode()) <= 8 * 1024
+
+
+def test_remote_execution_telemetry_normalizes_empty_optional_text_to_null() -> None:
+    state = _state("ordinary-value")
+    state["runtime_build_hash"] = ""
+    state["manifest"] = {
+        "pipeline": {"content_hash": ""},
+        "nodes": {
+            "": {
+                "id": "",
+                "alias": "",
+                "name": "",
+                "kind": "",
+                "status": "",
+                "fingerprint": {"sha256": ""},
+            }
+        },
+        "edges": [],
+    }
+
+    envelope = TelemetryPolicy().build_execution_telemetry_envelope(
+        state,
+        observed_at="2026-07-31T01:00:00+00:00",
+    )
+
+    assert envelope["nodes"] == [
+        {
+            "id": None,
+            "alias": None,
+            "name": None,
+            "kind": None,
+            "status": None,
+            "fingerprint_sha256": None,
+        }
+    ]
+    assert envelope["hashes"] == {
+        "pipeline_content_hash": None,
+        "runtime_build_hash": None,
+    }
+    assert all(value is None or bool(value) for node in envelope["nodes"] for value in node.values())
+    assert all(value is None or bool(value) for value in envelope["hashes"].values())
 
 
 @pytest.mark.parametrize(
@@ -855,7 +1001,7 @@ def test_existing_sync_schema_migrates_twice_and_backfills_run_link(tmp_path: Pa
             with upgraded._storage._lock:  # noqa: SLF001 - migration invariant fixture.
                 assert (  # noqa: SLF001
                     upgraded._storage._conn.execute("PRAGMA user_version").fetchone()[0]
-                    == SYNC_EVENT_TELEMETRY_SCHEMA_VERSION
+                    == LIBRARY_ADAPTER_SCHEMA_VERSION
                 )
                 assert upgraded._storage._conn.execute("PRAGMA foreign_key_check").fetchall() == []  # noqa: SLF001
                 assert upgraded._storage._conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"  # noqa: SLF001

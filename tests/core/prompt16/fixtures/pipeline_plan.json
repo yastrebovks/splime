@@ -1,0 +1,52 @@
+{
+  "schema": "splime.generated-plan/v1",
+  "schema_version": 1,
+  "kind": "pipeline",
+  "name": "double_pipeline",
+  "nodes": [
+    {
+      "id": "load",
+      "function": "load_value",
+      "runtime": "native"
+    },
+    {
+      "id": "double",
+      "function": "double_value",
+      "runtime": "native"
+    }
+  ],
+  "edges": [
+    {
+      "from": {
+        "kind": "input",
+        "name": "value"
+      },
+      "to": {
+        "node_id": "load",
+        "port": "value"
+      },
+      "adapter": null
+    },
+    {
+      "from": {
+        "kind": "node",
+        "node_id": "load",
+        "port": "default"
+      },
+      "to": {
+        "node_id": "double",
+        "port": "value"
+      },
+      "adapter": null
+    }
+  ],
+  "outputs": [
+    {
+      "name": "result",
+      "node_id": "double",
+      "port": "default"
+    }
+  ],
+  "dependencies": [],
+  "adapters": []
+}

@@ -127,13 +127,15 @@ class SyncEventRepository(RepositoryBase):
 
         current_owner_id = str(current_owner_id) if current_owner_id else None
         by_owner: dict[str, int] = {}
+        pending_by_owner: dict[str, int] = {}
         pre_enrollment = 0
+        pre_enrollment_pending = 0
         held = 0
         held_owners: set[str] = set()
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT payload_json
+                SELECT status, payload_json
                 FROM sync_events
                 WHERE status = 'pending'
                    OR (status = 'failed' AND retryable = 1)
@@ -144,14 +146,20 @@ class SyncEventRepository(RepositoryBase):
             owner_id = self._payload_owner_id(payload)
             if owner_id is None or owner_id == DEFAULT_OBJECT_OWNER_ID:
                 pre_enrollment += 1
+                if row["status"] == "pending":
+                    pre_enrollment_pending += 1
                 continue
             by_owner[owner_id] = by_owner.get(owner_id, 0) + 1
+            if row["status"] == "pending":
+                pending_by_owner[owner_id] = pending_by_owner.get(owner_id, 0) + 1
             if current_owner_id is not None and owner_id != current_owner_id:
                 held += 1
                 held_owners.add(owner_id)
         return {
             "by_owner": by_owner,
+            "pending_by_owner": pending_by_owner,
             "pre_enrollment": pre_enrollment,
+            "pre_enrollment_pending": pre_enrollment_pending,
             "held_for_other_identities": held,
             "held_owner_ids": sorted(held_owners),
         }

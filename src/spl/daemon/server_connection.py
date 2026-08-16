@@ -53,7 +53,15 @@ SERVER_OFFLINE_MESSAGE = (
     "reconnects."
 )
 SERVER_UNREACHABLE_CODE = "central_server_unreachable"
-SERVER_PROXY_TIMEOUT_SECONDS = 1.0
+# Metadata routes remain bounded, but one second is below the observed
+# production latency for compact Object and capability reads. Five seconds
+# still fails closed promptly without making local operations server-bound.
+SERVER_PROXY_TIMEOUT_SECONDS = 5.0
+# Remote Run snapshots may legitimately contain bounded inline inputs and a
+# terminal inline result.  A one-second metadata proxy budget is too short for
+# those larger responses even on a healthy server, so polling gets a separate
+# still-bounded allowance without slowing ordinary connection/status probes.
+SERVER_REMOTE_RUN_PROXY_TIMEOUT_SECONDS = 5.0
 
 
 class ServerConnectionManager:

@@ -66,7 +66,10 @@ def build_signature(
             "kind": kind,
             "description": record.get("description") or "",
             "inputs": inputs,
+            "input_order": _input_order(record.get("inputs") or []),
             "outputs": outputs,
+            "aliases": record.get("aliases") or [],
+            "distributions": record.get("distributions") or [],
             "pipeline_nodes": record.get("pipeline_nodes") or [],
             "remote_nodes": [node for node in record.get("pipeline_nodes") or [] if node.get("kind") == "remote"],
             "internal_objects": record.get("internal_objects") or [],
@@ -102,7 +105,10 @@ def _build_internal_function_signature(
             "kind": "function",
             "description": record.get("description") or "",
             "inputs": inputs,
+            "input_order": _input_order(item.get("inputs") or []),
             "outputs": outputs,
+            "aliases": [],
+            "distributions": record.get("distributions") or [],
             "pipeline_nodes": [],
             "remote_nodes": [],
             "internal_objects": [],
@@ -213,6 +219,17 @@ def _normalize_inputs(inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         )
         by_name[name]["required"] = by_name[name]["required"] or bool(item.get("required", item.get("default") is None))
     return [by_name[name] for name in sorted(by_name)]
+
+
+def _input_order(inputs: list[dict[str, Any]]) -> list[str]:
+    """Preserve first external-argument order outside the legacy input rows."""
+
+    result: list[str] = []
+    for item in inputs:
+        name = str(item.get("external_name") or item.get("name"))
+        if name and name not in result:
+            result.append(name)
+    return result
 
 
 def _normalize_outputs(kind: str, outputs: list[dict[str, Any]]) -> list[dict[str, Any]]:

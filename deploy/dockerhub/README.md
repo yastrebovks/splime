@@ -24,7 +24,7 @@ docker run -d --name spl-daemon \
   --cap-drop ALL --security-opt no-new-privileges:true \
   -p 127.0.0.1:8765:8765 \
   -v /var/lib/spl-daemon:/var/lib/spl-daemon \
-  yastrebovks/spl-daemon:0.4.6
+  yastrebovks/spl-daemon:0.4.7
 ```
 
 ## Per-node Docker nodes (0.4 series)
@@ -102,16 +102,20 @@ print(client.health())
 docker login                                   # to your Docker Hub account (yastrebovks)
 docker buildx create --use --name splime-builder
 
-# build + push multi-arch (version and latest)
-./publish.sh 0.4.6
+# from the repository root: verify PyPI, build and smoke locally
+release/0.4.7/update-docker.sh build
+
+# after review: publish 0.4.7, 0.4 and latest, then verify both platforms
+SPLIME_CONFIRM_DOCKER=yastrebovks/spl-daemon:0.4.7 \
+  release/0.4.7/update-docker.sh push
 ```
 
 To build a single-arch image locally for testing:
 
 ```bash
-docker build -t yastrebovks/spl-daemon:0.4.6 .
+docker build -t yastrebovks/spl-daemon:0.4.7 .
 docker run --rm -p 127.0.0.1:8765:8765 \
-  -v /var/lib/spl-daemon:/var/lib/spl-daemon yastrebovks/spl-daemon:0.4.6
+  -v /var/lib/spl-daemon:/var/lib/spl-daemon yastrebovks/spl-daemon:0.4.7
 ```
 
 ## Security

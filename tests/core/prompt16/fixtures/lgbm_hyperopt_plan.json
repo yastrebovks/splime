@@ -1,0 +1,35 @@
+{
+  "schema": "splime.generated-plan/v1",
+  "schema_version": 1,
+  "kind": "pipeline",
+  "name": "lgbm_hyperopt_pipeline",
+  "nodes": [
+    {"id": "prepare-training", "function": "prepare_training", "runtime": "native"},
+    {"id": "prepare-validation", "function": "prepare_validation", "runtime": "native"},
+    {"id": "train", "function": "train_lgbm", "runtime": "native"},
+    {"id": "objective", "function": "hyperopt_objective", "runtime": "native"},
+    {"id": "search", "function": "run_hyperopt", "runtime": "native"}
+  ],
+  "edges": [
+    {"from": {"kind": "input", "name": "prepare_training__df"}, "to": {"node_id": "prepare-training", "port": "df"}, "adapter": null},
+    {"from": {"kind": "input", "name": "prepare_validation__df"}, "to": {"node_id": "prepare-validation", "port": "df"}, "adapter": null},
+    {"from": {"kind": "node", "node_id": "prepare-training", "port": "default"}, "to": {"node_id": "train", "port": "train_df"}, "adapter": null},
+    {"from": {"kind": "input", "name": "train__target"}, "to": {"node_id": "train", "port": "target"}, "adapter": null},
+    {"from": {"kind": "node", "node_id": "prepare-validation", "port": "default"}, "to": {"node_id": "objective", "port": "validation_df"}, "adapter": null},
+    {"from": {"kind": "input", "name": "objective__params"}, "to": {"node_id": "objective", "port": "params"}, "adapter": null},
+    {"from": {"kind": "input", "name": "objective__target"}, "to": {"node_id": "objective", "port": "target"}, "adapter": null},
+    {"from": {"kind": "input", "name": "search__objective"}, "to": {"node_id": "search", "port": "objective"}, "adapter": null},
+    {"from": {"kind": "input", "name": "search__trials"}, "to": {"node_id": "search", "port": "trials"}, "adapter": null}
+  ],
+  "outputs": [
+    {"name": "best_params", "node_id": "search", "port": "default"}
+  ],
+  "dependencies": [
+    {"package": "hyperopt", "version": "0.2.7", "modules": ["hyperopt"]},
+    {"package": "lightgbm", "version": "4.6.0", "modules": ["lightgbm"]},
+    {"package": "numpy", "version": "2.3.2", "modules": ["numpy"]},
+    {"package": "pandas", "version": "2.3.1", "modules": ["pandas"]},
+    {"package": "scikit-learn", "version": "1.7.1", "modules": ["sklearn"]}
+  ],
+  "adapters": []
+}

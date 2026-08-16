@@ -15,6 +15,7 @@ V045_MIGRATIONS = (
     "20260715_run_retention_delivery_v2",
     "20260715_sync_event_telemetry_v1",
 )
+CURRENT_MIGRATIONS = (*V045_MIGRATIONS, "20260810_library_adapters_v1")
 VERSION_HASHES = (
     (
         "fixture-local-version-1",
@@ -280,8 +281,11 @@ def test_v045_state_survives_bootstrap_reopen_backup_and_restore(
         first_bootstrap = _identity_snapshot(store._conn)
         assert first_bootstrap == baseline
         assert set(row[0] for row in store._conn.execute("SELECT id FROM schema_migrations")).issuperset(
-            V045_MIGRATIONS
+            CURRENT_MIGRATIONS
         )
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert store._conn.execute("SELECT COUNT(*) FROM library_adapters").fetchone()[0] == 0
+        assert store._conn.execute("SELECT COUNT(*) FROM library_adapter_versions").fetchone()[0] == 0
 
     with RegistryStore(home) as reopened:
         reopened._conn.execute("PRAGMA foreign_keys = ON")

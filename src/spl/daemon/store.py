@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal, Mapping
 
 from spl.core.manifest import KeepPolicy
 from spl.daemon.repositories import (
     EnvRepository,
+    LibraryAdapterRepository,
     LibraryRepository,
     ObjectRepository,
     RunRepository,
@@ -66,6 +67,7 @@ class RegistryStore:
         self.server_connections = ServerConnectionRepository(self._storage)
         self.sync_events = SyncEventRepository(self._storage)
         self.libraries = LibraryRepository(self._storage)
+        self.library_adapters = LibraryAdapterRepository(self._storage)
         self.objects = ObjectRepository(self._storage)
         self.runs = RunRepository(self._storage)
         self._storage.register_repositories(
@@ -73,6 +75,7 @@ class RegistryStore:
             self.server_connections,
             self.sync_events,
             self.libraries,
+            self.library_adapters,
             self.objects,
             self.runs,
         )
@@ -455,6 +458,46 @@ class RegistryStore:
     ) -> dict[str, Any]:
         return self.libraries.mark_remote_signature_unavailable(ref, error)
 
+    def publish_library_adapter(
+        self,
+        prepared: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return self.library_adapters.publish_library_adapter(prepared, **kwargs)
+
+    def list_library_adapters(self, **kwargs: Any) -> dict[str, Any]:
+        return self.library_adapters.list_library_adapters(**kwargs)
+
+    def get_library_adapter(self, name_or_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self.library_adapters.get_library_adapter(name_or_id, **kwargs)
+
+    def list_library_adapter_versions(
+        self,
+        name_or_id: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return self.library_adapters.list_library_adapter_versions(name_or_id, **kwargs)
+
+    def get_library_adapter_version(
+        self,
+        version_ref: str | int,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return self.library_adapters.get_library_adapter_version(version_ref, **kwargs)
+
+    def resolve_library_adapter_ref(
+        self,
+        ref: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return self.library_adapters.resolve_library_adapter_ref(ref, **kwargs)
+
+    def library_adapter_remote_link(
+        self,
+        ref: Mapping[str, Any],
+    ) -> dict[str, str]:
+        return self.library_adapters.library_adapter_remote_link(ref)
+
     def register_object(
         self,
         name: str,
@@ -551,6 +594,17 @@ class RegistryStore:
 
     def get_object_decomposition(self, object_version_id: str) -> dict[str, Any]:
         return self.objects.get_object_decomposition(object_version_id)
+
+    def prepared_validation_facts(
+        self,
+        *,
+        base: Mapping[str, Any] | None,
+        environment_ref: str | None,
+    ) -> dict[str, Any]:
+        return self.objects.prepared_validation_facts(
+            base=base,
+            environment_ref=environment_ref,
+        )
 
     def get_object(
         self,
@@ -656,11 +710,22 @@ class RegistryStore:
         function: str | None = None,
         owner_id: str | None = None,
         library: str | None = None,
-        runtimes: dict[str, str] | None = None,
+        runtimes: str | dict[str, str] | None = None,
         keep: KeepPolicy = True,
         parent_run_id: str | None = None,
         resume: dict[str, Any] | None = None,
+        runtime_port_adapters: dict[str, Any] | None = None,
+        runtime_library_adapter_refs: dict[str, Any] | None = None,
+        runtime_adapter_semantic_advisories: dict[str, Any] | None = None,
+        runtime_library_adapter_sources: list[dict[str, Any]] | None = None,
+        _runtime_library_adapter_execution_target: Literal["local", "remote"] = "local",
+        adapter_policy: dict[str, Any] | None = None,
+        custom_remote_allowed: bool = False,
         report_local_run: bool = True,
+        _precommit_check: Callable[[dict[str, Any]], None] | None = None,
+        _postcommit_confirm: Callable[[], None] | None = None,
+        _browser_adapter_admission: dict[str, Any] | None = None,
+        _runtime_adapter_semantic_claim: bool = False,
     ) -> dict[str, Any]:
         return self.runs.create_run(
             object_name,
@@ -677,7 +742,18 @@ class RegistryStore:
             keep=keep,
             parent_run_id=parent_run_id,
             resume=resume,
+            runtime_port_adapters=runtime_port_adapters,
+            runtime_library_adapter_refs=runtime_library_adapter_refs,
+            runtime_adapter_semantic_advisories=runtime_adapter_semantic_advisories,
+            runtime_library_adapter_sources=runtime_library_adapter_sources,
+            _runtime_library_adapter_execution_target=(_runtime_library_adapter_execution_target),
+            adapter_policy=adapter_policy,
+            custom_remote_allowed=custom_remote_allowed,
             report_local_run=report_local_run,
+            _precommit_check=_precommit_check,
+            _postcommit_confirm=_postcommit_confirm,
+            _browser_adapter_admission=_browser_adapter_admission,
+            _runtime_adapter_semantic_claim=_runtime_adapter_semantic_claim,
         )
 
     def update_run(self, run_id: str, **changes: Any) -> dict[str, Any]:

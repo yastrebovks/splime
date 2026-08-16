@@ -196,6 +196,31 @@ capabilities from older Workers remain unknown; the advertisement does not
 override payload bounds, make redaction a privacy boundary, or guarantee that a
 queued Run will execute under an unchanged policy.
 
+Accepted remote execution evidence
+----------------------------------
+
+For a claim-bound remote Run, every terminal update also carries one
+``execution_telemetry`` schema-v1 envelope describing the policy and bounded
+evidence observed for that accepted execution. This is separate from the
+Worker's preflight capability: the capability describes the policy selected
+before queueing, while the terminal envelope is evidence from one actual
+attempt.
+
+The envelope is capped at 64 KiB and contains the telemetry level, observation
+time, redaction mode, result-presence evidence, bounded counts, node metadata,
+hashes, omission codes, and an optional bounded redacted error. Its explicit
+availability fields for inputs, results, streams, and artifact bodies are
+always false. Functional result and requested-artifact delivery use the Run
+protocol independently and are not duplicated into this observability
+envelope.
+
+The central server accepts the envelope only with a fenced terminal Worker
+update, stamps its receipt time and accepted claim-attempt number in the same
+transaction, and exposes it on Run detail. Historical Runs without an accepted
+envelope remain ``unknown``. A stale claim cannot replace accepted evidence,
+and malformed or corrupted stored evidence is omitted rather than interpreted
+as a more permissive policy.
+
 Worker operations evidence
 --------------------------
 

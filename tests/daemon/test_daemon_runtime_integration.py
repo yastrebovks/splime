@@ -112,6 +112,14 @@ def _worker_explicit_artifact_payload() -> dict[str, Any]:
     }
 
 
+def _worker_parse_length(text: str) -> int:
+    return len(text)
+
+
+def _worker_scale_length(n: int) -> int:
+    return n * 10
+
+
 def _worker_slow_marker(marker_path: str) -> str:
     import time
     from pathlib import Path
@@ -1392,6 +1400,30 @@ def test_pipeline_output_normalizer_extracts_nested_explicit_artifacts(
     assert (tmp_path / "artifacts" / "nested.txt").read_text(encoding="utf-8") == "nested daemon artifact"
 
 
+def test_pipeline_output_selector_completes_downstream_nodes_before_close(tmp_path: Path) -> None:
+    parsed = lift(_worker_parse_length).alias("parse")
+    pipeline = lift(_worker_scale_length).bind(n=parsed).alias("total").render("selected_intermediate_output")
+
+    result, artifacts, manifest = run_pipeline(
+        pipeline,
+        {"text": "TODO"},
+        "parse",
+        daemon_url="http://127.0.0.1:8765",
+        timeout_seconds=None,
+        artifacts_dir=tmp_path / "artifacts",
+        include_manifest=True,
+    )
+
+    assert result == {"default": 4}
+    assert artifacts == {}
+    assert manifest is not None
+    assert manifest["status"] == "succeeded"
+    assert {node["alias"]: node["status"] for node in manifest["nodes"].values()} == {
+        "parse": "succeeded",
+        "total": "succeeded",
+    }
+
+
 def test_pipeline_output_normalizer_reports_missing_adapter_path(tmp_path) -> None:
     pipeline = lift(_worker_final_unadapted_bytes).alias("thumbnail").render("thumbnail_pipeline")
 
@@ -1568,6 +1600,45 @@ def test_node_docker_start_run_without_docker_selection_is_zero_cost(tmp_path, m
         store.close()
 
 
+def test_function_run_admission_does_not_import_user_dependencies(tmp_path, monkeypatch) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        store.register_env("default", sys.executable)
+        runtime = DaemonRuntime(store, auto_build_envs=False)
+        monkeypatch.setattr(runtime, "_execute_run", lambda run_id, report_local_run=True: None)
+        missing_module = "splime_test_dependency_that_is_not_installed"
+        yaml_text = f"""\
+- !DFunction
+  name: dependency_isolated_function
+  inputs: []
+  outputs:
+  - name: default
+    type: int
+  body: return {missing_module}.value
+- !DImport
+  module: {missing_module}
+  alias: null
+"""
+        runtime.register_object(
+            "dependency_isolated_function",
+            "dependency_isolated_function",
+            "default",
+            yaml_text=yaml_text,
+        )
+
+        started = runtime.start_run(
+            "dependency_isolated_function",
+            source="local",
+            report_local_run=False,
+        )
+
+        assert started["status"] == "starting"
+        assert started["started_at"] is None
+        assert started["error"] is None
+    finally:
+        store.close()
+
+
 def test_node_docker_explicit_image_bypasses_daemon_build(tmp_path, monkeypatch) -> None:
     runtime_config = {"docker": {"image": "python:3.13-slim", "network": "none"}}
     local_environment = _local_node_docker_environment(tmp_path, runtime_config)
@@ -1652,6 +1723,73 @@ def test_node_docker_run_override_prepares_image(tmp_path, monkeypatch) -> None:
         state = store.get_run(started["id"])
         assert len(docker_manager.calls) == 1
         assert state["input"]["node_runtime_environments"]["docker"]["image_tag"] == "splime-runtime:from-override"
+    finally:
+        store.close()
+
+
+def test_pipeline_string_docker_override_prepares_all_node_runtime_support(tmp_path, monkeypatch) -> None:
+    store = RegistryStore(tmp_path)
+    docker_manager = _FakeDockerEnvironmentManager(image_tag="splime-runtime:all-functions")
+    try:
+        store.register_env("default", sys.executable)
+        runtime = DaemonRuntime(store, auto_build_envs=False, docker_environment_manager=docker_manager)
+        monkeypatch.setattr(runtime, "_execute_run", lambda run_id, report_local_run=True: None)
+        pipeline = _node_docker_pipeline("all_docker_pipeline", tag_consumer=False)
+        yaml_path = tmp_path / "all_docker_pipeline.yaml"
+        spl_export_to_file(yaml_path, [pipeline])
+        runtime.register_object(
+            "all_docker_pipeline",
+            "all_docker_pipeline",
+            "default",
+            yaml_text=yaml_path.read_text(encoding="utf-8"),
+        )
+
+        started = runtime.start_run(
+            "all_docker_pipeline",
+            output="consumer",
+            source="local",
+            report_local_run=False,
+            runtimes="docker",
+        )
+
+        state = store.get_run(started["id"])
+        assert state["input"]["runtimes"] == "docker"
+        assert state["input"]["runtime_config"]["mode"] == "venv"
+        assert state["input"]["node_runtime_environments"]["docker"]["image_tag"] == ("splime-runtime:all-functions")
+    finally:
+        store.close()
+
+
+def test_function_string_docker_override_is_run_scoped_object_runtime(tmp_path, monkeypatch) -> None:
+    store = RegistryStore(tmp_path)
+    try:
+        store.register_env("default", sys.executable)
+        runtime = DaemonRuntime(store, auto_build_envs=False)
+        monkeypatch.setattr(runtime, "_execute_run", lambda run_id, report_local_run=True: None)
+        runtime.register_object(
+            "artifact_func",
+            "artifact_func",
+            "default",
+            yaml_text=ARTIFACT_FUNCTION_YAML,
+        )
+
+        started = runtime.start_run(
+            "artifact_func",
+            source="local",
+            report_local_run=False,
+            runtimes="docker",
+        )
+        state = store.get_run(started["id"])
+        assert state["input"]["runtimes"] == "docker"
+        assert state["input"]["runtime_config"]["mode"] == "docker"
+
+        with pytest.raises(ValueError, match="per-node mappings are supported only for Pipelines"):
+            runtime.start_run(
+                "artifact_func",
+                source="local",
+                report_local_run=False,
+                runtimes={"artifact_func": "docker"},
+            )
     finally:
         store.close()
 
@@ -2053,7 +2191,7 @@ def test_docker_runtime_config_is_persisted_and_command_is_constructed(
         worker.parent.mkdir(parents=True)
         worker.write_text("# worker", encoding="utf-8")
         framework_src = tmp_path / "framework-src"
-        framework_src.mkdir()
+        (framework_src / "spl").mkdir(parents=True)
         monkeypatch.setattr(
             runtime.docker_pool,
             "source_roots",
@@ -2092,6 +2230,9 @@ def test_docker_runtime_config_is_persisted_and_command_is_constructed(
         assert not any(str(workdir.resolve()) in item for item in command)
         assert "/workspace" not in command
         assert command[command.index("-w") + 1] == "/work"
+        assert f"{daemon_src / 'spl'}:/opt/splime/src0/spl:ro" in command
+        assert f"{framework_src / 'spl'}:/opt/splime/src1/spl:ro" in command
+        assert f"{daemon_src}:/opt/splime/src0:ro" not in command
         assert "PYTHONPATH=/opt/splime/src0:/opt/splime/src1" in command
         assert "SPL_OBJECT_RUNTIME_BACKEND=docker" in command
         assert "SPL_OBJECT_DOCKER_WORKER=1" in command

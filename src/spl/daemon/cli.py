@@ -89,6 +89,18 @@ def read_runtime_config(
     return config
 
 
+def _remote_custom_adapters_env_default() -> bool:
+    value = os.environ.get("SPL_DAEMON_ALLOW_REMOTE_CUSTOM_ADAPTERS")
+    if value is None or not value.strip():
+        return False
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("SPL_DAEMON_ALLOW_REMOTE_CUSTOM_ADAPTERS must be a boolean (1/0, true/false, yes/no, or on/off)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the top-level CLI parser."""
 
@@ -109,6 +121,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=DEFAULT_DAEMON_PORT)
     serve.add_argument("--home", type=Path, default=None)
+    serve.add_argument(
+        "--startup-binding-fd",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     serve.add_argument(
         "--auto-port",
         dest="auto_port",
@@ -174,6 +192,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--docker-prewarm",
         action="store_true",
         help="after Docker object registration, build the image and warm a pooled container",
+    )
+    serve.add_argument(
+        "--allow-remote-custom-adapters",
+        action="store_true",
+        default=_remote_custom_adapters_env_default(),
+        help=(
+            "permit claim-bound custom adapter bundles on this machine; disabled "
+            "by default and also configurable with SPL_DAEMON_ALLOW_REMOTE_CUSTOM_ADAPTERS"
+        ),
     )
     serve.add_argument(
         "--telemetry",
@@ -569,8 +596,10 @@ def main(argv: list[str] | None = None) -> int:
                 docker_pool_size=args.docker_pool_size,
                 docker_idle_timeout_seconds=args.docker_idle_timeout,
                 docker_prewarm=args.docker_prewarm,
+                allow_remote_custom_adapters=args.allow_remote_custom_adapters,
                 telemetry=args.telemetry,
                 telemetry_sensitive_fields=args.telemetry_sensitive_field,
+                startup_binding_fd=args.startup_binding_fd,
             )
             return 0
         except Exception as exc:

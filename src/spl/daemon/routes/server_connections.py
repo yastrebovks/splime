@@ -3,8 +3,18 @@
 from __future__ import annotations
 
 from http import HTTPStatus
-from typing import Any
+from typing import Any, cast
 
+from spl.daemon.connected_ide import (
+    CONNECTED_CREDENTIALS_REVEAL_ROUTE,
+    MAX_CONNECTED_BODY_BYTES,
+    ConnectedIDEContractError,
+    build_connected_credentials_reveal_response,
+    connected_error_document,
+    connected_request_path,
+    install_connected_request_limit,
+    parse_connected_credentials_reveal_request,
+)
 from spl.daemon.remote_client import DEFAULT_SERVER_URL, ServerClientError
 from spl.daemon.routes._helpers import RouteContext, RouteRegistrar
 
@@ -17,6 +27,18 @@ def register_server_connection_routes(
 ) -> None:
     route_errors = context.route_errors
     json_response = context.json_response
+    route_app = cast(Any, app)
+    install_connected_request_limit(route_app)
+
+    if not getattr(route_app, "_spl_connected_no_store", False):
+
+        async def connected_no_store(response: Any) -> Any:
+            if connected_request_path(str(context.request.path)):
+                response.headers["Cache-Control"] = "no-store"
+            return response
+
+        route_app.after_request(connected_no_store)
+        route_app._spl_connected_no_store = True
 
     @app.get("/server/connection")
     @route_errors
@@ -32,6 +54,45 @@ def register_server_connection_routes(
     @route_errors
     async def list_server_connections() -> Any:
         return json_response(runtime.store.list_server_connections())
+
+    @app.post(CONNECTED_CREDENTIALS_REVEAL_ROUTE)
+    async def reveal_server_connection_credentials() -> Any:
+        operation = "connected_credentials_reveal"
+        try:
+            raw = await _read_connected_body(context)
+            request = parse_connected_credentials_reveal_request(raw)
+            credentials = await context.run_blocking(runtime.store.current_server_connection_credentials)
+            if credentials is None or credentials.get("id") != request.connection_id:
+                raise ConnectedIDEContractError(
+                    "credential_reveal_unavailable",
+                    HTTPStatus.CONFLICT,
+                )
+            try:
+                document = build_connected_credentials_reveal_response(
+                    credentials,
+                    forbidden_values=(context.local_api_token,),
+                )
+            except ConnectedIDEContractError as exc:
+                if exc.code == "credential_reveal_unavailable":
+                    raise
+                raise ConnectedIDEContractError(
+                    "credential_reveal_unavailable",
+                    HTTPStatus.CONFLICT,
+                ) from exc
+        except ConnectedIDEContractError as exc:
+            return _connected_error_response(context, exc, operation)
+        except Exception:
+            return _connected_error_response(
+                context,
+                ConnectedIDEContractError(
+                    "credential_reveal_unavailable",
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                ),
+                operation,
+            )
+        response = json_response(document)
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.get("/server/users")
     @route_errors
@@ -53,17 +114,26 @@ def register_server_connection_routes(
     @route_errors
     async def prune_server_connections() -> Any:
         older_than_days = context.optional_int_query("older_than_days")
-        return json_response(
-            runtime.store.prune_server_connections(
-                older_than_days=30 if older_than_days is None else older_than_days,
-                dry_run=context.strict_query_bool("dry_run"),
+        dry_run = context.strict_query_bool("dry_run")
+        prune_kwargs = {
+            "older_than_days": 30 if older_than_days is None else older_than_days,
+            "dry_run": dry_run,
+        }
+        if dry_run:
+            result = runtime.store.prune_server_connections(**prune_kwargs)
+        else:
+            result = runtime.run_registry_mutation(
+                runtime.store.prune_server_connections,
+                **prune_kwargs,
             )
-        )
+        return json_response(result)
 
     @app.get("/server/sync/status")
     @route_errors
     async def sync_status() -> Any:
-        return json_response(runtime.sync_status())
+        return json_response(
+            runtime.sync_status(include_identity_scope=context.query_bool("identity_scope", accept_on=False))
+        )
 
     @app.post("/server/sync/prune")
     @route_errors
@@ -199,3 +269,42 @@ def _is_technical_machine_label(value: Any, machine_id: str) -> bool:
     if suffix.startswith(("_", "-")):
         suffix = suffix[1:]
     return len(suffix) >= 8 and all(char in "0123456789abcdef" for char in suffix)
+
+
+async def _read_connected_body(context: RouteContext) -> bytes:
+    if context.request.mimetype != "application/json":
+        raise ConnectedIDEContractError("request_invalid", HTTPStatus.BAD_REQUEST)
+    content_length = context.request.content_length
+    if content_length is not None and content_length > MAX_CONNECTED_BODY_BYTES:
+        raise ConnectedIDEContractError(
+            "body_too_large",
+            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+        )
+    try:
+        raw = await context.request.get_data(cache=False)
+    except Exception as exc:
+        too_large = getattr(exc, "code", None) == int(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        raise ConnectedIDEContractError(
+            "body_too_large" if too_large else "request_invalid",
+            (HTTPStatus.REQUEST_ENTITY_TOO_LARGE if too_large else HTTPStatus.BAD_REQUEST),
+        ) from exc
+    if not isinstance(raw, bytes):
+        raise ConnectedIDEContractError("request_invalid", HTTPStatus.BAD_REQUEST)
+    return raw
+
+
+def _connected_error_response(
+    context: RouteContext,
+    error: ConnectedIDEContractError,
+    operation: str,
+) -> Any:
+    response = context.json_response(
+        connected_error_document(
+            error.code,
+            operation,
+            retryable=error.retryable,
+        ),
+        error.status,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response

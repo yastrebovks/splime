@@ -1034,6 +1034,7 @@ def test_sync_status_and_prune_routes_are_bounded_and_protect_object_events(tmp_
 
         connection_status, connection = _json_from_app(app, "/server/connection")
         status_code, status = _json_from_app(app, "/server/sync/status")
+        scoped_status_code, scoped_status = _json_from_app(app, "/server/sync/status?identity_scope=true")
         prune_code, pruned = _post_json_from_app(
             app,
             "/server/sync/prune?status=pending&older_than_days=0&limit=1000",
@@ -1056,6 +1057,12 @@ def test_sync_status_and_prune_routes_are_bounded_and_protect_object_events(tmp_
         assert status_code == 200
         assert status["breaker"] == connection["breaker"]
         assert status["by_status"] == {"pending": 2}
+        assert "identity_scope" not in status
+        assert scoped_status_code == 200
+        assert scoped_status["identity_scope"] == {
+            "current_owner_pending": 2,
+            "held_for_other_identities": 0,
+        }
         assert status["heartbeat"]["thread_alive"] is False
         assert prune_code == 200
         assert [row["id"] for row in pruned["pruned"]] == [telemetry["id"]]
@@ -1079,6 +1086,7 @@ def test_health_and_connections_include_sync_events_held_for_other_identities(tm
         app = create_app(store)
         health_status, health = _json_from_app(app, "/health")
         connections_status, connections = _json_from_app(app, "/server/connections")
+        sync_status_code, sync_status = _json_from_app(app, "/server/sync/status?identity_scope=true")
 
         assert health_status == 200
         assert health["server"]["connection_summary"]["held_sync_events"] == 1
@@ -1088,6 +1096,11 @@ def test_health_and_connections_include_sync_events_held_for_other_identities(tm
         current_row = next(row for row in connections if row["id"] == current["id"])
         assert current_row["held_sync_events"] == 1
         assert current_row["pending_sync_events"] == 0
+        assert sync_status_code == 200
+        assert sync_status["identity_scope"] == {
+            "current_owner_pending": 0,
+            "held_for_other_identities": 1,
+        }
     finally:
         _shutdown_app(app)
         store.close()
@@ -2670,6 +2683,47 @@ def test_daemon_pipeline_venv_subprocess_uses_ir_source_for_yaml_functions(tmp_p
             "config_hash": consumer["runtime"]["config_hash"],
             "resolved": consumer["runtime"]["resolved"],
         } in observed["run_progress"]["node_runtimes"]
+    finally:
+        _shutdown_app(app)
+        store.close()
+
+
+def test_daemon_pipeline_string_runtime_applies_to_all_function_nodes_via_http(tmp_path) -> None:
+    store = RegistryStore(tmp_path)
+    app = None
+    try:
+        store.register_env("default", sys.executable)
+        store.register_object(
+            "daemon_all_venv_pipeline",
+            "daemon_venv_pipeline",
+            "default",
+            yaml_text=VENV_SUBPROCESS_PIPELINE_YAML,
+        )
+        app = create_app(store, auto_build_envs=False)
+
+        status, started = _post_json_from_app(
+            app,
+            "/runs",
+            {
+                "object": "daemon_all_venv_pipeline",
+                "output": "consumer",
+                "source": "local",
+                "keep": True,
+                "runtimes": "venv-subprocess",
+            },
+        )
+        assert status == 202
+        final = _wait_store_run(store, started["id"])
+
+        assert final["status"] == "succeeded"
+        assert final["input"]["runtimes"] == "venv-subprocess"
+        assert {
+            node["alias"]: (node["runtime"]["name"], node["runtime"]["source"])
+            for node in final["manifest"]["nodes"].values()
+        } == {
+            "consumer": ("venv-subprocess", "run-override"),
+            "seed": ("venv-subprocess", "run-override"),
+        }
     finally:
         _shutdown_app(app)
         store.close()

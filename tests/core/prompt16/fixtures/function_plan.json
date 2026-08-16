@@ -1,0 +1,11 @@
+{
+  "schema": "splime.generated-plan/v1",
+  "schema_version": 1,
+  "kind": "function",
+  "name": "add_values",
+  "nodes": [],
+  "edges": [],
+  "outputs": [],
+  "dependencies": [],
+  "adapters": []
+}

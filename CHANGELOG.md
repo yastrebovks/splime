@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-08-16
+
+### Added
+
+- `SPLClient.call()` and `submit()` now accept closed per-Run `adapters`
+  mappings for independent input and output transport. The public registry
+  includes inline JSON, opaque files, UTF-8 text files, binary files,
+  DataFrame JSON-split/semicolon-CSV/XLSX, and PNG/Pillow; custom adapters use
+  the same generic lifecycle without adding library branches to the Run core.
+- Adapter-backed remote Runs use atomic input/bundle admission, verified
+  content identities, claim-fenced downloads and explicit two-sided policy for
+  custom code. `FileInput` stages an existing regular file without decoding it
+  in the caller.
+- Immutable Library Adapters can be published, synchronized and selected by
+  owner, Library, name and exact version. Load-only, save-only and bidirectional
+  resources are supported; semantic type/category metadata ranks choices but
+  never blocks an explicit user selection.
+- The daemon exposes authenticated, browser-safe IDE metadata, guarded local
+  Run admission, lifecycle, source-analysis/preparation, deterministic AI
+  Preview relay and Library Adapter catalog/publication contracts. Every new
+  surface is additive and capability-gated.
+- Runtime selection accepts an object-wide runtime or a per-Function mapping,
+  including mixed native, virtual-environment and Docker execution within a
+  Pipeline.
+
+### Compatibility
+
+- Omitting `adapters` preserves the legacy JSON request/result shape. Existing
+  `Deployment.run()` edge adapters, `.as_format(...)`, resume behavior and
+  immutable Object source/version identities are unchanged.
+- Existing clients that do not understand the new capabilities continue to use
+  the 0.4.6 JSON and Object/Run contracts. Missing capabilities fail closed
+  only for the newly requested operation.
+
+### Fixed
+
+- Default adapter artifact staging now canonicalizes the trusted macOS system
+  temporary root before no-follow traversal, while user-provided destinations
+  remain unresolved and symlink traversal remains rejected.
+- Remote Run request matching treats an omitted empty Library Adapter reference
+  projection as equivalent to the canonical empty schema-v3 projection,
+  without weakening non-empty exact-version checks.
+
 ## [0.4.6] - 2026-07-30
 
 ### Added
@@ -573,7 +616,8 @@ here. No breaking API changes.
 - Initial release: turn trusted Python functions into versioned, portable nodes
   reusable across projects and executed locally or remotely.
 
-[Unreleased]: https://github.com/yastrebovks/splime/compare/v0.4.6...HEAD
+[Unreleased]: https://github.com/yastrebovks/splime/compare/v0.4.7...HEAD
+[0.4.7]: https://github.com/yastrebovks/splime/compare/v0.4.6...v0.4.7
 [0.4.6]: https://github.com/yastrebovks/splime/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/yastrebovks/splime/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/yastrebovks/splime/compare/v0.4.3...v0.4.4

@@ -28,7 +28,7 @@ def register_env_routes(
     async def register_env() -> Any:
         body = await context.read_json_body()
         return json_response(
-            runtime.store.register_env(body["name"], body.get("python")),
+            runtime.register_env(body["name"], body.get("python")),
             HTTPStatus.CREATED,
         )
 
@@ -76,5 +76,8 @@ def register_env_routes(
         body = await context.read_json_body()
         spec_hash = body.get("spec_hash")
         return json_response(
-            runtime.docker_environment_manager.prune_images(validate_name(spec_hash) if spec_hash else None)
+            runtime.run_registry_mutation(
+                runtime.docker_environment_manager.prune_images,
+                validate_name(spec_hash) if spec_hash else None,
+            )
         )

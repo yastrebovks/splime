@@ -1,0 +1,43 @@
+{
+  "expected": {
+    "content_hash": "5b1fd99334e6dd907373cde0fc69b97705ebe8d8826028d6e8ec2e3dfbe2cfa4",
+    "environment_fingerprint": "fbe05d0cca5a1497ea3d059b3ed39805775f4ba5ca29a68431060dfed0eeaf06",
+    "load_source": "def load_frame(path: str) -> 'pandas.DataFrame':\n    import pandas\n    return pandas.read_csv(path, sep=';')\n",
+    "save_source": "def save_frame(path: str, value: 'pandas.DataFrame') -> None:\n    import pandas\n    value.to_csv(path, sep=';', index=False)\n",
+    "signature_hash": "ab3b642fefde2b386cf7406263f7148aed4f33b7d17f542137a038efa426bc2b"
+  },
+  "request": {
+    "dependencies": [
+      {
+        "modules": [
+          "pandas"
+        ],
+        "package": "pandas",
+        "version": "2.2.3"
+      }
+    ],
+    "description": "Présentation Καλημέρα — 東京",
+    "format_tag": null,
+    "load_source": "def load_frame(path: str) -> 'pandas.DataFrame':\n    import pandas\n    return pandas.read_csv(path, sep=';')\n",
+    "media_type": null,
+    "name": "pandas-csv-semicolon",
+    "policy": {
+      "local_custom_code": "allow",
+      "remote_custom_code": "deny"
+    },
+    "preferred_extension": null,
+    "publication_environment": {
+      "distributions": [
+        {
+          "package": "pandas",
+          "version": "2.2.3"
+        }
+      ],
+      "fingerprint": "fbe05d0cca5a1497ea3d059b3ed39805775f4ba5ca29a68431060dfed0eeaf06"
+    },
+    "save_source": "def save_frame(path: str, value: 'pandas.DataFrame') -> None:\n    import pandas\n    value.to_csv(path, sep=';', index=False)\n",
+    "schema_version": 1,
+    "semantic_category": "table",
+    "semantic_type": "pandas.core.frame.DataFrame"
+  }
+}

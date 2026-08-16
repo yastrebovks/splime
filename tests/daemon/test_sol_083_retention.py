@@ -24,9 +24,9 @@ import spl.daemon.repositories.run as run_repository_module
 from spl.daemon.remote_client import ServerClientError
 from spl.daemon.server import DaemonRuntime, create_app
 from spl.daemon.storage_base import (
+    LIBRARY_ADAPTER_SCHEMA_VERSION,
     RUN_RETENTION_DELIVERY_MIGRATION_ID,
     RUN_RETENTION_MIGRATION_ID,
-    SYNC_EVENT_TELEMETRY_SCHEMA_VERSION,
 )
 from spl.daemon.store import RegistryStore
 from spl.daemon.worker_runtime_marker import WORKER_MANIFEST_HANDOFF_FILE
@@ -538,7 +538,7 @@ def test_run_retention_migration_grandfathers_rows_and_is_idempotent(
                 ).fetchone()[0]
                 == 1
             )
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == SYNC_EVENT_TELEMETRY_SCHEMA_VERSION
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == LIBRARY_ADAPTER_SCHEMA_VERSION
             assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
             assert [row[0] for row in conn.execute("PRAGMA integrity_check").fetchall()] == ["ok"]
     finally:
@@ -630,7 +630,7 @@ def test_recorded_retention_v1_adds_delivery_v2_without_data_loss(tmp_path: Path
             (RUN_RETENTION_DELIVERY_MIGRATION_ID,),
         ).fetchone()[0]
         assert v2_applied_at
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SYNC_EVENT_TELEMETRY_SCHEMA_VERSION
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == LIBRARY_ADAPTER_SCHEMA_VERSION
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         assert [row[0] for row in conn.execute("PRAGMA integrity_check").fetchall()] == ["ok"]
 

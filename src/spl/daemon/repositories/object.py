@@ -7,7 +7,7 @@ import logging
 import os
 import sqlite3
 from pathlib import Path
-from typing import Any, Callable, cast
+from typing import Any, Callable, Mapping, cast
 from uuid import uuid4
 
 from spl.daemon.canonical import canonical_object_definition, canonicalize
@@ -1311,6 +1311,80 @@ class ObjectRepository(RepositoryBase):
             raise ValueError(f"object display name is ambiguous locally: {name_or_id}; use one of: {names}")
         [row] = rows
         return self._object_row_to_record(row, include_yaml=include_yaml)
+
+    def prepared_validation_facts(
+        self,
+        *,
+        base: Mapping[str, Any] | None,
+        environment_ref: str | None,
+    ) -> dict[str, Any]:
+        """Return the narrow immutable facts used by prepared validation.
+
+        This deliberately does not call the ordinary Object projection: that
+        projection probes interpreter metadata and constructs filesystem
+        paths.  The validation endpoint needs only exact registry identity,
+        current-version identity, content hashes, and whether a named
+        environment is registered.
+        """
+
+        base_facts: dict[str, Any] | None = None
+        with self._lock:
+            if base is not None:
+                row = self._conn.execute(
+                    """
+                    SELECT
+                        o.id AS object_id,
+                        o.owner_id AS owner_id,
+                        o.library AS library_id,
+                        o.current_version_id AS current_version_id,
+                        ov.id AS version_id,
+                        ov.version AS version,
+                        COALESCE(o.kind, ov.kind) AS kind,
+                        ov.content_hash AS content_hash,
+                        current_ov.content_hash AS current_content_hash
+                    FROM objects o
+                    LEFT JOIN object_versions ov
+                      ON ov.object_id = o.id AND ov.id = ?
+                    LEFT JOIN object_versions current_ov
+                      ON current_ov.object_id = o.id
+                     AND current_ov.id = o.current_version_id
+                    WHERE o.id = ?
+                    """,
+                    (base["version_id"], base["object_id"]),
+                ).fetchone()
+                if row is None:
+                    base_facts = {
+                        "object_found": False,
+                        "version_found": False,
+                    }
+                else:
+                    base_facts = {
+                        "object_found": True,
+                        "version_found": row["version_id"] is not None,
+                        "owner_id": row["owner_id"],
+                        "library_id": row["library_id"],
+                        "object_id": row["object_id"],
+                        "version_id": row["version_id"],
+                        "version": row["version"],
+                        "kind": row["kind"],
+                        "content_hash": row["content_hash"],
+                        "current_version_id": row["current_version_id"],
+                        "current_content_hash": row["current_content_hash"],
+                    }
+
+            environment_facts: dict[str, Any] | None = None
+            if environment_ref is not None:
+                environment_row = self._conn.execute(
+                    "SELECT name FROM envs WHERE name = ?",
+                    (environment_ref,),
+                ).fetchone()
+                environment_facts = {
+                    "registered": environment_row is not None,
+                }
+        return {
+            "base": base_facts,
+            "environment": environment_facts,
+        }
 
     def get_object_version(
         self,

@@ -17,6 +17,7 @@ from spl.daemon.callback_capability import (
 )
 from spl.daemon.remote_client import ServerClientError
 from spl.daemon.runtime_dependencies import ServerClientProtocol
+from spl.daemon.storage_base import validate_name
 from spl.daemon.server_connection import (
     SERVER_PROXY_TIMEOUT_SECONDS,
     SERVER_UNREACHABLE_CODE,
@@ -222,19 +223,30 @@ class RouteContext:
             return value
         raise ValueError(f"JSON field {name!r} must be a boolean; received {value!r}")
 
-    def connected_server_client(self) -> tuple[dict[str, Any], ServerClientProtocol]:
+    def connected_server_client(
+        self,
+        *,
+        request_timeout_seconds: float = SERVER_PROXY_TIMEOUT_SECONDS,
+    ) -> tuple[dict[str, Any], ServerClientProtocol]:
         credentials = self.runtime._require_live_server_channel_credentials()
         return credentials, self.runtime._server_client_for_credentials(
             credentials,
-            request_timeout_seconds=SERVER_PROXY_TIMEOUT_SECONDS,
+            request_timeout_seconds=request_timeout_seconds,
         )
 
-    async def connected_server_client_async(self) -> tuple[dict[str, Any], ServerClientProtocol]:
+    async def connected_server_client_async(
+        self,
+        *,
+        request_timeout_seconds: float = SERVER_PROXY_TIMEOUT_SECONDS,
+    ) -> tuple[dict[str, Any], ServerClientProtocol]:
         """Acquire a live server client without blocking the daemon event loop."""
 
         return cast(
             tuple[dict[str, Any], ServerClientProtocol],
-            await self.run_blocking(self.connected_server_client),
+            await self.run_blocking(
+                self.connected_server_client,
+                request_timeout_seconds=request_timeout_seconds,
+            ),
         )
 
     def object_function_ref(self, name_or_id: str) -> tuple[str, str | None]:
@@ -250,8 +262,24 @@ class RouteContext:
         include_yaml: bool = False,
     ) -> dict[str, Any]:
         version = self.optional_int_query("version")
+        version_id = self.first_query_value("version_id")
         owner_id = self.first_query_value("owner", "owner_id")
         library = self.first_query_value("library")
+        if version_id is not None:
+            if version is not None:
+                raise ValueError("version and version_id cannot both select a signature")
+            record = cast(
+                dict[str, Any],
+                self.runtime.store.get_object_version(validate_name(version_id), include_yaml=include_yaml),
+            )
+            if name_or_id not in {record.get("name"), record.get("id")}:
+                raise ValueError("version_id does not belong to the requested Object")
+            resolved_owner = self.runtime.resolve_user_ref(owner_id) if owner_id is not None else None
+            if resolved_owner is not None and record.get("owner_id") != resolved_owner:
+                raise ValueError("version_id does not belong to the requested owner")
+            if library is not None and record.get("library") != library:
+                raise ValueError("version_id does not belong to the requested library")
+            return record
         refresh = await self.run_blocking(
             self.runtime.refresh_server_object_if_available,
             name_or_id,

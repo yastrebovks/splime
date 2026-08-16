@@ -22,6 +22,15 @@ spl.daemon.repositories.library module
    :show-inheritance:
    :undoc-members:
 
+spl.daemon.repositories.library\_adapter module
+-----------------------------------------------
+
+.. automodule:: spl.daemon.repositories.library_adapter
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.daemon.repositories.object module
 -------------------------------------
 

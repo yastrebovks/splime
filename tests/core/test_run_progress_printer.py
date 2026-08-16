@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from spl._client import RemoteRun, _progress_callback
-from spl.daemon_client import Client, RunProgressPrinter, _format_duration
+from spl.daemon_client import Client, ClientError, RunProgressPrinter, _format_duration
 
 
 class FakeClock:
@@ -213,6 +213,21 @@ class SequenceClient(Client):
         return next(self._states)
 
 
+class RemoteSequenceClient(Client):
+    """Return remote states or raise the queued client errors in order."""
+
+    def __init__(self, results: list[dict[str, Any] | ClientError]):
+        self.base_url = "http://test.invalid"
+        self.api_token = None
+        self._results = iter(results)
+
+    def get_remote_run(self, run_id: str) -> dict[str, Any]:
+        result = next(self._results)
+        if isinstance(result, ClientError):
+            raise result
+        return result
+
+
 class TestWaitLoopCallback:
     def test_wait_run_invokes_callback_for_every_state(self) -> None:
         states = [
@@ -244,6 +259,27 @@ class TestWaitLoopCallback:
         assert final["status"] == "succeeded"
         assert seen == ["queued", "succeeded"]
 
+    def test_wait_remote_run_survives_transient_status_read_failure(self) -> None:
+        transient = ClientError("502: upstream timed out", status_code=502)
+        client = RemoteSequenceClient([transient, {"status": "running"}, {"status": "succeeded"}])
+        seen: list[str] = []
+
+        final = client.wait_remote_run(
+            "run-1",
+            poll_interval=0.0,
+            timeout_seconds=10.0,
+            on_state=lambda state: seen.append(state["status"]),
+        )
+
+        assert final["status"] == "succeeded"
+        assert seen == ["running", "succeeded"]
+
+    def test_wait_remote_run_does_not_hide_non_transient_failure(self) -> None:
+        denied = ClientError("403: forbidden", status_code=403)
+
+        with pytest.raises(ClientError, match="403: forbidden"):
+            RemoteSequenceClient([denied]).wait_remote_run("run-1", poll_interval=0.0, timeout_seconds=10.0)
+
     def test_callback_exception_aborts_wait(self) -> None:
         def explode(state: dict[str, Any]) -> None:
             raise RuntimeError("observer failed")
@@ -264,6 +300,16 @@ class RecordingDaemon:
     def wait_run(self, run_id: str, **kwargs: Any) -> dict[str, Any]:
         self.wait_run_kwargs = kwargs
         return self.final_state
+
+
+class RecordingRemoteDaemon:
+    def __init__(self, state: dict[str, Any]):
+        self.state = state
+        self.get_calls = 0
+
+    def get_remote_run(self, run_id: str) -> dict[str, Any]:
+        self.get_calls += 1
+        return self.state
 
 
 class TestProgressOption:
@@ -295,3 +341,23 @@ class TestProgressOption:
 
         run.wait()
         assert isinstance(daemon.wait_run_kwargs["on_state"], RunProgressPrinter)
+
+    def test_terminal_remote_result_uses_complete_wait_snapshot(self) -> None:
+        daemon = RecordingRemoteDaemon({"id": "run-1", "status": "succeeded", "result": {"output": 2}})
+        client = SimpleNamespace(_daemon=daemon)
+        run = RemoteRun(
+            client,
+            {"id": "run-1", "status": "succeeded", "result": {"output": 2}},
+            server_side=True,
+        )
+
+        assert run.result() == {"output": 2}
+        assert daemon.get_calls == 0
+
+    def test_nonterminal_remote_result_still_refreshes(self) -> None:
+        daemon = RecordingRemoteDaemon({"id": "run-1", "status": "succeeded", "result": {"output": 2}})
+        client = SimpleNamespace(_daemon=daemon)
+        run = RemoteRun(client, {"id": "run-1", "status": "running"}, server_side=True)
+
+        assert run.result() == {"output": 2}
+        assert daemon.get_calls == 1
