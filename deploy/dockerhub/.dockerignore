@@ -1,3 +1,3 @@
-# This image installs splime from PyPI and copies nothing from the build
-# context, so ignore everything to keep the context empty and builds fast.
+# This image installs splime from PyPI and copies no local source or payload.
+# Ignore the bounded release context so builds stay private and fast.
 *

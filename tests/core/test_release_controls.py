@@ -52,14 +52,16 @@ def test_canonical_docker_context_is_exact_bounded_and_private_free() -> None:
     assert all((DOCKER_ROOT / name).is_file() for name in expected)
     assert all(not (DOCKER_ROOT / name).is_symlink() for name in expected)
     assert (DOCKER_ROOT / ".dockerignore").read_text(encoding="utf-8") == (
-        "# This image installs splime from PyPI and copies nothing from the build\n"
-        "# context, so ignore everything to keep the context empty and builds fast.\n"
+        "# This image installs splime from PyPI and copies no local source or payload.\n"
+        "# Ignore the bounded release context so builds stay private and fast.\n"
         "*\n"
     )
     dockerfile = (DOCKER_ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY ." not in dockerfile
     assert dockerfile.count("COPY ") == 1
-    assert "COPY --from=docker:27-cli" in dockerfile
+    assert "COPY --from=docker-cli" in dockerfile
+    assert "FROM docker:27-cli@sha256:" in dockerfile
+    assert "FROM python:3.13-slim@sha256:" in dockerfile
 
 
 def test_canonical_docker_source_pins_the_exact_release_and_oci_identity() -> None:
@@ -74,19 +76,26 @@ def test_canonical_docker_source_pins_the_exact_release_and_oci_identity() -> No
     assert version == "0.4.7"
     assert f"ARG SPL_VERSION={version}" in dockerfile
     assert 'python -m pip install "splime==${SPL_VERSION}"' in dockerfile
+    assert '"uv==${UV_VERSION}"' in dockerfile
+    assert "ARG SPL_PACKAGE_REVISION=3f42945a96fe2347ba13c5fd89f10120137cdf6b" in dockerfile
+    assert "ARG SPL_SOURCE_REVISION=unknown" in dockerfile
     assert f"image: {manifest['docker']['repository']}:{version}" in compose
     assert f'VERSION="${{1:-{version}}}"' in publish_text
+    assert 'exec "${CANONICAL}" push' in publish_text
     assert "0.4.5" not in combined
     assert os.access(publish, os.X_OK)
     for label in (
         "org.opencontainers.image.title",
         "org.opencontainers.image.description",
         "org.opencontainers.image.version",
+        "org.opencontainers.image.revision",
+        "org.opencontainers.image.created",
         "org.opencontainers.image.source",
         "org.opencontainers.image.url",
         "org.opencontainers.image.licenses",
     ):
         assert label in dockerfile
+    assert "io.splime.package.revision" in dockerfile
     assert 'org.opencontainers.image.version="${SPL_VERSION}"' in dockerfile
 
 

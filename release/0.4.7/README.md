@@ -25,7 +25,8 @@ publishes by default.
    `release/0.4.7/update-docker.sh check` and
    `release/0.4.7/update-docker.sh build`, inspect the smoke result, then export
    `SPLIME_CONFIRM_DOCKER=yastrebovks/spl-daemon:0.4.7` and run
-   `release/0.4.7/update-docker.sh push`.
+   `release/0.4.7/update-docker.sh push`. Finish with the independent
+   `release/0.4.7/update-docker.sh verify` command.
 
 ## Trust boundaries
 
@@ -35,6 +36,9 @@ publishes by default.
 - Publishing the GitHub Release publishes to PyPI through GitHub OIDC.
 - The Docker image installs the already-published exact PyPI version; it never
   copies the dirty checkout or local credentials into the image.
+- The Docker gate binds the exact published wheel and sdist hashes, the signed
+  package-release commit, the separately committed Docker packaging revision,
+  pinned multi-arch base-image digests, and tested `uv` version.
 - Docker `0.4` and `latest` are moved only by the explicit `push` command.
 
 ## Operator prerequisites
