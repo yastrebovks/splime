@@ -40,6 +40,7 @@ class ObjectRepository(RepositoryBase):
         workdir: str | None = None,
         runtime_config: dict[str, Any] | None = None,
         description: str | None = None,
+        preserve_description: bool = False,
         version_label: str | None = None,
         object_id: str | None = None,
         owner_id: str | None = None,
@@ -55,6 +56,8 @@ class ObjectRepository(RepositoryBase):
     ) -> dict[str, Any]:
         """Register a new immutable version of a function or pipeline."""
 
+        if not isinstance(preserve_description, bool):
+            raise ValueError("preserve_description must be a boolean")
         name = validate_name(name)
         origin = validate_name(origin)
         if object_id is not None:
@@ -164,7 +167,7 @@ class ObjectRepository(RepositoryBase):
                 if remote_object_id is not None:
                     object_row = self._conn.execute(
                         """
-                        SELECT id, owner_id, library, name, kind, created_at
+                        SELECT id, owner_id, library, name, kind, description, created_at
                         FROM objects
                         WHERE remote_object_id = ?
                         """,
@@ -173,7 +176,7 @@ class ObjectRepository(RepositoryBase):
                 if object_row is None:
                     object_row = self._conn.execute(
                         """
-                        SELECT id, owner_id, library, name, kind, created_at
+                        SELECT id, owner_id, library, name, kind, description, created_at
                         FROM objects
                         WHERE owner_id = ? AND library = ? AND name = ?
                         """,
@@ -182,7 +185,7 @@ class ObjectRepository(RepositoryBase):
             else:
                 object_row = self._conn.execute(
                     """
-                    SELECT id, owner_id, library, name, kind, created_at
+                    SELECT id, owner_id, library, name, kind, description, created_at
                     FROM objects
                     WHERE id = ?
                     """,
@@ -201,6 +204,9 @@ class ObjectRepository(RepositoryBase):
                 raise ValueError(
                     f"object kind is stable and cannot change from {object_row['kind']!r} to {object_kind!r}"
                 )
+
+            if preserve_description and object_row is not None:
+                object_description = str(object_row["description"] or "")
 
             self._validate_object_decomposition_metadata(metadata)
 
@@ -2232,7 +2238,10 @@ class ObjectRepository(RepositoryBase):
                     "storage_field": "objects.source_object_name",
                 }
             },
-            "description": row["version_description"] or row["object_description"] or "",
+            # Description is mutable profile metadata on the stable Object
+            # identity. Historical version rows retain their legacy snapshot,
+            # but reads intentionally project the authoritative Object value.
+            "description": row["object_description"] or "",
             "current_version_id": row["current_version_id"],
             "version_id": row["version_id"],
             "version": row["version"],

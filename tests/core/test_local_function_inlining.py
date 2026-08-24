@@ -115,10 +115,12 @@ def test_inlines_local_functions_across_deep_files(tmp_path: Path) -> None:
     assert "!DFunction" in text
     assert "name: top" in text
     assert "name: mid" in text
-    assert "name: leaf" in text
+    assert "name: leaf" not in text
 
-    # The aliased local import (`leaf as lf`) is rebound, not imported.
-    assert "!DLocalAlias" in text
+    # The aliased local import (`leaf as lf`) is emitted under its bound name
+    # through the already-released DFunction tag, not a new YAML element.
+    assert "!DLocalAlias" not in text
+    assert "name: lf" in text
 
     # No local import leaks into the "include" section, and the local package
     # name appears nowhere in the artifact.
@@ -130,7 +132,7 @@ def test_inlines_local_functions_across_deep_files(tmp_path: Path) -> None:
     assert "proj_inline" not in sys.modules
     namespace: dict = {}
     spl_import_from_file(out, globals=namespace)
-    assert namespace["leaf"](5) == 10
+    assert namespace["lf"](5) == 10
     assert namespace["mid"](5) == 11
     assert namespace["top"](5) == 21
 

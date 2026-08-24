@@ -8,12 +8,11 @@ from the project that exported the object.
 
 from __future__ import annotations
 
-import os
 import shutil
 import sys
 from pathlib import Path
 from threading import RLock
-from typing import Any, Protocol
+from typing import Any
 
 from spl._process import run_process_tree
 from spl.daemon.environment_base import (
@@ -36,6 +35,18 @@ from spl.daemon.environment_base import (
 )
 from spl.daemon.interpreter_visibility import INTERPRETER_RESOLUTION_KEY
 from spl.daemon.store import RegistryStore, utc_now
+from spl.runtime_environment import (
+    PipVenvCommandBuilder,
+    UvVenvCommandBuilder,
+    VenvCommandBuilder,
+    venv_python_path,
+)
+
+# Private compatibility aliases retained for the established daemon test and
+# extension seam; their implementation now lives in the shared module.
+_EnvironmentBuilderProtocol = VenvCommandBuilder
+_PipEnvironmentBuilder = PipVenvCommandBuilder
+_UvEnvironmentBuilder = UvVenvCommandBuilder
 
 __all__ = [
     "ABSENT",
@@ -47,81 +58,6 @@ __all__ = [
     "FAILED",
     "READY",
 ]
-
-
-class _EnvironmentBuilderProtocol(Protocol):
-    """Command strategy for constructing one cached Python environment."""
-
-    name: str
-
-    def create_command(self, spec: dict[str, Any]) -> list[str]:
-        """Return the command that creates the empty environment."""
-        ...
-
-    def install_command(
-        self,
-        spec: dict[str, Any],
-        requirements: list[str],
-    ) -> list[str]:
-        """Return the command that installs requirements into the environment."""
-        ...
-
-
-class _PipEnvironmentBuilder:
-    """Build a venv with the stdlib venv module and pip."""
-
-    name = "pip"
-
-    def create_command(self, spec: dict[str, Any]) -> list[str]:
-        return [str(spec["base_python"]), "-m", "venv", str(spec["venv_path"])]
-
-    def install_command(
-        self,
-        spec: dict[str, Any],
-        requirements: list[str],
-    ) -> list[str]:
-        return [
-            str(spec["python_path"]),
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            *requirements,
-        ]
-
-
-class _UvEnvironmentBuilder:
-    """Build a relocatable venv with uv and install requirements with uv pip."""
-
-    name = "uv"
-
-    def __init__(self, executable: str):
-        self.executable = executable
-
-    def create_command(self, spec: dict[str, Any]) -> list[str]:
-        return [
-            self.executable,
-            "venv",
-            "--relocatable",
-            "--python",
-            str(spec["base_python"]),
-            str(spec["venv_path"]),
-        ]
-
-    def install_command(
-        self,
-        spec: dict[str, Any],
-        requirements: list[str],
-    ) -> list[str]:
-        return [
-            self.executable,
-            "pip",
-            "install",
-            "--strict",
-            "--python",
-            str(spec["python_path"]),
-            *requirements,
-        ]
 
 
 class EnvironmentManager(BaseEnvironmentManager):
@@ -140,9 +76,9 @@ class EnvironmentManager(BaseEnvironmentManager):
             stale_lock_seconds=stale_lock_seconds,
         )
         uv_executable = shutil.which("uv")
-        self._builders: dict[str, _EnvironmentBuilderProtocol] = {
-            "pip": _PipEnvironmentBuilder(),
-            "uv": _UvEnvironmentBuilder(uv_executable or "uv"),
+        self._builders: dict[str, VenvCommandBuilder] = {
+            "pip": PipVenvCommandBuilder(),
+            "uv": UvVenvCommandBuilder(uv_executable or "uv"),
         }
         self._default_builder = self._builders["uv" if uv_executable else "pip"]
         self._python_version_cache: dict[tuple[str, int | None], str] = {}
@@ -295,7 +231,7 @@ class EnvironmentManager(BaseEnvironmentManager):
         except _ExternalBuildReady:
             return
 
-    def _builder_for_spec(self, spec: dict[str, Any]) -> _EnvironmentBuilderProtocol:
+    def _builder_for_spec(self, spec: dict[str, Any]) -> VenvCommandBuilder:
         builder_name = str(spec.get("builder") or (spec.get("spec") or {}).get("builder") or "pip")
         try:
             return self._builders[builder_name]
@@ -421,6 +357,4 @@ class EnvironmentManager(BaseEnvironmentManager):
         return version or "unknown"
 
     def _venv_python_path(self, venv_path: Path) -> Path:
-        if os.name == "nt":
-            return venv_path / "Scripts" / "python.exe"
-        return venv_path / "bin" / "python"
+        return venv_python_path(venv_path)

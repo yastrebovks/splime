@@ -35,6 +35,11 @@ from spl.core.library_adapters import (
     LIBRARY_ADAPTER_PUBLISH_CAPABILITY,
     RUNTIME_LIBRARY_ADAPTER_REF_CAPABILITY,
 )
+from spl.core.publications import (
+    PUBLIC_ADAPTER_PROFILE_CAPABILITY,
+    PUBLIC_OBJECT_PROFILE_CAPABILITY,
+    PUBLIC_PROFILE_CAPABILITY_VERSION,
+)
 
 DEFAULT_DAEMON_HOST = "127.0.0.1"
 DEFAULT_DAEMON_PORT = 8765
@@ -861,6 +866,49 @@ class Client:
             raise ClientError(message)
         return dict(capability)
 
+    def supports_public_profile_capability(self, capability_id: str) -> bool:
+        """Return whether the live daemon proves one v1 public-profile surface."""
+
+        if capability_id not in {
+            PUBLIC_OBJECT_PROFILE_CAPABILITY,
+            PUBLIC_ADAPTER_PROFILE_CAPABILITY,
+        }:
+            raise ValueError("public profile capability is not recognized")
+        try:
+            document = self._json_request("GET", "/meta/capabilities")
+        except ClientError as exc:
+            # A daemon that cannot prove its live metadata identity is not a
+            # capable peer for this additive operation.  Treat both the
+            # legacy 404 and the fail-closed metadata 503 as unsupported so
+            # omission can continue over the exact legacy registration wire.
+            if str(exc).startswith(("404:", "503:")):
+                return False
+            raise
+        capabilities = document.get("capabilities") if isinstance(document, Mapping) else None
+        capability = capabilities.get(capability_id) if isinstance(capabilities, Mapping) else None
+        return bool(
+            isinstance(capability, Mapping)
+            and set(capability) == {"state", "version", "reason"}
+            and capability.get("state") == "supported"
+            and capability.get("version") == PUBLIC_PROFILE_CAPABILITY_VERSION
+            and capability.get("reason") is None
+        )
+
+    def require_public_profile_capability(self, capability_id: str) -> dict[str, Any]:
+        """Fail before mutation unless the live daemon proves the new operation."""
+
+        if not self.supports_public_profile_capability(capability_id):
+            raise ClientError(
+                "local SPL daemon does not support public Object profiles; "
+                "upgrade and restart the daemon before using this feature",
+                payload={"code": "feature_not_supported"},
+            )
+        return {
+            "state": "supported",
+            "version": PUBLIC_PROFILE_CAPABILITY_VERSION,
+            "reason": None,
+        }
+
     def require_runtime_adapter_semantic_override_capability(self) -> dict[str, Any]:
         """Prove semantic-advisory support before sending its additive sibling."""
 
@@ -1437,6 +1485,7 @@ class Client:
         create_library: bool = False,
         library_display_name: str | None = None,
         local_only: bool = False,
+        profile_description: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Send a serialized SPL object to the daemon registry.
 
@@ -1462,6 +1511,8 @@ class Client:
             payload["runtime_config"] = runtime_config
         if description is not None:
             payload["description"] = description
+        if profile_description is not None:
+            payload["profile_description"] = profile_description
         if version_label is not None:
             payload["version_label"] = version_label
         if object_id is not None:
@@ -1473,6 +1524,63 @@ class Client:
         if library_display_name is not None:
             payload["library_display_name"] = library_display_name
         return _as_json_dict(self._json_request("POST", "/objects", payload))
+
+    def object_profile_status(
+        self,
+        name_or_id: str,
+        *,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        self.require_public_profile_capability(PUBLIC_OBJECT_PROFILE_CAPABILITY)
+        suffix = f"?{urlencode({'library': library})}" if library is not None else ""
+        return _as_json_dict(self._json_request("GET", f"/server/objects/{quote(name_or_id)}/public-status{suffix}"))
+
+    def update_object_profile(
+        self,
+        name_or_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.require_public_profile_capability(PUBLIC_OBJECT_PROFILE_CAPABILITY)
+        return _as_json_dict(self._json_request("POST", f"/server/objects/{quote(name_or_id)}/profile", payload))
+
+    def preflight_public_object(
+        self,
+        name_or_id: str,
+        *,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        self.require_public_profile_capability(PUBLIC_OBJECT_PROFILE_CAPABILITY)
+        payload = {"library": library} if library is not None else {}
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/server/objects/{quote(name_or_id)}/public-preflight",
+                payload,
+            )
+        )
+
+    def update_library_adapter_profile(
+        self,
+        adapter_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.require_public_profile_capability(PUBLIC_ADAPTER_PROFILE_CAPABILITY)
+        return _as_json_dict(
+            self._json_request(
+                "POST",
+                f"/server/library-adapters/{quote(adapter_id)}/profile",
+                payload,
+            )
+        )
+
+    def library_adapter_profile_status(self, adapter_id: str) -> dict[str, Any]:
+        self.require_public_profile_capability(PUBLIC_ADAPTER_PROFILE_CAPABILITY)
+        return _as_json_dict(
+            self._json_request(
+                "GET",
+                f"/server/library-adapters/{quote(adapter_id)}/public-status",
+            )
+        )
 
     def list_objects(
         self,

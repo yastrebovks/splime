@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "official_registry": {
+    "origin": "https://splime.io",
+    "signature_algorithm": "ed25519",
+    "signing_key_id": "ed25519-sha256:635b0f38b59fa4a513723bc8e347d807dae535996173ffebfba2fcca73cbe91e",
+    "signing_public_key_b64": "DDWqFt/l2ZaRFMgvdCdyoCcQ15ixQyMjx4nqtmvqTz4="
+  },
+  "public_runtime_policy": {
+    "name": "splime-public-python-artifacts",
+    "version": "0.4.8",
+    "target": {
+      "implementation": "cpython",
+      "python": "3.13"
+    },
+    "metadata_origins": [
+      "https://pypi.org"
+    ],
+    "file_origins": [
+      "https://files.pythonhosted.org"
+    ],
+    "spdx_allowlist": [
+      "0BSD",
+      "Apache-2.0",
+      "BSD-2-Clause",
+      "BSD-3-Clause",
+      "ISC",
+      "MIT",
+      "PSF-2.0",
+      "Python-2.0",
+      "Unlicense",
+      "Zlib"
+    ],
+    "wheel_policy": "non-yanked-universal-pure-python-only",
+    "runtime_lock_schema": "spl.public_runtime_lock.v2",
+    "resolver": "splime-pypi-closure-v1"
+  }
+}

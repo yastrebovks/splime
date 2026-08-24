@@ -7,7 +7,7 @@ from operator import itemgetter
 from pathlib import Path
 from typing import Any, Generator, TypeVar, cast
 
-import yaml
+from spl.core._yaml import yaml
 
 import spl.core.entities.adapter as m_adapter
 import spl.core.entities.artifact as m_artifact

@@ -5,6 +5,8 @@ VERSION="0.4.7"
 IMAGE="yastrebovks/spl-daemon"
 PLATFORMS="linux/amd64,linux/arm64"
 PACKAGE_REVISION="3f42945a96fe2347ba13c5fd89f10120137cdf6b"
+IMAGE_SOURCE_REVISION="290348dbe0089ed9497ac6030aa960262249eb01"
+IMAGE_BUILD_DATE="2026-08-16T23:14:15+03:00"
 UV_VERSION="0.11.25"
 PYTHON_BASE_DIGEST="sha256:ffb752e139c0a19692a43af8d8523b274222dd68eebad5d583b45c2201c6e30a"
 DOCKER_CLI_DIGEST="sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c"
@@ -16,14 +18,13 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 ROOT="$(CDPATH= cd -- "${SCRIPT_DIR}/../.." && pwd -P)"
 CONTEXT="${ROOT}/deploy/dockerhub"
 LOCAL_TAG_PREFIX="${IMAGE}:${VERSION}-release-smoke"
-SOURCE_REVISION="$(git -C "${ROOT}" rev-parse HEAD)"
-BUILD_DATE="$(git -C "${ROOT}" show -s --format=%cI HEAD)"
+CURRENT_REVISION="$(git -C "${ROOT}" rev-parse HEAD)"
 BUILD_ARGUMENTS=(
   --build-arg "SPL_VERSION=${VERSION}"
   --build-arg "UV_VERSION=${UV_VERSION}"
   --build-arg "SPL_PACKAGE_REVISION=${PACKAGE_REVISION}"
-  --build-arg "SPL_SOURCE_REVISION=${SOURCE_REVISION}"
-  --build-arg "SPL_BUILD_DATE=${BUILD_DATE}"
+  --build-arg "SPL_SOURCE_REVISION=${IMAGE_SOURCE_REVISION}"
+  --build-arg "SPL_BUILD_DATE=${IMAGE_BUILD_DATE}"
 )
 
 fail() {
@@ -33,6 +34,25 @@ fail() {
 
 need() {
   command -v "$1" >/dev/null 2>&1 || fail "required command is unavailable: $1"
+}
+
+registry_retry() {
+  local attempt status delay=2 max_attempts=5
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    if "$@"; then
+      return 0
+    else
+      status=$?
+    fi
+    if ((attempt == max_attempts)); then
+      break
+    fi
+    printf 'WARN: Docker registry request failed (attempt %d/%d); retrying in %ds.\n' \
+      "${attempt}" "${max_attempts}" "${delay}" >&2
+    sleep "${delay}"
+    delay=$((delay * 2))
+  done
+  return "${status}"
 }
 
 assert_sources() {
@@ -112,7 +132,7 @@ smoke_image() {
       label_revision="$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${name}")"
       package_revision="$(docker inspect --format '{{index .Config.Labels "io.splime.package.revision"}}' "${name}")"
       if [[ "${label_version}" != "${VERSION}" \
-        || "${label_revision}" != "${SOURCE_REVISION}" \
+        || "${label_revision}" != "${IMAGE_SOURCE_REVISION}" \
         || "${package_revision}" != "${PACKAGE_REVISION}" ]]; then
         docker rm -f "${name}" >/dev/null
         fail "container OCI version/source labels are incorrect"
@@ -171,7 +191,9 @@ push_multiarch() {
     || fail "set SPLIME_CONFIRM_DOCKER=${IMAGE}:${VERSION} to authorize Docker Hub publication"
   [[ -z "$(git -C "${ROOT}" status --porcelain)" ]] \
     || fail "commit the Docker release controls before publication"
-  [[ "$(git -C "${ROOT}" rev-parse github/main)" == "${SOURCE_REVISION}" ]] \
+  [[ "${CURRENT_REVISION}" == "${IMAGE_SOURCE_REVISION}" ]] \
+    || fail "the immutable ${VERSION} image is bound to source revision ${IMAGE_SOURCE_REVISION}; do not republish it from another commit"
+  [[ "$(git -C "${ROOT}" rev-parse github/main)" == "${CURRENT_REVISION}" ]] \
     || fail "push the Docker release-control commit to github/main before publication"
   build_local
   docker buildx build \
@@ -192,19 +214,25 @@ verify_remote() {
   need docker
   manifest_directory="$(mktemp -d "${TMPDIR:-/tmp}/splime-docker-${VERSION}.XXXXXX")"
   manifest_file="${manifest_directory}/manifest.txt"
-  docker buildx imagetools inspect "${IMAGE}:${VERSION}" > "${manifest_file}"
+  registry_retry docker buildx imagetools inspect "${IMAGE}:${VERSION}" > "${manifest_file}" \
+    || fail "could not inspect ${IMAGE}:${VERSION} after bounded retries"
   grep -Fq 'linux/amd64' "${manifest_file}" \
     || fail "published manifest lacks linux/amd64"
   grep -Fq 'linux/arm64' "${manifest_file}" \
     || fail "published manifest lacks linux/arm64"
   version_digest="$(awk '$1 == "Digest:" {print $2; exit}' "${manifest_file}")"
-  minor_digest="$(docker buildx imagetools inspect "${IMAGE}:0.4" | awk '$1 == "Digest:" {print $2; exit}')"
-  latest_digest="$(docker buildx imagetools inspect "${IMAGE}:latest" | awk '$1 == "Digest:" {print $2; exit}')"
+  minor_digest="$(registry_retry docker buildx imagetools inspect "${IMAGE}:0.4" \
+    | awk '$1 == "Digest:" {print $2; exit}')" \
+    || fail "could not inspect ${IMAGE}:0.4 after bounded retries"
+  latest_digest="$(registry_retry docker buildx imagetools inspect "${IMAGE}:latest" \
+    | awk '$1 == "Digest:" {print $2; exit}')" \
+    || fail "could not inspect ${IMAGE}:latest after bounded retries"
   [[ -n "${version_digest}" && "${version_digest}" == "${minor_digest}" && "${version_digest}" == "${latest_digest}" ]] \
     || fail "0.4.7, 0.4 and latest do not resolve to one manifest digest"
   unlink "${manifest_file}"
   rmdir "${manifest_directory}"
-  docker pull "${IMAGE}:${VERSION}"
+  registry_retry docker pull "${IMAGE}:${VERSION}" \
+    || fail "could not pull ${IMAGE}:${VERSION} after bounded retries"
   smoke_image "${IMAGE}:${VERSION}"
 }
 

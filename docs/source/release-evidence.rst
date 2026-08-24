@@ -1,7 +1,7 @@
 Release and compatibility evidence
 ==================================
 
-SPLime 0.4.7 separates a version declaration from evidence that exact source
+SPLime 0.4.8 separates a version declaration from evidence that exact source
 was built, published, and deployed. A matching version string is useful
 context; it is not a deployment attestation.
 
@@ -65,10 +65,10 @@ Materialize the built BOM only after all four exact artifacts exist:
      --workspace-root .. \
      --manifest ../artifacts/source-release-manifest.json \
      --emit-built-evidence ../artifacts/release-manifest.json \
-     --component-artifact framework=artifacts/python/splime-0.4.7-py3-none-any.whl \
-     --component-artifact daemon=artifacts/python/splime-0.4.7-py3-none-any.whl \
-     --component-artifact server=artifacts/server/spl_server-0.4.7-py3-none-any.whl \
-     --component-artifact console=artifacts/splime-console-0.4.7.tar.gz \
+     --component-artifact framework=artifacts/python/splime-0.4.8-py3-none-any.whl \
+     --component-artifact daemon=artifacts/python/splime-0.4.8-py3-none-any.whl \
+     --component-artifact server=artifacts/server/spl_server-0.4.8-py3-none-any.whl \
+     --component-artifact console=artifacts/splime-console-0.4.8.tar.gz \
      --observed-at 2026-07-30T12:00:00Z
 
 The normal identity-generator ``--check`` requires the tracked manifest to
@@ -89,14 +89,14 @@ the external published manifest. The final PyPI workflow job uploads
      --workspace-root .. \
      --manifest ../artifacts/release-manifest.json \
      --emit-published-evidence ../artifacts/published/release-manifest.json \
-     --pypi-artifact splime-0.4.7-py3-none-any.whl=https://files.pythonhosted.org/packages/<reviewed-path>/splime-0.4.7-py3-none-any.whl=<sha256> \
-     --pypi-artifact splime-0.4.7.tar.gz=https://files.pythonhosted.org/packages/<reviewed-path>/splime-0.4.7.tar.gz=<sha256> \
+     --pypi-artifact splime-0.4.8-py3-none-any.whl=https://files.pythonhosted.org/packages/<reviewed-path>/splime-0.4.8-py3-none-any.whl=<sha256> \
+     --pypi-artifact splime-0.4.8.tar.gz=https://files.pythonhosted.org/packages/<reviewed-path>/splime-0.4.8.tar.gz=<sha256> \
      --github-asset source-release-manifest.json=artifacts/source-release-manifest.json \
      --github-asset release-artifact-bom.sha256=artifacts/release-artifact-bom.sha256 \
-     --github-asset splime-0.4.7-py3-none-any.whl=artifacts/python/splime-0.4.7-py3-none-any.whl \
-     --github-asset splime-0.4.7.tar.gz=artifacts/python/splime-0.4.7.tar.gz \
-     --github-asset spl_server-0.4.7-py3-none-any.whl=artifacts/server/spl_server-0.4.7-py3-none-any.whl \
-     --github-asset splime-console-0.4.7.tar.gz=artifacts/splime-console-0.4.7.tar.gz \
+     --github-asset splime-0.4.8-py3-none-any.whl=artifacts/python/splime-0.4.8-py3-none-any.whl \
+     --github-asset splime-0.4.8.tar.gz=artifacts/python/splime-0.4.8.tar.gz \
+     --github-asset spl_server-0.4.8-py3-none-any.whl=artifacts/server/spl_server-0.4.8-py3-none-any.whl \
+     --github-asset splime-console-0.4.8.tar.gz=artifacts/splime-console-0.4.8.tar.gz \
      --github-asset static-integrity.json=artifacts/console/static-integrity.json \
      --public-artifact https://splime.io/downloads/splime-cookbook.ipynb=<sha256> \
      --docker-manifest-digest sha256:<multi-arch-digest> \

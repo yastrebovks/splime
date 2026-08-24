@@ -104,7 +104,7 @@ from spl.core.runtime_port_adapters import (
     validate_custom_bundle_dependencies,
 )
 from spl.daemon.callback_capability import CALLBACK_CAPABILITY_ENV
-from spl.daemon.store import validate_name
+from spl.daemon.name_validation import validate_name
 from spl.daemon.worker_runtime_marker import (
     WORKER_MANIFEST_HANDOFF_FILE,
     WORKER_RUNTIME_ADAPTER_FAILURE_EXIT_CODE,
@@ -312,7 +312,39 @@ class WorkerNodeEnvironmentProvider:
         wait: bool = True,
         retry_failed: bool = False,
     ) -> m_node_runtime.PreparedNodeEnvironment:
+        return self.prepare_for_node(
+            spec,
+            node_label=None,
+            wait=wait,
+            retry_failed=retry_failed,
+        )
+
+    def prepare_for_node(
+        self,
+        spec: Mapping[str, Any],
+        *,
+        node_label: str | None,
+        wait: bool = True,
+        retry_failed: bool = False,
+    ) -> m_node_runtime.PreparedNodeEnvironment:
+        """Resolve an optional daemon-prepared environment for one node alias."""
+
         runtime_name = spec.get("node_runtime")
+        if runtime_name == m_node_runtime.VENV_SUBPROCESS_NODE_RUNTIME:
+            raw_environments = self.node_runtime_environments.get(m_node_runtime.VENV_SUBPROCESS_NODE_RUNTIME)
+            environments = raw_environments if isinstance(raw_environments, Mapping) else {}
+            raw_environment = environments.get(node_label) or environments.get("default")
+            environment = raw_environment if isinstance(raw_environment, Mapping) else {}
+            python_path = environment.get("python_path")
+            if isinstance(python_path, str) and python_path:
+                return m_node_runtime.PreparedNodeEnvironment(
+                    name="prepared-venv",
+                    python_path=Path(python_path),
+                    metadata={
+                        "spec_hash": environment.get("lock_hash"),
+                        "source": "worker-input",
+                    },
+                )
         if runtime_name != m_node_runtime.DOCKER_NODE_RUNTIME:
             return self.default_provider.prepare(spec, wait=wait, retry_failed=retry_failed)
 
@@ -1735,6 +1767,30 @@ def load_entrypoint_with_namespace(
         raise KeyError(f"entrypoint is not found in SPL file: {entrypoint}") from exc
 
 
+def load_compiled_entrypoint_with_namespace(
+    object_python: Path,
+    entrypoint: str,
+) -> tuple[Any, dict[str, Any]]:
+    """Execute a producer-compiled, signed SPL member without a YAML parser."""
+
+    namespace: dict[str, Any] = {
+        "__file__": str(object_python),
+        "__name__": "__spl_public_object__",
+        "__package__": None,
+    }
+    bundle_root = str(object_python.parent.absolute())
+    if bundle_root not in sys.path:
+        # The exact embedded authority is inserted at index zero by the public
+        # worker.  Signed bundle modules follow it and cannot shadow ``spl``.
+        sys.path.insert(1, bundle_root)
+    source = object_python.read_text(encoding="utf-8")
+    exec(compile(source, str(object_python), mode="exec"), namespace)  # noqa: S102
+    try:
+        return namespace[entrypoint], namespace
+    except KeyError as exc:
+        raise KeyError(f"entrypoint is not found in compiled SPL member: {entrypoint}") from exc
+
+
 def _read_remote_ports(path: Path | None) -> dict[str, dict[str, Any]]:
     if path is None or not path.exists():
         return {}
@@ -1823,7 +1879,8 @@ def _install_node_remote_hydration(remote_ports: dict[str, dict[str, Any]]) -> N
 
 def execute(
     *,
-    object_yaml: Path,
+    object_yaml: Path | None = None,
+    object_python: Path | None = None,
     entrypoint: str,
     input_path: Path,
     result_path: Path,
@@ -1867,11 +1924,19 @@ def execute(
         )
     )
 
-    target, namespace = load_entrypoint_with_namespace(
-        object_yaml,
-        entrypoint,
-        remote_signatures_path=remote_signatures_path,
-    )
+    if (object_yaml is None) == (object_python is None):
+        raise ValueError("exactly one serialized or compiled SPL object is required")
+    if object_python is not None:
+        if remote_signatures_path is not None:
+            raise ValueError("compiled public execution does not admit remote signatures")
+        target, namespace = load_compiled_entrypoint_with_namespace(object_python, entrypoint)
+    else:
+        assert object_yaml is not None
+        target, namespace = load_entrypoint_with_namespace(
+            object_yaml,
+            entrypoint,
+            remote_signatures_path=remote_signatures_path,
+        )
 
     from spl.core.entities.pipeline import Pipeline
 
@@ -1932,7 +1997,9 @@ def build_parser() -> argparse.ArgumentParser:
     """Create the worker argument parser."""
 
     parser = argparse.ArgumentParser(description="Execute one SPL object")
-    parser.add_argument("--object-yaml", required=True, type=Path)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--object-yaml", type=Path)
+    source.add_argument("--object-python", type=Path)
     parser.add_argument("--entrypoint", required=True)
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--result", required=True, type=Path)
@@ -1950,6 +2017,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         execute(
             object_yaml=args.object_yaml,
+            object_python=args.object_python,
             entrypoint=args.entrypoint,
             input_path=args.input,
             result_path=args.result,

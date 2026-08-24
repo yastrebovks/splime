@@ -1,0 +1,805 @@
+{
+  "schema_version": 1,
+  "release_target": "0.4.8",
+  "observed_at": "2026-08-21",
+  "registry": {
+    "project": "splime",
+    "source": "https://pypi.org/pypi/splime/json",
+    "release_source": "https://api.github.com/repos/spl894143/spl/releases",
+    "expected_python": ">=3.13"
+  },
+  "absent_registry_versions": [
+    {
+      "version": "0.1.0",
+      "status": "not_applicable",
+      "reason": "No PyPI distribution or GitHub release artifact exists."
+    },
+    {
+      "version": "0.1.1",
+      "status": "not_applicable",
+      "reason": "No PyPI distribution or GitHub release artifact exists."
+    },
+    {
+      "version": "0.4.1",
+      "status": "not_applicable",
+      "reason": "The published sequence is non-contiguous; no 0.4.1 distribution exists."
+    }
+  ],
+  "artifacts": [
+    {
+      "version": "0.1.2",
+      "filename": "splime-0.1.2-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/54/48/1a020898ec3acf6d8dbdefee1006ddfcbc7eb63888ac2a66386d1cc94bb5/splime-0.1.2-py3-none-any.whl",
+      "sha256": "d4d11b2ab87967430d50f291f74d2ae12ddc6c21b30326c13ec4c736f732deba",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.1.2",
+      "filename": "splime-0.1.2.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/b7/25/669a46e032f2fc2b551c18f7af9433de98db015960a6dcc2aeb51d4709d8/splime-0.1.2.tar.gz",
+      "sha256": "beff164274a3a4285ae51d3e5634f4820bb2f34b147baf6b35aa81d3407dbd40",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.1.3",
+      "filename": "splime-0.1.3-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/8e/9e/644c021964e75ceef959fa72e3c4a6e542443d29d7bf2132135e41ac009b/splime-0.1.3-py3-none-any.whl",
+      "sha256": "bb9d020c7ae44b91057757d00b95853feb5861e25a9820d4e3fcf79e6899d865",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.1.3",
+      "filename": "splime-0.1.3.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/23/8c/7dd3afaf5968e221d7929cf10a256a3e8354e3f08e19065405fbbd99ed8c/splime-0.1.3.tar.gz",
+      "sha256": "bb1bb9cd82727385b64496565902c0f06b5a6d382831bd1136313a85da2f528e",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.1.4",
+      "filename": "splime-0.1.4-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/e9/66/1e894e5b8c295eed42be554d077d849e7616a25c8cde4a4a8df4853b5da9/splime-0.1.4-py3-none-any.whl",
+      "sha256": "3255bc176d4a4f3eb9aa5f241a869aca60bffc8ca3b70d71e670792dfddccb6a",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.1.4",
+      "filename": "splime-0.1.4.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/26/82/c2147cc31344e4c2c5b703e71dc11cf7398a6c2ca5bb30a0a832eb9ad140/splime-0.1.4.tar.gz",
+      "sha256": "40f8d51c48ff13f5099632675fb68e68db754671fe9a82b7a0c8088a2a3fd775",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.1.5",
+      "filename": "splime-0.1.5-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/0e/4e/c91b503f60f715a43266c83c2e156dda04073514531c015f54344b7b2871/splime-0.1.5-py3-none-any.whl",
+      "sha256": "b2b8494dd61a7cac17e0b8b42cd0dfd323d9161ae33703df579d28bccb2cbf78",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.1.5",
+      "filename": "splime-0.1.5.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/fa/2b/32efef10817fc55f49bcea5c1d9b77fb14aeb3d4188ea680f30eaab0cbca/splime-0.1.5.tar.gz",
+      "sha256": "b5be5a069c6a032c9eda8b5e3196801e1850fd3c9f591448ec2632e66cd2e034",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.2.0",
+      "filename": "splime-0.2.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/a8/b2/60c3352a2221e24c1555d9cb036b13f7af4788d4d725923090fd5968ef57/splime-0.2.0-py3-none-any.whl",
+      "sha256": "a92336512a2715d483757c5df733b913b9f4883f730d65f9942e5534ff81e01d",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.2.0",
+      "filename": "splime-0.2.0.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/50/e9/2839f72c332f3660c305efe98dcff4e5d7e0d19aa837467b551feddc5a30/splime-0.2.0.tar.gz",
+      "sha256": "fe2069edf83b69bc7af16122d4da7f429593b211d988d01334e4da0f5c75a040",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.2.1",
+      "filename": "splime-0.2.1-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/2f/b5/2ffa50317d86d59caecc53decc4cfd495f120a4dabcc2294f7104575cd84/splime-0.2.1-py3-none-any.whl",
+      "sha256": "8db666db8992f6b9250bcb2a588aa8eb4b70bf50d66ac614838e2a8d07cda723",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.2.1",
+      "filename": "splime-0.2.1.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/8a/80/4144be64ff0b89dd19abff8810a3f12820872d7c139d55076710461cfaff/splime-0.2.1.tar.gz",
+      "sha256": "4dc0a8744dd5eac0d3b2c61f0e6a2ea5f90800d790934d9eebffb1fe957becb4",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.2.2",
+      "filename": "splime-0.2.2-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/c2/62/f72500e71af2c508b4be06d8ccba9c16e5edfe1cb65695315adb929f0260/splime-0.2.2-py3-none-any.whl",
+      "sha256": "0134ae36ea2bee8a7ead23760a39b6e09a60b28a46c5d9761630ffe7527bfd02",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.2.2",
+      "filename": "splime-0.2.2.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/9b/1e/8217ba5e91860ed74dc211ccd6965eed692591f808d1de330fe022fafaa3/splime-0.2.2.tar.gz",
+      "sha256": "08ce78354c40daa113edf02736cfbdde5b97cd45bb6012458a1f533ec7978b4b",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.2.3",
+      "filename": "splime-0.2.3-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/d3/91/7ce79d3cf7ceb1859d444c1ad5db072c813ce97aaa34df109d16fea9a2bc/splime-0.2.3-py3-none-any.whl",
+      "sha256": "f5295526dbcf76bfc274acf3b2b168182b424f0635d1e1641913a9debb12b30b",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.2.3",
+      "filename": "splime-0.2.3.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/62/01/fe15db96ec6b00696cf9ca028e04cbdd98cdc7c5370ec51f7b178aae9b26/splime-0.2.3.tar.gz",
+      "sha256": "1fc17646996cff7eafb8e3db16e9cef665d8a7038b500fe3925700d7a6bf7c56",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.2.4",
+      "filename": "splime-0.2.4-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/71/2b/eb3f31f3ef0f4ba85ee48d95c6df37e0dab3f0b54b897dd321c486e2767c/splime-0.2.4-py3-none-any.whl",
+      "sha256": "36d76b896a834502f2a5b473a825333ac48d2acdefca16b215f3b27ac2f0cdf1",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.2.4",
+      "filename": "splime-0.2.4.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/98/18/38f53a2b654b4eccdb5ac0bc0606282f11884fea34dc67c2e23233dfe876/splime-0.2.4.tar.gz",
+      "sha256": "ac18e6b65fa423ed028789c2bdf047299f7ea85703280850332cd3dcd46cf797",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.2.5",
+      "filename": "splime-0.2.5-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/cc/9a/c355938c095f2a45300b5e8007b6cc904d5694b38c3de6f4790367dec308/splime-0.2.5-py3-none-any.whl",
+      "sha256": "d73d0b7d74953daeecb8eaba10d09b82e2b71fa753b92904208f317c6431b201",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.2.5",
+      "filename": "splime-0.2.5.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/f0/49/ca709a19d6682a46563f0c61c4eaeb797d087351e482376691c12cc97b9b/splime-0.2.5.tar.gz",
+      "sha256": "13555a4dacc032c47abf8bdb1b25bf927b26b991f59d234ecac4cc77fddbb2f1",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.3.0",
+      "filename": "splime-0.3.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/10/29/c96d7bfeea8c152d5548b8d6ae0c4455adb04d987653ced6f9d40143dd4d/splime-0.3.0-py3-none-any.whl",
+      "sha256": "ed821c869fca6df522b04776af10a20b29fe93542cc81b8a935ca59bec1fcf1d",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.3.0",
+      "filename": "splime-0.3.0.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/dc/0a/493341394ffe1b2d92155eacf0fdc147c7ccb4f707d911ed3c16e2f7e4f1/splime-0.3.0.tar.gz",
+      "sha256": "21ba6b3ca5ec1ec6e5477e90af6412e096884efbc8f01baf6733812951490ec6",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.4.0",
+      "filename": "splime-0.4.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/df/bc/4c2efada68c8ffa6f8cc8aa6042b9ebc50307b83a3602bb95678cc8d7937/splime-0.4.0-py3-none-any.whl",
+      "sha256": "699f40bc696d0a90aa2ca7d1b1e05fee87fc2a4fd1ca9e213e23c924c4f63a4b",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.4.0",
+      "filename": "splime-0.4.0.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/3e/78/6284711363d34a6baa50b31630878b147749baa5f5071d300bf40d82092d/splime-0.4.0.tar.gz",
+      "sha256": "65e56e74457ecd16d4081ff3e4cf3e22dc0ff1f18e5f5ad2c736fb7b6b4e89f3",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.4.2",
+      "filename": "splime-0.4.2-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/04/59/f563e3b45f6d6a17a98599c360cd4de4edad7a12134417d11c2ccd10fbe2/splime-0.4.2-py3-none-any.whl",
+      "sha256": "de479af0f53ebb791e1f787ba1c7f29892ed5e82b077f765e0896855fc96974f",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.4.2",
+      "filename": "splime-0.4.2.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/74/7e/a1a9dc8c73e99d8d0b2620f6b80783331edeac5c4eb9205ff71ceacb1f13/splime-0.4.2.tar.gz",
+      "sha256": "52261e4df09af8abb0e28227fbebfe107fbddb54c7fafbacfbc84544f0165357",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.4.3",
+      "filename": "splime-0.4.3-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/19/ec/571b537370eb45160df3e00c682e292577204c5d86d6ef2d4627d684eaf7/splime-0.4.3-py3-none-any.whl",
+      "sha256": "97b83ff34024387bbab44831b32f9acf256e5701ad032ee82851b92f8587c866",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.4.3",
+      "filename": "splime-0.4.3.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/fe/70/5b26cdee9785a442f87b4764876434778882ed15e0a42217f43c8adb20e6/splime-0.4.3.tar.gz",
+      "sha256": "b69b1f9ebe23b51349e2fef2ecf25e11af476d13ab91dd8da10cfaf2fc985024",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.4.4",
+      "filename": "splime-0.4.4-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/eb/a7/86d21925f1bd7ff2329cfc7410031509f946f066da6f38dae91175f66aa5/splime-0.4.4-py3-none-any.whl",
+      "sha256": "a38bb345f87f8057451ce0aac92eda449c1197f4c98b822d92104b4975059f68",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.4.4",
+      "filename": "splime-0.4.4.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/76/b5/5b80e1875f9cca3efd60e88bfef146416571da12b15b37a3e4bda7ef9bd0/splime-0.4.4.tar.gz",
+      "sha256": "247e9e412b36d67ca24130dbadb0ff66a23fcfe0c34998a9dffa1d0470f4d997",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.4.5",
+      "filename": "splime-0.4.5-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/41/14/7027fd4bf8bed529eda2a5af206c58b1224948457b2ebc4a350b97373080/splime-0.4.5-py3-none-any.whl",
+      "sha256": "417122bd3f320f5e1503aa459099673df08ba327e5a75421b2c86efed75a1987",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.4.5",
+      "filename": "splime-0.4.5.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/a9/ab/9747352179b87793fa47f793fdac602c6ae84ffdd24f61200147548bdd9b/splime-0.4.5.tar.gz",
+      "sha256": "7e7424d02d92a3624c20dea2d9302da32cd1d175c61aeaea0a7bf18cd8d08934",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.4.6",
+      "filename": "splime-0.4.6-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/b3/7c/958f745e1389f3cbf522a994337a62fc2897b85a8c6e9d0aafedbfec39d9/splime-0.4.6-py3-none-any.whl",
+      "sha256": "fb88b488c4da5c421e47a78c7e75d5cbe232607c962282b1873ebf61b5d759ba",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.4.6",
+      "filename": "splime-0.4.6.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/e0/3f/4f4211fb92f9d19cbf9a276baecec4c579dc08b660c8d60c3803a3a09096/splime-0.4.6.tar.gz",
+      "sha256": "29e4f4c3f517ce5d38cc7c826a3ce1d59148ce50ffab36801b2483a23866e584",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.4.7",
+      "filename": "splime-0.4.7-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/53/49/58ede74cfee565744bc7c404b2270d03d762d644e177ce1836bba4a78d05/splime-0.4.7-py3-none-any.whl",
+      "sha256": "57f795eb4995f63617a89806e886d410051eb4646e50a2dcb8f2f2fc5b457bf7",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    },
+    {
+      "version": "0.4.7",
+      "filename": "splime-0.4.7.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/bf/f3/78c62644b92b0e1dd5dd426daf0f6d264bbc3e1943347cef2245e2adc781/splime-0.4.7.tar.gz",
+      "sha256": "5c3c20d635f01cc6d17fdf9d0064c9d55a8c068defd9fef073ec8fe8a9ba7b77",
+      "requires_python": ">=3.13",
+      "yanked": false,
+      "status": "tested",
+      "reason": "Registry SHA-256 matched the downloaded artifact; the artifact installed in an isolated CPython 3.13 environment.",
+      "evidence": [
+        "tests/core/test_prompt01_historical_inventory.py"
+      ]
+    }
+  ],
+  "api_rows": [
+    {
+      "version": "0.1.2",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "present",
+      "reason": "Raw wheel evidence plus the separate current-facade comparison confirms compatible call, parameter, view and error contracts."
+    },
+    {
+      "version": "0.1.3",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "present",
+      "reason": "Raw wheel evidence plus the separate current-facade comparison confirms compatible call, parameter, view and error contracts."
+    },
+    {
+      "version": "0.1.4",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "present",
+      "reason": "Raw wheel evidence plus the separate current-facade comparison confirms compatible call, parameter, view and error contracts."
+    },
+    {
+      "version": "0.1.5",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "present",
+      "reason": "Raw wheel evidence plus the separate current-facade comparison confirms compatible call, parameter, view and error contracts."
+    },
+    {
+      "version": "0.2.0",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "not_applicable",
+      "reason": "Raw wheel evidence records the absent legacy spellings; the separate comparison validates every callable contract that applies to this release."
+    },
+    {
+      "version": "0.2.1",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "not_applicable",
+      "reason": "Raw wheel evidence records the absent legacy spellings; the separate comparison validates every callable contract that applies to this release."
+    },
+    {
+      "version": "0.2.2",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "not_applicable",
+      "reason": "Raw wheel evidence records the absent legacy spellings; the separate comparison validates every callable contract that applies to this release."
+    },
+    {
+      "version": "0.2.3",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "not_applicable",
+      "reason": "Raw wheel evidence records the absent legacy spellings; the separate comparison validates every callable contract that applies to this release."
+    },
+    {
+      "version": "0.2.4",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "not_applicable",
+      "reason": "Raw wheel evidence records the absent legacy spellings; the separate comparison validates every callable contract that applies to this release."
+    },
+    {
+      "version": "0.2.5",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "not_applicable",
+      "reason": "Raw wheel evidence records the absent legacy spellings; the separate comparison validates every callable contract that applies to this release."
+    },
+    {
+      "version": "0.3.0",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "not_applicable",
+      "reason": "Raw wheel evidence records the absent legacy spellings; the separate comparison validates every callable contract that applies to this release."
+    },
+    {
+      "version": "0.4.0",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "not_applicable",
+      "reason": "Raw wheel evidence records the absent legacy spellings; the separate comparison validates every callable contract that applies to this release."
+    },
+    {
+      "version": "0.4.2",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "not_applicable",
+      "reason": "Raw wheel evidence records the absent legacy spellings; the separate comparison validates every callable contract that applies to this release."
+    },
+    {
+      "version": "0.4.3",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "not_applicable",
+      "reason": "Raw wheel evidence records the absent legacy spellings; the separate comparison validates every callable contract that applies to this release."
+    },
+    {
+      "version": "0.4.4",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "not_applicable",
+      "reason": "Raw wheel evidence records the absent legacy spellings; the separate comparison validates every callable contract that applies to this release."
+    },
+    {
+      "version": "0.4.5",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "not_applicable",
+      "reason": "Raw wheel evidence records the absent legacy spellings; the separate comparison validates every callable contract that applies to this release."
+    },
+    {
+      "version": "0.4.6",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "not_applicable",
+      "reason": "Raw wheel evidence records the absent legacy spellings; the separate comparison validates every callable contract that applies to this release."
+    },
+    {
+      "version": "0.4.7",
+      "status": "tested",
+      "python": "3.13",
+      "evidence": [
+        "tools/probe_historical_api.py",
+        "release/0.4.8/historical-api-signatures.json",
+        "release/0.4.8/historical-api-comparison.json",
+        "tests/core/test_prompt01_compatibility_facade.py"
+      ],
+      "legacy_facades": "not_applicable",
+      "reason": "Raw wheel evidence records the absent legacy spellings; the separate comparison validates every callable contract that applies to this release."
+    }
+  ],
+  "protocol_rows": [
+    {
+      "producer": "old client",
+      "daemon": "old daemon",
+      "server": "0.4.8",
+      "status": "tested",
+      "reason": "Legacy registration and sync payloads retain their existing fields and semantics.",
+      "evidence": [
+        "tests/core/test_prompt01_profiles.py",
+        "spl-server/tests/test_public_object_publication.py"
+      ]
+    },
+    {
+      "producer": "old client",
+      "daemon": "0.4.8",
+      "server": "0.4.8",
+      "status": "tested",
+      "reason": "Requests without profile_description take the unchanged legacy registration branch.",
+      "evidence": [
+        "tests/core/test_prompt01_profiles.py"
+      ]
+    },
+    {
+      "producer": "0.4.8 client",
+      "daemon": "old daemon",
+      "server": "old server",
+      "status": "tested",
+      "reason": "Omitted Description sends no new field; explicit new intent fails with feature_not_supported before registration.",
+      "evidence": [
+        "tests/core/test_prompt01_profiles.py"
+      ]
+    },
+    {
+      "producer": "0.4.8 client",
+      "daemon": "0.4.8",
+      "server": "old server",
+      "status": "tested",
+      "reason": "Daemon proves the server capability before forwarding a profile mutation.",
+      "evidence": [
+        "tests/daemon/test_prompt01_publication_routes.py"
+      ]
+    },
+    {
+      "producer": "0.4.8 client",
+      "daemon": "0.4.8",
+      "server": "0.4.8",
+      "status": "tested",
+      "reason": "Authenticated profile, eligibility, immutable release and withdrawal flow is exercised.",
+      "evidence": [
+        "spl-server/tests/test_public_object_publication.py"
+      ]
+    }
+  ]
+}

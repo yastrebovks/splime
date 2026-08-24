@@ -16,7 +16,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import uuid4
 
 from spl._process import run_process_tree
@@ -173,6 +173,15 @@ class VenvSubprocessNodeRuntime:
     name = VENV_SUBPROCESS_NODE_RUNTIME
 
     def prepare(self, context: NodeRuntimeContext) -> PreparedNodeEnvironment:
+        prepare_for_node = getattr(context.environment_provider, "prepare_for_node", None)
+        if callable(prepare_for_node):
+            return cast(
+                PreparedNodeEnvironment,
+                prepare_for_node(
+                    _runtime_spec(self.name, context),
+                    node_label=context.node_label,
+                ),
+            )
         return context.environment_provider.prepare(_runtime_spec(self.name, context))
 
     def execute(self, context: NodeRuntimeContext, environment: PreparedNodeEnvironment) -> dict[str, Any]:

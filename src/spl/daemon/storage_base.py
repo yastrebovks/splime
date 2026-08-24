@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -23,12 +22,13 @@ from uuid import uuid4
 
 from spl.core import json_contract as m_json_contract
 from spl.daemon.secret_store import SecretStore
+from spl.daemon.name_validation import NAME_PATTERN as NAME_PATTERN
+from spl.daemon.name_validation import validate_name as validate_name
 from spl.daemon.telemetry import (
     TELEMETRY_PAYLOAD_TTL_SECONDS,
     local_run_proof,
 )
 
-NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 FUNCTION_REF_SEPARATOR = "::"
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60.0
 REDACTED_SECRET_VALUE = "__spl_daemon_secret__"
@@ -77,16 +77,6 @@ def default_home() -> Path:
     import os
 
     return Path(os.environ.get("SPL_DAEMON_HOME", Path.home() / ".spl-daemon"))
-
-
-def validate_name(name: str) -> str:
-    """Validate a registry-safe name and return it unchanged."""
-
-    # Keep this rule in sync with spl.daemon.spl_free_runner.validate_name;
-    # the runner duplicates it intentionally to stay stdlib-only.
-    if not NAME_PATTERN.fullmatch(name) or set(name) == {"."}:
-        raise ValueError("name must contain only letters, digits, underscore, dash, and dot, and not only dots")
-    return name
 
 
 def split_object_function_ref(

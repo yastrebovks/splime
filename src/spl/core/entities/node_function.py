@@ -5,7 +5,7 @@ from types import FunctionType
 from typing import Any, Generator, cast
 from uuid import UUID
 
-import yaml
+from spl.core._yaml import yaml
 
 from spl.core.entities.function import get_function_metadata
 from spl.core.entities.node import Node

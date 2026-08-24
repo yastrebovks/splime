@@ -33,6 +33,12 @@ _CALLBACK_PRINCIPAL: ContextVar[CallbackCapabilityPrincipal | None] = ContextVar
 )
 
 
+class FeatureNotSupportedError(RuntimeError):
+    """A new additive operation is unavailable on one negotiated component."""
+
+    code = "feature_not_supported"
+
+
 class RouteErrorDecorator(Protocol):
     def __call__(self, handler: RouteHandler) -> RouteHandler: ...
 
@@ -114,6 +120,10 @@ class RouteContext:
                     self.runtime._mark_current_server_channel_failure(error=exc)
                     body["offline"] = True
                     body["code"] = SERVER_UNREACHABLE_CODE
+                elif exc.code:
+                    body["code"] = exc.code
+                if isinstance(exc.payload, dict) and isinstance(exc.payload.get("blockers"), list):
+                    body["blockers"] = exc.payload["blockers"]
                 try:
                     status = HTTPStatus(exc.status_code)
                 except ValueError:
@@ -121,6 +131,11 @@ class RouteContext:
                 if int(status) >= 500:
                     status = HTTPStatus.BAD_GATEWAY
                 return self.json_response(body, status)
+            except FeatureNotSupportedError as exc:
+                return self.json_response(
+                    {"error": str(exc), "code": exc.code},
+                    HTTPStatus.NOT_IMPLEMENTED,
+                )
             except RuntimeError as exc:
                 return self.json_response({"error": str(exc)}, HTTPStatus.CONFLICT)
             except Exception as exc:

@@ -18,11 +18,13 @@ from spl.core.library_adapters import (
     LibraryAdapterRef,
     LibraryAdapterVersion,
 )
+from spl.core.publications import UNSET
 from spl.core._common import Deployment, lift
 from spl.core.entities.distribution import DDistribution
 from spl.core.entities.node import DEFAULT_PORT, InputPort, OutputPort
 from spl.core.entities.node_remote import NodeRemote
 from spl.server_client import SPLServerClient
+from spl.public import PublicObjectRef, format_public_ref, parse_public_ref
 
 __all__ = [
     "SPLClient",
@@ -42,6 +44,10 @@ __all__ = [
     "LibraryAdapterDependency",
     "LibraryAdapterRef",
     "LibraryAdapterVersion",
+    "UNSET",
+    "PublicObjectRef",
+    "format_public_ref",
+    "parse_public_ref",
     "analyze_selected_code",
     "inspect_active_kernel_environment",
     "prepare_source",

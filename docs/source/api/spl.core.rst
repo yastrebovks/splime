@@ -31,6 +31,15 @@ spl.core.\_graph module
    :show-inheritance:
    :undoc-members:
 
+spl.core.\_yaml module
+----------------------
+
+.. automodule:: spl.core._yaml
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.core.adapter\_compat module
 -------------------------------
 
@@ -80,6 +89,15 @@ spl.core.node\_runtime module
 -----------------------------
 
 .. automodule:: spl.core.node_runtime
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.core.publications module
+----------------------------
+
+.. automodule:: spl.core.publications
    :members:
    :private-members:
    :show-inheritance:

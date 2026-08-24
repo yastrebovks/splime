@@ -28,7 +28,7 @@ redeploying.
 ## Install
 
 ```bash
-python3.13 -m pip install "splime==0.4.7"
+python3.13 -m pip install "splime==0.4.8"
 ```
 
 The distribution is named `splime`; the Python import package is `spl`.

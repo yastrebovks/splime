@@ -32,6 +32,7 @@ from spl.core.entities.pipeline import AdapterResolutionSource, DPipeline, Pipel
 from spl.core.ir.parse import get_top_level_deps
 from spl.core.ir.unparse import ir_unparse
 from spl.core.ir.utils import SPLSafeLoader, spl_export_to_file, spl_import_from_file
+from spl.daemon.metadata import extract_metadata
 
 
 def _adapter_save(path: str, obj: str) -> None:
@@ -716,6 +717,41 @@ def test_e2e_artifact_adapter_pipeline_round_trips_through_yaml(
         in_memory_refs = list(run._artifact_refs.values())
 
     spl_export_to_file(yaml_path, [pipeline])
+    yaml_text = yaml_path.read_text(encoding="utf-8")
+    assert "!DLocalClass" not in yaml_text
+    assert "!DLocalAlias" not in yaml_text
+    emitted_tags = set(re.findall(r"!D[A-Za-z]+", yaml_text))
+    assert emitted_tags <= {
+        "!DAdapter",
+        "!DArtifactRef",
+        "!DDistribution",
+        "!DFormattedOutputRef",
+        "!DFunction",
+        "!DImport",
+        "!DImportFrom",
+        "!DLoadAdapter",
+        "!DNodeFunction",
+        "!DNodeInputRef",
+        "!DNodeOutputRef",
+        "!DNodeRemote",
+        "!DPipeline",
+        "!DSPLImport",
+        "!DSPLSelfImport",
+        "!DSaveAdapter",
+        "!DScalar",
+    }
+    assert "!DImportFrom\n  module: adapter_e2e_module" not in yaml_text
+    metadata = extract_metadata(yaml_text, "adapter_e2e_pipeline")
+    assert metadata["kind"] == "pipeline"
+    assert not any(item["module"] == module.__name__ for item in metadata["imports"])
+
+    sys.modules.pop(module.__name__, None)
+    monkeypatch.setattr(
+        sys,
+        "path",
+        [entry for entry in sys.path if Path(entry or ".").resolve() != tmp_path.resolve()],
+    )
+    importlib.invalidate_caches()
     spl_import_from_file(yaml_path, namespace)
 
     imported = cast(Pipeline, namespace["adapter_e2e_pipeline"])

@@ -2,7 +2,8 @@
 
 Three layers are pinned here:
 
-* aliases that warned through 0.1.4/0.1.5 are **gone** in 0.2.0;
+* aliases that warned through 0.1.4/0.1.5 are restored in 0.4.8 as source-
+  compatibility facades;
 * the canonical replacements stay silent;
 * the new 0.2.0 deprecations (deep-import shims, convenience ``NodeRemote``
   constructor forms) warn while keeping the old behavior.
@@ -21,7 +22,7 @@ import pytest
 from spl import DEFAULT_PORT, Deployment, InputPort, NodeRemote, OutputPort, lift
 from spl._client import SPLClient
 
-REMOVED_CLIENT_ALIASES = (
+RESTORED_CLIENT_ALIASES = (
     "create_library",
     "get_library",
     "update_library",
@@ -90,11 +91,11 @@ def _offline_node() -> NodeRemote:
     )
 
 
-class TestRemovedAliases:
-    def test_legacy_client_aliases_are_gone(self) -> None:
+class TestRestoredAliases:
+    def test_legacy_client_aliases_are_callable_facades(self) -> None:
         client, _ = _client()
-        for alias in REMOVED_CLIENT_ALIASES:
-            assert not hasattr(client, alias), f"SPLClient.{alias} was removed in 0.2.0 and must not come back"
+        for alias in RESTORED_CLIENT_ALIASES:
+            assert callable(getattr(client, alias)), f"SPLClient.{alias} must remain source compatible"
 
     def test_canonical_library_namespace_is_silent(self) -> None:
         client, _ = _client()

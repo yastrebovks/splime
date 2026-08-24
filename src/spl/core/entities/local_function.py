@@ -39,52 +39,22 @@ import inspect
 import sys
 import sysconfig
 import textwrap
-from dataclasses import dataclass
+from dataclasses import replace
 from functools import lru_cache
 from itertools import chain
 from pathlib import Path
 from types import FunctionType
 from typing import Any, Generator, cast
 
-import yaml
-
 from spl.core.entities.control import DSPLImport
 from spl.core.entities.function import (
+    DFunction,
     LOCATION_DUNDER_NAME,
     get_dependency_names_from_bytecode,
     serialize_function,
 )
-from spl.core.ir.common import DBase
+from spl.core.entities.node import InputPort
 from spl.core.ir.parse import _attach, _branch, ir_parse
-from spl.core.ir.unparse import ir_unparse
-
-# --------------------------------------------------------------------------- #
-# DLocalAlias: rebind an aliased local import after the target is inlined.
-#
-# A helper is always inlined under its real ``def`` name, so a caller that
-# referred to it through an alias (``from helpers import helper as h``) needs
-# that alias rebound in its own scope: ``h = helper``.
-# --------------------------------------------------------------------------- #
-
-
-@dataclass(frozen=True)
-class DLocalAlias(DBase):
-    alias: str
-    target: str
-
-
-yaml.add_representer(DLocalAlias, lambda dumper, data: dumper.represent_mapping("!DLocalAlias", data.__dict__))
-
-
-yaml.add_constructor(
-    "!DLocalAlias", lambda loader, node: DLocalAlias(**cast(dict[str, Any], loader.construct_mapping(cast(Any, node))))
-)
-
-
-@ir_unparse.register(lambda x: isinstance(x, DLocalAlias))
-def _ir_unparse__local_alias(x: DLocalAlias, source: Path) -> Generator[ast.stmt]:
-    yield ast.Assign(targets=[ast.Name(id=x.alias, ctx=ast.Store())], value=ast.Name(id=x.target, ctx=ast.Load()))
-
 
 # --------------------------------------------------------------------------- #
 # Locality detection: is a module first-party user code, or third-party?
@@ -198,6 +168,23 @@ def _function_def(func: FunctionType) -> ast.FunctionDef | None:
     return None
 
 
+def _class_def(cls: type[Any]) -> ast.ClassDef | None:
+    """Parse one source-backed local class, or return ``None`` if unsafe."""
+
+    try:
+        source = textwrap.dedent(inspect.getsource(cls))
+    except (OSError, TypeError):
+        return None
+    try:
+        module = ast.parse(source)
+    except SyntaxError:
+        return None
+    body = module.body
+    if len(body) == 1 and isinstance(body[0], ast.ClassDef):
+        return body[0]
+    return None
+
+
 def is_inlinable_local_function(x: Any) -> bool:
     """Dispatch predicate: a pure-Python function from a first-party local file.
 
@@ -213,6 +200,22 @@ def is_inlinable_local_function(x: Any) -> bool:
         if not _module_is_local(module_name):
             return False
         return _function_def(x) is not None
+    except Exception:
+        return False
+
+
+def is_inlinable_local_class(x: Any) -> bool:
+    """Return whether a local Python class can be captured from exact source."""
+
+    try:
+        if not isinstance(x, type):
+            return False
+        module_name = getattr(x, "__module__", None)
+        if module_name in (None, "__main__"):
+            return False
+        if not _module_is_local(module_name):
+            return False
+        return _class_def(x) is not None
     except Exception:
         return False
 
@@ -250,6 +253,100 @@ def _local_dependencies(func: FunctionType, tree: ast.FunctionDef) -> Generator[
         yield ir_parse(namespace[name], name)
 
 
+def _local_class_dependencies(cls: type[Any], tree: ast.ClassDef) -> Generator[Any]:
+    """Yield external names required to reconstruct one captured local class."""
+
+    module = sys.modules.get(cls.__module__)
+    if module is None:
+        raise ValueError("cannot capture local class from an unloaded module")
+    namespace = vars(module)
+    compiler_names = {"__annotations__", "__name__"}
+    names = sorted(
+        name
+        for name in set(get_dependency_names_from_bytecode(ast.unparse(tree)))
+        if name not in vars(builtins) and name not in compiler_names
+    )
+    missing = [name for name in names if name not in namespace]
+    if missing:
+        raise ValueError(
+            "cannot capture local class {!r}: undefined names {}".format(
+                cls.__qualname__,
+                ", ".join(missing),
+            )
+        )
+    for name in names:
+        yield ir_parse(namespace[name], name)
+
+
+def _serialize_local_class_factory(
+    cls: type[Any],
+    tree: ast.ClassDef,
+    exported_name: str,
+) -> DFunction:
+    """Encode a constructible local class through the released ``DFunction`` tag.
+
+    The 0.4.x YAML vocabulary has no class-definition element.  For the
+    historical Adapter closure, callers only construct values; a source-backed
+    factory preserves that behavior without adding a tag older readers reject.
+    Unsupported class call signatures fail closed instead of widening the IR.
+    """
+
+    signature = inspect.signature(cls)
+    inputs: list[InputPort] = []
+    call_arguments: list[ast.expr] = []
+    for parameter in signature.parameters.values():
+        if parameter.kind not in {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }:
+            raise ValueError(
+                f"cannot capture local class {cls.__qualname__!r}: "
+                "only positional constructor parameters are supported by the released DFunction schema"
+            )
+        default = None if parameter.default is inspect.Parameter.empty else repr(parameter.default)
+        inputs.append(InputPort(name=parameter.name, typ_=None, default=default))
+        call_arguments.append(ast.Name(id=parameter.name, ctx=ast.Load()))
+    body = ast.Module(
+        body=[
+            tree,
+            ast.Assign(
+                targets=[
+                    ast.Attribute(
+                        value=ast.Name(id=tree.name, ctx=ast.Load()),
+                        attr="__module__",
+                        ctx=ast.Store(),
+                    )
+                ],
+                value=ast.Constant(value=cls.__module__),
+            ),
+            ast.Assign(
+                targets=[
+                    ast.Attribute(
+                        value=ast.Name(id=tree.name, ctx=ast.Load()),
+                        attr="__qualname__",
+                        ctx=ast.Store(),
+                    )
+                ],
+                value=ast.Constant(value=cls.__qualname__),
+            ),
+            ast.Return(
+                value=ast.Call(
+                    func=ast.Name(id=tree.name, ctx=ast.Load()),
+                    args=call_arguments,
+                    keywords=[],
+                )
+            ),
+        ],
+        type_ignores=[],
+    )
+    return DFunction(
+        name=exported_name,
+        body=ast.unparse(ast.fix_missing_locations(body)),
+        inputs=inputs,
+        outputs=None,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # ir_parse handler: inline the local function instead of importing it.
 # --------------------------------------------------------------------------- #
@@ -265,15 +362,20 @@ def _ir_parse__local_function(x: FunctionType, name: str | None = None) -> _atta
 
     tree = _function_def(x)
     tree = cast(ast.FunctionDef, tree)
-    branch = _branch(x, lambda: serialize_function(x, tree), lambda _frame_offset: _local_dependencies(x, tree))
+    exported_name = name or tree.name
+    return _branch(
+        x,
+        lambda: replace(serialize_function(x, tree), name=exported_name),
+        lambda _frame_offset: _local_dependencies(x, tree),
+    )
 
-    # When this helper is reached through an alias (``import helper as h``) the
-    # calling body still refers to it as ``h``, yet it is inlined under its real
-    # def name.  Bundle a local rebind (``h = helper``) next to the inlined
-    # function so the alias lands in *the caller's* scope.  Because the alias is
-    # attached here -- not in the caller's dependency walk -- this works for any
-    # caller, including a ``__main__`` entry function whose name resolution also
-    # routes through ``ir_parse`` and therefore through this handler.
-    if name is not None and name != tree.name:
-        return _attach([branch, DLocalAlias(alias=name, target=tree.name)])
-    return branch
+
+@ir_parse.register(is_inlinable_local_class)
+def _ir_parse__local_class(x: type[Any], name: str | None = None) -> _attach | _branch:
+    tree = cast(ast.ClassDef, _class_def(x))
+    exported_name = name or tree.name
+    return _branch(
+        x,
+        lambda: _serialize_local_class_factory(x, tree, exported_name),
+        lambda _frame_offset: _local_class_dependencies(x, tree),
+    )

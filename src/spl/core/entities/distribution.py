@@ -1,12 +1,13 @@
 import importlib
 import logging
+import sys
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, packages_distributions
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Generator, cast
 
-import yaml
+from spl.core._yaml import yaml
 
 from spl.core.ir.common import DBase
 from spl.core.ir.unparse import ir_unparse
@@ -30,10 +31,17 @@ yaml.add_constructor(
 
 
 def get_dependencies_from_distribution(module: ModuleType) -> Generator[DDistribution]:
+    root = module.__name__.partition(".")[0]
+    if root in sys.stdlib_module_names or root in sys.builtin_module_names:
+        return
+
     distributions = packages_distributions()
-    if package := module.__package__:
-        for x in set(distributions[package.split(".")[0]]):
-            yield DDistribution(package=x, version=importlib.metadata.version(x))
+    packages = distributions.get(root)
+    if not packages:
+        raise ValueError(f"cannot resolve an installed distribution for non-standard module {module.__name__!r}")
+
+    for package in sorted(set(packages)):
+        yield DDistribution(package=package, version=importlib.metadata.version(package))
 
 
 def validate_distributions(deps: list[tuple[DBase, list[DBase]]], source: str) -> None:

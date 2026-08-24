@@ -1,0 +1,110 @@
+{
+  "bundle_base64": "UEsDBBQAAAAAAAAAIQAkc129nwAAAJ8AAAALAAAAb2JqZWN0Lmpzb257ImRlY29tcG9zaXRpb24iOnt9LCJkaXN0cmlidXRpb25zIjpbXSwiZW50cnlwb2ludCI6ImFkZCIsImtpbmQiOiJmdW5jdGlvbiIsIm1ldGFkYXRhIjp7ImVudHJ5cG9pbnQiOiJhZGQiLCJraW5kIjoiZnVuY3Rpb24ifSwicnVudGltZV9jb25maWciOnsibW9kZSI6InZlbnYifX1QSwMEFAAAAAAAAAAhAGKiMf+sAAAArAAAAAsAAABvYmplY3QueWFtbC0gIURGdW5jdGlvbgogIG5hbWU6IGFkZAogIGlucHV0czoKICAtIG5hbWU6IGxlZnQKICAgIHR5cGU6IGludAogIC0gbmFtZTogcmlnaHQKICAgIHR5cGU6IGludAogIG91dHB1dHM6CiAgLSBuYW1lOiBkZWZhdWx0CiAgICB0eXBlOiBpbnQKICBib2R5OiB8LQogICAgcmV0dXJuIGxlZnQgKyByaWdodApQSwECFAMUAAAAAAAAACEAJHNdvZ8AAACfAAAACwAAAAAAAAAAAAAApIEAAAAAb2JqZWN0Lmpzb25QSwECFAMUAAAAAAAAACEAYqIx/6wAAACsAAAACwAAAAAAAAAAAAAApIHIAAAAb2JqZWN0LnlhbWxQSwUGAAAAAAIAAgByAAAAnQEAAAAA",
+  "bundle_hash": "57494aa3cb6a9005899b98243fc5f5b079bd1aaec291cb645444e0850580cca1",
+  "identity": {
+    "entry_type": "object",
+    "library": "default",
+    "name": "add",
+    "owner": "@alice",
+    "uri": "splime://@alice/default/add"
+  },
+  "manifest": {
+    "bundle_format": "zip-store-v1",
+    "bundle_hash": "57494aa3cb6a9005899b98243fc5f5b079bd1aaec291cb645444e0850580cca1",
+    "callable": true,
+    "components": [
+      {
+        "content_hash": "9745db4392102a5a92708ccf3e689dede68960efcc19e9495dab9aff3d3378d4",
+        "identity": "object-fixed-add",
+        "path": "root",
+        "type": "object",
+        "version": 1,
+        "version_id": "version-fixed-add-1"
+      }
+    ],
+    "contracts": {
+      "inputs": [],
+      "outputs": []
+    },
+    "dependencies": [],
+    "description": "Add two integers.",
+    "entrypoint": "add",
+    "identity": {
+      "entry_id": "object-fixed-add",
+      "entry_type": "object",
+      "library": "default",
+      "name": "add",
+      "owner": "@alice",
+      "owner_id": "author-fixed",
+      "uri": "splime://@alice/default/add"
+    },
+    "kind": "function",
+    "members": [
+      {
+        "path": "object.json",
+        "sha256": "7d67e364a4bcd8b9c8cb50538753c80a6a132d2d6295ae10c8be8e6767b5db3d",
+        "size": 159
+      },
+      {
+        "path": "object.yaml",
+        "sha256": "9745db4392102a5a92708ccf3e689dede68960efcc19e9495dab9aff3d3378d4",
+        "size": 172
+      }
+    ],
+    "provenance": {
+      "producer": "spl-server",
+      "producer_contract": "public-release-producer-v1",
+      "source_version_id": "version-fixed-add-1"
+    },
+    "python_constraints": {
+      "python": "3.13",
+      "runtime": {
+        "mode": "venv"
+      }
+    },
+    "required_capabilities": [
+      "spl.public_object_profile.v1"
+    ],
+    "runtime_locks": [
+      {
+        "dependencies": [],
+        "lock_hash": "d34d28d04678bcb98db29ae792197ed65dd296df2fdd39d578658f74cf35f344",
+        "names": [
+          "root"
+        ],
+        "python": "3.13",
+        "runtime": "venv"
+      }
+    ],
+    "schema": "spl.public_object_manifest.v1",
+    "schema_version": 1,
+    "signature": {
+      "algorithm": "ed25519",
+      "detached": true,
+      "scope": "manifest_hash:bundle_hash"
+    },
+    "validation": {
+      "blocker_count": 0,
+      "checks": [
+        "archive_path_safety",
+        "dependency_closure",
+        "entrypoint_contract",
+        "no_private_infrastructure",
+        "runtime_materialization"
+      ],
+      "component_count": 1,
+      "eligible": true,
+      "validator": "spl.public_eligibility.v1"
+    },
+    "version": 1,
+    "version_id": "version-fixed-add-1"
+  },
+  "manifest_hash": "61d48205ffd7be62feea32823c9e5e7d3c459b0f34a5676aad3eaccafabd05a8",
+  "release_id": "61d48205ffd7be62feea32823c9e5e7d3c459b0f34a5676aad3eaccafabd05a8",
+  "schema": "spl.public_manifest_fixture.v1",
+  "signature": {
+    "algorithm": "ed25519",
+    "key_id": "ed25519-sha256:65b60673d6ed884bf01c2c222d82ada0740f29ac3355d6a925c81f17f47a27b8",
+    "value": "CIqB0e73/c9SUE/lRerST0tkSJe+b3khUCfux6EX9TMNHriQ5h4PFpSG/3xrFrl4LsDOTtdd2JueIhWpRt5OCQ=="
+  }
+}

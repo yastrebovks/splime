@@ -6,6 +6,8 @@ from http import HTTPStatus
 from typing import Any
 
 from spl.daemon.routes._helpers import RouteContext, RouteRegistrar
+from spl.core.publications import PUBLIC_OBJECT_PROFILE_CAPABILITY
+from spl.daemon.publications import require_server_publication_capability
 from spl.daemon.signature import build_signature, summarize_object
 from spl.daemon.store import validate_name
 
@@ -31,6 +33,59 @@ def register_object_routes(
                 owner_id=context.first_query_value("owner", "owner_id"),
                 library=context.first_query_value("library"),
                 compact=view == "summary" or compact,
+            )
+        )
+
+    @app.get("/server/objects/<name_or_id>/public-status")
+    @route_errors
+    async def public_object_status(name_or_id: str) -> Any:
+        _, server = await context.connected_server_client_async()
+        await context.run_blocking(
+            require_server_publication_capability,
+            server,
+            PUBLIC_OBJECT_PROFILE_CAPABILITY,
+        )
+        return json_response(
+            await context.run_blocking(
+                server.object_profile_status,
+                validate_name(name_or_id),
+                library=context.first_query_value("library"),
+            )
+        )
+
+    @app.post("/server/objects/<name_or_id>/profile")
+    @route_errors
+    async def update_public_object_profile(name_or_id: str) -> Any:
+        body = await context.read_json_body()
+        _, server = await context.connected_server_client_async()
+        await context.run_blocking(
+            require_server_publication_capability,
+            server,
+            PUBLIC_OBJECT_PROFILE_CAPABILITY,
+        )
+        return json_response(
+            await context.run_blocking(
+                server.update_object_profile,
+                validate_name(name_or_id),
+                body,
+            )
+        )
+
+    @app.post("/server/objects/<name_or_id>/public-preflight")
+    @route_errors
+    async def preflight_public_object(name_or_id: str) -> Any:
+        body = await context.read_json_body()
+        _, server = await context.connected_server_client_async()
+        await context.run_blocking(
+            require_server_publication_capability,
+            server,
+            PUBLIC_OBJECT_PROFILE_CAPABILITY,
+        )
+        return json_response(
+            await context.run_blocking(
+                server.preflight_public_object,
+                validate_name(name_or_id),
+                body,
             )
         )
 
@@ -205,6 +260,25 @@ def register_object_routes(
     @route_errors
     async def register_object() -> Any:
         body = await context.read_json_body()
+        profile_description = body.get("profile_description")
+        preserve_description = False
+        description = body.get("description")
+        if profile_description is not None:
+            if not isinstance(profile_description, dict) or set(profile_description) not in (
+                {"mode"},
+                {"mode", "value"},
+            ):
+                raise ValueError("profile_description must be a versioned description intent")
+            mode = profile_description.get("mode")
+            if mode == "preserve" and set(profile_description) == {"mode"}:
+                preserve_description = True
+                description = None
+            elif mode == "set" and set(profile_description) == {"mode", "value"}:
+                description = profile_description.get("value")
+                if not isinstance(description, str):
+                    raise ValueError("profile_description set value must be a string")
+            else:
+                raise ValueError("profile_description mode must be preserve or set")
         create_library_field = "create_library" if "create_library" in body else "create"
         create_library = context.strict_body_bool(body, create_library_field)
         local_only = context.strict_body_bool(body, "local_only")
@@ -215,7 +289,8 @@ def register_object_routes(
             yaml_text=body.get("yaml"),
             yaml_path=body.get("yaml_path"),
             workdir=body.get("workdir"),
-            description=body.get("description"),
+            description=description,
+            preserve_description=preserve_description,
             version_label=body.get("version_label"),
             object_id=body.get("object_id"),
             owner_id=body.get("owner_id") or body.get("object_owner_id"),

@@ -57,6 +57,8 @@ NON_ROOT_MUTATION_ROUTES = frozenset(
         ("lifecycle.py", "lifecycle_cancel"),
         ("remote.py", "resolve_remote_decomposition"),
         ("runs.py", "connected_remote_run_preflight"),
+        ("library_adapters.py", "update_public_adapter_profile"),
+        ("objects.py", "update_public_object_profile"),
         ("server_connections.py", "reveal_server_connection_credentials"),
     }
 )
@@ -67,6 +69,7 @@ NON_MUTATING_POST_ROUTES = frozenset(
         ("ai_assistant.py", "create_ai_assistant"),
         ("ai_preview.py", "create_ai_preview"),
         ("library_adapters.py", "preflight_library_adapter"),
+        ("objects.py", "preflight_public_object"),
         ("prepared_validation.py", "prepare_publication_object"),
         ("prepared_validation.py", "validate_prepared_object"),
         ("source_analysis.py", "analyze_source"),

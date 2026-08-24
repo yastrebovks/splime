@@ -75,6 +75,11 @@ from spl.core.runtime_port_adapters import (
     normalize_public_adapter_mapping,
     normalize_runtime_output_record,
 )
+from spl.core.publications import (
+    PUBLIC_ADAPTER_PROFILE_CAPABILITY,
+    PUBLIC_OBJECT_PROFILE_CAPABILITY,
+    UNSET,
+)
 from spl.daemon_client import (
     DEFAULT_DAEMON_HOST,
     DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
@@ -1542,6 +1547,57 @@ class _LibraryAdmin:
         )
 
 
+class _ObjectAdmin:
+    """Grouped owner administration without colliding with ``objects()``."""
+
+    def __init__(self, client: "SPLClient") -> None:
+        self._c = client
+
+    def update(
+        self,
+        name_or_id: str,
+        *,
+        library: str | None = None,
+        description: Any = UNSET,
+        public: Any = UNSET,
+        expected_revision: int | None = None,
+        wait: bool = True,
+    ) -> dict[str, Any]:
+        """Update one revisioned profile and optionally activate/withdraw it."""
+
+        self._c._daemon.require_public_profile_capability(PUBLIC_OBJECT_PROFILE_CAPABILITY)
+        payload: dict[str, Any] = {"wait": wait}
+        if library is not None:
+            payload["library"] = library
+        if description is not UNSET:
+            payload["description"] = description
+        if public is not UNSET:
+            payload["public"] = public
+        if expected_revision is not None:
+            payload["expected_revision"] = expected_revision
+        return self._c._daemon.update_object_profile(name_or_id, payload)
+
+    def status(
+        self,
+        name_or_id: str,
+        *,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the authenticated owner's current profile/publication state."""
+
+        return self._c._daemon.object_profile_status(name_or_id, library=library)
+
+    def preflight(
+        self,
+        name_or_id: str,
+        *,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate and materialize a candidate without activating it."""
+
+        return self._c._daemon.preflight_public_object(name_or_id, library=library)
+
+
 class SPLClient:
     """High-level client used by SPL users to interact with the local daemon."""
 
@@ -1561,6 +1617,7 @@ class SPLClient:
         heartbeat_interval_seconds: float | None = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
         api_token: str | None = None,
     ):
+        self._embedded_backend: Any | None = None
         self._daemon = Client(
             base_url,
             daemon_host=daemon_host,
@@ -1582,6 +1639,41 @@ class SPLClient:
                 capabilities=capabilities,
                 heartbeat_interval_seconds=heartbeat_interval_seconds,
             )
+
+    @classmethod
+    def embedded(
+        cls,
+        registry_url: str = "https://splime.io",
+        cache_dir: str | Path | None = None,
+        *,
+        run_receipts: bool | None = None,
+        trusted_keys: Mapping[str, Mapping[str, str | bytes]] | None = None,
+    ) -> "SPLClient":
+        """Create a daemon-free client for verified public releases only.
+
+        ``run_receipts=False`` disables privacy-minimal best-effort public Run
+        counters. ``SPL_PUBLIC_RUN_RECEIPTS=0`` provides the same opt-out.
+        """
+
+        from spl.embedded import EmbeddedBackend, UnsupportedEmbeddedDaemon
+
+        client = cls.__new__(cls)
+        client._embedded_backend = EmbeddedBackend(
+            registry_url,
+            cache_dir,
+            run_receipts=run_receipts,
+            trusted_keys=trusted_keys,
+        )
+        client._daemon = cast(Client, UnsupportedEmbeddedDaemon())
+        client.server_connection = None
+        client._user_token = None
+        return client
+
+    @property
+    def mode(self) -> str:
+        """Return ``embedded`` or the historical integrated-daemon mode."""
+
+        return "embedded" if self._embedded_backend is not None else "daemon"
 
     def health(self) -> dict[str, Any]:
         """Check that the local daemon is reachable."""
@@ -1630,6 +1722,14 @@ class SPLClient:
     def server(self) -> SPLServerClient:
         """Advanced direct central-server client for callers with a user token."""
 
+        if self._embedded_backend is not None:
+            raise ClientError(
+                "feature_not_supported: server administration is unavailable in SPLClient embedded mode",
+                payload={
+                    "code": "feature_not_supported",
+                    "error": "server administration is unavailable in SPLClient embedded mode",
+                },
+            )
         if self._user_token is None:
             raise RuntimeError(
                 "SPLClient.server requires a user token supplied to "
@@ -1646,6 +1746,118 @@ class SPLClient:
         """Grouped library administration (create/grant/reference/copy/...)."""
 
         return _LibraryAdmin(self)
+
+    @property
+    def object(self) -> _ObjectAdmin:
+        """Grouped Object profile/publication administration."""
+
+        return _ObjectAdmin(self)
+
+    # Historical 0.1.x spellings are deliberately retained as thin facades.
+    # Their signatures come from the released wheels rather than from the
+    # evolving grouped API below.
+    def create_library(
+        self,
+        slug: str,
+        *,
+        display_name: str | None = None,
+        description: str = "",
+        visibility: str = "private",
+        default_machine: str | None = None,
+        execution: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.library.create(
+            slug,
+            display_name=display_name,
+            description=description,
+            visibility=visibility,
+            default_machine=default_machine,
+            execution=execution,
+        )
+
+    def get_library(self, ref: str) -> dict[str, Any]:
+        return self.library.get(ref)
+
+    def update_library(
+        self,
+        ref: str,
+        *,
+        display_name: str | None = None,
+        description: str | None = None,
+        visibility: str | None = None,
+        default_machine: str | None = None,
+        execution: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.library.update(
+            ref,
+            display_name=display_name,
+            description=description,
+            visibility=visibility,
+            default_machine=default_machine,
+            execution=execution,
+        )
+
+    def delete_library(self, ref: str) -> dict[str, Any]:
+        return self.library.delete(ref)
+
+    def grant_library(
+        self,
+        ref: str,
+        grantee: str,
+        *,
+        grantee_type: str = "user",
+        scopes: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return self.library.grant(
+            ref,
+            grantee,
+            grantee_type=grantee_type,
+            scopes=scopes,
+        )
+
+    def revoke_library_grant(self, ref: str, grantee: str) -> dict[str, Any]:
+        return self.library.revoke(ref, grantee)
+
+    def add_reference(
+        self,
+        into_library: str,
+        name: str,
+        *,
+        owner: str | None = None,
+        from_library: str = "default",
+        version: str | int | None = "latest",
+        alias: str | None = None,
+    ) -> dict[str, Any]:
+        return self.library.add_reference(
+            into_library,
+            name,
+            owner=owner,
+            from_library=from_library,
+            version=version,
+            alias=alias,
+        )
+
+    def copy_object(
+        self,
+        name: str,
+        *,
+        into_library: str,
+        from_owner: str | None = None,
+        from_library: str = "default",
+        version: str | int | None = "latest",
+        new_name: str | None = None,
+    ) -> dict[str, Any]:
+        return self.library.copy_object(
+            name,
+            into_library=into_library,
+            from_owner=from_owner,
+            from_library=from_library,
+            version=version,
+            new_name=new_name,
+        )
+
+    def remove_entry(self, library: str, name: str) -> dict[str, Any]:
+        return self.library.remove_entry(library, name)
 
     def current_server_connection(self, *, probe: bool = True) -> dict[str, Any]:
         """Return server state, probing an open channel unless ``probe=False``."""
@@ -1829,10 +2041,29 @@ class SPLClient:
             local_only=local_only,
         )
 
-    # The flat library aliases (create_library, get_library, update_library,
-    # delete_library, grant_library, revoke_library_grant, add_reference,
-    # copy_object, remove_entry) warned through 0.1.4/0.1.5 and were removed
-    # in 0.2.0 — use ``client.library.*`` (docs/migration-0.2.0.md).
+    def update_library_adapter(
+        self,
+        adapter_id: str,
+        *,
+        description: Any = UNSET,
+        public: Any = UNSET,
+        expected_revision: int | None = None,
+        wait: bool = True,
+    ) -> dict[str, Any]:
+        """Update one Adapter profile without making the Adapter callable."""
+
+        self._daemon.require_public_profile_capability(PUBLIC_ADAPTER_PROFILE_CAPABILITY)
+        payload: dict[str, Any] = {"wait": wait}
+        if description is not UNSET:
+            payload["description"] = description
+        if public is not UNSET:
+            payload["public"] = public
+        if expected_revision is not None:
+            payload["expected_revision"] = expected_revision
+        return self._daemon.update_library_adapter_profile(adapter_id, payload)
+
+    # The grouped ``client.library.*`` surface remains canonical. The flat
+    # 0.1.x spellings above are retained as source-compatibility facades.
 
     def register_env(self, name: str = "default", python: str | None = None) -> dict[str, Any]:
         """Register a Python executable as a daemon environment.
@@ -1864,6 +2095,7 @@ class SPLClient:
         create: bool = False,
         library_display_name: str | None = None,
         local_only: bool = False,
+        description: Any = UNSET,
     ) -> PublishedObject:
         """Serialize a live function/pipeline and store it in the daemon.
 
@@ -1889,6 +2121,10 @@ class SPLClient:
             frame_offset=4 + dependency_frame_offset,
         )
         registry_name = name or resolved_entrypoint
+        profile_description = self._publish_description_intent(description)
+        profile_options: dict[str, Any] = (
+            {} if profile_description is None else {"profile_description": profile_description}
+        )
         record = self._daemon.register_object(
             registry_name,
             entrypoint=resolved_entrypoint,
@@ -1905,6 +2141,7 @@ class SPLClient:
             create_library=create,
             library_display_name=library_display_name,
             local_only=local_only,
+            **profile_options,
         )
         return PublishedObject(
             name=record["name"],
@@ -1931,6 +2168,7 @@ class SPLClient:
         create: bool = False,
         library_display_name: str | None = None,
         local_only: bool = False,
+        description: Any = UNSET,
     ) -> PublishedObject:
         """Store an already generated SPL/YAML document in the daemon.
 
@@ -1946,6 +2184,10 @@ class SPLClient:
         """
 
         yaml_text = read_yaml_input(yaml)
+        profile_description = self._publish_description_intent(description)
+        profile_options: dict[str, Any] = (
+            {} if profile_description is None else {"profile_description": profile_description}
+        )
         record = self._daemon.register_object(
             name,
             entrypoint=entrypoint,
@@ -1962,6 +2204,7 @@ class SPLClient:
             create_library=create,
             library_display_name=library_display_name,
             local_only=local_only,
+            **profile_options,
         )
         return PublishedObject(
             name=record["name"],
@@ -1972,8 +2215,57 @@ class SPLClient:
             raw=record,
         )
 
-    # ``local_objects()``/``server_objects()`` warned through 0.1.4/0.1.5 and
-    # were removed in 0.2.0 — use ``objects(scope='local'/'server')``.
+    def _publish_description_intent(self, description: Any) -> dict[str, Any] | None:
+        """Negotiate the 0.4.8 preserve/set/clear registration operation."""
+
+        supports = getattr(
+            self._daemon,
+            "supports_public_profile_capability",
+            None,
+        )
+        capable = bool(callable(supports) and supports(PUBLIC_OBJECT_PROFILE_CAPABILITY))
+        if description is UNSET:
+            return {"mode": "preserve"} if capable else None
+        require = getattr(self._daemon, "require_public_profile_capability", None)
+        if not callable(require):
+            raise ClientError(
+                "local SPL daemon does not support public Object profiles; "
+                "upgrade and restart the daemon before setting description",
+                payload={"code": "feature_not_supported"},
+            )
+        require(PUBLIC_OBJECT_PROFILE_CAPABILITY)
+        if not isinstance(description, str):
+            raise ValueError("description must be a string")
+        return {"mode": "set", "value": description}
+
+    def local_objects(self, *, compact: bool = False) -> list[dict[str, Any]]:
+        """Historical facade for ``objects(scope='local')``."""
+
+        records = self.objects(scope="local", compact=compact)
+        if isinstance(records, list):
+            return list(records)
+        return [
+            dict(record) if isinstance(record, dict) else {"name": name, "value": record}
+            for name, record in records.items()
+        ]
+
+    def server_objects(
+        self,
+        *,
+        owner: str | None = None,
+        library: str | None = None,
+        compact: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Historical facade for ``objects(scope='server')``."""
+
+        return list(
+            self.objects(
+                scope="server",
+                owner=owner,
+                library=library,
+                compact=compact,
+            )
+        )
 
     def _owner_for_library_listing(self, library: str) -> str | None:
         """Return the sole foreign owner or reject an ambiguous library slug."""
@@ -3342,8 +3634,43 @@ class SPLClient:
             runtime_adapter_plan=runtime_plan,
         )
 
-    # ``start()`` warned through 0.1.4/0.1.5 and was removed in 0.2.0 — use
-    # :meth:`submit` (same signature and behavior).
+    def start(
+        self,
+        name: str,
+        *,
+        args: list[Any] | None = None,
+        kwargs: dict[str, Any] | None = None,
+        output: str | None = None,
+        timeout_seconds: float | None = None,
+        target_machine: str | None = None,
+        owner: str | None = None,
+        library: str | None = None,
+        offline_policy: OfflinePolicy | None = None,
+        function: str | None = None,
+        source: RunSource = "auto",
+        **compat_kwargs: Any,
+    ) -> RemoteRun:
+        """Historical 0.1.x facade for :meth:`submit`."""
+
+        options: dict[str, Any] = {
+            key: value
+            for key, value in {
+                "args": args,
+                "kwargs": kwargs,
+                "output": output,
+                "timeout_seconds": timeout_seconds,
+                "target_machine": target_machine,
+                "owner": owner,
+                "library": library,
+                "offline_policy": offline_policy,
+                "function": function,
+            }.items()
+            if value is not None
+        }
+        if source != "auto":
+            options["source"] = source
+        options.update(compat_kwargs)
+        return self.submit(name, **options)
 
     def submit(
         self,
@@ -3405,8 +3732,40 @@ class SPLClient:
             keep=keep,
         )
 
-    # ``queue()`` warned through 0.1.4/0.1.5 and was removed in 0.2.0 — use
-    # ``submit(..., offline_policy='queue')``.
+    def queue(
+        self,
+        name: str,
+        *,
+        args: list[Any] | None = None,
+        kwargs: dict[str, Any] | None = None,
+        output: str | None = None,
+        timeout_seconds: float | None = None,
+        target_machine: str,
+        owner: str | None = None,
+        library: str | None = None,
+        function: str | None = None,
+        source: RunSource = "auto",
+    ) -> RemoteRun:
+        """Historical 0.1.x queued-run facade."""
+
+        options: dict[str, Any] = {
+            key: value
+            for key, value in {
+                "args": args,
+                "kwargs": kwargs,
+                "output": output,
+                "timeout_seconds": timeout_seconds,
+                "target_machine": target_machine,
+                "owner": owner,
+                "library": library,
+                "function": function,
+            }.items()
+            if value is not None
+        }
+        options["offline_policy"] = "queue"
+        if source != "auto":
+            options["source"] = source
+        return self.submit(name, **options)
 
     def call(
         self,
@@ -3430,6 +3789,7 @@ class SPLClient:
         runtimes: str | dict[str, str] | None = None,
         keep: bool | str | None = None,
         progress: ProgressOption = True,
+        trust: bool = False,
     ) -> RemoteResult:
         """Run an object, wait for completion, and return result/artifacts.
 
@@ -3451,6 +3811,52 @@ class SPLClient:
         mapping or one whole-target runtime name. Custom remote execution additionally
         requires ``adapter_policy={"custom_remote": "allow"}``.
         """
+
+        if self._embedded_backend is not None:
+            unsupported = {
+                "output": output,
+                "version": version,
+                "version_id": version_id,
+                "target_machine": target_machine,
+                "owner": owner,
+                "library": library,
+                "offline_policy": offline_policy,
+                "function": function,
+                "adapters": adapters,
+                "adapter_policy": adapter_policy,
+                "runtimes": runtimes,
+                "keep": keep,
+            }
+            if source != "auto":
+                unsupported["source"] = source
+            supplied = sorted(key for key, value in unsupported.items() if value is not None)
+            if supplied:
+                message = "embedded public calls do not support: " + ", ".join(supplied)
+                raise ClientError(
+                    f"feature_not_supported: {message}",
+                    payload={"code": "feature_not_supported", "error": message},
+                )
+            run_record, payload, downloaded = self._embedded_backend.call(
+                name,
+                args=args,
+                kwargs=kwargs,
+                timeout_seconds=timeout_seconds,
+                artifacts_dir=artifacts_dir,
+                trust=trust,
+            )
+            return RemoteResult(
+                run=run_record,
+                payload=payload,
+                mode="embedded",
+                downloaded_artifacts=downloaded,
+            )
+
+        if trust:
+            message = "trust is available only for SPLClient embedded public calls"
+            raise ClientError(
+                f"feature_not_supported: {message}",
+                payload={"code": "feature_not_supported", "error": message},
+            )
 
         run = self._start_run(
             name,
@@ -3499,9 +3905,49 @@ class SPLClient:
         )
         return response.get("value")
 
-    # ``run_node()``/``run_node_result()`` warned through 0.1.4/0.1.5 and were
-    # removed in 0.2.0 — wire the node into a pipeline instead:
-    # ``Deployment(client, lift(NodeRemote.locate(...))...).run(...)``.
+    def run_node(
+        self,
+        node: Any,
+        kwargs: dict[str, Any],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Any:
+        """Historical facade for direct ``NodeRemote`` execution."""
+
+        return self._run_node_value(node, kwargs, timeout_seconds=timeout_seconds)
+
+    def run_node_result(
+        self,
+        node: Any,
+        *,
+        kwargs: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
+    ) -> RemoteResult:
+        """Historical facade returning metadata for direct ``NodeRemote`` execution."""
+
+        payload = self._remote_node_payload(node)
+        response = self._daemon.run_remote_node(
+            payload,
+            kwargs=kwargs or {},
+            timeout_seconds=timeout_seconds,
+        )
+        value = response.get("value")
+        raw_payload = response.get("payload")
+        result_payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+        result_payload["result"] = value
+        result_payload.setdefault("artifacts", response.get("artifacts") or {})
+        run = response.get("run")
+        if not isinstance(run, dict):
+            run = {
+                "id": response.get("run_id"),
+                "status": response.get("status") or "succeeded",
+            }
+        return RemoteResult(
+            run=run,
+            payload=result_payload,
+            mode="server",
+            downloaded_artifacts={},
+        )
 
     def _is_node_remote(self, value: Any) -> bool:
         try:

@@ -11,7 +11,7 @@ from pathlib import Path
 from types import UnionType
 from typing import Any
 
-import yaml
+from spl.core._yaml import yaml
 
 from spl.core.entities.adapter import (
     BUILTIN_JSON_ADAPTER,

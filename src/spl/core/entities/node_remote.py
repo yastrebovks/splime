@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generator, cast
 from uuid import UUID
 
-import yaml
+from spl.core._yaml import yaml
 
 from spl._deprecate import warn_deprecated
 from spl._owner_ref import canonical_owner_from_response, normalize_owner_ref

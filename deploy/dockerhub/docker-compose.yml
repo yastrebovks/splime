@@ -9,7 +9,7 @@ name: spl-daemon
 
 services:
   spl-daemon:
-    image: yastrebovks/spl-daemon:0.4.7
+    image: yastrebovks/spl-daemon:0.4.8
     container_name: spl-daemon
     restart: unless-stopped
     init: true

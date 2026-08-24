@@ -81,6 +81,14 @@ def release_manifest(contract: dict[str, Any]) -> dict[str, Any]:
             "schema_target": contract["server_schema_target"],
             "deployment_receipt_schema": contract["contracts"]["deployment_receipt"],
         },
+        **(
+            {
+                "official_registry": contract["official_registry"],
+                "public_runtime_policy": contract["public_runtime_policy"],
+            }
+            if "official_registry" in contract and "public_runtime_policy" in contract
+            else {}
+        ),
         "contracts": contract["contracts"],
         "compatibility": {
             "matrix": contract["compatibility_matrix"],
@@ -282,6 +290,14 @@ def server_release_identity(contract: dict[str, Any]) -> dict[str, Any]:
         "artifact_sha256": None,
         "release_manifest_sha256": None,
         "schema_target": contract["server_schema_target"],
+        **(
+            {
+                "official_registry": contract["official_registry"],
+                "public_runtime_policy": contract["public_runtime_policy"],
+            }
+            if "official_registry" in contract and "public_runtime_policy" in contract
+            else {}
+        ),
         "contracts": {
             "console_server": contract["contracts"]["console_server"],
             "daemon_server_capabilities": contract["contracts"]["daemon_server_capabilities"],
@@ -303,6 +319,12 @@ def generate(
             server_release_identity(contract)
         ),
     }
+    if "official_registry" in contract and "public_runtime_policy" in contract:
+        exact_json_outputs[workspace_root / "spl" / "src" / "spl" / "official-registry.json"] = {
+            "schema_version": 1,
+            "official_registry": contract["official_registry"],
+            "public_runtime_policy": contract["public_runtime_policy"],
+        }
     exact_rendered_outputs = {
         path: f"{json.dumps(payload, indent=2, sort_keys=False)}\n" for path, payload in exact_json_outputs.items()
     }

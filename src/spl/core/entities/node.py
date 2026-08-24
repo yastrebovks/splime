@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Generator, cast
 from uuid import UUID, uuid4
 
-import yaml
+from spl.core._yaml import yaml
 
 from spl.core.ir.common import DBase
 from spl.core.ir.parse import _branch, ir_parse

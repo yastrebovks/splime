@@ -1,29 +1,29 @@
 {
   "schema_version": 2,
-  "release_id": "splime-0.4.7",
-  "version": "0.4.7",
+  "release_id": "splime-0.4.8",
+  "version": "0.4.8",
   "source_date_epoch": null,
   "packages": {
-    "framework": "0.4.7",
-    "daemon": "0.4.7",
-    "server": "0.4.7",
-    "console": "0.4.7"
+    "framework": "0.4.8",
+    "daemon": "0.4.8",
+    "server": "0.4.8",
+    "console": "0.4.8"
   },
   "python": {
     "distribution": "splime",
     "requires_python": ">=3.13",
-    "project_url": "https://pypi.org/project/splime/0.4.7/",
-    "install_requirement": "splime==0.4.7",
+    "project_url": "https://pypi.org/project/splime/0.4.8/",
+    "install_requirement": "splime==0.4.8",
     "artifacts": [
       {
-        "filename": "splime-0.4.7-py3-none-any.whl",
-        "path": "artifacts/python/splime-0.4.7-py3-none-any.whl",
+        "filename": "splime-0.4.8-py3-none-any.whl",
+        "path": "artifacts/python/splime-0.4.8-py3-none-any.whl",
         "url": null,
         "sha256": null
       },
       {
-        "filename": "splime-0.4.7.tar.gz",
-        "path": "artifacts/python/splime-0.4.7.tar.gz",
+        "filename": "splime-0.4.8.tar.gz",
+        "path": "artifacts/python/splime-0.4.8.tar.gz",
         "url": null,
         "sha256": null
       }
@@ -31,14 +31,49 @@
   },
   "console": {
     "url": "https://splime.io/app/",
-    "integrity_url": "https://splime.io/app/static-integrity.json?release=splime-0.4.7",
+    "integrity_url": "https://splime.io/app/static-integrity.json?release=splime-0.4.8",
     "integrity_path": "artifacts/console/static-integrity.json",
     "integrity_sha256": null,
     "cache_policy": "unhashed assets revalidate; only content-hashed assets are immutable"
   },
   "server": {
-    "schema_target": 43,
+    "schema_target": 48,
     "deployment_receipt_schema": 1
+  },
+  "official_registry": {
+    "origin": "https://splime.io",
+    "signature_algorithm": "ed25519",
+    "signing_key_id": "ed25519-sha256:635b0f38b59fa4a513723bc8e347d807dae535996173ffebfba2fcca73cbe91e",
+    "signing_public_key_b64": "DDWqFt/l2ZaRFMgvdCdyoCcQ15ixQyMjx4nqtmvqTz4="
+  },
+  "public_runtime_policy": {
+    "name": "splime-public-python-artifacts",
+    "version": "0.4.8",
+    "target": {
+      "implementation": "cpython",
+      "python": "3.13"
+    },
+    "metadata_origins": [
+      "https://pypi.org"
+    ],
+    "file_origins": [
+      "https://files.pythonhosted.org"
+    ],
+    "spdx_allowlist": [
+      "0BSD",
+      "Apache-2.0",
+      "BSD-2-Clause",
+      "BSD-3-Clause",
+      "ISC",
+      "MIT",
+      "PSF-2.0",
+      "Python-2.0",
+      "Unlicense",
+      "Zlib"
+    ],
+    "wheel_policy": "non-yanked-universal-pure-python-only",
+    "runtime_lock_schema": "spl.public_runtime_lock.v2",
+    "resolver": "splime-pypi-closure-v1"
   },
   "contracts": {
     "console_server": "console-server/v1",
@@ -57,8 +92,15 @@
       "spl.remote_run.runtime_overrides.v1",
       "spl.runtime_adapter_semantic_override.v1",
       "spl.library_adapter_catalog.v1",
+      "spl.library_adapter_date_facts.v1",
       "spl.library_adapter_publish.v1",
+      "spl.library_adapter_source.read.v1",
       "spl.runtime_library_adapter_ref.v1",
+      "spl.public_object_profile.v1",
+      "spl.public_library_adapter_profile.v1",
+      "spl.public_distribution.v1",
+      "spl.public_catalog.v1",
+      "spl.public_run_receipt.v1",
       "spl.sync.flush_without_claim.v1"
     ],
     "manifest_evidence": "spl.execution_manifest.v1",
@@ -75,10 +117,10 @@
   "components": {
     "framework": {
       "repository": "https://github.com/yastrebovks/splime",
-      "source_ref": "v0.4.7",
+      "source_ref": "v0.4.8",
       "source_binding": "signed_tag_external_provenance",
       "source_commit": null,
-      "package_version": "0.4.7",
+      "package_version": "0.4.8",
       "artifact": {
         "identifier": "splime",
         "path": null,
@@ -90,10 +132,10 @@
     },
     "daemon": {
       "repository": "https://github.com/yastrebovks/splime",
-      "source_ref": "v0.4.7",
+      "source_ref": "v0.4.8",
       "source_binding": "signed_tag_external_provenance",
       "source_commit": null,
-      "package_version": "0.4.7",
+      "package_version": "0.4.8",
       "artifact": {
         "identifier": "splime",
         "path": null,
@@ -115,8 +157,15 @@
           "spl.remote_run.runtime_overrides.v1",
           "spl.runtime_adapter_semantic_override.v1",
           "spl.library_adapter_catalog.v1",
+          "spl.library_adapter_date_facts.v1",
           "spl.library_adapter_publish.v1",
+          "spl.library_adapter_source.read.v1",
           "spl.runtime_library_adapter_ref.v1",
+          "spl.public_object_profile.v1",
+          "spl.public_library_adapter_profile.v1",
+          "spl.public_distribution.v1",
+          "spl.public_catalog.v1",
+          "spl.public_run_receipt.v1",
           "spl.sync.flush_without_claim.v1"
         ],
         "manifest_evidence": "spl.execution_manifest.v1"
@@ -124,10 +173,10 @@
     },
     "server": {
       "repository": "gitlab.com/spl894143/spl-server",
-      "source_ref": "v0.4.7",
+      "source_ref": "v0.4.8",
       "source_binding": "pinned_commit",
       "source_commit": null,
-      "package_version": "0.4.7",
+      "package_version": "0.4.8",
       "artifact": {
         "identifier": "spl-server",
         "path": null,
@@ -150,8 +199,15 @@
           "spl.remote_run.runtime_overrides.v1",
           "spl.runtime_adapter_semantic_override.v1",
           "spl.library_adapter_catalog.v1",
+          "spl.library_adapter_date_facts.v1",
           "spl.library_adapter_publish.v1",
+          "spl.library_adapter_source.read.v1",
           "spl.runtime_library_adapter_ref.v1",
+          "spl.public_object_profile.v1",
+          "spl.public_library_adapter_profile.v1",
+          "spl.public_distribution.v1",
+          "spl.public_catalog.v1",
+          "spl.public_run_receipt.v1",
           "spl.sync.flush_without_claim.v1"
         ],
         "deployment_receipt": 1
@@ -159,10 +215,10 @@
     },
     "console": {
       "repository": "gitlab.com/spl894143/spl-frontend",
-      "source_ref": "v0.4.7",
+      "source_ref": "v0.4.8",
       "source_binding": "pinned_commit",
       "source_commit": null,
-      "package_version": "0.4.7",
+      "package_version": "0.4.8",
       "artifact": {
         "identifier": "splime-console",
         "path": null,
@@ -176,8 +232,8 @@
   },
   "install_page_urls": [
     "https://splime.io/install.html",
-    "https://pypi.org/project/splime/0.4.7/",
-    "https://github.com/yastrebovks/splime/releases/download/v0.4.7/release-manifest.json"
+    "https://pypi.org/project/splime/0.4.8/",
+    "https://github.com/yastrebovks/splime/releases/download/v0.4.8/release-manifest.json"
   ],
   "public_artifacts": [
     {
@@ -185,59 +241,59 @@
       "sha256": null
     }
   ],
-  "manifest_url": "https://github.com/yastrebovks/splime/releases/download/v0.4.7/release-manifest.json",
+  "manifest_url": "https://github.com/yastrebovks/splime/releases/download/v0.4.8/release-manifest.json",
   "github_release": {
-    "url": "https://github.com/yastrebovks/splime/releases/tag/v0.4.7",
+    "url": "https://github.com/yastrebovks/splime/releases/tag/v0.4.8",
     "assets": [
       {
         "name": "source-release-manifest.json",
         "path": "artifacts/source-release-manifest.json",
-        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.7/source-release-manifest.json",
+        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.8/source-release-manifest.json",
         "sha256": null
       },
       {
         "name": "release-artifact-bom.sha256",
         "path": "artifacts/release-artifact-bom.sha256",
-        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.7/release-artifact-bom.sha256",
+        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.8/release-artifact-bom.sha256",
         "sha256": null
       },
       {
-        "name": "splime-0.4.7-py3-none-any.whl",
-        "path": "artifacts/python/splime-0.4.7-py3-none-any.whl",
-        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.7/splime-0.4.7-py3-none-any.whl",
+        "name": "splime-0.4.8-py3-none-any.whl",
+        "path": "artifacts/python/splime-0.4.8-py3-none-any.whl",
+        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.8/splime-0.4.8-py3-none-any.whl",
         "sha256": null
       },
       {
-        "name": "splime-0.4.7.tar.gz",
-        "path": "artifacts/python/splime-0.4.7.tar.gz",
-        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.7/splime-0.4.7.tar.gz",
+        "name": "splime-0.4.8.tar.gz",
+        "path": "artifacts/python/splime-0.4.8.tar.gz",
+        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.8/splime-0.4.8.tar.gz",
         "sha256": null
       },
       {
-        "name": "spl_server-0.4.7-py3-none-any.whl",
-        "path": "artifacts/server/spl_server-0.4.7-py3-none-any.whl",
-        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.7/spl_server-0.4.7-py3-none-any.whl",
+        "name": "spl_server-0.4.8-py3-none-any.whl",
+        "path": "artifacts/server/spl_server-0.4.8-py3-none-any.whl",
+        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.8/spl_server-0.4.8-py3-none-any.whl",
         "sha256": null
       },
       {
-        "name": "splime-console-0.4.7.tar.gz",
-        "path": "artifacts/splime-console-0.4.7.tar.gz",
-        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.7/splime-console-0.4.7.tar.gz",
+        "name": "splime-console-0.4.8.tar.gz",
+        "path": "artifacts/splime-console-0.4.8.tar.gz",
+        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.8/splime-console-0.4.8.tar.gz",
         "sha256": null
       },
       {
         "name": "static-integrity.json",
         "path": "artifacts/console/static-integrity.json",
-        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.7/static-integrity.json",
+        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.8/static-integrity.json",
         "sha256": null
       }
     ]
   },
   "docker": {
     "repository": "yastrebovks/spl-daemon",
-    "tag": "0.4.7",
+    "tag": "0.4.8",
     "source_repository": "https://github.com/yastrebovks/splime",
-    "source_ref": "v0.4.7",
+    "source_ref": "v0.4.8",
     "source_path": "deploy/dockerhub",
     "manifest_digest": null,
     "platform_digests": {
@@ -245,8 +301,8 @@
       "linux/arm64": null
     },
     "advertised_in_console": false,
-    "verification_url": "https://hub.docker.com/v2/repositories/yastrebovks/spl-daemon/tags/0.4.7",
-    "publication_url": "https://hub.docker.com/r/yastrebovks/spl-daemon/tags?name=0.4.7"
+    "verification_url": "https://hub.docker.com/v2/repositories/yastrebovks/spl-daemon/tags/0.4.8",
+    "publication_url": "https://hub.docker.com/r/yastrebovks/spl-daemon/tags?name=0.4.8"
   },
   "publication_order": [
     "pypi",

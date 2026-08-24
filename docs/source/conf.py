@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.abspath("../../src"))
 project = "splime"
 copyright = "2026, Yastrebov Kirill"
 author = "Yastrebov Kirill"
-release = "0.4.7"
+release = "0.4.8"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -80,7 +80,19 @@ apidoc_modules = [
 
 
 def _skip_duplicate_node_remote_reexport(app, what, name, obj, skip, options):
-    if skip or what != "module":
+    if skip:
+        return None
+    if (
+        what == "class"
+        and name == "object"
+        and isinstance(obj, property)
+        and getattr(obj.fget, "__qualname__", "") == "SPLClient.object"
+    ):
+        # The short property name makes every builtin ``object`` type hint
+        # ambiguous to the Python domain. The grouped surface is documented
+        # explicitly; suppress only the duplicate autodoc property targets.
+        return True
+    if what != "module":
         return None
     # Sphinx 9 (current autodoc) tracks the module being documented on
     # env.current_document; the legacy class-based autodoc used temp_data.

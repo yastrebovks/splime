@@ -11,7 +11,7 @@ Setup
 
 .. code-block:: bash
 
-   python3.13 -m pip install "splime==0.4.7"
+   python3.13 -m pip install "splime==0.4.8"
    spl-daemon serve        # local daemon on http://127.0.0.1:8765
 
 One import is enough:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "splime"
-version = "0.4.7"
+version = "0.4.8"
 
 description = "Reuse Python functions across projects without rewriting or redeploying them."
 readme = "README.md"
@@ -19,6 +19,7 @@ requires-python = ">= 3.13"
 
 dependencies = [
   "certifi==2026.6.17",
+  "cryptography==50.0.0",
   "pyyaml==6.0.3",
   "keyring==25.7.0",
   "quart==0.20.0",
@@ -86,7 +87,7 @@ where = ["src"]
 include = ["spl*"]
 
 [tool.setuptools.package-data]
-"*" = ["py.typed"]
+"*" = ["py.typed", "*.json"]
 
 [tool.uv]
 constraint-dependencies = [

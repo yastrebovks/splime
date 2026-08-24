@@ -6,7 +6,7 @@ from pathlib import Path
 from types import FunctionType, ModuleType
 from typing import Any, Generator, cast
 
-import yaml
+from spl.core._yaml import yaml
 
 from spl.core.entities.distribution import get_dependencies_from_distribution
 from spl.core.ir.common import DBase

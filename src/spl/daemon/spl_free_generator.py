@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import os
 import shutil
 import tempfile
@@ -13,7 +14,6 @@ from typing import Any, Literal, cast
 
 from spl.core.ir.unparse import mk_top_level_ast
 from spl.core.ir.utils import mk_top_level_deps_closure
-from spl.daemon.storage_base import read_json, write_json
 
 GENERATED_MODULE_CACHE_VERSION = "v1"
 WorkerRuntime = Literal["spl-free-runner", "legacy-spl-worker"]
@@ -132,13 +132,13 @@ def unsupported_stage1_reason(module: ast.AST) -> str | None:
 def write_worker_runtime_marker(plan: WorkerRuntimePlan) -> None:
     """Persist the worker runtime marker as run-dir diagnostics."""
 
-    write_json(plan.marker_path, plan.marker())
+    _write_json(plan.marker_path, plan.marker())
 
 
 def read_worker_runtime_marker(path: Path) -> dict[str, Any] | None:
     """Read a worker runtime marker if one has been written."""
 
-    marker = read_json(path, None)
+    marker = _read_json(path, None)
     if not isinstance(marker, dict):
         return None
     return cast(dict[str, Any], marker)
@@ -176,6 +176,39 @@ def _write_text_atomically_if_absent(path: Path, text: str) -> None:
             return
         os.replace(temp_path, path)
         temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def _read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            json.dump(value, temp_file, ensure_ascii=False, indent=2, sort_keys=True)
+            temp_file.write("\n")
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        temp_path.chmod(0o600)
+        os.replace(temp_path, path)
+        temp_path = None
+        path.chmod(0o600)
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)

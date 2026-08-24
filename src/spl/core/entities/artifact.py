@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generator
 
-import yaml
+from spl.core._yaml import yaml
 
 from spl.core.entities.adapter import _format_from_key
 from spl.core.ir.common import DBase

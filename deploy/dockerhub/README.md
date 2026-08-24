@@ -28,7 +28,7 @@ docker run -d --name spl-daemon \
   --cap-drop ALL --security-opt no-new-privileges:true \
   -p 127.0.0.1:8765:8765 \
   -v /var/lib/spl-daemon:/var/lib/spl-daemon \
-  yastrebovks/spl-daemon:0.4.7
+  yastrebovks/spl-daemon:0.4.8
 ```
 
 ## Per-node Docker nodes (0.4 series)
@@ -106,19 +106,10 @@ print(client.health())
 docker login                                   # to your Docker Hub account (yastrebovks)
 docker buildx create --use --name splime-builder
 
-# from the repository root: verify pinned sources and exact PyPI artifacts
-release/0.4.7/update-docker.sh sources
-release/0.4.7/update-docker.sh check
-
-# build amd64 and arm64 separately and run health/version/OCI-label smoke
-release/0.4.7/update-docker.sh build
-
-# after review: publish 0.4.7, 0.4 and latest, then verify both platforms
-SPLIME_CONFIRM_DOCKER=yastrebovks/spl-daemon:0.4.7 \
-  release/0.4.7/update-docker.sh push
-
-# independently re-check all three tags and both target platforms
-release/0.4.7/update-docker.sh verify
+# After the signed 0.4.8 package commit and exact PyPI wheel/sdist hashes exist,
+# finalize the separate release/0.4.8/update-docker.sh control and its immutable
+# package/source bindings. Until then publish.sh fails closed and no 0.4.8 image
+# may be built or pushed from this preparation tree.
 ```
 
 `deploy/dockerhub/publish.sh` is only a compatibility entry point and delegates
@@ -128,13 +119,13 @@ To build directly for development only, use the bounded context explicitly:
 
 ```bash
 docker build \
-  --build-arg SPL_VERSION=0.4.7 \
+  --build-arg SPL_VERSION=0.4.8 \
   --build-arg UV_VERSION=0.11.25 \
-  -t yastrebovks/spl-daemon:0.4.7-dev \
+  -t yastrebovks/spl-daemon:0.4.8-dev \
   deploy/dockerhub
 docker run --rm -p 127.0.0.1:8765:8765 \
   -v /var/lib/spl-daemon:/var/lib/spl-daemon \
-  yastrebovks/spl-daemon:0.4.7-dev
+  yastrebovks/spl-daemon:0.4.8-dev
 ```
 
 ## Security
@@ -149,5 +140,6 @@ docker run --rm -p 127.0.0.1:8765:8765 \
   [`deploy/daemon/README.md`](../daemon/README.md) for the DooD details.
 - `SPL_DAEMON_SECRET_BACKEND=file` keeps secrets in the daemon home instead of
   an OS keyring (there is no desktop keyring in a container).
-- SPLime 0.4.7, `uv`, the Python base image and Docker CLI source image are all
-  release-pinned. Updating any of them requires a new reviewed build.
+- `uv`, the Python base image and Docker CLI source image are release-pinned.
+  The 0.4.8 package revision remains deliberately `unpublished` until the
+  separate post-PyPI Docker release-control commit binds its exact artifacts.

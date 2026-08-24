@@ -25,7 +25,6 @@ from spl.core.entities.artifact import DArtifactRef
 from spl.core.entities.control import DSPLImport, DSPLSelfImport
 from spl.core.entities.distribution import DDistribution
 from spl.core.entities.function import DFunction
-from spl.core.entities.local_function import DLocalAlias
 from spl.core.entities.module import DImport, DImportFrom
 from spl.core.entities.node import (
     DFormattedOutputRef,
@@ -309,7 +308,7 @@ def _validate_document_roots(ir: ObjectIR) -> None:
         location = f"{ir.source}:documents[{document_index}].root"
         if not isinstance(root, DFunction | DPipeline):
             raise ValueError(
-                "SPL YAML document root must be a DFunction or DPipeline, got `{}` "
+                "SPL YAML document root must be a DFunction or DPipeline entrypoint, got `{}` "
                 "(location: `{}`); register a self-contained executable object bundle".format(
                     type(root).__name__,
                     location,
@@ -369,7 +368,6 @@ def _validate_function_definitions(
 
 def _validate_declared_symbol_references(ir: ObjectIR) -> None:
     root_symbols = {item.name for item, _ in _iter_object_items(ir) if isinstance(item, DFunction | DPipeline)}
-    declared = _declared_symbols(ir)
     for item, location in _iter_object_items(ir):
         if isinstance(item, DSPLImport):
             raise ValueError(
@@ -381,10 +379,6 @@ def _validate_declared_symbol_references(ir: ObjectIR) -> None:
             raise ValueError(
                 f"SPL self-import references missing object symbol `{item.name}` (location: `{location}`); "
                 "include that object in the same YAML bundle"
-            )
-        if isinstance(item, DLocalAlias) and item.target not in declared:
-            raise ValueError(
-                f"local alias `{item.alias}` references missing symbol `{item.target}` (location: `{location}`)"
             )
 
 
@@ -403,10 +397,6 @@ def _validate_executable_symbols(ir: ObjectIR) -> None:
             if isinstance(item, DFunction | DPipeline):
                 symbol = item.name
                 semantic_key = (type(item).__name__, item.name)
-            elif isinstance(item, DLocalAlias):
-                symbol = item.alias
-                semantic_key = ("local_alias", item.alias, item.target)
-                allow_identical_rebinding = True
             elif isinstance(item, DImport):
                 symbol = item.alias or item.module.split(".")[0]
                 semantic_key = ("import", item.module, item.alias)
@@ -807,8 +797,6 @@ def _declared_symbols(ir: ObjectIR) -> set[str]:
     for item, _ in _iter_object_items(ir):
         if isinstance(item, (DFunction, DPipeline, DSPLSelfImport, DSPLImport)):
             symbols.add(item.name)
-        elif isinstance(item, DLocalAlias):
-            symbols.add(item.alias)
         elif isinstance(item, DImport):
             symbols.add(item.alias or item.module.split(".")[0])
         elif isinstance(item, DImportFrom):
@@ -825,14 +813,6 @@ def _declared_callable_symbols(ir: ObjectIR) -> set[str]:
         if isinstance(item, DSPLSelfImport) and item.name in function_symbols
     )
     symbols.update(item.alias or item.target for item, _ in _iter_object_items(ir) if isinstance(item, DImportFrom))
-    aliases = [item for item, _ in _iter_object_items(ir) if isinstance(item, DLocalAlias)]
-    changed = True
-    while changed:
-        changed = False
-        for alias in aliases:
-            if alias.target in symbols and alias.alias not in symbols:
-                symbols.add(alias.alias)
-                changed = True
     return symbols
 
 

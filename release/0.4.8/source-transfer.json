@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "source": {
+    "workspace": "development/spl",
+    "branch": "master",
+    "head": "17104360a996ce71800117604f38a8ff429f0c26",
+    "status_entries": 345,
+    "status_sha256": "3101b92d816cc931aa3db0d6cc627c6e229f471feb00526f2fa3e8fef6a10733",
+    "reviewed_paths": 217,
+    "path_manifest_sha256": "97ed7d582a63398f29e001503ed5dab247eb5d47e19c8133241681cf784f4df1",
+    "content_manifest_sha256": "c0ad0234e31447cf1ded9a18aa86891176540f923c37688fa626ceb7e982c194"
+  },
+  "target": {
+    "workspace": "Release/spl",
+    "branch": "main",
+    "base_head": "290348dbe0089ed9497ac6030aa960262249eb01",
+    "preserved_preexisting_dirty_paths": [
+      "release/0.4.7/update-docker.sh",
+      "release/compatibility-matrix.json",
+      "tests/core/test_release_controls.py"
+    ]
+  },
+  "merge_policy": {
+    "generated_documentation_excluded": "docs/_build/",
+    "active_publication_workflow": ".github/workflows/publish-to-pypi.yml",
+    "active_publication_workflow_sha256": "11f770b8a3c9e6eec30eae826a1910acfab5f02ac753bb922a9039bc403458cf",
+    "reason": "Retain the newer signed-tag package-only trusted-publishing workflow and all 0.4.6/0.4.7 hardening while integrating the reviewed additive 0.4.8 implementation.",
+    "docker": "Retain digest and uv pinning; mark the 0.4.8 package revision unpublished until a separate post-PyPI Docker control binds exact package artifacts and source revisions."
+  },
+  "archived_development_controls": [
+    {
+      "source_path": ".github/workflows/publish-to-pypi.yml",
+      "archive_path": "release/0.4.8/archived-development-release-controls/.github/workflows/publish-to-pypi.yml",
+      "sha256": "dca54aad90eac859ab62585616dd748a32e7a90c7446afe326c585b4a190a9e7"
+    },
+    {
+      "source_path": "tests/core/test_release_workflows.py",
+      "archive_path": "release/0.4.8/archived-development-release-controls/tests/core/test_release_workflows.py",
+      "sha256": "823331f33c3f4b70691d7a3478ea3d796f68527ac030e0dc47c07a165a4392b2"
+    }
+  ],
+  "release_normalization": {
+    "version": "0.4.8",
+    "server_schema_target": 48,
+    "official_registry_origin": "https://splime.io",
+    "target_only_release_signing_key_preserved": true,
+    "source_worktree_mutated": false
+  }
+}

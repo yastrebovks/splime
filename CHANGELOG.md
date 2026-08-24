@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-08-21
+
+### Added
+
+- Revision-aware Object and Library Adapter Descriptions, deterministic public
+  eligibility, immutable signed public releases, and capability-negotiated
+  compatibility behavior.
+- Anonymous public resolution, manifests and verified bundles plus
+  ``SPLClient.embedded()`` for daemon-free, exact-release local execution.
+- A dedicated deterministic public catalog, canonical server-rendered profiles,
+  active release history, Similar Objects, authenticated votes, full-download
+  accounting, and privacy-minimized best-effort embedded run receipts.
+
+### Compatibility
+
+- Published 0.1.2 through 0.4.7 artifacts were inventoried without assuming a
+  contiguous version sequence. Restored wrappers preserve confirmed historical
+  facade spellings; unsupported additive operations fail before mutation.
+- Existing adapter, local/remote Run, Library, lifecycle, sync and private
+  ``NodeRemote`` behavior remains unchanged; public execution rejects
+  ``NodeRemote`` without weakening its established private paths.
+
 ## [0.4.7] - 2026-08-16
 
 ### Added
@@ -616,7 +638,8 @@ here. No breaking API changes.
 - Initial release: turn trusted Python functions into versioned, portable nodes
   reusable across projects and executed locally or remotely.
 
-[Unreleased]: https://github.com/yastrebovks/splime/compare/v0.4.7...HEAD
+[Unreleased]: https://github.com/yastrebovks/splime/compare/v0.4.8...HEAD
+[0.4.8]: https://github.com/yastrebovks/splime/compare/v0.4.7...v0.4.8
 [0.4.7]: https://github.com/yastrebovks/splime/compare/v0.4.6...v0.4.7
 [0.4.6]: https://github.com/yastrebovks/splime/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/yastrebovks/splime/compare/v0.4.4...v0.4.5

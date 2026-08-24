@@ -11,7 +11,7 @@ from pathlib import Path
 from types import CodeType, FunctionType
 from typing import Annotated, Any, Generator, cast
 
-import yaml
+from spl.core._yaml import yaml
 
 import spl.core.entities.node as m_node
 from spl.core.entities.control import DSPLImport

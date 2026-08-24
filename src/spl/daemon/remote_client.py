@@ -77,11 +77,13 @@ class ServerClientError(RuntimeError):
         *,
         code: str | None = None,
         event_id: str | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> None:
         self.status_code = status_code
         self.message = message
         self.code = code
         self.event_id = event_id
+        self.payload = payload
         super().__init__(f"{status_code}: {message}")
 
 
@@ -453,6 +455,12 @@ class ServerClient:
                         deadline=deadline,
                     )
                 )
+                try:
+                    decoded_error = json.loads(raw)
+                except json.JSONDecodeError:
+                    error_payload = None
+                else:
+                    error_payload = decoded_error if isinstance(decoded_error, dict) else None
                 message: str
                 error_code: str | None
                 event_id: str | None
@@ -482,6 +490,7 @@ class ServerClient:
                     message,
                     code=error_code,
                     event_id=event_id,
+                    payload=error_payload,
                 ) from exc
             except URLError as exc:
                 message = f"central SPL daemon server is not reachable at {self.base_url}: {exc.reason}"
@@ -1483,6 +1492,83 @@ class ServerClient:
                 "GET",
                 "/version",
                 auth="user",
+                max_response_bytes=MAX_UPSTREAM_RESPONSE_BYTES,
+            )
+        )
+
+    def object_profile_status(
+        self,
+        name_or_id: str,
+        *,
+        library: str | None = None,
+    ) -> dict[str, Any]:
+        params = {"library": library} if library is not None else {}
+        suffix = f"?{urlencode(params)}" if params else ""
+        return _require_json_dict(
+            self._json_request(
+                "GET",
+                f"/objects/{quote(name_or_id)}/public-status{suffix}",
+                auth="machine",
+                max_response_bytes=MAX_UPSTREAM_RESPONSE_BYTES,
+            )
+        )
+
+    def update_object_profile(
+        self,
+        name_or_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return _require_json_dict(
+            self._json_request(
+                "PATCH",
+                f"/objects/{quote(name_or_id)}/profile",
+                payload,
+                auth="machine",
+                allow_transport_retries=False,
+                max_transport_attempts=1,
+                max_response_bytes=MAX_UPSTREAM_RESPONSE_BYTES,
+            )
+        )
+
+    def preflight_public_object(
+        self,
+        name_or_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return _require_json_dict(
+            self._json_request(
+                "POST",
+                f"/objects/{quote(name_or_id)}/public-preflight",
+                payload,
+                auth="machine",
+                post_send_retry_safe=True,
+                max_response_bytes=MAX_UPSTREAM_RESPONSE_BYTES,
+            )
+        )
+
+    def library_adapter_profile_status(self, adapter_id: str) -> dict[str, Any]:
+        return _require_json_dict(
+            self._json_request(
+                "GET",
+                f"/library-adapters/{quote(adapter_id)}/public-status",
+                auth="machine",
+                max_response_bytes=MAX_UPSTREAM_RESPONSE_BYTES,
+            )
+        )
+
+    def update_library_adapter_profile(
+        self,
+        adapter_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return _require_json_dict(
+            self._json_request(
+                "PATCH",
+                f"/library-adapters/{quote(adapter_id)}/profile",
+                payload,
+                auth="machine",
+                allow_transport_retries=False,
+                max_transport_attempts=1,
                 max_response_bytes=MAX_UPSTREAM_RESPONSE_BYTES,
             )
         )

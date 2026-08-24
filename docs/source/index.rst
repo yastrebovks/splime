@@ -10,6 +10,7 @@ reused across projects and executed locally or remotely.
 
    cookbook
    owners-libraries-handles
+   public-embedded-runtime
    daemon-security-telemetry
    daemon-ide-metadata
    daemon-guarded-local-runs

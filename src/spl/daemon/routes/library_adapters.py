@@ -14,6 +14,8 @@ from spl.core.library_adapters import (
     LibraryAdapterContractError,
     domain_hash,
 )
+from spl.core.publications import PUBLIC_ADAPTER_PROFILE_CAPABILITY
+from spl.daemon.publications import require_server_publication_capability
 from spl.daemon.library_adapters import (
     commit_library_adapter_publication,
     prepare_library_adapter_publication,
@@ -69,6 +71,40 @@ def register_library_adapter_routes(
         return response
 
     route_app.after_request(no_store)
+
+    @app.get("/server/library-adapters/<adapter_id>/public-status")
+    @context.route_errors
+    async def public_adapter_status(adapter_id: str) -> Any:
+        _, server = await context.connected_server_client_async()
+        await context.run_blocking(
+            require_server_publication_capability,
+            server,
+            PUBLIC_ADAPTER_PROFILE_CAPABILITY,
+        )
+        return context.json_response(
+            await context.run_blocking(
+                server.library_adapter_profile_status,
+                validate_name(adapter_id),
+            )
+        )
+
+    @app.post("/server/library-adapters/<adapter_id>/profile")
+    @context.route_errors
+    async def update_public_adapter_profile(adapter_id: str) -> Any:
+        body = await context.read_json_body()
+        _, server = await context.connected_server_client_async()
+        await context.run_blocking(
+            require_server_publication_capability,
+            server,
+            PUBLIC_ADAPTER_PROFILE_CAPABILITY,
+        )
+        return context.json_response(
+            await context.run_blocking(
+                server.update_library_adapter_profile,
+                validate_name(adapter_id),
+                body,
+            )
+        )
 
     @app.get(LIBRARY_ADAPTER_CATALOG_ROUTE)
     async def list_library_adapters() -> Any:

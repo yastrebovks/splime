@@ -1,3 +1,4 @@
+import ast
 import sys
 from collections.abc import Callable, Iterable
 from itertools import chain, repeat
@@ -5,14 +6,13 @@ from operator import itemgetter
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
-import yaml
+from spl.core._yaml import yaml
 
 from spl.core.entities.adapter import DAdapter, DLoadAdapter, DSaveAdapter
 from spl.core.entities.artifact import DArtifactRef
 from spl.core.entities.control import DSPLImport, DSPLSelfImport
 from spl.core.entities.distribution import DDistribution, validate_distributions
 from spl.core.entities.function import DFunction
-from spl.core.entities.local_function import DLocalAlias
 from spl.core.entities.module import DImport, DImportFrom
 from spl.core.entities.node import (
     DFormattedOutputRef,
@@ -32,7 +32,9 @@ from spl.core.ir.unparse import mk_top_level_ast
 _T = TypeVar("_T", bound=DBase)
 
 
-class SPLSafeLoader(yaml.SafeLoader):
+class SPLSafeLoader(yaml.SafeLoader):  # type: ignore[misc]
+    """Loader subclass selected dynamically by the optional execution seam."""
+
     pass
 
 
@@ -60,7 +62,6 @@ SPL_YAML_CONSTRUCTORS = {
     "!DSPLImport": _construct_dataclass(DSPLImport),
     "!DDistribution": _construct_dataclass(DDistribution),
     "!DFunction": _construct_dfunction,
-    "!DLocalAlias": _construct_dataclass(DLocalAlias),
     "!DImport": _construct_dataclass(DImport),
     "!DImportFrom": _construct_dataclass(DImportFrom),
     "!DFormattedOutputRef": _construct_dataclass(DFormattedOutputRef),
@@ -157,3 +158,27 @@ def spl_import_from_file(fname: Path, globals: dict[str, Any] | None = None) -> 
         eval(  # noqa: S307
             compile(expr, str(fname), mode="exec"), globals=globals
         )
+
+
+def spl_compile_to_source(fname: Path) -> str:
+    """Compile one existing SPL/YAML closure into deterministic Python.
+
+    This is the public producer boundary, not another parser: it uses the same
+    loader, dependency closure, validation and IR unparser as
+    :func:`spl_import_from_file`.  Logical absolute member paths replace
+    temporary producer paths so identical bundle inputs produce identical
+    authenticated bytes.
+    """
+
+    root = fname.absolute().parent
+    closure = mk_top_level_deps_closure([fname.absolute()])
+    validate_distributions(list(map(itemgetter(1), closure)), str(fname.absolute()))
+    body: list[ast.stmt] = []
+    for source, (entry, dependencies) in closure[::-1]:
+        try:
+            logical_source = Path("/") / source.absolute().relative_to(root)
+        except ValueError as exc:
+            raise ValueError("SPL import escapes the producer compilation root") from exc
+        body.extend(mk_top_level_ast((entry, dependencies), logical_source).body)
+    module = ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
+    return ast.unparse(module) + "\n"

@@ -103,10 +103,55 @@ spl.daemon\_client module
    :show-inheritance:
    :undoc-members:
 
+spl.embedded module
+-------------------
+
+.. automodule:: spl.embedded
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.official\_registry module
+-----------------------------
+
+.. automodule:: spl.official_registry
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.pipeline\_widget module
 ---------------------------
 
 .. automodule:: spl.pipeline_widget
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.public module
+-----------------
+
+.. automodule:: spl.public
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.public\_artifact\_policy module
+-----------------------------------
+
+.. automodule:: spl.public_artifact_policy
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.runtime\_environment module
+-------------------------------
+
+.. automodule:: spl.runtime_environment
    :members:
    :private-members:
    :show-inheritance:

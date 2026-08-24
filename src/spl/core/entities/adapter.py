@@ -6,7 +6,7 @@ from pathlib import Path
 from types import FunctionType
 from typing import Any, Generator, Protocol, cast
 
-import yaml
+from spl.core._yaml import yaml
 
 from spl.core.entities.distribution import DDistribution
 from spl.core.entities.function import get_function_metadata

@@ -230,10 +230,28 @@ spl.daemon.metadata module
    :show-inheritance:
    :undoc-members:
 
+spl.daemon.name\_validation module
+----------------------------------
+
+.. automodule:: spl.daemon.name_validation
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.daemon.prepared\_validation module
 --------------------------------------
 
 .. automodule:: spl.daemon.prepared_validation
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.daemon.publications module
+------------------------------
+
+.. automodule:: spl.daemon.publications
    :members:
    :private-members:
    :show-inheritance:
