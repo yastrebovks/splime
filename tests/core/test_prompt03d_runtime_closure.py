@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import io
 import json
 import stat
@@ -26,14 +25,6 @@ from spl.runtime_environment import (
 
 
 FRAMEWORK_ROOT = Path(__file__).parents[2]
-WORKSPACE = next(
-    (
-        root
-        for root in (Path(__file__).parents[3], Path(__file__).parents[4])
-        if (root / "spl-server" / "src" / "daemon_server").is_dir()
-    ),
-    Path(__file__).parents[3],
-)
 
 
 def _wheel(name: str, version: str) -> bytes:
@@ -44,15 +35,12 @@ def _wheel(name: str, version: str) -> bytes:
             f"{name.replace('-', '_')}/__init__.py": b"",
             f"{dist}/METADATA": (
                 f"Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n"
-                f"License-Expression: {'Apache-2.0' if name == 'splime-public-worker' else 'MIT'}\n"
+                "License-Expression: MIT\n"
                 "Requires-Python: >=3.13\n" + "\n"
             ).encode(),
             f"{dist}/WHEEL": b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n\n",
             f"{dist}/RECORD": b"",
         }
-        if name == "splime-public-worker":
-            members["splime_public_worker/__main__.py"] = b"_AUTHORITY_ROOT = 'signed'\nfrom spl.daemon import worker\n"
-            members["splime_public_worker/_authority/spl/daemon/worker.py"] = b"# signed fixture authority\n"
         for path, data in members.items():
             info = zipfile.ZipInfo(path, date_time=(1980, 1, 1, 0, 0, 0))
             info.external_attr = 0o100644 << 16
@@ -60,8 +48,8 @@ def _wheel(name: str, version: str) -> bytes:
     return stream.getvalue()
 
 
-def _artifact(name: str, version: str, payload: bytes, *, source: dict[str, str], worker: bool) -> dict[str, object]:
-    base: dict[str, object] = {
+def _artifact(name: str, version: str, payload: bytes, *, source: dict[str, str]) -> dict[str, object]:
+    return {
         "project": name,
         "version": version,
         "filename": f"{name.replace('-', '_')}-{version}-py3-none-any.whl",
@@ -72,31 +60,27 @@ def _artifact(name: str, version: str, payload: bytes, *, source: dict[str, str]
         "yanked": False,
         "root_is_purelib": True,
         "native_members": [],
-        "license_expression": "Apache-2.0" if worker else "MIT",
+        "license_expression": "MIT",
         "source": source,
+        "direct": True,
+        "parent_requirements": [f"{name}=={version}"],
+        "evaluated_requirements": [],
+        "metadata_url": f"https://pypi.org/pypi/{name}/{version}/json",
+        "metadata_sha256": "5" * 64,
     }
-    if worker:
-        base["build_identity"] = "4" * 64
-        base["requires_dist"] = []
-    else:
-        base.update(
-            {
-                "direct": True,
-                "parent_requirements": [f"{name}=={version}"],
-                "evaluated_requirements": [],
-                "metadata_url": f"https://pypi.org/pypi/{name}/{version}/json",
-                "metadata_sha256": "5" * 64,
-            }
-        )
-    return base
 
 
-def _lock(worker: dict[str, object], artifacts: list[dict[str, object]]) -> dict[str, object]:
+def _lock(artifacts: list[dict[str, object]]) -> dict[str, object]:
     return {
         **runtime_lock_document(
             python="3.13",
             requirements=[{"requirement": f"{item['project']}=={item['version']}", "extras": []} for item in artifacts],
-            worker=worker,
+            executor={
+                "kind": "installed-framework",
+                "project": "splime",
+                "contract": "spl.public_embedded_host.v1",
+                "minimum_version": "0.4.9",
+            },
             artifacts=artifacts,
             policy={
                 "name": PUBLIC_RUNTIME_POLICY_NAME,
@@ -123,15 +107,16 @@ def test_direct_package_version_lock_is_rejected_as_under_specified() -> None:
         )
 
 
-def test_runtime_lock_requires_an_exact_worker_and_every_wheel_hash() -> None:
-    assert PUBLIC_RUNTIME_LOCK_SCHEMA == "spl.public_runtime_lock.v2"
-    with pytest.raises(ValueError, match="worker artifact"):
+def test_runtime_lock_requires_the_installed_framework_executor() -> None:
+    assert PUBLIC_RUNTIME_LOCK_SCHEMA == "spl.public_runtime_lock.v3"
+    with pytest.raises(ValueError, match="installed framework executor"):
         validate_runtime_lock(
             {
                 "schema": PUBLIC_RUNTIME_LOCK_SCHEMA,
-                "schema_version": 2,
+                "schema_version": 3,
+                "runtime": "venv",
                 "target": {"implementation": "cpython", "python": "3.13", "extras": []},
-                "policy": {"name": "splime-public-python-artifacts", "version": "0.4.8"},
+                "policy": {"name": "splime-public-python-artifacts", "version": "0.4.9"},
                 "resolver": {"name": "splime-pypi-closure", "version": 1},
                 "requirements": [],
                 "artifacts": [],
@@ -142,20 +127,6 @@ def test_runtime_lock_requires_an_exact_worker_and_every_wheel_hash() -> None:
 
 
 def test_verified_wheel_cache_is_concurrent_corruption_safe_and_offline_reusable(tmp_path: Path) -> None:
-    bundle = tmp_path / "bundle"
-    worker_bytes = _wheel("splime-public-worker", "0.4.8")
-    worker_digest = hashlib.sha256(worker_bytes).hexdigest()
-    member = f"runtime-artifacts/{worker_digest}/splime_public_worker-0.4.8-py3-none-any.whl"
-    member_path = bundle.joinpath(*member.split("/"))
-    member_path.parent.mkdir(parents=True)
-    member_path.write_bytes(worker_bytes)
-    worker = _artifact(
-        "splime-public-worker",
-        "0.4.8",
-        worker_bytes,
-        source={"kind": "candidate-bundle", "bundle_member": member},
-        worker=True,
-    )
     dependency_bytes = _wheel("example", "1.0")
     dependency_url = "https://files.pythonhosted.org/packages/example-1.0-py3-none-any.whl"
     dependency = _artifact(
@@ -163,9 +134,8 @@ def test_verified_wheel_cache_is_concurrent_corruption_safe_and_offline_reusable
         "1.0",
         dependency_bytes,
         source={"kind": "official-pypi", "url": dependency_url},
-        worker=False,
     )
-    lock = _lock(worker, [dependency])
+    lock = _lock([dependency])
     backend = EmbeddedBackend("https://registry.example.test", tmp_path / "cache", run_receipts=False)
     calls = 0
 
@@ -178,20 +148,20 @@ def test_verified_wheel_cache_is_concurrent_corruption_safe_and_offline_reusable
 
     backend.artifact_transport.wheel = online
     with ThreadPoolExecutor(max_workers=4) as executor:
-        paths = list(executor.map(lambda _: backend._materialize_wheels(lock, bundle_dir=bundle), range(4)))
+        paths = list(executor.map(lambda _: backend._materialize_wheels(lock, bundle_dir=None), range(4)))
     assert calls == 1
     assert all(paths[0] == item for item in paths)
 
     backend.artifact_transport.wheel = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("offline cache used network")
     )
-    assert backend._materialize_wheels(lock, bundle_dir=bundle) == paths[0]
+    assert backend._materialize_wheels(lock, bundle_dir=None) == paths[0]
 
-    dependency_cache = paths[0][1]
+    dependency_cache = paths[0][0]
     dependency_cache.write_bytes(b"corrupt")
     backend.artifact_transport.wheel = online
-    repaired = backend._materialize_wheels(lock, bundle_dir=bundle)
-    assert repaired[1].read_bytes() == dependency_bytes
+    repaired = backend._materialize_wheels(lock, bundle_dir=None)
+    assert repaired[0].read_bytes() == dependency_bytes
     assert calls == 2
 
 
@@ -239,6 +209,33 @@ def test_consumer_rejects_adversarial_wheel_members(tmp_path: Path, payload: byt
 
 
 @pytest.mark.parametrize(
+    "member",
+    [
+        "spl.py",
+        "unsafe-1.0.data/purelib/spl/__init__.py",
+        "sitecustomize.py",
+        "usercustomize/__init__.py",
+        "unsafe-1.0.data/platlib/bootstrap.pth",
+    ],
+)
+def test_consumer_rejects_framework_and_startup_preemption(
+    tmp_path: Path,
+    member: str,
+) -> None:
+    payload = _unsafe_wheel(member)
+    path = tmp_path / "unsafe-1.0-py3-none-any.whl"
+    path.write_bytes(payload)
+    artifact = {
+        "project": "unsafe",
+        "size": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+    with pytest.raises(Exception, match="replace|startup hooks"):
+        EmbeddedBackend._verify_wheel_file(path, artifact)
+
+
+@pytest.mark.parametrize(
     "expression",
     [
         "(MIT",
@@ -258,39 +255,13 @@ def test_consumer_spdx_parser_is_strict_and_balanced(expression: str) -> None:
 
 
 def test_isolated_public_bridge_executes_the_authoritative_contract_surface(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    worker_path = WORKSPACE / "spl-server" / "src" / "daemon_server" / "public_worker.py"
-    spec = importlib.util.spec_from_file_location("prompt03d_public_worker", worker_path)
-    assert spec is not None and spec.loader is not None
-    worker_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(worker_module)
-    built = worker_module.build_worker_wheel(
-        output_dir=tmp_path / "worker",
-        license_path=FRAMEWORK_ROOT / "LICENSE",
-        notice_path=FRAMEWORK_ROOT / "NOTICE",
-    )
-    worker_payload = Path(built["path"]).read_bytes()
-    worker = _artifact(
-        "splime-public-worker",
-        "0.4.8",
-        worker_payload,
-        source={
-            "kind": "candidate-bundle",
-            "bundle_member": (f"runtime-artifacts/{built['sha256']}/{built['filename']}"),
-        },
-        worker=True,
-    )
-    worker["build_identity"] = built["build_identity"]
-    lock = _lock(worker, [])
+    lock = _lock([])
     backend = EmbeddedBackend("https://registry.example.test", tmp_path / "cache", run_receipts=False)
-    monkeypatch.setattr(
-        backend,
-        "_materialize_wheels",
-        lambda lock, **kwargs: [Path(built["path"])],
-    )
     python = backend._ensure_environment(lock)
-    assert not (python.parent.parent / "execution-authority").exists()
+    assert backend._environment_healthy(python)
+    assert not (python.parent.parent / "splime_public_worker").exists()
 
     def invoke(
         object_yaml: Path,
@@ -320,7 +291,7 @@ def test_isolated_public_bridge_executes_the_authoritative_contract_surface(
                 str(python),
                 "-I",
                 "-m",
-                "splime_public_worker",
+                "spl.daemon.worker",
                 "--object-python",
                 str(object_python),
                 "--entrypoint",

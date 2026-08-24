@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.metadata
 import io
 import json
 import os
@@ -43,6 +44,7 @@ from spl.public_artifact_policy import (
     inspect_wheel_archive,
 )
 from spl.runtime_environment import (
+    PUBLIC_EMBEDDED_HOST_CONTRACT,
     default_venv_command_builder,
     environment_identity,
     python_constraint_matches,
@@ -68,6 +70,90 @@ RUN_RECEIPT_TIMEOUT_SECONDS = 2.0
 PUBLIC_RUN_RECEIPTS_ENV = "SPL_PUBLIC_RUN_RECEIPTS"
 _THREAD_LOCK_GUARD = threading.Lock()
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _tree_hash(root: Path) -> str:
+    """Hash the installed framework package without mutable bytecode caches."""
+
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root)
+        if "__pycache__" in relative.parts or path.suffix in {".pyc", ".pyo"}:
+            continue
+        if path.is_symlink():
+            raise _error("embedded_framework_invalid", "installed splime package contains a symlink")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise _error("embedded_framework_invalid", "installed splime package contains a non-file member")
+        data = path.read_bytes()
+        digest.update(relative.as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(data).digest())
+    return digest.hexdigest()
+
+
+def _runtime_projection_violation(name: str) -> str | None:
+    """Reject wheel members that can pre-empt the embedded framework host."""
+
+    parts = PurePosixPath(name).parts
+    projected = parts
+    for index, part in enumerate(parts[:-1]):
+        if part.casefold().endswith(".data") and parts[index + 1].casefold() in {
+            "purelib",
+            "platlib",
+        }:
+            projected = parts[index + 2 :]
+            break
+    if not projected:
+        return None
+    first = projected[0].casefold()
+    if first in {"spl", "spl.py", "spl.pyc", "spl.pyo"}:
+        return "Object dependencies cannot replace the installed splime authority"
+    if first in {
+        "sitecustomize",
+        "sitecustomize.py",
+        "sitecustomize.pyc",
+        "sitecustomize.pyo",
+        "usercustomize",
+        "usercustomize.py",
+        "usercustomize.pyc",
+        "usercustomize.pyo",
+    } or any(part.casefold().endswith(".pth") for part in projected):
+        return "Object dependencies cannot install Python startup hooks"
+    return None
+
+
+def _version_tuple(value: str) -> tuple[int, int, int]:
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", value)
+    if match is None:
+        raise _error("embedded_framework_invalid", "installed splime version is malformed")
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def _installed_framework_authority(executor: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the exact installed ``spl`` package used as execution authority."""
+
+    if executor.get("contract") != PUBLIC_EMBEDDED_HOST_CONTRACT:
+        raise _error("public_manifest_invalid", "installed framework executor contract is unsupported")
+    try:
+        version = importlib.metadata.version("splime")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise _error("embedded_framework_unavailable", "splime is not installed") from exc
+    minimum = str(executor.get("minimum_version") or "")
+    if _version_tuple(version) < _version_tuple(minimum):
+        raise _error(
+            "embedded_framework_upgrade_required",
+            f"public execution requires splime>={minimum}; installed version is {version}",
+        )
+    package_root = Path(__file__).resolve().parent
+    identity = _tree_hash(package_root)
+    return {
+        "version": version,
+        "package_root": package_root,
+        "tree_hash": identity,
+        "identity": _sha256(f"{PUBLIC_EMBEDDED_HOST_CONTRACT}\0{version}\0{identity}".encode("utf-8")),
+    }
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -1074,10 +1160,12 @@ class EmbeddedBackend:
                 f"release requires Python {python_constraint}; running interpreter is "
                 f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
             )
-        digest = environment_identity(
+        authority = _installed_framework_authority(lock["executor"])
+        base_identity = environment_identity(
             lock,
             interpreter_abi=getattr(sys.implementation, "cache_tag", "unknown"),
         )
+        digest = _sha256(f"{base_identity}\0{authority['identity']}".encode("utf-8"))
         directory = self.cache_root / "environments" / digest
         marker = directory / "ready.json"
         with _hash_lock(self.cache_root, f"environment-{digest}"):
@@ -1085,9 +1173,13 @@ class EmbeddedBackend:
                 try:
                     ready = json.loads(marker.read_text(encoding="utf-8"))
                     python = Path(str(ready["python"]))
+                    framework_path = Path(str(ready["framework_path"]))
                     if (
                         ready["identity"] == digest
                         and ready["lock_hash"] == lock["lock_hash"]
+                        and ready["framework_identity"] == authority["identity"]
+                        and framework_path.is_dir()
+                        and _tree_hash(framework_path) == authority["tree_hash"]
                         and self._environment_healthy(python)
                     ):
                         return python
@@ -1106,16 +1198,18 @@ class EmbeddedBackend:
                     "venv_path": temporary,
                     "python_path": python,
                 }
-                install_command = builder.install_command(
-                    spec,
-                    [str(path) for path in wheels],
-                )
-                install_index = install_command.index("install") + 1
-                install_command[install_index:install_index] = [
-                    "--no-index",
-                    "--no-deps",
-                ]
-                commands = [builder.create_command(spec), install_command]
+                commands = [builder.create_command(spec)]
+                if wheels:
+                    install_command = builder.install_command(
+                        spec,
+                        [str(path) for path in wheels],
+                    )
+                    install_index = install_command.index("install") + 1
+                    install_command[install_index:install_index] = [
+                        "--no-index",
+                        "--no-deps",
+                    ]
+                    commands.append(install_command)
                 for command in commands:
                     try:
                         built = run_process_tree(command, timeout=600)
@@ -1129,7 +1223,13 @@ class EmbeddedBackend:
                             "embedded_environment_build_failed",
                             (built.stderr or "environment installation failed")[-2000:],
                         )
+                framework_path = self._project_framework_authority(
+                    python,
+                    temporary,
+                    authority,
+                )
                 final_python = directory / python.relative_to(temporary)
+                final_framework_path = directory / framework_path.relative_to(temporary)
                 _atomic_write(
                     temporary / "ready.json",
                     _canonical_json(
@@ -1138,6 +1238,8 @@ class EmbeddedBackend:
                             "lock_hash": lock["lock_hash"],
                             "builder": builder.name,
                             "python": str(final_python),
+                            "framework_path": str(final_framework_path),
+                            "framework_identity": authority["identity"],
                         }
                     ),
                 )
@@ -1160,12 +1262,56 @@ class EmbeddedBackend:
         return Path(json.loads(marker.read_text(encoding="utf-8"))["python"])
 
     @staticmethod
+    def _project_framework_authority(
+        python: Path,
+        environment: Path,
+        authority: Mapping[str, Any],
+    ) -> Path:
+        """Copy only the installed ``spl`` package into the isolated runtime."""
+
+        discovered = run_process_tree(
+            [
+                str(python),
+                "-I",
+                "-c",
+                "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+            ],
+            env={
+                "PATH": str(python.parent),
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "PYTHONUTF8": "1",
+                "PYTHONNOUSERSITE": "1",
+            },
+            timeout=30,
+        )
+        if discovered.returncode:
+            raise _error("embedded_environment_build_failed", "environment package path discovery failed")
+        environment_root = environment.resolve()
+        purelib = Path(discovered.stdout.strip()).resolve()
+        try:
+            relative_purelib = purelib.relative_to(environment_root)
+        except ValueError as exc:
+            raise _error("embedded_environment_build_failed", "environment package path escaped its root") from exc
+        target = environment / relative_purelib / "spl"
+        if target.exists():
+            raise _error("embedded_environment_build_failed", "an Object dependency attempted to provide spl")
+        shutil.copytree(
+            Path(authority["package_root"]),
+            target,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        if _tree_hash(target) != authority["tree_hash"]:
+            raise _error("embedded_environment_build_failed", "installed framework projection changed during copy")
+        return target
+
+    @staticmethod
     def _environment_healthy(python: Path) -> bool:
         if not python.is_file():
             return False
         try:
             completed = run_process_tree(
-                [str(python), "-I", "-m", "splime_public_worker", "--health-check"],
+                [str(python), "-I", "-m", "spl.daemon.worker", "--health-check"],
                 env={
                     "PATH": str(python.parent),
                     "LANG": "C.UTF-8",
@@ -1177,7 +1323,7 @@ class EmbeddedBackend:
             )
         except (OSError, subprocess.TimeoutExpired):
             return False
-        return completed.returncode == 0
+        return completed.returncode == 0 and completed.stdout.strip() == PUBLIC_EMBEDDED_HOST_CONTRACT
 
     def _materialize_wheels(
         self,
@@ -1185,7 +1331,8 @@ class EmbeddedBackend:
         *,
         bundle_dir: Path | None,
     ) -> list[Path]:
-        artifacts = [lock["worker"], *lock["artifacts"]]
+        del bundle_dir
+        artifacts = list(lock["artifacts"])
         result: list[Path] = []
         for artifact in artifacts:
             digest = str(artifact["sha256"])
@@ -1200,21 +1347,10 @@ class EmbeddedBackend:
                         shutil.rmtree(directory)
                 if not path.is_file():
                     source = artifact["source"]
-                    if source["kind"] == "candidate-bundle":
-                        if bundle_dir is None:
-                            raise _error("public_artifact_unavailable", "candidate worker bundle is unavailable")
-                        source_path = bundle_dir.joinpath(*PurePosixPath(str(source["bundle_member"])).parts)
-                        try:
-                            data = source_path.read_bytes()
-                        except OSError as exc:
-                            raise _error(
-                                "public_artifact_unavailable", "candidate worker bundle is unavailable"
-                            ) from exc
-                    else:
-                        data = self.artifact_transport.wheel(
-                            str(source["url"]),
-                            expected_size=int(artifact["size"]),
-                        )
+                    data = self.artifact_transport.wheel(
+                        str(source["url"]),
+                        expected_size=int(artifact["size"]),
+                    )
                     if len(data) != artifact["size"] or _sha256(data) != digest:
                         raise _error("public_artifact_hash_mismatch", "wheel bytes disagree with the signed lock")
                     directory.parent.mkdir(parents=True, exist_ok=True)
@@ -1241,6 +1377,14 @@ class EmbeddedBackend:
         except PublicArtifactPolicyError as exc:
             raise _error("public_artifact_unsafe", str(exc)) from exc
         names = list(members)
+        violation = next(
+            (message for name in names if (message := _runtime_projection_violation(name)) is not None),
+            None,
+        )
+        if artifact.get("project") == "splime":
+            raise _error("public_artifact_unsafe", "Object dependencies cannot replace the installed splime authority")
+        if violation is not None:
+            raise _error("public_artifact_unsafe", violation)
         if any(name.casefold().endswith((".so", ".dylib", ".dll", ".pyd", ".a", ".lib", ".exe")) for name in names):
             raise _error("public_artifact_unsafe", "wheel contains native members")
         wheel_names = [name for name in names if name.endswith(".dist-info/WHEEL")]
@@ -1249,33 +1393,6 @@ class EmbeddedBackend:
         wheel_metadata = members[wheel_names[0]].decode("utf-8", errors="strict")
         if "Root-Is-Purelib: true" not in wheel_metadata:
             raise _error("public_artifact_unsafe", "wheel is not pure Python")
-        if artifact.get("project") == "splime-public-worker":
-            metadata_names = [name for name in names if name.endswith(".dist-info/METADATA")]
-            if len(metadata_names) != 1:
-                raise _error("public_artifact_unsafe", "worker metadata inventory is invalid")
-            metadata = members[metadata_names[0]].decode("utf-8", errors="strict")
-            if (
-                "Name: splime-public-worker\n" not in metadata
-                or "Version: 0.4.8\n" not in metadata
-                or "Requires-Dist:" in metadata
-                or artifact.get("requires_dist") != []
-                or "splime_public_worker/_authority/spl/daemon/worker.py" not in members
-            ):
-                raise _error(
-                    "public_artifact_unsafe",
-                    "worker is not the self-contained SPLime 0.4.8 execution authority",
-                )
-            worker_source = members.get("splime_public_worker/__main__.py", b"").decode("utf-8", errors="strict")
-            if (
-                "_AUTHORITY_ROOT" not in worker_source
-                or "from spl.daemon import worker" not in worker_source
-                or "def _pipeline(" in worker_source
-                or "re.search(" in worker_source
-            ):
-                raise _error(
-                    "public_artifact_unsafe",
-                    "worker contains a divergent execution implementation",
-                )
 
     @contextmanager
     def _environment_use_locks(self, environments: Iterable[Path]) -> Iterator[None]:
@@ -1379,16 +1496,11 @@ class EmbeddedBackend:
                 "SPL_EMBEDDED_MODE": "1",
                 "TMPDIR": str(run_dir),
             }
-            worker_module = (
-                "spl.daemon.worker"
-                if Path(environment).absolute() == Path(sys.executable).absolute()
-                else "splime_public_worker"
-            )
             command = [
                 str(environment),
                 "-I",
                 "-m",
-                worker_module,
+                "spl.daemon.worker",
                 "--object-python",
                 str(object_python),
                 "--entrypoint",

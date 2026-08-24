@@ -73,7 +73,7 @@ def test_canonical_docker_source_pins_the_exact_release_and_oci_identity() -> No
     publish_text = publish.read_text(encoding="utf-8")
     combined = "\n".join((dockerfile, compose, publish_text, (DOCKER_ROOT / "README.md").read_text(encoding="utf-8")))
 
-    assert version == "0.4.8"
+    assert version == "0.4.9"
     assert f"ARG SPL_VERSION={version}" in dockerfile
     assert 'python -m pip install "splime==${SPL_VERSION}"' in dockerfile
     assert '"uv==${UV_VERSION}"' in dockerfile
@@ -123,6 +123,32 @@ def test_048_owner_runbook_is_versioned_and_requires_the_reviewed_cookbook() -> 
     assert "SPL_RELEASE_COOKBOOK_PATH" in text
     assert (release_root / "README.md").is_file()
     assert (release_root / "release-notes.md").is_file()
+
+
+def test_049_owner_release_script_is_single_distribution_and_fail_closed() -> None:
+    release_root = SPL_ROOT / "release" / "0.4.9"
+    release_script = release_root / "release.sh"
+    text = release_script.read_text(encoding="utf-8")
+    readme = (release_root / "README.md").read_text(encoding="utf-8")
+
+    assert release_script.is_file()
+    assert os.access(release_script, os.X_OK)
+    assert 'VERSION="0.4.9"' in text
+    assert '"spl.public_runtime_lock.v3"' in text
+    assert 'f"splime>={expected}"' in text
+    assert 'project["project"]["name"] != "splime"' in text
+    assert 'forbidden = "splime" + "-public-worker"' in text
+    assert "splime-public-worker" not in text
+    assert "SPLIME_RELEASE_CONFIRM" in text
+    assert "SPLIME_CONFIRM_PUSH" in text
+    assert "SPLIME_CONFIRM_DRAFT" in text
+    assert "SPLIME_CONFIRM_PYPI" in text
+    assert 'verify_index_artifacts "https://test.pypi.org"' in text
+    assert 'verify_index_artifacts "https://pypi.org"' in text
+    assert 'git -C "${ROOT}" push --atomic' in text
+    assert "pypa/gh-action-pypi-publish" not in text
+    assert "{check|artifacts|commit|push|draft|publish|verify}" in text
+    assert "script never accepts a PyPI password" in readme
 
 
 def test_048_docker_publication_is_fail_closed_until_post_pypi_evidence() -> None:

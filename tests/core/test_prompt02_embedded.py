@@ -106,25 +106,12 @@ def _canonical(value: object) -> bytes:
     ).encode()
 
 
-def _test_worker() -> dict[str, object]:
+def _test_executor() -> dict[str, object]:
     return {
-        "project": "splime-public-worker",
-        "version": "0.4.8",
-        "filename": "splime_public_worker-0.4.8-py3-none-any.whl",
-        "size": 1,
-        "sha256": "1" * 64,
-        "tags": ["py3-none-any"],
-        "requires_python": ">=3.13",
-        "yanked": False,
-        "root_is_purelib": True,
-        "native_members": [],
-        "license_expression": "Apache-2.0",
-        "build_identity": "2" * 64,
-        "requires_dist": [],
-        "source": {
-            "kind": "official-pypi",
-            "url": "https://files.pythonhosted.org/packages/splime_public_worker-0.4.8-py3-none-any.whl",
-        },
+        "kind": "installed-framework",
+        "project": "splime",
+        "contract": "spl.public_embedded_host.v1",
+        "minimum_version": "0.4.9",
     }
 
 
@@ -163,7 +150,7 @@ def _test_runtime_lock(
     return runtime_lock_document(
         python=python,
         requirements=[{"requirement": f"{item['project']}=={item['version']}", "extras": []} for item in closure],
-        worker=_test_worker(),
+        executor=_test_executor(),
         artifacts=closure,
         policy={
             "name": PUBLIC_RUNTIME_POLICY_NAME,
@@ -173,6 +160,56 @@ def _test_runtime_lock(
         },
         resolver={"name": PUBLIC_RUNTIME_RESOLVER_NAME, "version": 1},
     )
+
+
+def test_embedded_executor_rejects_non_final_framework_versions() -> None:
+    from spl import embedded as embedded_module
+
+    with pytest.raises(ClientError, match="installed splime version is malformed"):
+        embedded_module._version_tuple("0.4.9rc1")
+
+
+def test_framework_projection_accepts_an_os_canonical_temp_alias(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from spl import embedded as embedded_module
+
+    if sys.platform == "win32":
+        pytest.skip("unprivileged Windows symlink creation is not portable")
+    real_environment = tmp_path / "private" / "environment"
+    purelib = real_environment / "lib" / "python3.13" / "site-packages"
+    purelib.mkdir(parents=True)
+    alias_environment = tmp_path / "environment-alias"
+    alias_environment.symlink_to(real_environment, target_is_directory=True)
+    python = alias_environment / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("test interpreter", encoding="utf-8")
+    package_root = tmp_path / "framework" / "spl"
+    package_root.mkdir(parents=True)
+    (package_root / "__init__.py").write_text("VALUE = 41\n", encoding="utf-8")
+    authority = {
+        "package_root": package_root,
+        "tree_hash": embedded_module._tree_hash(package_root),
+    }
+    monkeypatch.setattr(
+        embedded_module,
+        "run_process_tree",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=f"{purelib}\n",
+            stderr="",
+        ),
+    )
+
+    projected = EmbeddedBackend._project_framework_authority(
+        python,
+        alias_environment,
+        authority,
+    )
+
+    assert projected == alias_environment / "lib" / "python3.13" / "site-packages" / "spl"
+    assert (projected / "__init__.py").read_text(encoding="utf-8") == "VALUE = 41\n"
 
 
 def _verify_bundle(
@@ -673,10 +710,12 @@ def test_interrupted_environment_build_recovers_atomically(
 
     backend = EmbeddedBackend("https://registry.example.test", tmp_path)
     lock = {**_test_runtime_lock(), "names": ["root"]}
-    digest = environment_identity(
+    base_identity = environment_identity(
         lock,
         interpreter_abi=getattr(sys.implementation, "cache_tag", "unknown"),
     )
+    authority = embedded_module._installed_framework_authority(lock["executor"])
+    digest = embedded_module._sha256(f"{base_identity}\0{authority['identity']}".encode("utf-8"))
     incomplete = tmp_path / "environments" / digest
     incomplete.mkdir(parents=True)
     (incomplete / "partial").write_text("interrupted", encoding="utf-8")
@@ -705,7 +744,24 @@ def test_interrupted_environment_build_recovers_atomically(
 
     monkeypatch.setattr(embedded_module, "default_venv_command_builder", Builder)
     monkeypatch.setattr(embedded_module, "run_process_tree", run)
-    monkeypatch.setattr(backend, "_materialize_wheels", lambda lock, **kwargs: [tmp_path / "worker.whl"])
+    monkeypatch.setattr(backend, "_materialize_wheels", lambda lock, **kwargs: [tmp_path / "dependency.whl"])
+
+    def project_framework(
+        python: Path,
+        environment: Path,
+        authority: dict[str, object],
+    ) -> Path:
+        del python, authority
+        target = environment / "lib" / "spl"
+        target.mkdir(parents=True)
+        return target
+
+    monkeypatch.setattr(backend, "_project_framework_authority", project_framework)
+    monkeypatch.setattr(
+        embedded_module,
+        "_tree_hash",
+        lambda root: authority["tree_hash"],
+    )
     monkeypatch.setattr(
         backend,
         "_environment_healthy",

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-08-24
+
+### Fixed
+
+- Public Objects now execute through the installed `splime` framework. The
+  erroneous separate public-worker distribution and its artifact contract have
+  been removed; signed runtime locks contain only Object dependencies and the
+  minimum compatible framework version.
+- Isolated embedded environments receive an authenticated projection of the
+  installed framework and reject dependency wheels that attempt to provide or
+  replace the `spl` package, including via wheel `.data` projections, or install
+  Python startup hooks.
+
+### Compatibility
+
+- The change is additive to the existing framework, daemon, cookbook and
+  private execution APIs. Public releases using the corrected runtime-lock
+  contract require `splime>=0.4.9`.
+
 ## [0.4.8] - 2026-08-21
 
 ### Added
@@ -638,7 +657,8 @@ here. No breaking API changes.
 - Initial release: turn trusted Python functions into versioned, portable nodes
   reusable across projects and executed locally or remotely.
 
-[Unreleased]: https://github.com/yastrebovks/splime/compare/v0.4.8...HEAD
+[Unreleased]: https://github.com/yastrebovks/splime/compare/v0.4.9...HEAD
+[0.4.9]: https://github.com/yastrebovks/splime/compare/v0.4.8...v0.4.9
 [0.4.8]: https://github.com/yastrebovks/splime/compare/v0.4.7...v0.4.8
 [0.4.7]: https://github.com/yastrebovks/splime/compare/v0.4.6...v0.4.7
 [0.4.6]: https://github.com/yastrebovks/splime/compare/v0.4.5...v0.4.6

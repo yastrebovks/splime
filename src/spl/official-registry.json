@@ -8,7 +8,7 @@
   },
   "public_runtime_policy": {
     "name": "splime-public-python-artifacts",
-    "version": "0.4.8",
+    "version": "0.4.9",
     "target": {
       "implementation": "cpython",
       "python": "3.13"
@@ -32,7 +32,8 @@
       "Zlib"
     ],
     "wheel_policy": "non-yanked-universal-pure-python-only",
-    "runtime_lock_schema": "spl.public_runtime_lock.v2",
-    "resolver": "splime-pypi-closure-v1"
+    "runtime_lock_schema": "spl.public_runtime_lock.v3",
+    "resolver": "splime-pypi-closure-v1",
+    "executor": "splime>=0.4.9"
   }
 }

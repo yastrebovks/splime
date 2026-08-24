@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "release_id": "splime-0.4.8",
-  "version": "0.4.8",
-  "source_tag": "v0.4.8",
+  "release_id": "splime-0.4.9",
+  "version": "0.4.9",
+  "source_tag": "v0.4.9",
   "official_registry": {
     "origin": "https://splime.io",
     "signature_algorithm": "ed25519",
@@ -11,7 +11,7 @@
   },
   "public_runtime_policy": {
     "name": "splime-public-python-artifacts",
-    "version": "0.4.8",
+    "version": "0.4.9",
     "target": {
       "implementation": "cpython",
       "python": "3.13"
@@ -35,16 +35,17 @@
       "Zlib"
     ],
     "wheel_policy": "non-yanked-universal-pure-python-only",
-    "runtime_lock_schema": "spl.public_runtime_lock.v2",
-    "resolver": "splime-pypi-closure-v1"
+    "runtime_lock_schema": "spl.public_runtime_lock.v3",
+    "resolver": "splime-pypi-closure-v1",
+    "executor": "splime>=0.4.9"
   },
   "components": {
     "framework": {
       "repository": "https://github.com/yastrebovks/splime",
       "workspace": "spl",
       "package": "splime",
-      "version": "0.4.8",
-      "source_ref": "v0.4.8",
+      "version": "0.4.9",
+      "source_ref": "v0.4.9",
       "source_binding": "signed_tag_external_provenance",
       "source_commit": null,
       "artifact": "splime"
@@ -53,8 +54,8 @@
       "repository": "https://github.com/yastrebovks/splime",
       "workspace": "spl",
       "package": "splime",
-      "version": "0.4.8",
-      "source_ref": "v0.4.8",
+      "version": "0.4.9",
+      "source_ref": "v0.4.9",
       "source_binding": "signed_tag_external_provenance",
       "source_commit": null,
       "artifact": "splime"
@@ -63,8 +64,8 @@
       "repository": "gitlab.com/spl894143/spl-server",
       "workspace": "spl-server",
       "package": "spl-server",
-      "version": "0.4.8",
-      "source_ref": "v0.4.8",
+      "version": "0.4.9",
+      "source_ref": "v0.4.9",
       "source_binding": "pinned_commit",
       "source_commit": null,
       "artifact": "spl-server"
@@ -73,8 +74,8 @@
       "repository": "gitlab.com/spl894143/spl-frontend",
       "workspace": "spl-frontend",
       "package": "splime-console",
-      "version": "0.4.8",
-      "source_ref": "v0.4.8",
+      "version": "0.4.9",
+      "source_ref": "v0.4.9",
       "source_binding": "pinned_commit",
       "source_commit": null,
       "artifact": "splime-console"

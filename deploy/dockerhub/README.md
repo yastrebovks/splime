@@ -28,7 +28,7 @@ docker run -d --name spl-daemon \
   --cap-drop ALL --security-opt no-new-privileges:true \
   -p 127.0.0.1:8765:8765 \
   -v /var/lib/spl-daemon:/var/lib/spl-daemon \
-  yastrebovks/spl-daemon:0.4.8
+  yastrebovks/spl-daemon:0.4.9
 ```
 
 ## Per-node Docker nodes (0.4 series)
@@ -106,9 +106,9 @@ print(client.health())
 docker login                                   # to your Docker Hub account (yastrebovks)
 docker buildx create --use --name splime-builder
 
-# After the signed 0.4.8 package commit and exact PyPI wheel/sdist hashes exist,
-# finalize the separate release/0.4.8/update-docker.sh control and its immutable
-# package/source bindings. Until then publish.sh fails closed and no 0.4.8 image
+# After the signed 0.4.9 package commit and exact PyPI wheel/sdist hashes exist,
+# finalize the separate release/0.4.9/update-docker.sh control and its immutable
+# package/source bindings. Until then publish.sh fails closed and no 0.4.9 image
 # may be built or pushed from this preparation tree.
 ```
 
@@ -119,13 +119,13 @@ To build directly for development only, use the bounded context explicitly:
 
 ```bash
 docker build \
-  --build-arg SPL_VERSION=0.4.8 \
+  --build-arg SPL_VERSION=0.4.9 \
   --build-arg UV_VERSION=0.11.25 \
-  -t yastrebovks/spl-daemon:0.4.8-dev \
+  -t yastrebovks/spl-daemon:0.4.9-dev \
   deploy/dockerhub
 docker run --rm -p 127.0.0.1:8765:8765 \
   -v /var/lib/spl-daemon:/var/lib/spl-daemon \
-  yastrebovks/spl-daemon:0.4.8-dev
+  yastrebovks/spl-daemon:0.4.9-dev
 ```
 
 ## Security
@@ -141,5 +141,5 @@ docker run --rm -p 127.0.0.1:8765:8765 \
 - `SPL_DAEMON_SECRET_BACKEND=file` keeps secrets in the daemon home instead of
   an OS keyring (there is no desktop keyring in a container).
 - `uv`, the Python base image and Docker CLI source image are release-pinned.
-  The 0.4.8 package revision remains deliberately `unpublished` until the
+  The 0.4.9 package revision remains deliberately `unpublished` until the
   separate post-PyPI Docker release-control commit binds its exact artifacts.

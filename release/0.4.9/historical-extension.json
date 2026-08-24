@@ -1,0 +1,42 @@
+{
+  "schema": "splime.historical_compatibility_extension.v1",
+  "schema_version": 1,
+  "release_target": "0.4.9",
+  "observed_at": "2026-08-24",
+  "extends": "release/0.4.8/historical-artifacts.json",
+  "version": "0.4.8",
+  "artifacts": [
+    {
+      "filename": "splime-0.4.8-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/b8/ef/b3279696cd0c4e283618b3accff6d437e6423197521745e39a56cf3f9286/splime-0.4.8-py3-none-any.whl",
+      "size": 696359,
+      "sha256": "0193a5b1db7d1a3b20d98f1affceda5b84e0def465d12fea966cb9191e23e7cd",
+      "requires_python": ">=3.13",
+      "yanked": false
+    },
+    {
+      "filename": "splime-0.4.8.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/27/3f/79aa798b947fe9f114ffdcf99ca0483acf74d623f97b80dead150a7bff60/splime-0.4.8.tar.gz",
+      "size": 622859,
+      "sha256": "07c920e5e7d40f3cff20f5c378078fcbd284e22afce50b3e2d7cbdf151feb0bd",
+      "requires_python": ">=3.13",
+      "yanked": false
+    }
+  ],
+  "api_probe": {
+    "schema": "splime.historical_api_probe.v2",
+    "status": "PASS",
+    "behavioral_rows": 19,
+    "failures": []
+  },
+  "facade_comparison": {
+    "status": "PASS",
+    "present_callables": 19,
+    "structural_signatures": 19,
+    "annotation_rows": 19,
+    "successful_behavioral_calls": 19,
+    "compared_return_rows": 19,
+    "required_gaps": 0,
+    "null_observation_pass_rows": 0
+  }
+}

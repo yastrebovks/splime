@@ -103,6 +103,10 @@ from spl.core.runtime_port_adapters import (
     validate_custom_adapter_source,
     validate_custom_bundle_dependencies,
 )
+
+
+PUBLIC_EMBEDDED_HOST_CONTRACT = "spl.public_embedded_host.v1"
+
 from spl.daemon.callback_capability import CALLBACK_CAPABILITY_ENV
 from spl.daemon.name_validation import validate_name
 from spl.daemon.worker_runtime_marker import (
@@ -2013,7 +2017,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Run the worker from the command line."""
 
-    args = build_parser().parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments == ["--health-check"]:
+        print(PUBLIC_EMBEDDED_HOST_CONTRACT)
+        return 0
+    args = build_parser().parse_args(arguments)
     try:
         execute(
             object_yaml=args.object_yaml,

@@ -6,12 +6,12 @@
 #   docker buildx create --use --name splime-builder
 #
 # Usage:
-#   SPLIME_CONFIRM_DOCKER=yastrebovks/spl-daemon:0.4.8 ./publish.sh 0.4.8
+#   SPLIME_CONFIRM_DOCKER=yastrebovks/spl-daemon:0.4.9 ./publish.sh 0.4.9
 #
 # This file intentionally contains no second build/push implementation.
 set -euo pipefail
 
-VERSION="${1:-0.4.8}"
+VERSION="${1:-0.4.9}"
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)"
 CANONICAL="${ROOT}/release/${VERSION}/update-docker.sh"
 

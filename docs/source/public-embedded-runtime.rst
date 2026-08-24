@@ -21,7 +21,7 @@ origin.  A custom registry must be configured explicitly, for example::
        trusted_keys=trusted_keys,
    )
 
-Release 0.4.8 packages the owner-approved trust pin for the one exact origin
+Release 0.4.9 packages the owner-approved trust pin for the one exact origin
 ``https://splime.io``::
 
    key_id = ed25519-sha256:635b0f38b59fa4a513723bc8e347d807dae535996173ffebfba2fcca73cbe91e
@@ -80,9 +80,10 @@ Downloads and builds use per-hash interprocess locks, temporary siblings,
 verification and atomic rename.  Retained artifacts use a unique embedded run
 ID.  Cache cleanup is bounded and skips entries whose use lock is held.
 
-Every executable lock uses ``spl.public_runtime_lock.v2`` and includes the
-complete CPython 3.13 dependency closure plus the exact
-``splime-public-worker==0.4.8`` wheel.  Third-party bytes are accepted only from
+Every corrected executable lock uses ``spl.public_runtime_lock.v3`` and includes
+the complete CPython 3.13 Object dependency closure plus an explicit
+``splime>=0.4.9`` installed-framework executor contract.  There is no second
+SPLime execution distribution. Third-party bytes are accepted only from
 official PyPI JSON metadata and ``https://files.pythonhosted.org``.  Selected
 files must be non-yanked ``py3-none-any`` pure-Python wheels with matching
 name, version, size, SHA-256, ``Requires-Python``, dependency metadata and an
@@ -94,9 +95,11 @@ The first online execution stores every verified wheel under its SHA-256.
 Environment installation consumes only those local files with ``--no-index``
 and ``--no-deps``.  A later exact execution is therefore offline-reproducible;
 missing or corrupt cache content is never replaced by an implicit index
-lookup.  Candidate release bundles carry the deterministic dependency-free
-worker wheel.  Production activation instead requires a separately published,
-official-PyPI worker declaration matching the same 0.4.8 contract.
+lookup. The isolated environment receives the execution code directly from the
+caller's installed ``splime`` package. Object dependencies cannot declare
+``splime``, project files onto ``spl`` through wheel ``.data`` directories, or
+install ``.pth``/``sitecustomize``/``usercustomize`` startup hooks; attempts to
+pre-empt the framework authority fail closed.
 
 The environment is a virtual environment.  It prevents dependency installation
 from changing the caller's active Python environment, but **it is not an

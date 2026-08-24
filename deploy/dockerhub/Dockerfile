@@ -25,7 +25,7 @@ FROM python:3.13-slim@sha256:ffb752e139c0a19692a43af8d8523b274222dd68eebad5d583b
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 
 # Which splime release to install (override with --build-arg SPL_VERSION=...).
-ARG SPL_VERSION=0.4.8
+ARG SPL_VERSION=0.4.9
 ARG UV_VERSION=0.11.25
 # Filled with the exact signed package-release commit by the separate,
 # post-PyPI Docker release-control commit. The value below is deliberately

@@ -26,10 +26,12 @@ from spl.public_artifact_policy import spdx_allowed
 _PACKAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]*$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-PUBLIC_RUNTIME_LOCK_SCHEMA = "spl.public_runtime_lock.v2"
+PUBLIC_RUNTIME_LOCK_SCHEMA = "spl.public_runtime_lock.v3"
 PUBLIC_RUNTIME_POLICY_NAME = "splime-public-python-artifacts"
-PUBLIC_RUNTIME_POLICY_VERSION = "0.4.8"
+PUBLIC_RUNTIME_POLICY_VERSION = "0.4.9"
 PUBLIC_RUNTIME_RESOLVER_NAME = "splime-pypi-closure"
+PUBLIC_EMBEDDED_HOST_CONTRACT = "spl.public_embedded_host.v1"
+PUBLIC_EMBEDDED_HOST_MINIMUM_VERSION = "0.4.9"
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -94,7 +96,7 @@ def runtime_lock_document(
     *,
     python: Any,
     requirements: Any,
-    worker: Any,
+    executor: Any,
     artifacts: Any,
     policy: Any,
     resolver: Any,
@@ -111,19 +113,19 @@ def runtime_lock_document(
         raise ValueError("public runtime lock target must be CPython 3.13")
     normalized_extras = _string_list(extras or [], "target extras")
     normalized_requirements = _requirements(requirements)
-    normalized_worker = _worker_artifact(worker)
+    normalized_executor = _executor(executor)
     normalized_artifacts = sorted(
         (_third_party_artifact(item) for item in _mapping_list(artifacts, "artifact closure")),
         key=lambda item: (item["project"], item["version"], item["filename"]),
     )
-    projects = [normalized_worker["project"], *(item["project"] for item in normalized_artifacts)]
+    projects = [item["project"] for item in normalized_artifacts]
     if len(projects) != len(set(projects)):
         raise ValueError("artifact closure contains a duplicate project")
     normalized_policy = _policy(policy)
     normalized_resolver = _resolver(resolver)
     document: dict[str, Any] = {
         "schema": PUBLIC_RUNTIME_LOCK_SCHEMA,
-        "schema_version": 2,
+        "schema_version": 3,
         "runtime": runtime,
         "target": {
             "implementation": "cpython",
@@ -133,7 +135,7 @@ def runtime_lock_document(
         "policy": normalized_policy,
         "resolver": normalized_resolver,
         "requirements": normalized_requirements,
-        "worker": normalized_worker,
+        "executor": normalized_executor,
         "artifacts": normalized_artifacts,
     }
     document["lock_hash"] = hashlib.sha256(_canonical_json(document)).hexdigest()
@@ -145,7 +147,7 @@ def validate_runtime_lock(value: Any) -> dict[str, Any]:
 
     if not isinstance(value, Mapping):
         raise ValueError("runtime lock must be a mapping")
-    if value.get("schema") != PUBLIC_RUNTIME_LOCK_SCHEMA or value.get("schema_version") != 2:
+    if value.get("schema") != PUBLIC_RUNTIME_LOCK_SCHEMA or value.get("schema_version") != 3:
         raise ValueError("public runtime lock must contain the complete artifact closure")
     allowed = {
         "schema",
@@ -155,13 +157,13 @@ def validate_runtime_lock(value: Any) -> dict[str, Any]:
         "policy",
         "resolver",
         "requirements",
-        "worker",
+        "executor",
         "artifacts",
         "lock_hash",
         "names",
     }
-    if "worker" not in value:
-        raise ValueError("worker artifact is missing")
+    if "executor" not in value:
+        raise ValueError("installed framework executor is missing")
     if set(value) != allowed:
         raise ValueError("runtime lock contains unsupported or missing fields")
     target = value.get("target")
@@ -172,7 +174,7 @@ def validate_runtime_lock(value: Any) -> dict[str, Any]:
         python=target.get("python"),
         extras=target.get("extras"),
         requirements=value.get("requirements"),
-        worker=value.get("worker"),
+        executor=value.get("executor"),
         artifacts=value.get("artifacts"),
         policy=value.get("policy"),
         resolver=value.get("resolver"),
@@ -225,7 +227,7 @@ def _policy(value: Any) -> dict[str, Any]:
         "wheel_policy": "non-yanked-universal-pure-python-only",
     }
     if not isinstance(value, Mapping) or dict(value) != expected:
-        raise ValueError("runtime lock policy does not match the reviewed 0.4.8 policy")
+        raise ValueError("runtime lock policy does not match the reviewed 0.4.9 policy")
     return expected
 
 
@@ -236,9 +238,9 @@ def _resolver(value: Any) -> dict[str, Any]:
     return expected
 
 
-def _base_artifact(value: Any, *, worker: bool) -> dict[str, Any]:
+def _base_artifact(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
-        raise ValueError("worker artifact is missing" if worker else "artifact closure entry is malformed")
+        raise ValueError("artifact closure entry is malformed")
     common = {
         "project",
         "version",
@@ -253,15 +255,15 @@ def _base_artifact(value: Any, *, worker: bool) -> dict[str, Any]:
         "license_expression",
         "source",
     }
-    required = common | (
-        {"build_identity", "requires_dist"}
-        if worker
-        else {"direct", "parent_requirements", "evaluated_requirements", "metadata_url", "metadata_sha256"}
-    )
+    required = common | {
+        "direct",
+        "parent_requirements",
+        "evaluated_requirements",
+        "metadata_url",
+        "metadata_sha256",
+    }
     if set(value) != required:
-        raise ValueError(
-            "worker artifact evidence is incomplete" if worker else "artifact closure evidence is incomplete"
-        )
+        raise ValueError("artifact closure evidence is incomplete")
     project = value.get("project")
     version = value.get("version")
     filename = value.get("filename")
@@ -306,62 +308,49 @@ def _base_artifact(value: Any, *, worker: bool) -> dict[str, Any]:
         "native_members": [],
         "license_expression": license_expression,
     }
-    if worker:
-        if normalized["project"] != "splime-public-worker" or version != "0.4.8":
-            raise ValueError("worker artifact identity is unsupported")
-        if set(source) != {"kind", "bundle_member"} or source.get("kind") != "candidate-bundle":
-            if set(source) != {"kind", "url"} or source.get("kind") != "official-pypi":
-                raise ValueError("worker artifact source is unsupported")
-        build_identity = value.get("build_identity")
-        if not isinstance(build_identity, str) or _SHA256_PATTERN.fullmatch(build_identity) is None:
-            raise ValueError("worker artifact build identity is malformed")
-        normalized["build_identity"] = build_identity
-        requires_dist = _string_list(value.get("requires_dist"), "worker requirements")
-        if requires_dist:
-            raise ValueError("self-contained public worker must not declare external requirements")
-        normalized["requires_dist"] = requires_dist
-    else:
-        if set(source) != {"kind", "url"} or source.get("kind") != "official-pypi":
-            raise ValueError("third-party artifacts must use official PyPI")
-        if value.get("direct") not in {True, False}:
-            raise ValueError("artifact provenance is malformed")
-        normalized.update(
-            {
-                "direct": value["direct"],
-                "parent_requirements": _string_list(value.get("parent_requirements"), "parent requirements"),
-                "evaluated_requirements": _mapping_list(value.get("evaluated_requirements"), "evaluated requirements"),
-                "metadata_url": value.get("metadata_url"),
-                "metadata_sha256": value.get("metadata_sha256"),
-            }
-        )
-        if not isinstance(normalized["metadata_url"], str) or not normalized["metadata_url"].startswith(
-            "https://pypi.org/pypi/"
-        ):
-            raise ValueError("artifact metadata origin is not official PyPI")
-        if (
-            not isinstance(normalized["metadata_sha256"], str)
-            or _SHA256_PATTERN.fullmatch(normalized["metadata_sha256"]) is None
-        ):
-            raise ValueError("artifact metadata identity is malformed")
-    if set(source) == {"kind", "url"}:
-        url = source.get("url")
-        if not isinstance(url, str) or not url.startswith("https://files.pythonhosted.org/"):
-            raise ValueError("artifact file origin is not official PyPI")
-        normalized["source"] = {"kind": source["kind"], "url": url}
-    else:
-        member = source.get("bundle_member")
-        if not isinstance(member, str) or not member.startswith("runtime-artifacts/") or ".." in member.split("/"):
-            raise ValueError("worker bundle member is unsafe")
-        normalized["source"] = {"kind": "candidate-bundle", "bundle_member": member}
+    if set(source) != {"kind", "url"} or source.get("kind") != "official-pypi":
+        raise ValueError("third-party artifacts must use official PyPI")
+    if value.get("direct") not in {True, False}:
+        raise ValueError("artifact provenance is malformed")
+    normalized.update(
+        {
+            "direct": value["direct"],
+            "parent_requirements": _string_list(value.get("parent_requirements"), "parent requirements"),
+            "evaluated_requirements": _mapping_list(value.get("evaluated_requirements"), "evaluated requirements"),
+            "metadata_url": value.get("metadata_url"),
+            "metadata_sha256": value.get("metadata_sha256"),
+        }
+    )
+    if not isinstance(normalized["metadata_url"], str) or not normalized["metadata_url"].startswith(
+        "https://pypi.org/pypi/"
+    ):
+        raise ValueError("artifact metadata origin is not official PyPI")
+    if (
+        not isinstance(normalized["metadata_sha256"], str)
+        or _SHA256_PATTERN.fullmatch(normalized["metadata_sha256"]) is None
+    ):
+        raise ValueError("artifact metadata identity is malformed")
+    url = source.get("url")
+    if not isinstance(url, str) or not url.startswith("https://files.pythonhosted.org/"):
+        raise ValueError("artifact file origin is not official PyPI")
+    normalized["source"] = {"kind": source["kind"], "url": url}
     return normalized
 
 
-def _worker_artifact(value: Any) -> dict[str, Any]:
-    return _base_artifact(value, worker=True)
+def _executor(value: Any) -> dict[str, str]:
+    expected = {
+        "kind": "installed-framework",
+        "project": "splime",
+        "contract": PUBLIC_EMBEDDED_HOST_CONTRACT,
+        "minimum_version": PUBLIC_EMBEDDED_HOST_MINIMUM_VERSION,
+    }
+    if not isinstance(value, Mapping) or dict(value) != expected:
+        raise ValueError("installed framework executor identity is unsupported")
+    return expected
 
 
 def _third_party_artifact(value: Any) -> dict[str, Any]:
-    return _base_artifact(value, worker=False)
+    return _base_artifact(value)
 
 
 def environment_identity(
@@ -474,6 +463,8 @@ def default_venv_command_builder() -> VenvCommandBuilder:
 __all__ = [
     "PipVenvCommandBuilder",
     "PUBLIC_RUNTIME_LOCK_SCHEMA",
+    "PUBLIC_EMBEDDED_HOST_CONTRACT",
+    "PUBLIC_EMBEDDED_HOST_MINIMUM_VERSION",
     "PUBLIC_RUNTIME_POLICY_NAME",
     "PUBLIC_RUNTIME_POLICY_VERSION",
     "PUBLIC_RUNTIME_RESOLVER_NAME",
