@@ -311,7 +311,7 @@ def materialize_source_evidence(
         "show",
         "-s",
         "--format=%ct",
-        framework["source_ref"],
+        f"{framework['source_ref']}^{{commit}}",
     )
     try:
         source_date_epoch = int(epoch_text)

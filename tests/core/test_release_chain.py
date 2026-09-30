@@ -798,6 +798,24 @@ def test_source_evidence_is_materialized_outside_clean_repositories(
         )
 
 
+def test_source_evidence_uses_peeled_annotated_framework_tag_epoch(
+    tmp_path: Path,
+) -> None:
+    workspace, contract, _ = _disposable_built_release(tmp_path)
+    framework = workspace / "spl"
+    _git(framework, "tag", "--force", "--annotate", "v0.4.6", "-m", "release")
+    expected_epoch = int(_git(framework, "show", "-s", "--format=%ct", "v0.4.6^{commit}"))
+
+    source = materialize_source_evidence(
+        contract,
+        load_json(framework / "release-manifest.json"),
+        workspace_root=workspace,
+        observed_at="2026-07-30T09:00:00+00:00",
+    )
+
+    assert source["source_date_epoch"] == expected_epoch
+
+
 def test_built_evidence_materializer_binds_semantic_component_artifacts(
     tmp_path: Path,
 ) -> None:
