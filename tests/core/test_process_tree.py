@@ -147,6 +147,37 @@ class _ImmediateProcess:
         return "", ""
 
 
+class _InterruptedProcess:
+    pid = 12345
+    returncode = None
+
+    def communicate(self, *, timeout: float | None = None) -> tuple[str, str]:
+        del timeout
+        raise KeyboardInterrupt
+
+
+def test_process_tree_cancellation_terminates_and_reaps_group(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = _InterruptedProcess()
+    terminated: list[tuple[object, float]] = []
+
+    def record_termination(target: object, *, grace_seconds: float) -> tuple[str, str]:
+        terminated.append((target, grace_seconds))
+        return "", ""
+
+    monkeypatch.setattr(m_process, "_posix_process_groups_supported", lambda: True)
+    monkeypatch.setattr(m_process.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(
+        m_process,
+        "_terminate_timed_out_process",
+        record_termination,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        m_process.run_process_tree([sys.executable, "--version"])
+
+    assert terminated == [(process, m_process.DEFAULT_TERMINATION_GRACE_SECONDS)]
+
+
 @pytest.mark.parametrize("timeout", [None, 1, 1.25, 0, -1])
 def test_process_timeout_preserves_every_finite_deadline(
     monkeypatch: pytest.MonkeyPatch,

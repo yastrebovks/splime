@@ -28,7 +28,7 @@ redeploying.
 ## Install
 
 ```bash
-python3.13 -m pip install "splime==0.4.9"
+python3.13 -m pip install "splime==0.4.10"
 ```
 
 The distribution is named `splime`; the Python import package is `spl`.
@@ -62,6 +62,36 @@ print(result.output)   # 42.0  (.output always yields the plain value;
 
 That is the whole loop: define a function, `publish` it as a versioned node, then `call`
 it by name and get back the value (plus logs and any artifacts).
+
+## Values across per-node runtimes
+
+Pipeline edge adapters now carry non-JSON Python values across `native`,
+`venv-subprocess`, and per-node `docker` boundaries. Select an explicit format
+where more than one representation is possible:
+
+```python
+consumer = lift(use_array).bind(value=producer.as_format("npy"))
+pipeline = consumer.render("array_pipeline").with_node_runtime("use_array", "venv-subprocess")
+```
+
+The producing side saves one canonical, checksummed artifact for each unique
+save identity and the consuming side loads it in its own target environment.
+A run-level adapter override takes precedence over `.as_format(...)`. Retained
+runs record the exact save/load provenance and can resume from verified frozen
+artifacts without rerunning the producer.
+
+Plain JSON-compatible values keep the historical inline wire shape: no adapter
+bundle, staging file, or artifact directory is created. Custom adapters must be
+plain top-level save/load functions with statically recoverable source. Declare
+every non-stdlib import as an exact distribution dependency so it is installed
+and verified in each isolated target environment.
+
+Artifact transport accepts stable regular files only and checks names, sizes,
+SHA-256 digests, adapter identities, and format tags before loading. Current
+limits are 256 MiB per input or output, 512 MiB aggregate inputs and outputs,
+512 KiB for a custom adapter source bundle, and 1,024 adapter bindings. These
+checks harden the transport boundary; they do not make trusted Python functions
+safe to run as arbitrary untrusted code.
 
 ## Run it where the data lives
 

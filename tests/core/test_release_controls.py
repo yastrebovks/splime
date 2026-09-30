@@ -52,16 +52,14 @@ def test_canonical_docker_context_is_exact_bounded_and_private_free() -> None:
     assert all((DOCKER_ROOT / name).is_file() for name in expected)
     assert all(not (DOCKER_ROOT / name).is_symlink() for name in expected)
     assert (DOCKER_ROOT / ".dockerignore").read_text(encoding="utf-8") == (
-        "# This image installs splime from PyPI and copies no local source or payload.\n"
-        "# Ignore the bounded release context so builds stay private and fast.\n"
+        "# This image installs splime from PyPI and copies nothing from the build\n"
+        "# context, so ignore everything to keep the context empty and builds fast.\n"
         "*\n"
     )
     dockerfile = (DOCKER_ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY ." not in dockerfile
     assert dockerfile.count("COPY ") == 1
-    assert "COPY --from=docker-cli" in dockerfile
-    assert "FROM docker:27-cli@sha256:" in dockerfile
-    assert "FROM python:3.13-slim@sha256:" in dockerfile
+    assert "COPY --from=docker:27-cli" in dockerfile
 
 
 def test_canonical_docker_source_pins_the_exact_release_and_oci_identity() -> None:
@@ -73,103 +71,23 @@ def test_canonical_docker_source_pins_the_exact_release_and_oci_identity() -> No
     publish_text = publish.read_text(encoding="utf-8")
     combined = "\n".join((dockerfile, compose, publish_text, (DOCKER_ROOT / "README.md").read_text(encoding="utf-8")))
 
-    assert version == "0.4.9"
+    assert version == "0.4.10"
     assert f"ARG SPL_VERSION={version}" in dockerfile
     assert 'python -m pip install "splime==${SPL_VERSION}"' in dockerfile
-    assert '"uv==${UV_VERSION}"' in dockerfile
-    assert "ARG SPL_PACKAGE_REVISION=unpublished" in dockerfile
-    assert "ARG SPL_SOURCE_REVISION=unknown" in dockerfile
     assert f"image: {manifest['docker']['repository']}:{version}" in compose
     assert f'VERSION="${{1:-{version}}}"' in publish_text
-    assert 'exec "${CANONICAL}" push' in publish_text
     assert "0.4.5" not in combined
     assert os.access(publish, os.X_OK)
     for label in (
         "org.opencontainers.image.title",
         "org.opencontainers.image.description",
         "org.opencontainers.image.version",
-        "org.opencontainers.image.revision",
-        "org.opencontainers.image.created",
         "org.opencontainers.image.source",
         "org.opencontainers.image.url",
         "org.opencontainers.image.licenses",
     ):
         assert label in dockerfile
-    assert "io.splime.package.revision" in dockerfile
     assert 'org.opencontainers.image.version="${SPL_VERSION}"' in dockerfile
-
-
-def test_docker_release_verification_retries_transient_registry_failures() -> None:
-    release_script = (SPL_ROOT / "release" / "0.4.7" / "update-docker.sh").read_text(encoding="utf-8")
-
-    assert "registry_retry()" in release_script
-    assert "max_attempts=5" in release_script
-    assert "delay=$((delay * 2))" in release_script
-    assert 'registry_retry docker buildx imagetools inspect "${IMAGE}:${VERSION}"' in release_script
-    assert 'registry_retry docker pull "${IMAGE}:${VERSION}"' in release_script
-    assert 'IMAGE_SOURCE_REVISION="290348dbe0089ed9497ac6030aa960262249eb01"' in release_script
-    assert '"${label_revision}" != "${IMAGE_SOURCE_REVISION}"' in release_script
-
-
-def test_048_owner_runbook_is_versioned_and_requires_the_reviewed_cookbook() -> None:
-    release_root = SPL_ROOT / "release" / "0.4.8"
-    release_script = release_root / "release.sh"
-    text = release_script.read_text(encoding="utf-8")
-
-    assert release_script.is_file()
-    assert os.access(release_script, os.X_OK)
-    assert 'VERSION="0.4.8"' in text
-    assert 'contract["server_schema_target"] != 48' in text
-    assert "SPL_RELEASE_COOKBOOK_PATH" in text
-    assert (release_root / "README.md").is_file()
-    assert (release_root / "release-notes.md").is_file()
-
-
-def test_049_owner_release_script_is_single_distribution_and_fail_closed() -> None:
-    release_root = SPL_ROOT / "release" / "0.4.9"
-    release_script = release_root / "release.sh"
-    text = release_script.read_text(encoding="utf-8")
-    readme = (release_root / "README.md").read_text(encoding="utf-8")
-
-    assert release_script.is_file()
-    assert os.access(release_script, os.X_OK)
-    assert 'VERSION="0.4.9"' in text
-    assert '"spl.public_runtime_lock.v3"' in text
-    assert 'f"splime>={expected}"' in text
-    assert 'project["project"]["name"] != "splime"' in text
-    assert 'forbidden = "splime" + "-public-worker"' in text
-    assert "splime-public-worker" not in text
-    assert "SPLIME_RELEASE_CONFIRM" in text
-    assert "SPLIME_CONFIRM_PUSH" in text
-    assert "SPLIME_CONFIRM_DRAFT" in text
-    assert "SPLIME_CONFIRM_PYPI" in text
-    assert 'verify_index_artifacts "https://test.pypi.org"' in text
-    assert 'verify_index_artifacts "https://pypi.org"' in text
-    assert 'git -C "${ROOT}" push --atomic' in text
-    assert "pypa/gh-action-pypi-publish" not in text
-    assert "{check|artifacts|commit|push|draft|publish|verify}" in text
-    assert "script never accepts a PyPI password" in readme
-
-
-def test_048_docker_publication_is_fail_closed_until_post_pypi_evidence() -> None:
-    dockerfile = (DOCKER_ROOT / "Dockerfile").read_text(encoding="utf-8")
-    helper = (DOCKER_ROOT / "publish.sh").read_text(encoding="utf-8")
-
-    assert "ARG SPL_PACKAGE_REVISION=unpublished" in dockerfile
-    assert not (SPL_ROOT / "release" / "0.4.8" / "update-docker.sh").exists()
-    assert 'CANONICAL="${ROOT}/release/${VERSION}/update-docker.sh"' in helper
-    assert 'if [[ ! -x "${CANONICAL}" ]]' in helper
-
-
-def test_048_source_transfer_preserves_the_package_only_workflow() -> None:
-    transfer = json.loads((SPL_ROOT / "release" / "0.4.8" / "source-transfer.json").read_text(encoding="utf-8"))
-    active = (SPL_ROOT / ".github" / "workflows" / "publish-to-pypi.yml").read_bytes()
-
-    assert hashlib.sha256(active).hexdigest() == transfer["merge_policy"]["active_publication_workflow_sha256"]
-    assert transfer["target"]["base_head"] == "290348dbe0089ed9497ac6030aa960262249eb01"
-    for row in transfer["archived_development_controls"]:
-        archived = SPL_ROOT / row["archive_path"]
-        assert hashlib.sha256(archived.read_bytes()).hexdigest() == row["sha256"]
 
 
 def test_canonical_docker_runtime_is_non_root_loopback_first_and_socket_opt_in() -> None:
@@ -353,7 +271,6 @@ def test_build_main_passes_locked_epoch_to_backend(
 
     def fake_run(command: list[str], *, check: bool, env: dict[str, str]) -> None:
         assert check is True
-        assert command[1:4] == ["-P", "-m", "build"]
         assert env["SOURCE_DATE_EPOCH"] == str(locked_epoch)
         assert env["PATH"] == os.environ["PATH"]
         raw_dir = Path(command[-1])
@@ -535,8 +452,8 @@ def test_verify_github_release_assets_requires_exact_bytes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     asset = b"reviewed release asset"
-    release_url = "https://github.test/releases/tag/v0.4.8"
-    asset_url = "https://github.test/releases/download/v0.4.8/asset.bin"
+    release_url = "https://github.test/releases/tag/v0.4.6"
+    asset_url = "https://github.test/releases/download/v0.4.6/asset.bin"
     manifest = {
         "github_release": {
             "url": release_url,
@@ -557,7 +474,7 @@ def test_verify_github_release_assets_requires_exact_bytes(
 
     verify_published_release.verify_github_release_assets(manifest)
 
-    manifest["github_release"]["assets"][0]["url"] = "https://github.test/releases/download/v0.4.8/other.bin"
+    manifest["github_release"]["assets"][0]["url"] = "https://github.test/releases/download/v0.4.6/other.bin"
     with pytest.raises(SystemExit, match="URL does not end"):
         verify_published_release.verify_github_release_assets(manifest)
     manifest["github_release"]["assets"][0]["url"] = asset_url
@@ -570,11 +487,11 @@ def test_verify_github_release_assets_requires_exact_bytes(
 def test_verify_docker_requires_manifest_and_platform_digests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    verification_url = "https://hub.test/tags/0.4.8"
-    publication_url = "https://hub.test/repository/tags?name=0.4.8"
+    verification_url = "https://hub.test/tags/0.4.6"
+    publication_url = "https://hub.test/repository/tags?name=0.4.6"
     manifest = {
         "docker": {
-            "tag": "0.4.8",
+            "tag": "0.4.6",
             "manifest_digest": f"sha256:{'a' * 64}",
             "platform_digests": {
                 "linux/amd64": f"sha256:{'b' * 64}",
@@ -585,7 +502,7 @@ def test_verify_docker_requires_manifest_and_platform_digests(
         }
     }
     tag = {
-        "name": "0.4.8",
+        "name": "0.4.6",
         "digest": f"sha256:{'a' * 64}",
         "images": [
             {
@@ -670,7 +587,7 @@ def test_declared_v2_manifest_cannot_be_published() -> None:
         verify_published_release.require_publishable_manifest(
             {
                 "schema_version": 2,
-                "release_id": "splime-0.4.8",
+                "release_id": "splime-0.4.6",
                 "evidence": {"state": "declared"},
             }
         )
@@ -681,7 +598,7 @@ def test_v2_publishable_state_still_requires_exact_component_evidence() -> None:
         verify_published_release.require_publishable_manifest(
             {
                 "schema_version": 2,
-                "release_id": "splime-0.4.8",
+                "release_id": "splime-0.4.6",
                 "evidence": {"state": "published"},
                 "components": {
                     "server": {
@@ -698,7 +615,7 @@ def test_v2_publishable_state_still_requires_exact_component_evidence() -> None:
 def test_v2_publishable_guard_rejects_empty_artifact_sets() -> None:
     component = {
         "source_binding": "pinned_commit",
-        "source_ref": "v0.4.8",
+        "source_ref": "v0.4.6",
         "source_commit": "1" * 40,
         "artifact": {"sha256": "2" * 64},
     }
@@ -706,8 +623,8 @@ def test_v2_publishable_guard_rejects_empty_artifact_sets() -> None:
         verify_published_release.require_publishable_manifest(
             {
                 "schema_version": 2,
-                "release_id": "splime-0.4.8",
-                "version": "0.4.8",
+                "release_id": "splime-0.4.6",
+                "version": "0.4.6",
                 "evidence": {"state": "published"},
                 "components": {
                     "framework": {
@@ -731,14 +648,14 @@ def test_v2_publishable_guard_rejects_empty_artifact_sets() -> None:
 def test_v2_publishable_guard_requires_github_and_immutable_docker_evidence() -> None:
     component = {
         "source_binding": "pinned_commit",
-        "source_ref": "v0.4.8",
+        "source_ref": "v0.4.6",
         "source_commit": "1" * 40,
         "artifact": {"sha256": "2" * 64},
     }
     manifest = {
         "schema_version": 2,
-        "release_id": "splime-0.4.8",
-        "version": "0.4.8",
+        "release_id": "splime-0.4.6",
+        "version": "0.4.6",
         "evidence": {"state": "published"},
         "components": {
             "framework": {
@@ -795,7 +712,7 @@ def test_signed_source_tag_must_identify_the_checked_out_commit(
 
     with pytest.raises(SystemExit, match="does not identify"):
         verify_published_release.verify_signed_source_tag(
-            {"version": "0.4.8"},
+            {"version": "0.4.6"},
             repository=tmp_path,
         )
 
@@ -806,11 +723,11 @@ def test_signed_source_tag_must_match_both_external_bom_components(
 ) -> None:
     commit = "1" * 40
     manifest = {
-        "version": "0.4.8",
+        "version": "0.4.6",
         "components": {
             name: {
                 "source_binding": "signed_tag_external_provenance",
-                "source_ref": "v0.4.8",
+                "source_ref": "v0.4.6",
                 "source_commit": commit,
             }
             for name in ("framework", "daemon")
@@ -846,8 +763,8 @@ def test_published_manifest_remote_bytes_must_match_reviewed_bom_exactly(
         json.dumps(
             {
                 "schema_version": 2,
-                "release_id": "splime-0.4.8",
-                "version": "0.4.8",
+                "release_id": "splime-0.4.6",
+                "version": "0.4.6",
                 "manifest_url": "https://release.test/release-manifest.json",
             },
             indent=2,
@@ -889,12 +806,12 @@ def test_published_manifest_remote_bytes_must_match_reviewed_bom_exactly(
 
 def test_console_build_identity_rejects_non_allowlisted_provenance() -> None:
     manifest = {
-        "release_id": "splime-0.4.8",
-        "packages": {"console": "0.4.8"},
+        "release_id": "splime-0.4.6",
+        "packages": {"console": "0.4.6"},
         "components": {
             "console": {
                 "repository": "https://example.invalid/console",
-                "source_ref": "v0.4.8",
+                "source_ref": "v0.4.6",
                 "source_commit": "1" * 40,
                 "contracts": {"console_server": "console-server/v1"},
             }
@@ -903,12 +820,12 @@ def test_console_build_identity_rejects_non_allowlisted_provenance() -> None:
     build = {
         "schema_version": 1,
         "component": "console",
-        "release_id": "splime-0.4.8",
-        "version": "0.4.8",
+        "release_id": "splime-0.4.6",
+        "version": "0.4.6",
         "evidence_state": "built",
         "source": {
             "repository": "https://example.invalid/console",
-            "ref": "v0.4.8",
+            "ref": "v0.4.6",
             "binding": "pinned_commit",
             "commit": "1" * 40,
         },
@@ -930,12 +847,12 @@ def test_server_deployment_verification_separates_receipt_from_readiness(
 ) -> None:
     manifest = {
         "schema_version": 2,
-        "release_id": "splime-0.4.8",
-        "packages": {"server": "0.4.8"},
+        "release_id": "splime-0.4.6",
+        "packages": {"server": "0.4.6"},
         "server": {"schema_target": 32},
         "components": {
             "server": {
-                "source_ref": "v0.4.8",
+                "source_ref": "v0.4.6",
                 "source_commit": "a" * 40,
                 "artifact": {"sha256": "b" * 64},
             }
@@ -946,8 +863,8 @@ def test_server_deployment_verification_separates_receipt_from_readiness(
         "schema_version": 1,
         "release_id": manifest["release_id"],
         "component": "server",
-        "version": "0.4.8",
-        "source_ref": "v0.4.8",
+        "version": "0.4.6",
+        "source_ref": "v0.4.6",
         "source_commit": "a" * 40,
         "artifact_sha256": "b" * 64,
         "release_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),

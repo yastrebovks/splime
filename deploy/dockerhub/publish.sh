@@ -1,24 +1,28 @@
 #!/usr/bin/env bash
-# Compatibility entry point for the canonical, guarded Docker release script.
+# Build and publish the splime daemon image to Docker Hub (multi-arch).
 #
 # Prerequisites (once):
 #   docker login                                   # to your Docker Hub account (yastrebovks)
 #   docker buildx create --use --name splime-builder
 #
 # Usage:
-#   SPLIME_CONFIRM_DOCKER=yastrebovks/spl-daemon:0.4.9 ./publish.sh 0.4.9
-#
-# This file intentionally contains no second build/push implementation.
+#   ./publish.sh            # builds and pushes the configured version + latest
+#   ./publish.sh <version>  # builds and pushes a specific version + latest
 set -euo pipefail
 
-VERSION="${1:-0.4.9}"
-ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)"
-CANONICAL="${ROOT}/release/${VERSION}/update-docker.sh"
+VERSION="${1:-0.4.10}"
+IMAGE="yastrebovks/spl-daemon"
+PLATFORMS="linux/amd64,linux/arm64"
 
-if [[ ! -x "${CANONICAL}" ]]; then
-  printf 'No canonical Docker release script for SPLime %s: %s\n' \
-    "${VERSION}" "${CANONICAL}" >&2
-  exit 2
-fi
+cd "$(dirname "$0")"
 
-exec "${CANONICAL}" push
+echo "Building ${IMAGE}:${VERSION} (+ latest) for ${PLATFORMS} ..."
+docker buildx build \
+  --platform "${PLATFORMS}" \
+  --build-arg "SPL_VERSION=${VERSION}" \
+  --tag "${IMAGE}:${VERSION}" \
+  --tag "${IMAGE}:latest" \
+  --push \
+  .
+
+echo "Pushed ${IMAGE}:${VERSION} and ${IMAGE}:latest"

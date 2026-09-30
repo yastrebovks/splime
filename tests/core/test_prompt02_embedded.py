@@ -5,14 +5,18 @@ import copy
 import hashlib
 import io
 import json
+import os
+import platform
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -24,10 +28,12 @@ from spl.daemon.worker import WorkerNodeEnvironmentProvider
 from spl.core.ir.utils import spl_compile_to_source
 from spl.embedded import (
     EmbeddedBackend,
+    PublicRunReceiptEmitter,
     verify_public_bundle,
 )
 from spl.public import parse_public_ref
 from spl.runtime_environment import (
+    PUBLIC_EMBEDDED_EXECUTOR,
     PUBLIC_RUNTIME_POLICY_NAME,
     PUBLIC_RUNTIME_POLICY_VERSION,
     PUBLIC_RUNTIME_RESOLVER_NAME,
@@ -106,15 +112,6 @@ def _canonical(value: object) -> bytes:
     ).encode()
 
 
-def _test_executor() -> dict[str, object]:
-    return {
-        "kind": "installed-framework",
-        "project": "splime",
-        "contract": "spl.public_embedded_host.v1",
-        "minimum_version": "0.4.9",
-    }
-
-
 def _test_artifact(project: str, version: str) -> dict[str, object]:
     normalized = project.replace("-", "_")
     return {
@@ -150,7 +147,7 @@ def _test_runtime_lock(
     return runtime_lock_document(
         python=python,
         requirements=[{"requirement": f"{item['project']}=={item['version']}", "extras": []} for item in closure],
-        executor=_test_executor(),
+        executor=PUBLIC_EMBEDDED_EXECUTOR,
         artifacts=closure,
         policy={
             "name": PUBLIC_RUNTIME_POLICY_NAME,
@@ -160,56 +157,6 @@ def _test_runtime_lock(
         },
         resolver={"name": PUBLIC_RUNTIME_RESOLVER_NAME, "version": 1},
     )
-
-
-def test_embedded_executor_rejects_non_final_framework_versions() -> None:
-    from spl import embedded as embedded_module
-
-    with pytest.raises(ClientError, match="installed splime version is malformed"):
-        embedded_module._version_tuple("0.4.9rc1")
-
-
-def test_framework_projection_accepts_an_os_canonical_temp_alias(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    from spl import embedded as embedded_module
-
-    if sys.platform == "win32":
-        pytest.skip("unprivileged Windows symlink creation is not portable")
-    real_environment = tmp_path / "private" / "environment"
-    purelib = real_environment / "lib" / "python3.13" / "site-packages"
-    purelib.mkdir(parents=True)
-    alias_environment = tmp_path / "environment-alias"
-    alias_environment.symlink_to(real_environment, target_is_directory=True)
-    python = alias_environment / "bin" / "python"
-    python.parent.mkdir(parents=True)
-    python.write_text("test interpreter", encoding="utf-8")
-    package_root = tmp_path / "framework" / "spl"
-    package_root.mkdir(parents=True)
-    (package_root / "__init__.py").write_text("VALUE = 41\n", encoding="utf-8")
-    authority = {
-        "package_root": package_root,
-        "tree_hash": embedded_module._tree_hash(package_root),
-    }
-    monkeypatch.setattr(
-        embedded_module,
-        "run_process_tree",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=0,
-            stdout=f"{purelib}\n",
-            stderr="",
-        ),
-    )
-
-    projected = EmbeddedBackend._project_framework_authority(
-        python,
-        alias_environment,
-        authority,
-    )
-
-    assert projected == alias_environment / "lib" / "python3.13" / "site-packages" / "spl"
-    assert (projected / "__init__.py").read_text(encoding="utf-8") == "VALUE = 41\n"
 
 
 def _verify_bundle(
@@ -445,6 +392,7 @@ def test_embedded_run_receipts_are_minimal_ordered_and_execution_safe(
             "callable": True,
             "identity": {"entry_type": "object"},
             "execution": COMPILED_EXECUTION,
+            "runtime_locks": [{**_test_runtime_lock(), "names": ["root"]}],
         },
     }
     monkeypatch.setattr(
@@ -528,6 +476,7 @@ def test_embedded_run_receipt_failure_and_opt_out_never_change_execution(
                     "callable": True,
                     "identity": {"entry_type": "object"},
                     "execution": COMPILED_EXECUTION,
+                    "runtime_locks": [{**_test_runtime_lock(), "names": ["root"]}],
                 },
             },
             bundle_dir,
@@ -580,17 +529,161 @@ def test_embedded_run_receipt_failure_and_opt_out_never_change_execution(
     assert "secret argument" not in json.dumps(terminal_events)
 
 
-def test_cross_repository_fixture_is_identical_and_verifiable(tmp_path: Path) -> None:
-    workspace_candidates = (Path(__file__).parents[3], Path(__file__).parents[4])
-    server_fixture = next(
-        (
-            root / "spl-server" / "tests" / "fixtures" / "public_manifest_v1.json"
-            for root in workspace_candidates
-            if (root / "spl-server" / "tests" / "fixtures" / "public_manifest_v1.json").is_file()
-        ),
-        None,
+def _run_receipt_payload(state: str, *, event_id: str = "event-lifecycle-1") -> dict[str, str]:
+    return {
+        "release_id": "release-lifecycle-1",
+        "event_id": event_id,
+        "state": state,
+        "runtime_family": "cpython",
+        "occurred_at": "2026-08-25T12:00:00+00:00",
+    }
+
+
+def test_run_receipts_flush_at_normal_short_lived_interpreter_exit(tmp_path: Path) -> None:
+    output = tmp_path / "received.jsonl"
+    source_root = Path(__file__).parents[2] / "src"
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(source_root), environment.get("PYTHONPATH", "")) if part
     )
-    assert server_fixture is not None, "the sibling spl-server public-manifest fixture is required"
+    script = r"""
+import json
+import sys
+import time
+from pathlib import Path
+
+from spl.embedded import PublicRunReceiptEmitter
+
+output = Path(sys.argv[1])
+
+class RecordingTransport:
+    def post_json(self, path, value):
+        time.sleep(0.1)
+        with output.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"path": path, **value}, sort_keys=True) + "\n")
+
+emitter = PublicRunReceiptEmitter("https://registry.example.test")
+emitter.transport = RecordingTransport()
+base = {
+    "release_id": "release-process-exit-1",
+    "event_id": "event-process-exit-1",
+    "runtime_family": "cpython",
+    "occurred_at": "2026-08-25T12:00:00+00:00",
+}
+emitter.emit(**base, state="started")
+emitter.emit(**base, state="success")
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(output)],
+        cwd=Path(__file__).parents[2],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    received = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [item["state"] for item in received] == ["started", "success"]
+    assert {item["path"] for item in received} == {"/public/v1/run-receipts"}
+
+
+def test_run_receipt_flush_has_a_hard_bound_when_transport_stalls() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class StalledTransport:
+        def post_json(self, path: str, value: object) -> None:
+            entered.set()
+            release.wait(2)
+
+    emitter = PublicRunReceiptEmitter("https://registry.example.test")
+    emitter.transport = StalledTransport()
+    emitter.emit(**_run_receipt_payload("started"))
+    assert entered.wait(1)
+
+    started_at = time.monotonic()
+    assert emitter.flush(0.05) is False
+    elapsed = time.monotonic() - started_at
+
+    assert 0.04 <= elapsed < 0.5
+    release.set()
+    assert emitter.flush(1) is True
+
+
+def test_long_object_execution_keeps_receipts_ordered_and_terminal_emit_nonblocking() -> None:
+    started_delivered = threading.Event()
+    terminal_entered = threading.Event()
+    release_terminal = threading.Event()
+    events: list[str] = []
+
+    class ControlledTransport:
+        def post_json(self, path: str, value: dict[str, object]) -> None:
+            events.append(str(value["state"]))
+            if value["state"] == "started":
+                started_delivered.set()
+                return
+            terminal_entered.set()
+            release_terminal.wait(2)
+
+    emitter = PublicRunReceiptEmitter("https://registry.example.test")
+    emitter.transport = ControlledTransport()
+    emitter.emit(**_run_receipt_payload("started", event_id="event-long-run-1"))
+    assert started_delivered.wait(1)
+
+    time.sleep(0.15)  # The shutdown allowance must not start while the Object is running.
+    emitted_at = time.monotonic()
+    emitter.emit(**_run_receipt_payload("success", event_id="event-long-run-1"))
+    emit_elapsed = time.monotonic() - emitted_at
+
+    assert emit_elapsed < 0.05
+    assert terminal_entered.wait(1)
+    assert emitter.flush(0.02) is False
+    release_terminal.set()
+    assert emitter.flush(1) is True
+    assert events == ["started", "success"]
+
+
+def test_run_receipt_emitter_flushes_concurrent_events_without_lifecycle_races() -> None:
+    event_count = 16
+    ready = threading.Barrier(event_count + 1)
+    received: list[tuple[str, str]] = []
+    received_lock = threading.Lock()
+
+    class RecordingTransport:
+        def post_json(self, path: str, value: dict[str, object]) -> None:
+            with received_lock:
+                received.append((str(value["event_id"]), str(value["state"])))
+
+    emitter = PublicRunReceiptEmitter("https://registry.example.test")
+    emitter.transport = RecordingTransport()
+
+    def emit_event(index: int) -> None:
+        event_id = f"event-concurrent-{index}"
+        ready.wait()
+        emitter.emit(**_run_receipt_payload("started", event_id=event_id))
+        emitter.emit(**_run_receipt_payload("success", event_id=event_id))
+
+    with ThreadPoolExecutor(max_workers=event_count) as pool:
+        futures = [pool.submit(emit_event, index) for index in range(event_count)]
+        ready.wait()
+        for future in futures:
+            future.result(timeout=2)
+
+    assert emitter.flush(2) is True
+    assert len(received) == event_count * 2
+    for index in range(event_count):
+        event_id = f"event-concurrent-{index}"
+        assert [state for observed_id, state in received if observed_id == event_id] == [
+            "started",
+            "success",
+        ]
+
+
+def test_cross_repository_fixture_is_identical_and_verifiable(tmp_path: Path) -> None:
+    server_fixture = Path(__file__).parents[3] / "spl-server" / "tests" / "fixtures" / "public_manifest_v1.json"
     assert FIXTURE.read_bytes() == server_fixture.read_bytes()
     fixture = _fixture()
     bundle = base64.b64decode(fixture.pop("bundle_base64"), validate=True)
@@ -710,58 +803,28 @@ def test_interrupted_environment_build_recovers_atomically(
 
     backend = EmbeddedBackend("https://registry.example.test", tmp_path)
     lock = {**_test_runtime_lock(), "names": ["root"]}
-    base_identity = environment_identity(
+    projection = embedded_module._installed_framework_projection()
+    digest = environment_identity(
         lock,
         interpreter_abi=getattr(sys.implementation, "cache_tag", "unknown"),
+        framework_identity=projection[0],
     )
-    authority = embedded_module._installed_framework_authority(lock["executor"])
-    digest = embedded_module._sha256(f"{base_identity}\0{authority['identity']}".encode("utf-8"))
     incomplete = tmp_path / "environments" / digest
     incomplete.mkdir(parents=True)
     (incomplete / "partial").write_text("interrupted", encoding="utf-8")
 
-    class Builder:
-        name = "test"
-
-        def create_command(self, spec: dict[str, object]) -> list[str]:
-            return ["create", str(spec["venv_path"])]
-
-        def install_command(self, spec: dict[str, object], requirements: list[str]) -> list[str]:
-            return ["install", str(spec["python_path"]), *requirements]
-
     interrupted = True
+    write_environment_tree = embedded_module._write_environment_tree
 
-    def run(command: list[str], **kwargs: object) -> SimpleNamespace:
+    def write(directory: Path, files: object) -> None:
         nonlocal interrupted
-        if command[0] == "create":
-            python = Path(command[1]) / "bin" / "python"
-            python.parent.mkdir(parents=True)
-            python.write_text("test interpreter", encoding="utf-8")
-        elif command[0] == "install" and interrupted:
+        if interrupted:
             interrupted = False
-            raise subprocess.TimeoutExpired(command, 600)
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+            (directory / "partial").write_text("interrupted", encoding="utf-8")
+            raise OSError("private materialization path")
+        write_environment_tree(directory, files)
 
-    monkeypatch.setattr(embedded_module, "default_venv_command_builder", Builder)
-    monkeypatch.setattr(embedded_module, "run_process_tree", run)
-    monkeypatch.setattr(backend, "_materialize_wheels", lambda lock, **kwargs: [tmp_path / "dependency.whl"])
-
-    def project_framework(
-        python: Path,
-        environment: Path,
-        authority: dict[str, object],
-    ) -> Path:
-        del python, authority
-        target = environment / "lib" / "spl"
-        target.mkdir(parents=True)
-        return target
-
-    monkeypatch.setattr(backend, "_project_framework_authority", project_framework)
-    monkeypatch.setattr(
-        embedded_module,
-        "_tree_hash",
-        lambda root: authority["tree_hash"],
-    )
+    monkeypatch.setattr(embedded_module, "_write_environment_tree", write)
     monkeypatch.setattr(
         backend,
         "_environment_healthy",
@@ -770,6 +833,9 @@ def test_interrupted_environment_build_recovers_atomically(
     with pytest.raises(ClientError) as first_error:
         backend._ensure_environment(lock)
     assert first_error.value.code == "embedded_environment_build_failed"
+    assert first_error.value.__cause__ is None
+    assert "private materialization path" not in str(first_error.value)
+    assert "Traceback" not in str(first_error.value)
     assert not incomplete.exists()
     assert not list((tmp_path / "environments").glob(".*-*"))
 
@@ -778,6 +844,352 @@ def test_interrupted_environment_build_recovers_atomically(
     assert len(set(pythons)) == 1
     assert pythons[0].is_file()
     assert (incomplete / "ready.json").is_file()
+
+
+def _empty_environment(tmp_path: Path) -> tuple[EmbeddedBackend, dict[str, object], Path]:
+    backend = EmbeddedBackend("https://registry.example.test", tmp_path, run_receipts=False)
+    lock = {**_test_runtime_lock(), "names": ["root"]}
+    python = backend._ensure_environment(lock)
+    return backend, lock, python
+
+
+def _make_environment_mutable(environment: Path) -> None:
+    for path in [environment, *environment.rglob("*")]:
+        if path.is_symlink():
+            continue
+        if path.is_dir():
+            path.chmod(0o755)
+        elif path.is_file():
+            path.chmod(0o644)
+
+
+def _reseal_environment(environment: Path) -> None:
+    for path in environment.rglob("*"):
+        if path.is_symlink():
+            continue
+        if path.is_dir():
+            path.chmod(0o555)
+        elif path.is_file():
+            path.chmod(0o555 if path == environment / "bin" / "python" else 0o444)
+    environment.chmod(0o555)
+
+
+def _external_health_executable(path: Path, canary: Path) -> None:
+    path.write_text(
+        f"#!/bin/sh\nprintf ran > {canary!s}\nexit 0\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "absolute-python",
+        "traversal-python",
+        "sibling-python",
+        "malformed",
+        "oversized",
+        "duplicate-key",
+        "unknown-field",
+        "missing-field",
+        "wrong-schema",
+        "wrong-schema-version",
+        "wrong-identity",
+    ],
+)
+def test_environment_marker_is_non_authoritative_and_closed(tmp_path: Path, case: str) -> None:
+    backend, lock, python = _empty_environment(tmp_path / "cache")
+    environment = python.parent.parent
+    marker = environment / "ready.json"
+    external = tmp_path / "external-health"
+    canary = tmp_path / "external-ran"
+    _external_health_executable(external, canary)
+    original = json.loads(marker.read_text(encoding="utf-8"))
+    _make_environment_mutable(environment)
+    if case == "absolute-python":
+        original["python"] = str(external)
+        body = _canonical(original)
+    elif case == "traversal-python":
+        original["python"] = "../external-health"
+        body = _canonical(original)
+    elif case == "sibling-python":
+        original["python"] = f"../{'f' * 64}/bin/python"
+        body = _canonical(original)
+    elif case == "malformed":
+        body = b'{"schema":'
+    elif case == "oversized":
+        body = b"x" * (64 * 1024 + 1)
+    elif case == "duplicate-key":
+        body = b'{"schema":"first","schema":"second"}'
+    elif case == "unknown-field":
+        original["unexpected"] = True
+        body = _canonical(original)
+    elif case == "missing-field":
+        original.pop("lock_hash")
+        body = _canonical(original)
+    elif case == "wrong-schema":
+        original["schema"] = "spl.public_environment_cache.v0"
+        body = _canonical(original)
+    elif case == "wrong-schema-version":
+        original["schema_version"] = "1"
+        body = _canonical(original)
+    else:
+        original["identity"] = "0" * 64
+        body = _canonical(original)
+    marker.write_bytes(body)
+    marker.chmod(0o444)
+    _reseal_environment(environment)
+
+    selected = backend._ensure_environment(lock)
+
+    assert selected == environment / "bin" / "python"
+    assert selected != external
+    assert not canary.exists()
+    repaired = json.loads((environment / "ready.json").read_text(encoding="utf-8"))
+    assert repaired["python"] == "bin/python"
+    assert repaired["identity"] == environment.name
+
+
+def test_environment_marker_symlink_never_reads_or_executes_external_target(tmp_path: Path) -> None:
+    backend, lock, python = _empty_environment(tmp_path / "cache")
+    environment = python.parent.parent
+    marker = environment / "ready.json"
+    external = tmp_path / "private-marker-payload"
+    canary = tmp_path / "external-ran"
+    executable = tmp_path / "external-health"
+    _external_health_executable(executable, canary)
+    external.write_text(
+        json.dumps({"python": str(executable), "private": str(tmp_path / "credential")}),
+        encoding="utf-8",
+    )
+    _make_environment_mutable(environment)
+    marker.unlink()
+    marker.symlink_to(external)
+    _reseal_environment(environment)
+
+    selected = backend._ensure_environment(lock)
+
+    assert selected == environment / "bin" / "python"
+    assert not canary.exists()
+    assert external.is_file()
+    assert "private" not in (environment / "ready.json").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["symlink", "directory", "different-executable", "external-script", "hard-link"],
+)
+def test_canonical_environment_interpreter_is_verified_before_execution(tmp_path: Path, case: str) -> None:
+    backend, lock, python = _empty_environment(tmp_path / "cache")
+    environment = python.parent.parent
+    canary = tmp_path / "tampered-interpreter-ran"
+    external = tmp_path / "external-health"
+    _external_health_executable(external, canary)
+    _make_environment_mutable(environment)
+    python.unlink()
+    if case == "symlink":
+        python.symlink_to(external)
+    elif case == "directory":
+        python.mkdir()
+    elif case == "different-executable":
+        alternate = shutil.which("true")
+        assert alternate is not None
+        python.write_bytes(Path(alternate).read_bytes())
+        python.chmod(0o555)
+    elif case == "external-script":
+        python.write_bytes(external.read_bytes())
+        python.chmod(0o555)
+    else:
+        os.link(external, python)
+    _reseal_environment(environment)
+
+    selected = backend._ensure_environment(lock)
+
+    assert selected == environment / "bin" / "python"
+    assert not selected.is_symlink()
+    assert selected.read_bytes() == Path(sys.executable).resolve().read_bytes()
+    assert not canary.exists()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "worker",
+        "other-module",
+        "add",
+        "remove",
+        "rename",
+        "truncate",
+        "symlink",
+        "hard-link",
+        "metadata",
+        "direct-url",
+    ],
+)
+def test_framework_projection_is_rederived_before_cached_code_runs(tmp_path: Path, case: str) -> None:
+    backend, lock, python = _empty_environment(tmp_path / "cache")
+    environment = python.parent.parent
+    site_packages = environment / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    worker = site_packages / "spl" / "daemon" / "worker.py"
+    other = site_packages / "spl" / "adapters.py"
+    metadata = next(site_packages.glob("splime-*.dist-info/METADATA"))
+    canary = tmp_path / "tampered-framework-ran"
+    _make_environment_mutable(environment)
+    if case == "worker":
+        worker.write_text(
+            worker.read_text(encoding="utf-8") + f"\nPath({str(canary)!r}).write_text('ran', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+    elif case == "other-module":
+        other.write_text(
+            other.read_text(encoding="utf-8")
+            + f"\n__import__('pathlib').Path({str(canary)!r}).write_text('ran', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+    elif case == "add":
+        (site_packages / "spl" / "undeclared.py").write_text("value = 1\n", encoding="utf-8")
+    elif case == "remove":
+        other.unlink()
+    elif case == "rename":
+        other.rename(other.with_name("renamed.py"))
+    elif case == "truncate":
+        other.write_bytes(b"")
+    elif case == "symlink":
+        other.unlink()
+        other.symlink_to(worker)
+    elif case == "hard-link":
+        external = tmp_path / "framework-hard-link"
+        external.write_bytes(other.read_bytes())
+        other.unlink()
+        os.link(external, other)
+    elif case == "metadata":
+        metadata.write_bytes(metadata.read_bytes() + b"X-Tampered: true\n")
+    else:
+        (metadata.parent / "direct_url.json").write_text(
+            json.dumps({"url": str(tmp_path / "private-checkout")}),
+            encoding="utf-8",
+        )
+    _reseal_environment(environment)
+
+    selected = backend._ensure_environment(lock)
+
+    assert selected == environment / "bin" / "python"
+    assert not canary.exists()
+    assert not (metadata.parent / "direct_url.json").exists()
+    assert not (site_packages / "spl" / "undeclared.py").exists()
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "sitecustomize.py",
+        "sitecustomize/__init__.py",
+        "usercustomize.py",
+        "usercustomize/__init__.py",
+        "startup.pth",
+        "nested/startup.pth",
+    ],
+)
+def test_cached_startup_hooks_are_rejected_without_executing_canaries(tmp_path: Path, relative: str) -> None:
+    backend, lock, python = _empty_environment(tmp_path / "cache")
+    environment = python.parent.parent
+    site_packages = environment / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    canary = tmp_path / "startup-hook-ran"
+    target = site_packages / relative
+    _make_environment_mutable(environment)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.suffix == ".pth":
+        target.write_text(
+            f"import pathlib; pathlib.Path({str(canary)!r}).write_text('ran', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+    else:
+        target.write_text(
+            f"from pathlib import Path\nPath({str(canary)!r}).write_text('ran', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+    _reseal_environment(environment)
+
+    selected = backend._ensure_environment(lock)
+
+    assert selected == environment / "bin" / "python"
+    assert not canary.exists()
+    assert not target.exists()
+
+
+def test_coordinated_environment_and_marker_tampering_cannot_redefine_authority(tmp_path: Path) -> None:
+    backend, lock, python = _empty_environment(tmp_path / "cache")
+    environment = python.parent.parent
+    site_packages = environment / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    worker = site_packages / "spl" / "daemon" / "worker.py"
+    marker = environment / "ready.json"
+    canary = tmp_path / "coordinated-tamper-ran"
+    _make_environment_mutable(environment)
+    worker.write_text(
+        worker.read_text(encoding="utf-8") + f"\nPath({str(canary)!r}).write_text('ran', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    value = json.loads(marker.read_text(encoding="utf-8"))
+    value["framework"]["package_sha256"] = hashlib.sha256(worker.read_bytes()).hexdigest()
+    value["identity"] = environment.name
+    marker.write_bytes(_canonical(value))
+    _reseal_environment(environment)
+
+    assert backend._ensure_environment(lock) == environment / "bin" / "python"
+    assert not canary.exists()
+    assert hashlib.sha256(worker.read_bytes()).hexdigest() != value["framework"]["package_sha256"]
+
+
+def test_coordinated_interpreter_and_marker_substitution_never_executes_external_code(tmp_path: Path) -> None:
+    backend, lock, python = _empty_environment(tmp_path / "cache")
+    environment = python.parent.parent
+    marker = environment / "ready.json"
+    external = tmp_path / "external-interpreter"
+    canary = tmp_path / "coordinated-interpreter-ran"
+    _external_health_executable(external, canary)
+    _make_environment_mutable(environment)
+    python.unlink()
+    python.write_bytes(external.read_bytes())
+    python.chmod(0o555)
+    value = json.loads(marker.read_text(encoding="utf-8"))
+    value["python"] = str(external)
+    marker.write_bytes(_canonical(value))
+    _reseal_environment(environment)
+
+    selected = backend._ensure_environment(lock)
+
+    assert selected == environment / "bin" / "python"
+    assert selected.read_bytes() == Path(sys.executable).resolve().read_bytes()
+    assert json.loads(marker.read_text(encoding="utf-8"))["python"] == "bin/python"
+    assert not canary.exists()
+
+
+def test_marker_copy_and_digest_directory_substitution_rebuild_exact_environment(tmp_path: Path) -> None:
+    backend = EmbeddedBackend("https://registry.example.test", tmp_path / "cache", run_receipts=False)
+    first_lock = {**_test_runtime_lock(python="3.13"), "names": ["root"]}
+    second_lock = {**_test_runtime_lock(python=platform.python_version()), "names": ["root"]}
+    first_python = backend._ensure_environment(first_lock)
+    second_python = backend._ensure_environment(second_lock)
+    first_environment = first_python.parent.parent
+    second_environment = second_python.parent.parent
+    assert first_environment != second_environment
+    _make_environment_mutable(first_environment)
+    (first_environment / "ready.json").write_bytes((second_environment / "ready.json").read_bytes())
+    _reseal_environment(first_environment)
+
+    assert backend._ensure_environment(first_lock) == first_environment / "bin" / "python"
+    repaired = json.loads((first_environment / "ready.json").read_text(encoding="utf-8"))
+    assert repaired["identity"] == first_environment.name
+
+    from spl import embedded as embedded_module
+
+    embedded_module._remove_cache_path(first_environment)
+    first_environment.symlink_to(second_environment, target_is_directory=True)
+    selected = backend._ensure_environment(first_lock)
+    assert selected == first_environment / "bin" / "python"
+    assert not first_environment.is_symlink()
+    assert second_python.is_file()
 
 
 def test_cache_cleanup_skips_an_entry_with_an_active_use_lock(tmp_path: Path) -> None:
@@ -875,7 +1287,7 @@ def test_exact_cached_function_runs_offline_with_trust_and_no_daemon_secret(
     resolution.write_bytes(_canonical(resolved))
     monkeypatch.setattr(
         backend,
-        "_ensure_environment",
+        "_ensure_environment_locked",
         lambda manifest, **kwargs: Path(sys.executable),
     )
     monkeypatch.setenv("SPL_DAEMON_TOKEN", "must-not-enter-worker")
@@ -884,8 +1296,13 @@ def test_exact_cached_function_runs_offline_with_trust_and_no_daemon_secret(
     real_run_process_tree = embedded_module.run_process_tree
 
     def inspected_worker(*args: object, **kwargs: object) -> object:
+        command = args[0]
+        assert isinstance(command, list)
+        assert "spl.daemon.worker" in command
+        assert "splime_public_worker" not in command
         environment = kwargs.get("env")
         assert isinstance(environment, dict)
+        assert "PYTHONPATH" not in environment
         assert "SPL_DAEMON_TOKEN" not in environment
         assert not any("TOKEN" in key or "SECRET" in key for key in environment)
         return real_run_process_tree(*args, **kwargs)

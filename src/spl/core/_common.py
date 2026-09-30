@@ -1,4 +1,5 @@
 import inspect
+import hashlib
 import json
 import logging
 import os
@@ -98,12 +99,51 @@ class _SourceOutputCommitError(RuntimeError):
     """Failure while saving or recording one producing-node output."""
 
 
+@dataclass(frozen=True)
+class _ResolvedNodeRuntimePlan:
+    resolution: m_node_runtime.NodeRuntimeResolution
+    backend: m_node_runtime.NodeRuntimeBackend
+    fast_native: bool
+
+    @property
+    def isolated(self) -> bool:
+        return self.resolution.name != m_node_runtime.NATIVE_NODE_RUNTIME
+
+
 def _runtime_input_type_hint(node: Node, port: InputPort) -> type[Any] | str | None:
     if isinstance(node, NodeFunction):
         try:
             annotation = typing.get_type_hints(node.func, include_extras=True).get(port.name)
         except (NameError, TypeError):
             annotation = node.func.__annotations__.get(port.name)
+        while typing.get_origin(annotation) is typing.Annotated:
+            annotation = typing.get_args(annotation)[0]
+        if annotation is Any:
+            annotation = None
+        origin = typing.get_origin(annotation)
+        if origin in {typing.Union, UnionType}:
+            concrete = [item for item in typing.get_args(annotation) if item is not type(None)]
+            annotation = concrete[0] if len(concrete) == 1 else None
+            if annotation is Any:
+                annotation = None
+            origin = typing.get_origin(annotation)
+        if isinstance(origin, type):
+            return origin
+        if isinstance(annotation, type):
+            return annotation
+    if port.typ_ is not None:
+        type_name = _normalize_port_type_name(port.typ_)
+        if type_name is not None:
+            return _BUILTIN_PORT_TYPES.get(type_name, type_name)
+    return None
+
+
+def _runtime_output_type_hint(node: Node, port: OutputPort) -> type[Any] | str | None:
+    if isinstance(node, NodeFunction):
+        try:
+            annotation = typing.get_type_hints(node.func, include_extras=True).get("return")
+        except (NameError, TypeError):
+            annotation = node.func.__annotations__.get("return")
         while typing.get_origin(annotation) is typing.Annotated:
             annotation = typing.get_args(annotation)[0]
         if annotation is Any:
@@ -634,12 +674,18 @@ class Run:
         reserved_names = RESERVED_RESUME_KWARGS if resume_plan is not None else RESERVED_RUN_KWARGS
         _warn_reserved_run_input_names(pipeline, reserved_names)
         self._adapter_overrides = _validate_run_adapter_overrides(pipeline, adapters)
+        self._save_override_evidence = self._effective_save_override_evidence(resume_plan)
+        self._execution_plan_document = m_manifest.run_execution_plan_document(
+            self._run_id,
+            self._save_override_evidence,
+        )
         self._runtime_overrides = m_node_runtime.validate_run_runtime_overrides(pipeline, runtimes)
         self._runtime_config = m_node_runtime.validate_node_runtime_config(runtime_config)
         self._node_environment_provider = node_environment_provider or m_node_runtime.CurrentPythonEnvironmentProvider()
         self._runtime_env_spec = list(runtime_env_spec or [])
         self._runtime_adapter_fingerprint_sha256 = runtime_adapter_fingerprint_sha256
         self._node_runtime_registry = m_node_runtime.NodeRuntimeRegistry()
+        self._node_runtime_plans: dict[Node, _ResolvedNodeRuntimePlan] = {}
         self._has_runtime_selection = bool(
             self._runtime_overrides
             or self._runtime_config.get("node_runtime") is not None
@@ -647,10 +693,16 @@ class Run:
         )
         self._deps = _accumulate_pipeline_dependencies(pipeline)
         self._results: dict[Node, dict[str, Any]] = dict()
+        self._public_output_values: dict[tuple[Node, str], Any] = {}
         self._visiting_nodes: list[Node] = []
         self._visiting_node_set: set[Node] = set()
         self._artifact_refs: dict[tuple[Node, str, str], ArtifactRef] = dict()
         self._adapter_resolutions: dict[tuple[Node, str], SaveAdapterResolution | AdapterResolution] = dict()
+        self._variant_save_resolutions: dict[tuple[Node, str, str], SaveAdapterResolution | AdapterResolution] = dict()
+        self._edge_save_adapter_resolutions: dict[
+            tuple[Node, str, Node, str], SaveAdapterResolution | AdapterResolution
+        ] = dict()
+        self._edge_variant_ids: dict[tuple[Node, str, Node, str], str] = dict()
         self._load_adapter_resolutions: dict[tuple[Node, str, Node, str], LoadAdapterResolution] = dict()
         self._frozen_save_adapter_records: dict[tuple[Node, str, Node, str], dict[str, Any]] = dict()
         self._node_inputs: dict[Node, dict[str, Any]] = dict()
@@ -944,6 +996,15 @@ class Run:
                     pipeline_name=self._pipeline.name,
                     parent_run_id=self._parent_run_id,
                 )
+            self._manifest_writer.data["execution_plan"] = m_manifest.run_execution_plan_record(
+                self._execution_plan_document
+            )
+            if self._manifest_writer.path is not None:
+                m_manifest.write_run_execution_plan(
+                    self._manifest_writer.path.parent,
+                    self._execution_plan_document,
+                )
+            self._manifest_writer.write()
             if self._resume_plan is not None:
                 for node in sorted(self._resume_plan.frozen_nodes, key=lambda item: str(item.uuid)):
                     self._ensure_frozen_node_manifest(node)
@@ -957,11 +1018,58 @@ class Run:
             return
         should_retain = m_manifest.should_retain_terminal(self._keep, status)
         if should_retain:
-            writer.materialize(self._ensure_run_dir())
+            run_dir = self._ensure_run_dir()
+            self._localize_resume_manifest_artifacts(run_dir)
+            m_manifest.write_run_execution_plan(run_dir, self._execution_plan_document)
+            writer.materialize(run_dir)
         writer.finish(status=status, error=error)
         self._terminal_status = status
         if should_retain and self._run_dir_finalizer is not None:
             self._run_dir_finalizer.detach()
+
+    def _localize_resume_manifest_artifacts(self, run_dir: Path) -> None:
+        writer = self._manifest_writer
+        if writer is None or self._resume_plan is None:
+            return
+        nodes = writer.data.get("nodes")
+        if isinstance(nodes, Mapping):
+            localized_nodes: dict[str, Any] = {}
+            for node_id, raw_node in nodes.items():
+                if not isinstance(raw_node, Mapping):
+                    localized_nodes[str(node_id)] = raw_node
+                    continue
+                node_record = dict(raw_node)
+                for section in ("inputs", "outputs"):
+                    values = node_record.get(section)
+                    if not isinstance(values, Mapping):
+                        continue
+                    node_record[section] = {
+                        str(port): (
+                            m_resume.localize_output_record(cast(Mapping[str, Any], value), run_dir)
+                            if isinstance(value, Mapping)
+                            else value
+                        )
+                        for port, value in values.items()
+                    }
+                localized_nodes[str(node_id)] = node_record
+            writer.data["nodes"] = localized_nodes
+        edges = writer.data.get("edges")
+        if isinstance(edges, list):
+            localized_edges: list[Any] = []
+            for raw_edge in edges:
+                if not isinstance(raw_edge, Mapping):
+                    localized_edges.append(raw_edge)
+                    continue
+                edge = dict(raw_edge)
+                artifact = edge.get("artifact")
+                if isinstance(artifact, Mapping):
+                    edge["artifact"] = m_resume.localize_output_record(
+                        cast(Mapping[str, Any], artifact),
+                        run_dir,
+                    )
+                localized_edges.append(edge)
+            writer.data["edges"] = localized_edges
+        writer.write()
 
     def _should_retain_terminal(self) -> bool:
         return self._terminal_status is not None and m_manifest.should_retain_terminal(
@@ -1082,9 +1190,358 @@ class Run:
                 )
             )
 
+        edge_key = (source_ref.node, source_ref.port.name, target_node, target_port.name)
+        variant_id = self._save_adapter_variant_id(save.adapter)
         self._adapter_resolutions[(source_ref.node, source_ref.port.name)] = save
-        self._load_adapter_resolutions[(source_ref.node, source_ref.port.name, target_node, target_port.name)] = load
+        self._variant_save_resolutions[(source_ref.node, source_ref.port.name, variant_id)] = save
+        self._edge_save_adapter_resolutions[edge_key] = save
+        self._edge_variant_ids[edge_key] = variant_id
+        self._load_adapter_resolutions[edge_key] = load
         return save, load
+
+    @staticmethod
+    def _save_adapter_variant_id(adapter: SaveAdapter) -> str:
+        return hashlib.sha256(canonical_json_bytes(save_adapter_identity(adapter))).hexdigest()
+
+    def _resolve_static_save_adapter(
+        self,
+        type_hint: type[Any] | str | None,
+        *,
+        adapter_format: str | None,
+        run_override: RuntimeAdapter | None,
+    ) -> SaveAdapterResolution | None:
+        if run_override is not None:
+            return SaveAdapterResolution(run_override, AdapterResolutionSource.RUN_OVERRIDE)
+        registered: dict[str, SaveAdapter] = {
+            **self._pipeline.adapters,
+            **self._pipeline.save_adapters,
+        }
+        if isinstance(type_hint, type):
+            try:
+                return self._pipeline.resolve_save_adapter_binding(
+                    py_type=type_hint,
+                    format=adapter_format,
+                )
+            except ValueError:
+                prefix = "{}.{}@".format(type_hint.__module__, type_hint.__qualname__)
+                candidate_keys = [
+                    key
+                    for key in sorted(registered)
+                    if key.startswith(prefix) and (adapter_format is None or key.rpartition("@")[2] == adapter_format)
+                ]
+                raise ValueError(
+                    "pipeline save adapter lookup is ambiguous for Python output type `{}`; candidates: {}".format(
+                        "{}.{}".format(type_hint.__module__, type_hint.__qualname__),
+                        ", ".join("`{}`".format(key) for key in candidate_keys),
+                    )
+                ) from None
+        if isinstance(type_hint, str):
+            canonical = type_hint if "." in type_hint else "builtins.{}".format(type_hint)
+            candidates = [
+                (key, adapter)
+                for key, adapter in sorted(registered.items())
+                if (
+                    key.rpartition("@")[0] == canonical
+                    or ("." not in type_hint and key.rpartition("@")[0].endswith(".{}".format(type_hint)))
+                )
+                and (adapter_format is None or key.rpartition("@")[2] == adapter_format)
+            ]
+            if len(candidates) > 1:
+                raise ValueError(
+                    "pipeline save adapter lookup is ambiguous for Python output type hint `{}`; candidates: {}".format(
+                        type_hint,
+                        ", ".join("`{}`".format(key) for key, _ in candidates),
+                    )
+                )
+            if candidates:
+                source = (
+                    AdapterResolutionSource.EDGE if adapter_format is not None else AdapterResolutionSource.PIPELINE
+                )
+                return SaveAdapterResolution(candidates[0][1], source)
+        if type_hint is None and adapter_format is not None:
+            candidates = [
+                (key, adapter)
+                for key, adapter in sorted(registered.items())
+                if key.rpartition("@")[2] == adapter_format
+            ]
+            if len(candidates) > 1:
+                raise ValueError(
+                    "pipeline save adapter lookup is ambiguous for explicit format `{}`; candidates: {}".format(
+                        adapter_format,
+                        ", ".join("`{}`".format(key) for key, _ in candidates),
+                    )
+                )
+            if candidates:
+                return SaveAdapterResolution(candidates[0][1], AdapterResolutionSource.EDGE)
+        return None
+
+    def _isolated_output_plan(
+        self,
+        node: Node,
+        output_port: OutputPort,
+        output_request: _OutputMaterializationRequest | None,
+    ) -> m_node_runtime.ArtifactOutputPlan | None:
+        source_ref = NodeOutputRef(node, output_port)
+        run_override = self._adapter_override_for(source_ref)
+        label = self._node_alias(node) or self._node_name(node)
+        type_hint = _runtime_output_type_hint(node, output_port)
+        requests = self._outgoing_output_requests(source_ref)
+        if output_request is not None:
+            request_key = (
+                output_request[3],
+                output_request[4].name,
+                output_request[1],
+            )
+            if all((target, port.name, adapter_format) != request_key for target, port, adapter_format in requests):
+                requests.append((output_request[3], output_request[4], output_request[1]))
+        variants: dict[str, SaveAdapterResolution] = {}
+        json_edges: list[tuple[tuple[Node, str, Node, str], SaveAdapterResolution]] = []
+        for target_node, target_port, adapter_format in requests:
+            try:
+                save, load = self._resolve_static_edge_requirement(
+                    source_ref,
+                    target_node,
+                    target_port,
+                    type_hint=type_hint,
+                    adapter_format=adapter_format,
+                    run_override=run_override,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "adapter_resolution: isolated node `{}` output port `{}` cannot resolve graph requirement "
+                    "for {}.{}: {}. Select an exact adapter with `.as_format()` or a run-level adapter "
+                    "override.".format(
+                        label,
+                        output_port.name,
+                        self._node_alias(target_node) or self._node_name(target_node),
+                        target_port.name,
+                        exc,
+                    )
+                ) from None
+            if save is None or load is None:
+                continue
+            edge_key = (node, output_port.name, target_node, target_port.name)
+            self._edge_save_adapter_resolutions[edge_key] = save
+            self._load_adapter_resolutions[edge_key] = load
+            if save.adapter is BUILTIN_JSON_ADAPTER and load.adapter is BUILTIN_JSON_ADAPTER:
+                json_edges.append((edge_key, save))
+                continue
+            variant_id = self._save_adapter_variant_id(save.adapter)
+            self._edge_variant_ids[edge_key] = variant_id
+            self._variant_save_resolutions[(node, output_port.name, variant_id)] = save
+            existing = variants.get(variant_id)
+            if existing is None or self._adapter_source_rank(save.source) > self._adapter_source_rank(existing.source):
+                variants[variant_id] = save
+
+        if not requests:
+            try:
+                terminal_resolution = self._resolve_static_save_adapter(
+                    type_hint,
+                    adapter_format=None,
+                    run_override=run_override,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "adapter_resolution: isolated node `{}` output port `{}` is ambiguous: {}. "
+                    "Select an exact adapter with `.as_format()` or a run-level adapter override.".format(
+                        label, output_port.name, exc
+                    )
+                ) from None
+            if terminal_resolution is not None and terminal_resolution.adapter is not BUILTIN_JSON_ADAPTER:
+                variant_id = self._save_adapter_variant_id(terminal_resolution.adapter)
+                variants[variant_id] = terminal_resolution
+                self._variant_save_resolutions[(node, output_port.name, variant_id)] = terminal_resolution
+        if variants and json_edges:
+            for edge_key, resolution in json_edges:
+                variant_id = self._save_adapter_variant_id(resolution.adapter)
+                self._edge_variant_ids[edge_key] = variant_id
+                variants.setdefault(variant_id, resolution)
+        if not variants:
+            return None
+        for variant_id, resolution in variants.items():
+            self._variant_save_resolutions[(node, output_port.name, variant_id)] = resolution
+        ordered = sorted(variants.items())
+        primary_id, primary = ordered[0]
+        additional = tuple(
+            m_node_runtime.ArtifactOutputVariantPlan(
+                variant_id=variant_id,
+                save_adapter=resolution.adapter,
+                resolution_source=str(resolution.source),
+            )
+            for variant_id, resolution in ordered[1:]
+        )
+        self._adapter_resolutions[(node, output_port.name)] = primary
+        return m_node_runtime.ArtifactOutputPlan(
+            save_adapter=primary.adapter,
+            resolution_source=str(primary.source),
+            artifacts_dir=self._get_artifacts_dir(),
+            variant_id=primary_id,
+            additional_variants=additional,
+        )
+
+    @staticmethod
+    def _adapter_source_rank(source: AdapterResolutionSource) -> int:
+        return {
+            AdapterResolutionSource.PORT_DEFAULT: 0,
+            AdapterResolutionSource.PIPELINE: 1,
+            AdapterResolutionSource.EDGE: 2,
+            AdapterResolutionSource.RUN_OVERRIDE: 3,
+        }[source]
+
+    def _outgoing_output_requests(
+        self,
+        source_ref: NodeOutputRef,
+    ) -> list[tuple[Node, InputPort, str | None]]:
+        requests: list[tuple[Node, InputPort, str | None]] = []
+        for target_ref, value in sorted(self._pipeline.links, key=lambda item: node_input_ref_sort_key(item[0])):
+            if isinstance(value, FormattedOutputRef) and value.out_ref == source_ref:
+                requests.append((target_ref.node, target_ref.port, value.format))
+            elif isinstance(value, NodeOutputRef) and value == source_ref:
+                requests.append((target_ref.node, target_ref.port, None))
+        return requests
+
+    def _resolve_static_edge_requirement(
+        self,
+        source_ref: NodeOutputRef,
+        target_node: Node,
+        target_port: InputPort,
+        *,
+        type_hint: type[Any] | str | None,
+        adapter_format: str | None,
+        run_override: RuntimeAdapter | None,
+    ) -> tuple[SaveAdapterResolution | None, LoadAdapterResolution | None]:
+        del source_ref
+        if run_override is not None:
+            return (
+                SaveAdapterResolution(run_override, AdapterResolutionSource.RUN_OVERRIDE),
+                LoadAdapterResolution(run_override, AdapterResolutionSource.RUN_OVERRIDE),
+            )
+        target_type = _runtime_input_type_hint(target_node, target_port)
+        if type_hint is None and adapter_format is None:
+            pairs = self._untyped_adapter_pairs(target_type)
+            if len(pairs) > 1:
+                raise ValueError(
+                    "untyped/Any output has multiple valid save adapters: {}".format(
+                        ", ".join(
+                            "`{}` (format `{}`)".format(save_adapter.key, save_adapter.key.rpartition("@")[2])
+                            for save_adapter, _ in pairs
+                        )
+                    )
+                )
+            if pairs:
+                save_adapter, load_adapter = pairs[0]
+                return (
+                    SaveAdapterResolution(save_adapter, AdapterResolutionSource.PIPELINE),
+                    LoadAdapterResolution(load_adapter, AdapterResolutionSource.PIPELINE),
+                )
+        save = self._resolve_static_save_adapter(
+            type_hint,
+            adapter_format=adapter_format,
+            run_override=None,
+        )
+        load = self._resolve_static_load_adapter(target_type, adapter_format=adapter_format)
+        if save is None and type_hint is None and load is not None and load.adapter is not BUILTIN_JSON_ADAPTER:
+            candidates = self._untyped_save_candidates(load.adapter, adapter_format=adapter_format)
+            if len(candidates) > 1:
+                raise ValueError(
+                    "untyped/Any output has multiple valid save adapters: {}".format(
+                        ", ".join(
+                            "`{}` (format `{}`)".format(adapter.key, adapter.key.rpartition("@")[2])
+                            for adapter in candidates
+                        )
+                    )
+                )
+            if candidates:
+                source = (
+                    AdapterResolutionSource.EDGE if adapter_format is not None else AdapterResolutionSource.PIPELINE
+                )
+                save = SaveAdapterResolution(candidates[0], source)
+        if save is None:
+            if type_hint is None and adapter_format is None and (load is None or load.adapter is BUILTIN_JSON_ADAPTER):
+                return None, load
+            raise ValueError(
+                "no unambiguous save adapter for static Python type `{}` and format `{}`".format(
+                    type_hint if type_hint is not None else "<unknown>",
+                    adapter_format or "<default>",
+                )
+            )
+        if load is None:
+            if isinstance(save.adapter, Adapter | BuiltInJsonAdapter):
+                load = LoadAdapterResolution(save.adapter, save.source)
+            elif adapter_format is not None:
+                load = self._pipeline.resolve_load_adapter_binding_by_format(format=adapter_format)
+            else:
+                resolved_load_adapter = self._pipeline.resolve_load_adapter(key=save.adapter.key)
+                if resolved_load_adapter is not None:
+                    load = LoadAdapterResolution(resolved_load_adapter, AdapterResolutionSource.PIPELINE)
+        if load is None:
+            raise ValueError("no load adapter is registered for the downstream input")
+        if save.adapter.tag not in load.adapter.accepted_tags:
+            raise ValueError(
+                "save adapter tag `{}` is not accepted by load adapter `{}`".format(
+                    save.adapter.tag,
+                    load.adapter.key,
+                )
+            )
+        return save, load
+
+    def _untyped_adapter_pairs(
+        self,
+        target_type: type[Any] | str | None,
+    ) -> list[tuple[SaveAdapter, LoadAdapter]]:
+        if target_type is None:
+            return []
+        if isinstance(target_type, type):
+            target_name = "{}.{}".format(target_type.__module__, target_type.__qualname__)
+        else:
+            target_name = target_type if "." in target_type else "builtins.{}".format(target_type)
+        loads: dict[str, LoadAdapter] = {**self._pipeline.adapters, **self._pipeline.load_adapters}
+        pairs: dict[tuple[str, str], tuple[SaveAdapter, LoadAdapter]] = {}
+        for load_key, load_adapter in sorted(loads.items()):
+            load_type = load_key.rpartition("@")[0]
+            if load_type != target_name:
+                continue
+            for save_adapter in self._untyped_save_candidates(load_adapter, adapter_format=None):
+                save_id = self._save_adapter_variant_id(save_adapter)
+                load_id = hashlib.sha256(canonical_json_bytes(load_adapter_identity(load_adapter))).hexdigest()
+                pairs.setdefault((save_id, load_id), (save_adapter, load_adapter))
+        return [pairs[key] for key in sorted(pairs)]
+
+    def _resolve_static_load_adapter(
+        self,
+        type_hint: type[Any] | str | None,
+        *,
+        adapter_format: str | None,
+    ) -> LoadAdapterResolution | None:
+        if isinstance(type_hint, type):
+            return self._pipeline.resolve_load_adapter_binding(py_type=type_hint, format=adapter_format)
+        if isinstance(type_hint, str):
+            return self._pipeline.resolve_load_adapter_binding_by_type_name(
+                type_name=type_hint,
+                format=adapter_format,
+            )
+        if adapter_format is not None:
+            return self._pipeline.resolve_load_adapter_binding_by_format(format=adapter_format)
+        return None
+
+    def _untyped_save_candidates(
+        self,
+        load_adapter: LoadAdapter,
+        *,
+        adapter_format: str | None,
+    ) -> list[SaveAdapter]:
+        registered: dict[str, SaveAdapter] = {**self._pipeline.adapters, **self._pipeline.save_adapters}
+        candidates: dict[str, SaveAdapter] = {}
+        for key, adapter in sorted(registered.items()):
+            _, _, key_format = key.rpartition("@")
+            if adapter_format is not None and key_format != adapter_format:
+                continue
+            if adapter.tag not in load_adapter.accepted_tags:
+                continue
+            if load_adapter.legacy_key_guard and adapter.key != load_adapter.key:
+                continue
+            candidates.setdefault(self._save_adapter_variant_id(adapter), adapter)
+        return [candidates[key] for key in sorted(candidates)]
 
     def _round_trip_edge(
         self,
@@ -1095,6 +1552,16 @@ class Run:
         adapter_format: str | None,
         run_override: RuntimeAdapter | None,
     ) -> Any:
+        if isinstance(value, m_node_runtime.ArtifactOutput):
+            promoted_variant, _, promoted_load = self._resolve_promoted_output_edge(
+                value,
+                source_ref,
+                target_node,
+                target_port,
+                adapter_format,
+                run_override,
+            )
+            return decode(promoted_variant.ref, promoted_load.adapter)
         save, load = self._resolve_edge_adapter_bindings(
             value,
             source_ref,
@@ -1121,6 +1588,164 @@ class Run:
             raise
         return decode(ref, load.adapter)
 
+    def _transport_edge_input(
+        self,
+        value: Any,
+        source_ref: NodeOutputRef,
+        target_node: Node,
+        target_port: InputPort,
+        adapter_format: str | None,
+        run_override: RuntimeAdapter | None,
+    ) -> m_node_runtime.NodeInputTransport:
+        if isinstance(value, m_node_runtime.ArtifactOutput):
+            promoted_variant, _, promoted_load = self._resolve_promoted_output_edge(
+                value,
+                source_ref,
+                target_node,
+                target_port,
+                adapter_format,
+                run_override,
+            )
+            return m_node_runtime.ArtifactInput(
+                ref=promoted_variant.ref,
+                load_adapter=promoted_load.adapter,
+                resolution_source=str(promoted_load.source),
+            )
+        save, load = self._resolve_edge_adapter_bindings(
+            value,
+            source_ref,
+            target_node,
+            target_port,
+            adapter_format,
+            run_override,
+        )
+        if save is None or load is None:
+            return m_node_runtime.InlineInput(value)
+        if (
+            save.adapter is BUILTIN_JSON_ADAPTER
+            and load.adapter is BUILTIN_JSON_ADAPTER
+            and type(value) in _JSON_NATIVE_TYPES
+        ):
+            validate_json_value(value)
+            return m_node_runtime.InlineInput(value)
+        self._ensure_open()
+        try:
+            ref = self._materialize_source_output(value, source_ref, save)
+        except _SourceOutputCommitError as exc:
+            self._finalize_lazy_source_output_failure(source_ref, exc)
+            raise
+        return m_node_runtime.ArtifactInput(
+            ref=ref,
+            load_adapter=load.adapter,
+            resolution_source=str(load.source),
+        )
+
+    def _resolve_promoted_output_edge(
+        self,
+        value: m_node_runtime.ArtifactOutput,
+        source_ref: NodeOutputRef,
+        target_node: Node,
+        target_port: InputPort,
+        adapter_format: str | None,
+        run_override: RuntimeAdapter | None,
+    ) -> tuple[m_node_runtime.ArtifactOutputVariant, SaveAdapterResolution, LoadAdapterResolution]:
+        edge_key = (source_ref.node, source_ref.port.name, target_node, target_port.name)
+        expected_variant_id = self._edge_variant_ids.get(edge_key)
+        variants = {variant.variant_id: variant for variant in value.variants()}
+        if expected_variant_id is None:
+            expected_save, expected_load = self._resolve_static_edge_requirement(
+                source_ref,
+                target_node,
+                target_port,
+                type_hint=_runtime_output_type_hint(source_ref.node, source_ref.port),
+                adapter_format=adapter_format,
+                run_override=run_override,
+            )
+            if expected_save is None or expected_load is None:
+                raise ValueError("isolated artifact output has no resolved adapter requirement for this edge")
+            expected_variant_id = self._save_adapter_variant_id(expected_save.adapter)
+            self._edge_save_adapter_resolutions[edge_key] = expected_save
+            self._load_adapter_resolutions[edge_key] = expected_load
+            self._edge_variant_ids[edge_key] = expected_variant_id
+        variant = variants.get(expected_variant_id)
+        if variant is None:
+            raise ValueError(
+                "isolated output port `{}` does not contain the exact artifact variant required by this edge".format(
+                    source_ref.port.name
+                )
+            )
+        actual_format = variant.save_adapter.key.rpartition("@")[2]
+        if run_override is not None and run_override.key != variant.save_adapter.key:
+            raise ValueError(
+                "isolated output port `{}` was not materialized with its selected run-level adapter".format(
+                    source_ref.port.name
+                )
+            )
+        if run_override is None and adapter_format is not None and adapter_format != actual_format:
+            raise ValueError(
+                "isolated output port `{}` selected the wrong materialized variant `{}`".format(
+                    source_ref.port.name,
+                    actual_format,
+                )
+            )
+        save = cast(
+            SaveAdapterResolution,
+            self._edge_save_adapter_resolutions.get(edge_key),
+        )
+        if save is None:
+            try:
+                save_source = AdapterResolutionSource(variant.resolution_source)
+            except ValueError:
+                save_source = AdapterResolutionSource.PIPELINE
+            save = SaveAdapterResolution(variant.save_adapter, save_source)
+        target_type = _runtime_input_type_hint(target_node, target_port)
+        load = self._load_adapter_resolutions.get(edge_key)
+        if load is not None:
+            pass
+        elif run_override is not None:
+            load = LoadAdapterResolution(run_override, AdapterResolutionSource.RUN_OVERRIDE)
+        elif isinstance(target_type, type):
+            load = self._pipeline.resolve_load_adapter_binding(
+                py_type=target_type,
+                format=adapter_format,
+            )
+        elif isinstance(target_type, str):
+            load = self._pipeline.resolve_load_adapter_binding_by_type_name(
+                type_name=target_type,
+                format=adapter_format,
+            )
+        elif isinstance(variant.save_adapter, Adapter | BuiltInJsonAdapter):
+            load = LoadAdapterResolution(variant.save_adapter, save.source)
+        elif adapter_format is not None:
+            load = self._pipeline.resolve_load_adapter_binding_by_format(format=adapter_format)
+        else:
+            load_adapter = self._pipeline.resolve_load_adapter(key=variant.ref.key)
+            load = (
+                None if load_adapter is None else LoadAdapterResolution(load_adapter, AdapterResolutionSource.PIPELINE)
+            )
+        if load is None:
+            label = self._node_alias(target_node) or self._node_name(target_node)
+            raise ValueError(
+                "pipeline load adapter cannot be resolved for {}.{} from isolated artifact `{}`".format(
+                    label,
+                    target_port.name,
+                    variant.ref.key,
+                )
+            )
+        if cast(str, variant.ref.tag) not in load.adapter.accepted_tags:
+            raise ValueError(
+                "pipeline load adapter for {}.{} does not accept isolated artifact tag `{}`".format(
+                    self._node_alias(target_node) or self._node_name(target_node),
+                    target_port.name,
+                    variant.ref.tag,
+                )
+            )
+        self._adapter_resolutions.setdefault((source_ref.node, source_ref.port.name), save)
+        self._variant_save_resolutions.setdefault((source_ref.node, source_ref.port.name, expected_variant_id), save)
+        self._edge_save_adapter_resolutions[edge_key] = save
+        self._load_adapter_resolutions[edge_key] = load
+        return variant, save, load
+
     def _materialize_source_output(
         self,
         value: Any,
@@ -1128,7 +1753,9 @@ class Run:
         resolution: SaveAdapterResolution | AdapterResolution,
     ) -> ArtifactRef:
         adapter = resolution.adapter
-        cache_key = (source_ref.node, source_ref.port.name, adapter.key)
+        variant_id = self._save_adapter_variant_id(adapter)
+        cache_key = (source_ref.node, source_ref.port.name, variant_id)
+        self._variant_save_resolutions[cache_key] = resolution
         if cache_key not in self._artifact_refs:
             try:
                 self._artifact_refs[cache_key] = encode(value, adapter, self._get_artifacts_dir())
@@ -1189,6 +1816,26 @@ class Run:
             return None
         return self._adapter_overrides.get((source_ref.node, source_ref.port.name))
 
+    def _effective_save_override_evidence(
+        self,
+        resume_plan: m_resume.ResumePlan | None,
+    ) -> dict[tuple[str, str], Mapping[str, Any]]:
+        evidence: dict[tuple[str, str], Mapping[str, Any]] = {}
+        if resume_plan is not None:
+            frozen_ids = {str(node.uuid) for node in resume_plan.frozen_nodes}
+            evidence.update(
+                {
+                    key: dict(identity)
+                    for key, identity in resume_plan.historical_adapter_overrides.items()
+                    if key[0] in frozen_ids
+                }
+            )
+        for (node, port), adapter in self._adapter_overrides.items():
+            if resume_plan is not None and node not in resume_plan.recalculated_nodes:
+                continue
+            evidence[(str(node.uuid), port)] = save_adapter_identity(adapter)
+        return evidence
+
     def _parent_manifest(self) -> tuple[Path, dict[str, Any]]:
         if (
             self._manifest_writer is not None
@@ -1232,11 +1879,50 @@ class Run:
     ) -> None:
         if self._manifest_writer is None:
             return
-        output_record = m_manifest.artifact_record(ref, run_dir=self._run_dir)
+        variant_id = self._save_adapter_variant_id(resolution.adapter)
+        self._artifact_refs[(source_ref.node, source_ref.port.name, variant_id)] = ref
+        self._variant_save_resolutions[(source_ref.node, source_ref.port.name, variant_id)] = resolution
+        output_record, adapter_record = self._artifact_output_manifest_records(
+            source_ref.node,
+            source_ref.port.name,
+        )
         self._set_node_output(source_ref.node, source_ref.port.name, output_record)
-        adapter_record = m_manifest.adapter_record(save_adapter_identity(resolution.adapter), str(resolution.source))
         self._set_node_adapter(source_ref.node, source_ref.port.name, adapter_record)
         self._write_node_manifest(source_ref.node, status=self._node_status(source_ref.node))
+
+    def _artifact_output_manifest_records(
+        self,
+        node: Node,
+        port_name: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        variants: list[dict[str, Any]] = []
+        for ref_node, ref_port, variant_id in sorted(self._artifact_refs, key=lambda item: item[2]):
+            if ref_node != node or ref_port != port_name:
+                continue
+            ref = self._artifact_refs[(ref_node, ref_port, variant_id)]
+            resolution = self._variant_save_resolutions.get((ref_node, ref_port, variant_id))
+            if resolution is None:
+                continue
+            save_record = m_manifest.adapter_record(
+                save_adapter_identity(resolution.adapter),
+                str(resolution.source),
+            )
+            variants.append(
+                {
+                    "variant_id": variant_id,
+                    "artifact": m_manifest.artifact_record(ref, run_dir=self._run_dir),
+                    "save": save_record,
+                }
+            )
+        if not variants:
+            raise RuntimeError("artifact output manifest has no materialized variants")
+        primary = variants[0]
+        output_record = dict(primary["artifact"])
+        adapter_record = dict(primary["save"])
+        if len(variants) > 1:
+            output_record["variants"] = variants
+            adapter_record["variants"] = [{"variant_id": item["variant_id"], "save": item["save"]} for item in variants]
+        return output_record, adapter_record
 
     def _ensure_frozen_node_manifest(self, node: Node) -> None:
         writer = self._manifest_writer
@@ -1274,7 +1960,9 @@ class Run:
         adapter_format: str | None,
         target_node: Node,
         target_port: InputPort,
-    ) -> Any:
+        *,
+        isolated: bool,
+    ) -> m_node_runtime.NodeInputTransport:
         self._ensure_frozen_node_manifest(source_ref.node)
         if self._resume_plan is None:
             raise RuntimeError("frozen edge input requested outside resume")
@@ -1282,13 +1970,25 @@ class Run:
             self._resume_plan.parent_manifest, source_ref.node, source_ref.port.name
         )
         if record.get("kind") == "json":
-            return self._round_trip_edge(
-                record.get("value"),
-                source_ref,
-                target_node,
-                target_port,
-                adapter_format,
-                self._adapter_override_for(source_ref),
+            value = record.get("value")
+            if isolated:
+                return self._transport_edge_input(
+                    value,
+                    source_ref,
+                    target_node,
+                    target_port,
+                    adapter_format,
+                    self._adapter_override_for(source_ref),
+                )
+            return m_node_runtime.InlineInput(
+                self._round_trip_edge(
+                    value,
+                    source_ref,
+                    target_node,
+                    target_port,
+                    adapter_format,
+                    self._adapter_override_for(source_ref),
+                )
             )
         if record.get("kind") != "artifact":
             label = self._node_alias(source_ref.node) or self._node_id(source_ref.node)
@@ -1298,21 +1998,106 @@ class Run:
                 )
             )
 
-        ref = m_resume.artifact_ref_from_record(record, self._resume_plan.parent_run_dir)
-        parent_save_record = m_resume.manifest_frozen_save_adapter_record(
+        edge_key = (source_ref.node, source_ref.port.name, target_node, target_port.name)
+        parent_edge = m_resume.manifest_edge_record(
             self._resume_plan.parent_manifest,
             source_node=source_ref.node,
             source_port=source_ref.port.name,
             target_node=target_node,
             target_port=target_port.name,
         )
+        selected_record: Mapping[str, Any] = record
+        parent_save_record: dict[str, Any]
+        variant_id: str | None = None
+        used_legacy_fallback = False
+        node_variants = m_resume.manifest_output_variants(record)
+        has_current_variant_edge = parent_edge is not None and "artifact_variant" in parent_edge
+        if node_variants or has_current_variant_edge:
+            selected = m_resume.manifest_exact_variant_for_edge(
+                self._resume_plan.parent_manifest,
+                pipeline=self._pipeline,
+                historical_adapter_overrides=self._resume_plan.historical_adapter_overrides,
+                parent_run_dir=self._resume_plan.parent_run_dir,
+                source_node=source_ref.node,
+                source_port=source_ref.port.name,
+                target_node=target_node,
+                target_port=target_port.name,
+                output_record=record,
+            )
+            selected_record = cast(Mapping[str, Any], selected["artifact"])
+            parent_save_record = dict(cast(Mapping[str, Any], selected["save"]))
+            variant_id = str(selected["variant_id"])
+        else:
+            used_legacy_fallback = True
+            legacy = self._resume_plan.legacy_artifacts.get((str(source_ref.node.uuid), source_ref.port.name))
+            if legacy is None:
+                source_label = self._node_alias(source_ref.node) or self._node_id(source_ref.node)
+                raise m_resume.ResumeValidationError(
+                    "marker-free frozen artifact was not classified as an unambiguous legacy artifact/save "
+                    "pair; recalculate with from_='{}'".format(source_label)
+                )
+            selected_record = legacy.artifact
+            parent_save_record = dict(legacy.save)
+        validation_errors = m_resume.validate_artifact_record(
+            self._node_alias(source_ref.node) or self._node_id(source_ref.node),
+            source_ref.port.name,
+            selected_record,
+            self._resume_plan.parent_run_dir,
+            allow_absolute=used_legacy_fallback,
+        )
+        if validation_errors:
+            raise m_resume.ResumeValidationError(validation_errors[0])
+        ref = m_resume.artifact_ref_from_record(
+            selected_record,
+            self._resume_plan.parent_run_dir,
+            allow_absolute=used_legacy_fallback,
+        )
         parent_save_identity = parent_save_record.get("identity")
         parent_save_key = parent_save_identity.get("key") if isinstance(parent_save_identity, Mapping) else None
         if parent_save_key != ref.key:
+            source_label = self._node_alias(source_ref.node) or self._node_id(source_ref.node)
             raise m_resume.ResumeValidationError(
                 "cannot restore frozen artifact `{}` because its ref key `{}` does not match the parent save "
-                "adapter provenance key `{}`".format(ref.uri, ref.key, parent_save_key or "<missing>")
+                "adapter provenance key `{}`; recalculate with from_='{}'".format(
+                    ref.uri,
+                    ref.key,
+                    parent_save_key or "<missing>",
+                    source_label,
+                )
             )
+        parent_save_tag = parent_save_identity.get("tag") if isinstance(parent_save_identity, Mapping) else None
+        if parent_save_tag != ref.tag:
+            source_label = self._node_alias(source_ref.node) or self._node_id(source_ref.node)
+            raise m_resume.ResumeValidationError(
+                "cannot restore frozen artifact because its tag does not match the retained save provenance; "
+                "recalculate with from_='{}'".format(source_label)
+            )
+        computed_variant_id = (
+            hashlib.sha256(canonical_json_bytes(parent_save_identity)).hexdigest()
+            if isinstance(parent_save_identity, Mapping)
+            else None
+        )
+        if variant_id is not None and variant_id != computed_variant_id:
+            source_label = self._node_alias(source_ref.node) or self._node_id(source_ref.node)
+            raise m_resume.ResumeValidationError(
+                "cannot restore frozen artifact because its variant identity does not match save provenance; "
+                "recalculate with from_='{}'".format(source_label)
+            )
+        if variant_id is None:
+            variant_id = computed_variant_id
+        if used_legacy_fallback and adapter_format is not None and parent_save_key.rpartition("@")[2] != adapter_format:
+            source_label = self._node_alias(source_ref.node) or self._node_id(source_ref.node)
+            raise m_resume.ResumeValidationError(
+                "the old retained manifest has no exact `{}` artifact variant for `{}.{}`; "
+                "recalculate with from_='{}'".format(
+                    adapter_format,
+                    source_label,
+                    source_ref.port.name,
+                    source_label,
+                )
+            )
+        if self._run_dir is not None:
+            ref = m_resume.copy_artifact_ref_for_run(ref, self._run_dir)
         run_override = self._adapter_override_for(source_ref)
         target_type = _runtime_input_type_hint(target_node, target_port)
         load: LoadAdapterResolution | None
@@ -1349,10 +2134,26 @@ class Run:
                     ref.uri, target_type, adapter_format or "<default>"
                 )
             )
-        edge_key = (source_ref.node, source_ref.port.name, target_node, target_port.name)
+        if cast(str, ref.tag) not in load.adapter.accepted_tags or (
+            load.adapter.legacy_key_guard and ref.key != load.adapter.key
+        ):
+            source_label = self._node_alias(source_ref.node) or self._node_id(source_ref.node)
+            raise m_resume.ResumeValidationError(
+                "the retained artifact variant is incompatible with the exact load adapter for this edge; "
+                "recalculate with from_='{}'".format(source_label)
+            )
         self._frozen_save_adapter_records[edge_key] = parent_save_record
         self._load_adapter_resolutions[edge_key] = load
-        return decode(ref, load.adapter)
+        if variant_id is not None:
+            self._edge_variant_ids[edge_key] = variant_id
+            self._artifact_refs[(source_ref.node, source_ref.port.name, variant_id)] = ref
+        if isolated:
+            return m_node_runtime.ArtifactInput(
+                ref=ref,
+                load_adapter=load.adapter,
+                resolution_source=str(load.source),
+            )
+        return m_node_runtime.InlineInput(decode(ref, load.adapter))
 
     def _value_from_frozen_record(
         self, record: Mapping[str, Any], source_ref: NodeOutputRef, adapter_format: str | None
@@ -1391,14 +2192,26 @@ class Run:
         source = AdapterResolutionSource.EDGE if adapter_format is not None else AdapterResolutionSource.PIPELINE
         return LoadAdapterResolution(adapter, source)
 
-    def _get_input(self, x: Any, target_node: Node, target_port: InputPort) -> Any:
+    def _get_input(
+        self,
+        x: Any,
+        target_node: Node,
+        target_port: InputPort,
+        target_runtime: _ResolvedNodeRuntimePlan,
+    ) -> m_node_runtime.NodeInputTransport:
         match x:
             case Scalar():
-                return self._round_trip_artifact(x.value)
+                return m_node_runtime.InlineInput(self._round_trip_artifact(x.value))
 
             case NodeOutputRef():
                 if self._is_frozen_node(x.node):
-                    return self._get_frozen_edge_input(x, None, target_node, target_port)
+                    return self._get_frozen_edge_input(
+                        x,
+                        None,
+                        target_node,
+                        target_port,
+                        isolated=target_runtime.isolated,
+                    )
                 run_override = self._adapter_override_for(x)
                 value = (
                     self._get_result(
@@ -1406,11 +2219,21 @@ class Run:
                         output_request=(x, None, run_override, target_node, target_port),
                     )
                 )[x.port.name]
-                return self._round_trip_edge(value, x, target_node, target_port, None, run_override)
+                if target_runtime.isolated:
+                    return self._transport_edge_input(value, x, target_node, target_port, None, run_override)
+                return m_node_runtime.InlineInput(
+                    self._round_trip_edge(value, x, target_node, target_port, None, run_override)
+                )
 
             case FormattedOutputRef():
                 if self._is_frozen_node(x.out_ref.node):
-                    return self._get_frozen_edge_input(x.out_ref, x.format, target_node, target_port)
+                    return self._get_frozen_edge_input(
+                        x.out_ref,
+                        x.format,
+                        target_node,
+                        target_port,
+                        isolated=target_runtime.isolated,
+                    )
                 run_override = self._adapter_override_for(x.out_ref)
                 value = (
                     self._get_result(
@@ -1418,13 +2241,24 @@ class Run:
                         output_request=(x.out_ref, x.format, run_override, target_node, target_port),
                     )
                 )[x.out_ref.port.name]
-                return self._round_trip_edge(
-                    value,
-                    x.out_ref,
-                    target_node,
-                    target_port,
-                    x.format,
-                    run_override,
+                if target_runtime.isolated:
+                    return self._transport_edge_input(
+                        value,
+                        x.out_ref,
+                        target_node,
+                        target_port,
+                        x.format,
+                        run_override,
+                    )
+                return m_node_runtime.InlineInput(
+                    self._round_trip_edge(
+                        value,
+                        x.out_ref,
+                        target_node,
+                        target_port,
+                        x.format,
+                        run_override,
+                    )
                 )
 
             case _:
@@ -1469,7 +2303,8 @@ class Run:
         if self._is_frozen_node(node):
             self._results[node] = self._restore_frozen_result(node)
             return self._results[node]
-        kwargs: dict[InputPort, Any] = {}
+        runtime_plan = self._resolve_node_runtime_plan(node)
+        kwargs: dict[InputPort, m_node_runtime.NodeInputTransport] = {}
         input_records: dict[str, Any] = {}
         input_value_ref: Any = None
         try:
@@ -1478,14 +2313,14 @@ class Run:
                 if port.name not in self._kwargs:
                     continue
                 value = self._round_trip_artifact(self._kwargs[port.name])
-                kwargs[port] = value
+                kwargs[port] = m_node_runtime.InlineInput(value)
                 if self._manifest_writer is not None:
                     input_records[port.name] = self._value_record(value)
 
             if node in self._deps:
                 for port, value_ref in self._deps[node].items():
                     input_value_ref = value_ref
-                    value = self._get_input(value_ref, node, port)
+                    value = self._get_input(value_ref, node, port, runtime_plan)
                     kwargs[port] = value
                     if self._manifest_writer is not None:
                         input_records[port.name] = self._record_link_input(node, port, value_ref, value)
@@ -1508,7 +2343,13 @@ class Run:
 
         try:
             self._node_inputs[node] = input_records
-            result = self._execute_node_with_runtime(node, kwargs, input_records)
+            result = self._execute_node_with_runtime(
+                node,
+                kwargs,
+                input_records,
+                runtime_plan,
+                output_request=output_request,
+            )
             output_records = self._output_records(node, result, output_request=output_request)
             self._write_node_manifest(
                 node,
@@ -1548,33 +2389,70 @@ class Run:
     def _execute_node_with_runtime(
         self,
         node: Node,
-        kwargs: dict[InputPort, Any],
+        kwargs: dict[InputPort, m_node_runtime.NodeInputTransport],
         input_records: Mapping[str, Any],
+        runtime_plan: _ResolvedNodeRuntimePlan,
+        *,
+        output_request: _OutputMaterializationRequest | None,
     ) -> dict[str, Any]:
-        if self._can_use_native_fast_path(node):
-            return self._callback(node, kwargs)
-        resolution = m_node_runtime.resolve_node_runtime(
-            self._pipeline,
-            node,
-            runtime_config=self._runtime_config,
-            run_override=self._runtime_overrides.get(node),
-        )
-        backend = self._node_runtime_registry.backend_for(resolution.name)
+        if runtime_plan.fast_native:
+            return self._callback(
+                node,
+                {port: self._inline_input_value(value) for port, value in kwargs.items()},
+            )
+        resolution = runtime_plan.resolution
+        backend = runtime_plan.backend
+        output_port = self._single_output_port(node)
+        output_plan = self._isolated_output_plan(node, output_port, output_request) if runtime_plan.isolated else None
         context = m_node_runtime.NodeRuntimeContext(
             node=node,
             node_label=self._node_alias(node) or self._node_name(node),
             inputs=kwargs,
-            output_port=self._single_output_port(node),
+            output_port=output_port,
             callback=self._callback,
             work_dir=self._node_runtime_work_dir(node, resolution.name),
             environment_provider=self._node_environment_provider,
             runtime_config=self._runtime_config,
             environment_spec=self._runtime_env_spec,
+            output_plan=output_plan,
         )
+        if runtime_plan.isolated:
+            context = m_node_runtime.prepare_isolated_node_inputs(context, runtime_name=resolution.name)
         environment = backend.prepare(context)
         self._node_runtimes[node] = m_node_runtime.runtime_manifest_record(resolution, environment)
         self._write_node_manifest(node, status="running", inputs=input_records)
         return backend.execute(context, environment)
+
+    def _resolve_node_runtime_plan(self, node: Node) -> _ResolvedNodeRuntimePlan:
+        cached = self._node_runtime_plans.get(node)
+        if cached is not None:
+            return cached
+        fast_native = self._can_use_native_fast_path(node)
+        if fast_native:
+            resolution = m_node_runtime.NodeRuntimeResolution(
+                m_node_runtime.NATIVE_NODE_RUNTIME,
+                m_node_runtime.NodeRuntimeResolutionSource.DEFAULT,
+            )
+        else:
+            resolution = m_node_runtime.resolve_node_runtime(
+                self._pipeline,
+                node,
+                runtime_config=self._runtime_config,
+                run_override=self._runtime_overrides.get(node),
+            )
+        plan = _ResolvedNodeRuntimePlan(
+            resolution=resolution,
+            backend=self._node_runtime_registry.backend_for(resolution.name),
+            fast_native=fast_native,
+        )
+        self._node_runtime_plans[node] = plan
+        return plan
+
+    @staticmethod
+    def _inline_input_value(value: m_node_runtime.NodeInputTransport) -> Any:
+        if isinstance(value, m_node_runtime.InlineInput):
+            return value.value
+        raise RuntimeError("native node received an isolated artifact input")
 
     def _can_use_native_fast_path(self, node: Node) -> bool:
         del node
@@ -1601,13 +2479,36 @@ class Run:
 
     def __getitem__(self, node: Node) -> dict[str, Any]:
         try:
-            return self._get_result(node)
+            result = self._get_result(node)
+            if not any(isinstance(value, m_node_runtime.ArtifactOutput) for value in result.values()):
+                return result
+            return {port_name: self._public_output_value(node, port_name, value) for port_name, value in result.items()}
         except BaseException as exc:
             try:
                 self.close()
             except BaseException as close_exc:
                 raise close_exc from exc
             raise
+
+    def _public_output_value(self, node: Node, port_name: str, value: Any) -> Any:
+        if not isinstance(value, m_node_runtime.ArtifactOutput):
+            return value
+        cache_key = (node, port_name)
+        if cache_key in self._public_output_values:
+            return self._public_output_values[cache_key]
+        load_adapter = self._pipeline.resolve_load_adapter(key=value.ref.key)
+        if load_adapter is None and all(
+            hasattr(value.save_adapter, attribute) for attribute in ("load", "accepted_tags", "legacy_key_guard")
+        ):
+            load_adapter = cast(LoadAdapter, value.save_adapter)
+        if load_adapter is None:
+            raise ValueError(
+                "terminal isolated artifact output `{}` cannot be converted back to a Python value because "
+                "no matching load adapter is registered".format(value.ref.key)
+            )
+        loaded = decode(value.ref, load_adapter)
+        self._public_output_values[cache_key] = loaded
+        return loaded
 
     def value(self, alias: str | None = None, port: str = DEFAULT_PORT) -> Any:
         """Return one output value directly, without ``[node][port]`` indexing."""
@@ -1628,9 +2529,9 @@ class Run:
         if source_ref is None:
             return self._value_record(value)
 
-        record = self._edge_value_record(source_ref, value)
         edge_key = (source_ref.node, source_ref.port.name, target_node, target_port.name)
-        save_resolution = self._adapter_resolutions.get((source_ref.node, source_ref.port.name))
+        record = self._edge_value_record(source_ref, target_node, target_port, value)
+        save_resolution = self._edge_save_adapter_resolutions.get(edge_key)
         load_resolution = self._load_adapter_resolutions.get(edge_key)
         save_record = self._frozen_save_adapter_records.get(edge_key)
         load_record = None
@@ -1638,8 +2539,16 @@ class Run:
             save_record = m_manifest.adapter_record(
                 save_adapter_identity(save_resolution.adapter), str(save_resolution.source)
             )
-        if save_record is not None:
-            self._set_node_adapter(source_ref.node, source_ref.port.name, save_record)
+        if save_record is not None and not self._is_frozen_node(source_ref.node):
+            if self._artifact_ref_for_output(source_ref.node, source_ref.port.name) is None:
+                self._set_node_adapter(source_ref.node, source_ref.port.name, save_record)
+            else:
+                output_record, node_adapter_record = self._artifact_output_manifest_records(
+                    source_ref.node,
+                    source_ref.port.name,
+                )
+                self._set_node_output(source_ref.node, source_ref.port.name, output_record)
+                self._set_node_adapter(source_ref.node, source_ref.port.name, node_adapter_record)
         if load_resolution is not None:
             load_record = m_manifest.adapter_record(
                 load_adapter_identity(load_resolution.adapter), str(load_resolution.source)
@@ -1660,6 +2569,7 @@ class Run:
                         if save_record is None or load_record is None
                         else m_manifest.edge_adapter_record(save_record, load_record)
                     ),
+                    variant_id=self._edge_variant_ids.get(edge_key),
                 )
             )
             self._write_node_manifest(source_ref.node, status=self._node_status(source_ref.node))
@@ -1672,22 +2582,44 @@ class Run:
             return value_ref
         return None
 
-    def _edge_value_record(self, source_ref: NodeOutputRef, value: Any) -> dict[str, Any]:
+    def _edge_value_record(
+        self,
+        source_ref: NodeOutputRef,
+        target_node: Node,
+        target_port: InputPort,
+        value: Any,
+    ) -> dict[str, Any]:
+        if isinstance(value, m_node_runtime.ArtifactInput):
+            record = m_manifest.artifact_record(value.ref, run_dir=self._run_dir)
+            if not self._is_frozen_node(source_ref.node):
+                self._set_node_output(source_ref.node, source_ref.port.name, record)
+            return record
+        edge_key = (source_ref.node, source_ref.port.name, target_node, target_port.name)
+        variant_id = self._edge_variant_ids.get(edge_key)
+        ref = (
+            self._artifact_refs.get((source_ref.node, source_ref.port.name, variant_id))
+            if variant_id is not None
+            else self._artifact_ref_for_output(source_ref.node, source_ref.port.name)
+        )
+        if ref is not None:
+            record = m_manifest.artifact_record(ref, run_dir=self._run_dir)
+            if not self._is_frozen_node(source_ref.node):
+                self._set_node_output(source_ref.node, source_ref.port.name, record)
+            return record
         if self._is_frozen_node(source_ref.node) and self._resume_plan is not None:
             parent_record = m_resume.manifest_output_record(
                 self._resume_plan.parent_manifest, source_ref.node, source_ref.port.name
             )
-            record = m_resume.rebase_output_record(parent_record, self._resume_plan.parent_run_dir, self._run_dir)
-            self._set_node_output(source_ref.node, source_ref.port.name, record)
-            return record
-        ref = self._artifact_ref_for_output(source_ref.node, source_ref.port.name)
-        if ref is not None:
-            record = m_manifest.artifact_record(ref, run_dir=self._run_dir)
-            self._set_node_output(source_ref.node, source_ref.port.name, record)
-            return record
+            return m_resume.rebase_output_record(parent_record, self._resume_plan.parent_run_dir, self._run_dir)
         return self._value_record(value)
 
     def _value_record(self, value: Any) -> dict[str, Any]:
+        if isinstance(value, m_node_runtime.ArtifactOutput):
+            return m_manifest.artifact_record(value.ref, run_dir=self._run_dir)
+        if isinstance(value, m_node_runtime.ArtifactInput):
+            return m_manifest.artifact_record(value.ref, run_dir=self._run_dir)
+        if isinstance(value, m_node_runtime.InlineInput):
+            value = value.value
         if type(value) in _JSON_NATIVE_TYPES:
             return m_manifest.json_record(value)
         return m_manifest.unfreezable_record("value was not materialized as an artifact")
@@ -1727,13 +2659,17 @@ class Run:
                     label, "; ".join(details)
                 )
             )
+        for port_name, value in result.items():
+            if isinstance(value, m_node_runtime.ArtifactOutput):
+                self._register_promoted_output(node, port_name, value)
         if output_request is not None:
             self._materialize_requested_output_artifact(node, result, output_request)
         outputs = {}
         for port_name, value in result.items():
             ref = self._artifact_ref_for_output(node, port_name)
             if ref is not None:
-                outputs[port_name] = m_manifest.artifact_record(ref, run_dir=self._run_dir)
+                outputs[port_name], adapter_record = self._artifact_output_manifest_records(node, port_name)
+                self._node_adapters.setdefault(node, {})[port_name] = adapter_record
                 continue
             if type(value) in _JSON_NATIVE_TYPES:
                 try:
@@ -1757,6 +2693,16 @@ class Run:
         if source_ref.node != node:
             raise RuntimeError("output materialization request does not belong to the producing node")
         value = result[source_ref.port.name]
+        if isinstance(value, m_node_runtime.ArtifactOutput):
+            self._resolve_promoted_output_edge(
+                value,
+                source_ref,
+                target_node,
+                target_port,
+                adapter_format,
+                run_override,
+            )
+            return
         save, load = self._resolve_edge_adapter_bindings(
             value,
             source_ref,
@@ -1777,12 +2723,42 @@ class Run:
         self._ensure_open()
         self._materialize_source_output(value, source_ref, save)
 
+    def _register_promoted_output(
+        self,
+        node: Node,
+        port_name: str,
+        value: m_node_runtime.ArtifactOutput,
+    ) -> None:
+        primary_resolution: SaveAdapterResolution | None = None
+        source_ref = NodeOutputRef(node, node.get_output_port(port_name))
+        for variant in value.variants():
+            cache_key = (node, port_name, variant.variant_id)
+            existing = self._artifact_refs.get(cache_key)
+            if existing is not None and existing != variant.ref:
+                raise RuntimeError("isolated output artifact identity changed after promotion")
+            self._artifact_refs[cache_key] = variant.ref
+            cached_resolution = self._variant_save_resolutions.get(cache_key)
+            if isinstance(cached_resolution, SaveAdapterResolution):
+                resolution = cached_resolution
+            else:
+                try:
+                    source = AdapterResolutionSource(variant.resolution_source)
+                except ValueError:
+                    source = AdapterResolutionSource.PIPELINE
+                resolution = SaveAdapterResolution(variant.save_adapter, source)
+                self._variant_save_resolutions[cache_key] = resolution
+            if primary_resolution is None:
+                primary_resolution = resolution
+            self._record_materialized_output(source_ref, variant.ref, resolution)
+        if primary_resolution is not None:
+            self._adapter_resolutions[(node, port_name)] = primary_resolution
+
     def _artifact_ref_for_output(self, node: Node, port_name: str) -> ArtifactRef | None:
         refs = [
-            (adapter_key, ref)
-            for ref_node, ref_port, adapter_key in self._artifact_refs
+            (variant_id, ref)
+            for ref_node, ref_port, variant_id in self._artifact_refs
             if ref_node == node and ref_port == port_name
-            for ref in (self._artifact_refs[(ref_node, ref_port, adapter_key)],)
+            for ref in (self._artifact_refs[(ref_node, ref_port, variant_id)],)
         ]
         if not refs:
             return None
@@ -1839,8 +2815,25 @@ class Run:
         }
         inline_inputs = {port: record["value"] for port, record in inputs.items() if record.get("kind") == "json"}
         adapter_identities = {
-            port: record["identity"] for port, record in adapters.items() if isinstance(record.get("identity"), Mapping)
+            port: dict(record)
+            for port, record in adapters.items()
+            if isinstance(record, Mapping) and isinstance(record.get("identity"), Mapping)
         }
+        execution_context_sha256 = self._runtime_adapter_fingerprint_sha256
+        node_override_evidence = [
+            {"port": port, "identity": dict(identity)}
+            for (node_id, port), identity in sorted(self._save_override_evidence.items())
+            if node_id == str(node.uuid)
+        ]
+        if node_override_evidence:
+            execution_context_sha256 = hashlib.sha256(
+                canonical_json_bytes(
+                    {
+                        "runtime_adapter_fingerprint_sha256": execution_context_sha256,
+                        "historical_save_adapter_overrides": node_override_evidence,
+                    }
+                )
+            ).hexdigest()
         return node_fingerprint(
             node_content=self._node_content(node),
             node_version=self._node_version(node),
@@ -1849,7 +2842,7 @@ class Run:
             adapter_identities=adapter_identities,
             artifact_inputs=artifact_inputs,
             inline_inputs=inline_inputs,
-            execution_context_sha256=self._runtime_adapter_fingerprint_sha256,
+            execution_context_sha256=execution_context_sha256,
         )
 
     def _node_content(self, node: Node) -> bytes:

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.10] - 2026-09-30
+
+### Added
+
+- Pipeline adapters now transport non-JSON values across per-node
+  `venv-subprocess` and Docker boundaries in both directions. Exact adapter
+  dependencies are verified in the target environment; same-format fan-out
+  shares one canonical artifact, different save identities create variants,
+  and kept runs resume from verified frozen variants.
+
+### Fixed
+
+- Isolated adapter transport now rejects closed-schema, path, file-type,
+  hard-link, identity-race, size, checksum, adapter-identity and dependency
+  tampering before decoding or user code. Adapter and execution failures are
+  stage-specific, diagnostics are bounded, and the SPL-free runner blocks
+  access to an accidentally installed conductor package.
+- JSON-native isolated calls retain their exact legacy inline protocol and do
+  not create adapter staging or artifact directories. Ambiguous untyped
+  non-JSON outputs provide `.as_format(...)` repair guidance, while run-level
+  adapter overrides retain precedence and provenance.
+- Anonymous Public Object run receipts are now flushed within one bounded
+  shutdown allowance, so short-lived embedded clients reliably report ordered
+  `started` and terminal states without delaying Object execution or hanging
+  interpreter shutdown when the registry is unavailable.
+- Public runtime locks now use the closed `spl.public_runtime_lock.v3`
+  installed-framework contract. Verified third-party wheels remain isolated,
+  while the installed `splime` 0.4.10 distribution is the sole compiler and
+  execution authority; the separate public-worker distribution is removed.
+
 ## [0.4.9] - 2026-08-24
 
 ### Fixed
@@ -38,20 +68,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A dedicated deterministic public catalog, canonical server-rendered profiles,
   active release history, Similar Objects, authenticated votes, full-download
   accounting, and privacy-minimized best-effort embedded run receipts.
-
-### Compatibility
-
-- Published 0.1.2 through 0.4.7 artifacts were inventoried without assuming a
-  contiguous version sequence. Restored wrappers preserve confirmed historical
-  facade spellings; unsupported additive operations fail before mutation.
-- Existing adapter, local/remote Run, Library, lifecycle, sync and private
-  ``NodeRemote`` behavior remains unchanged; public execution rejects
-  ``NodeRemote`` without weakening its established private paths.
-
-## [0.4.7] - 2026-08-16
-
-### Added
-
 - `SPLClient.call()` and `submit()` now accept closed per-Run `adapters`
   mappings for independent input and output transport. The public registry
   includes inline JSON, opaque files, UTF-8 text files, binary files,
@@ -61,35 +77,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   content identities, claim-fenced downloads and explicit two-sided policy for
   custom code. `FileInput` stages an existing regular file without decoding it
   in the caller.
-- Immutable Library Adapters can be published, synchronized and selected by
-  owner, Library, name and exact version. Load-only, save-only and bidirectional
-  resources are supported; semantic type/category metadata ranks choices but
-  never blocks an explicit user selection.
-- The daemon exposes authenticated, browser-safe IDE metadata, guarded local
-  Run admission, lifecycle, source-analysis/preparation, deterministic AI
-  Preview relay and Library Adapter catalog/publication contracts. Every new
-  surface is additive and capability-gated.
-- Runtime selection accepts an object-wide runtime or a per-Function mapping,
-  including mixed native, virtual-environment and Docker execution within a
-  Pipeline.
 
 ### Compatibility
 
+- Published 0.1.2 through 0.4.7 artifacts were inventoried without assuming a
+  contiguous version sequence. Restored wrappers preserve confirmed historical
+  facade spellings; unsupported additive operations fail before mutation.
 - Omitting `adapters` preserves the legacy JSON request/result shape. Existing
   `Deployment.run()` edge adapters, `.as_format(...)`, resume behavior and
   immutable Object source/version identities are unchanged.
-- Existing clients that do not understand the new capabilities continue to use
-  the 0.4.6 JSON and Object/Run contracts. Missing capabilities fail closed
-  only for the newly requested operation.
-
-### Fixed
-
-- Default adapter artifact staging now canonicalizes the trusted macOS system
-  temporary root before no-follow traversal, while user-provided destinations
-  remain unresolved and symlink traversal remains rejected.
-- Remote Run request matching treats an omitted empty Library Adapter reference
-  projection as equivalent to the canonical empty schema-v3 projection,
-  without weakening non-empty exact-version checks.
 
 ## [0.4.6] - 2026-07-30
 
@@ -657,7 +653,8 @@ here. No breaking API changes.
 - Initial release: turn trusted Python functions into versioned, portable nodes
   reusable across projects and executed locally or remotely.
 
-[Unreleased]: https://github.com/yastrebovks/splime/compare/v0.4.9...HEAD
+[Unreleased]: https://github.com/yastrebovks/splime/compare/v0.4.10...HEAD
+[0.4.10]: https://github.com/yastrebovks/splime/compare/v0.4.9...v0.4.10
 [0.4.9]: https://github.com/yastrebovks/splime/compare/v0.4.8...v0.4.9
 [0.4.8]: https://github.com/yastrebovks/splime/compare/v0.4.7...v0.4.8
 [0.4.7]: https://github.com/yastrebovks/splime/compare/v0.4.6...v0.4.7

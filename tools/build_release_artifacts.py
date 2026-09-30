@@ -68,7 +68,6 @@ def main() -> int:
         subprocess.run(
             [
                 sys.executable,
-                "-P",
                 "-m",
                 "build",
                 "--sdist",

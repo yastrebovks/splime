@@ -9,6 +9,7 @@ lock and one way to construct its virtual environment.
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -28,10 +29,15 @@ _VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]*$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 PUBLIC_RUNTIME_LOCK_SCHEMA = "spl.public_runtime_lock.v3"
 PUBLIC_RUNTIME_POLICY_NAME = "splime-public-python-artifacts"
-PUBLIC_RUNTIME_POLICY_VERSION = "0.4.9"
+PUBLIC_RUNTIME_POLICY_VERSION = "0.4.10"
 PUBLIC_RUNTIME_RESOLVER_NAME = "splime-pypi-closure"
-PUBLIC_EMBEDDED_HOST_CONTRACT = "spl.public_embedded_host.v1"
-PUBLIC_EMBEDDED_HOST_MINIMUM_VERSION = "0.4.9"
+PUBLIC_EMBEDDED_EXECUTOR = {
+    "kind": "installed-framework",
+    "project": "splime",
+    "contract": "spl.public_embedded_host.v1",
+    "minimum_version": "0.4.10",
+}
+MAX_PUBLIC_RUNTIME_WHEEL_BYTES = 128 * 1024 * 1024
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -148,7 +154,7 @@ def validate_runtime_lock(value: Any) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError("runtime lock must be a mapping")
     if value.get("schema") != PUBLIC_RUNTIME_LOCK_SCHEMA or value.get("schema_version") != 3:
-        raise ValueError("public runtime lock must contain the complete artifact closure")
+        raise ValueError("public runtime lock must use the installed-framework v3 contract")
     allowed = {
         "schema",
         "schema_version",
@@ -162,8 +168,6 @@ def validate_runtime_lock(value: Any) -> dict[str, Any]:
         "lock_hash",
         "names",
     }
-    if "executor" not in value:
-        raise ValueError("installed framework executor is missing")
     if set(value) != allowed:
         raise ValueError("runtime lock contains unsupported or missing fields")
     target = value.get("target")
@@ -219,6 +223,58 @@ def _requirements(value: Any) -> list[dict[str, Any]]:
     return sorted(result, key=lambda item: (item["requirement"].casefold(), item["extras"]))
 
 
+def _executor(value: Any) -> dict[str, str]:
+    if not isinstance(value, Mapping) or dict(value) != PUBLIC_EMBEDDED_EXECUTOR:
+        raise ValueError("runtime lock executor is malformed or unsupported")
+    return dict(PUBLIC_EMBEDDED_EXECUTOR)
+
+
+def _release_tuple(value: str) -> tuple[int, int, int] | None:
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", value)
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
+
+
+def validate_installed_framework(executor: Any) -> dict[str, str]:
+    """Verify that the installed distribution is the signed lock's authority."""
+
+    normalized = _executor(executor)
+    try:
+        distribution = installed_framework_distribution()
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise ValueError("installed splime framework is unavailable") from exc
+    version = distribution.version
+    actual = _release_tuple(version)
+    minimum = _release_tuple(normalized["minimum_version"])
+    if actual is None or minimum is None or actual < minimum:
+        raise ValueError("installed splime framework does not satisfy the required minimum version")
+    try:
+        from spl.daemon.worker import PUBLIC_EMBEDDED_HOST_CONTRACT
+    except (ImportError, AttributeError) as exc:
+        raise ValueError("installed splime framework does not provide the embedded host contract") from exc
+    if PUBLIC_EMBEDDED_HOST_CONTRACT != normalized["contract"]:
+        raise ValueError("installed splime framework embedded host contract is incompatible")
+    return {
+        "project": normalized["project"],
+        "version": version,
+        "contract": PUBLIC_EMBEDDED_HOST_CONTRACT,
+    }
+
+
+def installed_framework_distribution() -> importlib.metadata.Distribution:
+    """Select the one installed wheel/editable distribution, ignoring source egg-info."""
+
+    candidates = []
+    for distribution in importlib.metadata.distributions(name="splime"):
+        raw_path = getattr(distribution, "_path", None)
+        if isinstance(raw_path, Path) and raw_path.name.casefold().endswith(".dist-info"):
+            candidates.append(distribution)
+    if len(candidates) != 1:
+        raise importlib.metadata.PackageNotFoundError("one installed splime distribution is required")
+    return candidates[0]
+
+
 def _policy(value: Any) -> dict[str, Any]:
     expected = {
         "name": PUBLIC_RUNTIME_POLICY_NAME,
@@ -227,7 +283,7 @@ def _policy(value: Any) -> dict[str, Any]:
         "wheel_policy": "non-yanked-universal-pure-python-only",
     }
     if not isinstance(value, Mapping) or dict(value) != expected:
-        raise ValueError("runtime lock policy does not match the reviewed 0.4.9 policy")
+        raise ValueError("runtime lock policy does not match the reviewed 0.4.10 policy")
     return expected
 
 
@@ -276,8 +332,11 @@ def _base_artifact(value: Any) -> dict[str, Any]:
         or _VERSION_PATTERN.fullmatch(version) is None
         or not isinstance(filename, str)
         or not filename.endswith(".whl")
+        or Path(filename).name != filename
+        or "\\" in filename
         or type(size) is not int
         or size <= 0
+        or size > MAX_PUBLIC_RUNTIME_WHEEL_BYTES
         or not isinstance(digest, str)
         or _SHA256_PATTERN.fullmatch(digest) is None
     ):
@@ -308,22 +367,29 @@ def _base_artifact(value: Any) -> dict[str, Any]:
         "native_members": [],
         "license_expression": license_expression,
     }
+    if normalized["project"] in {"splime", "splime-public-worker"}:
+        raise ValueError("artifact closure cannot replace the installed splime framework")
+    if not isinstance(normalized["requires_python"], str) or not normalized["requires_python"]:
+        raise ValueError("artifact Python requirement is malformed")
     if set(source) != {"kind", "url"} or source.get("kind") != "official-pypi":
         raise ValueError("third-party artifacts must use official PyPI")
-    if value.get("direct") not in {True, False}:
+    if type(value.get("direct")) is not bool:
         raise ValueError("artifact provenance is malformed")
+    evaluated = [
+        _evaluated_requirement(item)
+        for item in _mapping_list(value.get("evaluated_requirements"), "evaluated requirements")
+    ]
     normalized.update(
         {
             "direct": value["direct"],
-            "parent_requirements": _string_list(value.get("parent_requirements"), "parent requirements"),
-            "evaluated_requirements": _mapping_list(value.get("evaluated_requirements"), "evaluated requirements"),
+            "parent_requirements": _requirement_strings(value.get("parent_requirements"), "parent requirements"),
+            "evaluated_requirements": sorted(evaluated, key=lambda item: item["requirement"]),
             "metadata_url": value.get("metadata_url"),
             "metadata_sha256": value.get("metadata_sha256"),
         }
     )
-    if not isinstance(normalized["metadata_url"], str) or not normalized["metadata_url"].startswith(
-        "https://pypi.org/pypi/"
-    ):
+    metadata_url = normalized["metadata_url"]
+    if not isinstance(metadata_url, str) or not _official_url(metadata_url, "pypi.org", "/pypi/"):
         raise ValueError("artifact metadata origin is not official PyPI")
     if (
         not isinstance(normalized["metadata_sha256"], str)
@@ -331,22 +397,56 @@ def _base_artifact(value: Any) -> dict[str, Any]:
     ):
         raise ValueError("artifact metadata identity is malformed")
     url = source.get("url")
-    if not isinstance(url, str) or not url.startswith("https://files.pythonhosted.org/"):
+    if not isinstance(url, str) or not _official_url(url, "files.pythonhosted.org", "/"):
         raise ValueError("artifact file origin is not official PyPI")
-    normalized["source"] = {"kind": source["kind"], "url": url}
+    normalized["source"] = {"kind": "official-pypi", "url": url}
     return normalized
 
 
-def _executor(value: Any) -> dict[str, str]:
-    expected = {
-        "kind": "installed-framework",
-        "project": "splime",
-        "contract": PUBLIC_EMBEDDED_HOST_CONTRACT,
-        "minimum_version": PUBLIC_EMBEDDED_HOST_MINIMUM_VERSION,
+def _official_url(value: str, hostname: str, path_prefix: str) -> bool:
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(value)
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == hostname
+        and parsed.port is None
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.path.startswith(path_prefix)
+    )
+
+
+def _requirement_strings(value: Any, label: str) -> list[str]:
+    result = _string_list(value, label)
+    if any("@" in item for item in result):
+        raise ValueError(f"{label} must contain index requirements")
+    return result
+
+
+def _evaluated_requirement(value: Mapping[str, Any]) -> dict[str, Any]:
+    if set(value) != {"requirement", "marker", "extras", "included"}:
+        raise ValueError("evaluated requirement evidence is malformed")
+    requirement = value.get("requirement")
+    marker = value.get("marker")
+    included = value.get("included")
+    if (
+        not isinstance(requirement, str)
+        or not requirement
+        or "@" in requirement
+        or marker is not None
+        and (not isinstance(marker, str) or not marker)
+        or type(included) is not bool
+    ):
+        raise ValueError("evaluated requirement evidence is malformed")
+    return {
+        "requirement": requirement,
+        "marker": marker,
+        "extras": _string_list(value.get("extras"), "evaluated requirement extras"),
+        "included": included,
     }
-    if not isinstance(value, Mapping) or dict(value) != expected:
-        raise ValueError("installed framework executor identity is unsupported")
-    return expected
 
 
 def _third_party_artifact(value: Any) -> dict[str, Any]:
@@ -357,15 +457,18 @@ def environment_identity(
     lock: Mapping[str, Any],
     *,
     interpreter_abi: str,
+    framework_identity: Mapping[str, str] | None = None,
 ) -> str:
     """Bind an environment only to its signed lock and interpreter ABI."""
 
     validated = validate_runtime_lock(lock)
+    authority = dict(framework_identity or validate_installed_framework(validated["executor"]))
     return hashlib.sha256(
         _canonical_json(
             {
                 "runtime_lock_hash": validated["lock_hash"],
                 "interpreter_abi": interpreter_abi,
+                "framework": authority,
             }
         )
     ).hexdigest()
@@ -462,22 +565,24 @@ def default_venv_command_builder() -> VenvCommandBuilder:
 
 __all__ = [
     "PipVenvCommandBuilder",
+    "PUBLIC_EMBEDDED_EXECUTOR",
     "PUBLIC_RUNTIME_LOCK_SCHEMA",
-    "PUBLIC_EMBEDDED_HOST_CONTRACT",
-    "PUBLIC_EMBEDDED_HOST_MINIMUM_VERSION",
     "PUBLIC_RUNTIME_POLICY_NAME",
     "PUBLIC_RUNTIME_POLICY_VERSION",
     "PUBLIC_RUNTIME_RESOLVER_NAME",
     "PUBLIC_RUNTIME_SPDX_ALLOWLIST",
+    "MAX_PUBLIC_RUNTIME_WHEEL_BYTES",
     "spdx_allowed",
     "UvVenvCommandBuilder",
     "VenvCommandBuilder",
     "default_venv_command_builder",
     "environment_identity",
     "exact_requirements",
+    "installed_framework_distribution",
     "normalize_exact_dependencies",
     "python_constraint_matches",
     "runtime_lock_document",
+    "validate_installed_framework",
     "validate_runtime_lock",
     "venv_python_path",
 ]

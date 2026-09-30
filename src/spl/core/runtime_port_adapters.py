@@ -19,7 +19,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from importlib import metadata as importlib_metadata
 from types import FunctionType
-from typing import Any, Final, Literal, cast
+from typing import Any, Final, Iterable, Literal, cast
 
 from spl.adapters import (
     BUILTIN_ADAPTER_IDS,
@@ -32,11 +32,16 @@ from spl.adapters import (
     canonical_builtin_semantic_type,
     get_builtin_adapter,
 )
-from spl.core.entities.adapter import RuntimeAdapter
+from spl.core.entities.adapter import LoadAdapter, RuntimeAdapter, SaveAdapter
 from spl.core.json_contract import dumps as json_dumps
 from spl.core.json_contract import validate_json_value
 
 RUNTIME_PORT_ADAPTERS_SCHEMA_VERSION: Final = 1
+ISOLATED_NODE_INPUTS_SCHEMA_VERSION: Final = 2
+ISOLATED_NODE_TRANSPORT_SCHEMA_VERSION: Final = 3
+ISOLATED_NODE_MULTI_OUTPUT_TRANSPORT_SCHEMA_VERSION: Final = 4
+ISOLATED_NODE_OUTPUT_RESULT_SCHEMA_VERSION: Final = 1
+ISOLATED_NODE_MULTI_OUTPUT_RESULT_SCHEMA_VERSION: Final = 2
 RUNTIME_PORT_ADAPTERS_CAPABILITY: Final = "spl.remote_run.runtime_port_adapters.v1"
 RUNTIME_PORT_ADAPTERS_CAPABILITY_VERSION: Final = 1
 RUNTIME_ADAPTER_SEMANTIC_OVERRIDE_CAPABILITY: Final = "spl.runtime_adapter_semantic_override.v1"
@@ -47,6 +52,8 @@ MAX_RUNTIME_ADAPTER_SEMANTIC_ADVISORIES: Final = MAX_RUNTIME_ADAPTER_BINDINGS
 MAX_RUNTIME_INPUT_ARTIFACTS: Final = 1_024
 MAX_RUNTIME_INPUT_BYTES: Final = 256 * 1024 * 1024
 MAX_RUNTIME_INPUT_TOTAL_BYTES: Final = 512 * 1024 * 1024
+MAX_RUNTIME_OUTPUT_BYTES: Final = MAX_RUNTIME_INPUT_BYTES
+MAX_RUNTIME_OUTPUT_TOTAL_BYTES: Final = MAX_RUNTIME_INPUT_TOTAL_BYTES
 MAX_CUSTOM_BUNDLE_BYTES: Final = 512 * 1024
 
 AdapterDirection = Literal["input", "output"]
@@ -129,6 +136,22 @@ _INPUT_KEYS = frozenset(
     }
 )
 _CUSTOM_BUNDLE_KEYS = frozenset({"name", "size", "sha256", "functions", "content_base64", "staged_name"})
+_ISOLATED_INPUT_BINDING_KEYS = _BINDING_KEYS | frozenset({"artifact_key", "legacy_key_guard"})
+_ISOLATED_MULTI_OUTPUT_BINDING_KEYS = _ISOLATED_INPUT_BINDING_KEYS | frozenset({"variant_id"})
+_ISOLATED_OUTPUT_RESULT_KEYS = frozenset(
+    {
+        "schema_version",
+        "transport",
+        "port",
+        "relative_path",
+        "size",
+        "sha256",
+        "adapter_id",
+        "adapter_key",
+        "format_tag",
+    }
+)
+_ISOLATED_MULTI_OUTPUT_RESULT_KEYS = _ISOLATED_OUTPUT_RESULT_KEYS | frozenset({"variant_id"})
 _OUTPUT_RECORD_KEYS = frozenset(
     {"port", "name", "size", "sha256", "format_tag", "adapter_id", "media_type", "result_path"}
 )
@@ -549,11 +572,243 @@ def build_custom_bundle(adapters: Sequence[RuntimeAdapter]) -> tuple[dict[str, A
     )
 
 
+def build_custom_load_bundle(adapters: Sequence[LoadAdapter]) -> tuple[dict[str, Any], dict[int, str]]:
+    """Build the existing deterministic source package with load functions only.
+
+    Per-node isolated input transport does not send an adapter's unused save
+    callable into the consumer environment.  The bundle bytes and import
+    headers deliberately retain the reviewed ``custom-adapters.py`` v1
+    packaging contract.
+    """
+
+    sources: dict[str, str] = {}
+    imports_by_symbol: dict[str, list[dict[str, str]]] = {}
+    symbols: dict[int, str] = {}
+    for adapter in adapters:
+        name, source, imports = _validated_function_source(
+            adapter.load,
+            role="load",
+            distributions=adapter.distributions,
+        )
+        previous = sources.get(name)
+        if previous is not None and previous != source:
+            raise RuntimePortAdapterContractError(
+                "custom_symbol_collision",
+                f"custom adapter bundle contains conflicting function symbol {name!r}",
+            )
+        previous_imports = imports_by_symbol.get(name)
+        if previous_imports is not None and previous_imports != imports:
+            raise RuntimePortAdapterContractError(
+                "custom_dependency_collision",
+                f"custom adapter symbol {name!r} has conflicting import/distribution identity",
+                stage="environment_preflight",
+            )
+        sources[name] = source
+        imports_by_symbol[name] = imports
+        symbols[id(adapter)] = name
+    headers = [
+        "# spl-runtime-import-v1 symbol={symbol} module={module} package={package} version={version}".format(
+            symbol=symbol,
+            **row,
+        )
+        for symbol in sorted(imports_by_symbol)
+        for row in imports_by_symbol[symbol]
+    ]
+    body = "\n\n".join(sources[name].rstrip() for name in sorted(sources)) + "\n"
+    text = ("\n".join(headers) + "\n\n" if headers else "") + body
+    encoded = text.encode("utf-8")
+    if len(encoded) > MAX_CUSTOM_BUNDLE_BYTES:
+        raise RuntimePortAdapterContractError(
+            "custom_bundle_size",
+            f"custom adapter source bundle exceeds {MAX_CUSTOM_BUNDLE_BYTES} bytes",
+        )
+    digest = hashlib.sha256(encoded).hexdigest()
+    return (
+        {
+            "name": "custom-adapters.py",
+            "size": len(encoded),
+            "sha256": digest,
+            "functions": sorted(sources),
+            "content_base64": None,
+            "staged_name": None,
+            "source_bytes": encoded,
+        },
+        symbols,
+    )
+
+
+def build_custom_isolated_bundle(
+    load_adapters: Sequence[LoadAdapter],
+    save_adapters: Sequence[SaveAdapter],
+) -> tuple[dict[str, Any], dict[int, str], dict[int, str]]:
+    """Build one reviewed bundle containing only the halves used by a node."""
+
+    sources: dict[str, str] = {}
+    imports_by_symbol: dict[str, list[dict[str, str]]] = {}
+    load_symbols: dict[int, str] = {}
+    save_symbols: dict[int, str] = {}
+    roles: list[tuple[LoadAdapter | SaveAdapter, str, Any, dict[int, str]]] = [
+        *((adapter, "load", adapter.load, load_symbols) for adapter in load_adapters),
+        *((adapter, "save", adapter.save, save_symbols) for adapter in save_adapters),
+    ]
+    for adapter, role, function, symbol_map in roles:
+        name, source, imports = _validated_function_source(
+            function,
+            role=role,
+            distributions=adapter.distributions,
+            strip_annotations=True,
+        )
+        previous = sources.get(name)
+        if previous is not None and previous != source:
+            raise RuntimePortAdapterContractError(
+                "custom_symbol_collision",
+                f"custom adapter bundle contains conflicting function symbol {name!r}",
+            )
+        previous_imports = imports_by_symbol.get(name)
+        if previous_imports is not None and previous_imports != imports:
+            raise RuntimePortAdapterContractError(
+                "custom_dependency_collision",
+                f"custom adapter symbol {name!r} has conflicting import/distribution identity",
+                stage="environment_preflight",
+            )
+        sources[name] = source
+        imports_by_symbol[name] = imports
+        symbol_map[id(adapter)] = name
+    headers = [
+        "# spl-runtime-import-v1 symbol={symbol} module={module} package={package} version={version}".format(
+            symbol=symbol,
+            **row,
+        )
+        for symbol in sorted(imports_by_symbol)
+        for row in imports_by_symbol[symbol]
+    ]
+    body = "\n\n".join(sources[name].rstrip() for name in sorted(sources)) + "\n"
+    text = ("\n".join(headers) + "\n\n" if headers else "") + body
+    encoded = text.encode("utf-8")
+    if len(encoded) > MAX_CUSTOM_BUNDLE_BYTES:
+        raise RuntimePortAdapterContractError(
+            "custom_bundle_size",
+            f"custom adapter source bundle exceeds {MAX_CUSTOM_BUNDLE_BYTES} bytes",
+        )
+    digest = hashlib.sha256(encoded).hexdigest()
+    return (
+        {
+            "name": "custom-adapters.py",
+            "size": len(encoded),
+            "sha256": digest,
+            "functions": sorted(sources),
+            "content_base64": None,
+            "staged_name": None,
+            "source_bytes": encoded,
+        },
+        load_symbols,
+        save_symbols,
+    )
+
+
+def save_adapter_descriptor(
+    adapter: SaveAdapter,
+    *,
+    adapter_id: str | None,
+    custom_bundle_sha256: str | None = None,
+    save_symbol: str | None = None,
+) -> dict[str, Any]:
+    """Describe exactly one isolated output save half without its load code."""
+
+    if adapter_id is not None:
+        return adapter_descriptor(cast(RuntimeAdapter, adapter), adapter_id=adapter_id)
+    key = _required_text(adapter.key, "adapter key", maximum=512)
+    semantic_type, separator, key_format = key.rpartition("@")
+    if not separator or not semantic_type or not key_format:
+        raise RuntimePortAdapterContractError("adapter_key", "adapter key must be `<python_type>@<format>`")
+    _required_semantic_type(semantic_type)
+    format_tag = _required_tag(adapter.tag, "adapter format tag")
+    if key_format != format_tag:
+        raise RuntimePortAdapterContractError("adapter_key_format", "adapter key format must match format_tag")
+    if custom_bundle_sha256 is None or not _SHA256.fullmatch(custom_bundle_sha256):
+        raise RuntimePortAdapterContractError(
+            "custom_bundle_digest",
+            "custom adapters require a lowercase SHA-256 bundle digest",
+        )
+    if not _python_identifier(save_symbol):
+        raise RuntimePortAdapterContractError(
+            "custom_symbols",
+            "custom adapter save symbol must be a plain Python identifier",
+        )
+    return {
+        "kind": "custom",
+        "id": f"custom:{custom_bundle_sha256}",
+        "key": key,
+        "format_tag": format_tag,
+        "accepted_tags": [format_tag],
+        "distributions": _normalize_distribution_objects(adapter.distributions),
+        "save_symbol": save_symbol,
+        "load_symbol": None,
+        "bundle_sha256": custom_bundle_sha256,
+        "presentation": {"media_type": None, "preferred_extension": None},
+    }
+
+
+def load_adapter_descriptor(
+    adapter: LoadAdapter,
+    *,
+    adapter_id: str | None,
+    artifact_tag: str,
+    custom_bundle_sha256: str | None = None,
+    load_symbol: str | None = None,
+) -> dict[str, Any]:
+    """Describe exactly one isolated input load half without its save code."""
+
+    if adapter_id is not None:
+        descriptor = adapter_descriptor(cast(RuntimeAdapter, adapter), adapter_id=adapter_id)
+        if artifact_tag != descriptor["format_tag"]:
+            raise RuntimePortAdapterContractError(
+                "adapter_input_tag",
+                f"built-in adapter {adapter_id!r} does not emit artifact tag {artifact_tag!r}",
+            )
+        return descriptor
+    key = _required_text(adapter.key, "adapter key", maximum=512)
+    semantic_type, separator, key_format = key.rpartition("@")
+    if not separator or not semantic_type or not key_format:
+        raise RuntimePortAdapterContractError("adapter_key", "adapter key must be `<python_type>@<format>`")
+    _required_semantic_type(semantic_type)
+    accepted_tags = sorted({_required_tag(tag, "adapter accepted tag") for tag in adapter.accepted_tags})
+    normalized_tag = _required_tag(artifact_tag, "input artifact tag")
+    if normalized_tag not in accepted_tags:
+        raise RuntimePortAdapterContractError(
+            "adapter_input_tag",
+            f"input artifact tag {normalized_tag!r} is not accepted by the load adapter",
+        )
+    if custom_bundle_sha256 is None or not _SHA256.fullmatch(custom_bundle_sha256):
+        raise RuntimePortAdapterContractError(
+            "custom_bundle_digest",
+            "custom adapters require a lowercase SHA-256 bundle digest",
+        )
+    if not _python_identifier(load_symbol):
+        raise RuntimePortAdapterContractError(
+            "custom_symbols",
+            "custom adapter load symbol must be a plain Python identifier",
+        )
+    return {
+        "kind": "custom",
+        "id": f"custom:{custom_bundle_sha256}",
+        "key": key,
+        "format_tag": normalized_tag,
+        "accepted_tags": accepted_tags,
+        "distributions": _normalize_distribution_objects(adapter.distributions),
+        "save_symbol": None,
+        "load_symbol": load_symbol,
+        "bundle_sha256": custom_bundle_sha256,
+        "presentation": {"media_type": None, "preferred_extension": None},
+    }
+
+
 def _validated_function_source(
     function: Any,
     *,
     role: str,
     distributions: Sequence[Any],
+    strip_annotations: bool = False,
 ) -> tuple[str, str, list[dict[str, str]]]:
     if not isinstance(function, FunctionType):
         raise RuntimePortAdapterContractError(
@@ -595,6 +850,19 @@ def _validated_function_source(
             "custom_source_shape",
             f"custom adapter {role} must be undecorated and retain its declared name",
         )
+    if strip_annotations:
+        for argument in (
+            *definition.args.posonlyargs,
+            *definition.args.args,
+            *definition.args.kwonlyargs,
+        ):
+            argument.annotation = None
+        if definition.args.vararg is not None:
+            definition.args.vararg.annotation = None
+        if definition.args.kwarg is not None:
+            definition.args.kwarg.annotation = None
+        definition.returns = None
+        definition.type_comment = None
     _validate_custom_function_definition(definition, role=role)
     imports = _validate_function_imports(
         definition,
@@ -1026,6 +1294,897 @@ def normalize_wire_document(value: Any, *, allow_content: bool) -> dict[str, Any
     }
 
 
+def normalize_isolated_node_inputs(
+    value: Any,
+    *,
+    inline_keyword_names: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Validate the closed local schema-v2 artifact-input execution plan."""
+
+    document = _mapping(value, "isolated node inputs")
+    _exact_keys(document, _DOCUMENT_KEYS, "isolated node inputs")
+    if document["schema_version"] != ISOLATED_NODE_INPUTS_SCHEMA_VERSION:
+        raise RuntimePortAdapterContractError(
+            "schema_version",
+            f"isolated node inputs schema_version must be {ISOLATED_NODE_INPUTS_SCHEMA_VERSION}",
+            stage="node_adapter_input_validation",
+        )
+    raw_bindings = _list(document["bindings"], "isolated node inputs.bindings")
+    if not raw_bindings or len(raw_bindings) > MAX_RUNTIME_ADAPTER_BINDINGS:
+        raise RuntimePortAdapterContractError(
+            "bindings_size",
+            "isolated node inputs require a bounded non-empty binding list",
+            stage="node_adapter_input_validation",
+        )
+    bindings = [_normalize_isolated_input_binding(item) for item in raw_bindings]
+    ports = [item["port"] for item in bindings]
+    if len(set(ports)) != len(ports):
+        raise RuntimePortAdapterContractError(
+            "binding_duplicate",
+            "isolated node input port is duplicated",
+            stage="node_adapter_input_validation",
+        )
+    inline_names = set(inline_keyword_names)
+    if any(type(name) is not str for name in inline_names):
+        raise RuntimePortAdapterContractError(
+            "invocation_kwargs",
+            "inline invocation keyword names must be strings",
+            stage="node_adapter_input_validation",
+        )
+    artifact_names = {item["argument"]["name"] for item in bindings}
+    if artifact_names & inline_names:
+        raise RuntimePortAdapterContractError(
+            "argument_collision",
+            "isolated artifact inputs must not overwrite inline keyword arguments",
+            stage="node_adapter_input_validation",
+        )
+
+    raw_inputs = _list(document["inputs"], "isolated node inputs.inputs")
+    if not raw_inputs or len(raw_inputs) > MAX_RUNTIME_INPUT_ARTIFACTS:
+        raise RuntimePortAdapterContractError(
+            "inputs_size",
+            "isolated node inputs require a bounded non-empty artifact list",
+            stage="node_adapter_input_validation",
+        )
+    inputs = [_normalize_input(item, allow_content=False) for item in raw_inputs]
+    names = [item["name"] for item in inputs]
+    if len(set(names)) != len(names):
+        raise RuntimePortAdapterContractError(
+            "input_duplicate",
+            "isolated node input artifact name is duplicated",
+            stage="node_adapter_input_validation",
+        )
+    if sum(item["size"] for item in inputs) > MAX_RUNTIME_INPUT_TOTAL_BYTES:
+        raise RuntimePortAdapterContractError(
+            "input_total_size",
+            "isolated node input artifacts exceed the aggregate size limit",
+            stage="node_adapter_input_validation",
+        )
+    input_by_name = {item["name"]: item for item in inputs}
+    referenced_names: set[str] = set()
+    for binding in bindings:
+        input_name = binding["input_name"]
+        item = input_by_name.get(input_name)
+        if item is None:
+            raise RuntimePortAdapterContractError(
+                "binding_input_missing",
+                f"isolated input binding {binding['port']!r} references an undeclared artifact",
+                stage="node_adapter_input_validation",
+            )
+        referenced_names.add(input_name)
+        adapter = binding["adapter"]
+        expected = (
+            binding["port"],
+            adapter["format_tag"],
+            binding["semantic_type"],
+            adapter["id"],
+            adapter["presentation"]["media_type"],
+        )
+        observed = (
+            item["port"],
+            item["format_tag"],
+            item["semantic_type"],
+            item["adapter_id"],
+            item["media_type"],
+        )
+        if observed != expected:
+            raise RuntimePortAdapterContractError(
+                "binding_input_identity",
+                f"isolated input artifact {input_name!r} does not match its exact binding identity",
+                stage="node_adapter_input_validation",
+            )
+    if referenced_names != set(names):
+        raise RuntimePortAdapterContractError(
+            "input_unbound",
+            "every isolated node input artifact must have exactly one binding",
+            stage="node_adapter_input_validation",
+        )
+
+    raw_bundle = document["custom_bundle"]
+    bundle = None if raw_bundle is None else _normalize_bundle(raw_bundle, allow_content=False)
+    if bundle is not None and bundle["name"] in set(names):
+        raise RuntimePortAdapterContractError(
+            "input_bundle_name_collision",
+            "isolated input artifact name collides with the custom bundle namespace",
+            stage="node_adapter_input_validation",
+        )
+    custom_digests = {
+        binding["adapter"]["bundle_sha256"] for binding in bindings if binding["adapter"]["kind"] == "custom"
+    }
+    if custom_digests:
+        if bundle is None or custom_digests != {bundle["sha256"]}:
+            raise RuntimePortAdapterContractError(
+                "custom_bundle_binding",
+                "isolated custom input bindings must reference the singular bundle digest",
+                stage="node_adapter_input_validation",
+            )
+        symbols = {binding["adapter"]["load_symbol"] for binding in bindings if binding["adapter"]["kind"] == "custom"}
+        if set(bundle["functions"]) != symbols:
+            raise RuntimePortAdapterContractError(
+                "custom_bundle_functions",
+                "custom input bundle functions must exactly equal the bound load symbols",
+                stage="node_adapter_input_validation",
+            )
+    elif bundle is not None:
+        raise RuntimePortAdapterContractError(
+            "custom_bundle_unused",
+            "a custom bundle was supplied without a custom isolated input binding",
+            stage="node_adapter_input_validation",
+        )
+    return {
+        "schema_version": ISOLATED_NODE_INPUTS_SCHEMA_VERSION,
+        "bindings": sorted(bindings, key=lambda item: item["port"]),
+        "inputs": sorted(inputs, key=lambda item: item["name"]),
+        "custom_bundle": bundle,
+    }
+
+
+def isolated_wire_semantic_type(value: Any) -> str | None:
+    """Canonicalize an advisory Python annotation for the restricted local wire schema."""
+
+    if not isinstance(value, str) or not value or len(value) > 256:
+        return None
+    return value if _SAFE_TYPE.fullmatch(value) else None
+
+
+def _normalize_isolated_input_binding(value: Any) -> dict[str, Any]:
+    binding = _mapping(value, "isolated node input binding")
+    _exact_keys(binding, _ISOLATED_INPUT_BINDING_KEYS, "isolated node input binding")
+    if binding["direction"] != "input":
+        raise RuntimePortAdapterContractError(
+            "binding_direction",
+            "isolated node input bindings must have input direction",
+            stage="node_adapter_input_validation",
+        )
+    if binding["transport"] != "artifact":
+        raise RuntimePortAdapterContractError(
+            "binding_transport",
+            "isolated node input bindings support only artifact transport",
+            stage="node_adapter_input_validation",
+        )
+    port = _required_port(binding["port"])
+    external_name = _required_text(binding["external_name"], "binding external_name", maximum=128)
+    if external_name != port:
+        raise RuntimePortAdapterContractError(
+            "binding_external_name",
+            "isolated input external_name must equal its declared port",
+            stage="node_adapter_input_validation",
+        )
+    semantic_type = None if binding["semantic_type"] is None else _required_semantic_type(binding["semantic_type"])
+    adapter = _normalize_isolated_load_descriptor(binding["adapter"])
+    source = binding["resolution_source"]
+    if source not in {"system_default", "preset", "run_override"}:
+        raise RuntimePortAdapterContractError(
+            "binding_source",
+            "isolated input binding resolution_source is not recognized",
+            stage="node_adapter_input_validation",
+        )
+    argument = _normalize_argument(binding["argument"])
+    if argument != {"kind": "keyword", "name": port, "index": None}:
+        raise RuntimePortAdapterContractError(
+            "binding_argument",
+            "isolated input argument must be the keyword location of its declared port",
+            stage="node_adapter_input_validation",
+        )
+    input_name = _required_name(binding["input_name"])
+    result_path = binding["result_path"]
+    if result_path != []:
+        raise RuntimePortAdapterContractError(
+            "binding_result_path",
+            "isolated input binding result_path must be empty",
+            stage="node_adapter_input_validation",
+        )
+    artifact_key = _required_text(binding["artifact_key"], "binding artifact_key", maximum=512)
+    legacy_key_guard = binding["legacy_key_guard"]
+    if type(legacy_key_guard) is not bool:
+        raise RuntimePortAdapterContractError(
+            "binding_legacy_key_guard",
+            "isolated input binding legacy_key_guard must be a bool",
+            stage="node_adapter_input_validation",
+        )
+    if legacy_key_guard and artifact_key != adapter["key"]:
+        raise RuntimePortAdapterContractError(
+            "binding_artifact_key",
+            "isolated input artifact key does not match its guarded load adapter",
+            stage="node_adapter_input_validation",
+        )
+    if adapter["format_tag"] not in adapter["accepted_tags"]:
+        raise RuntimePortAdapterContractError(
+            "binding_artifact_tag",
+            "isolated input artifact tag is not accepted by its load adapter",
+            stage="node_adapter_input_validation",
+        )
+    return {
+        "direction": "input",
+        "port": port,
+        "external_name": external_name,
+        "semantic_type": semantic_type,
+        "adapter": adapter,
+        "resolution_source": source,
+        "transport": "artifact",
+        "argument": argument,
+        "input_name": input_name,
+        "result_path": [],
+        "artifact_key": artifact_key,
+        "legacy_key_guard": legacy_key_guard,
+    }
+
+
+def _normalize_isolated_load_descriptor(value: Any) -> dict[str, Any]:
+    descriptor = _mapping(value, "isolated load adapter descriptor")
+    _exact_keys(descriptor, _ADAPTER_KEYS, "isolated load adapter descriptor")
+    if descriptor["kind"] == "builtin":
+        return _normalize_adapter_descriptor(descriptor)
+    if descriptor["kind"] != "custom":
+        raise RuntimePortAdapterContractError(
+            "adapter_kind",
+            "isolated input adapter kind must be builtin or custom",
+            stage="node_adapter_input_validation",
+        )
+    adapter_id = _required_text(descriptor["id"], "adapter id", maximum=256)
+    bundle_sha256 = descriptor["bundle_sha256"]
+    if (
+        not isinstance(bundle_sha256, str)
+        or not _SHA256.fullmatch(bundle_sha256)
+        or adapter_id != f"custom:{bundle_sha256}"
+    ):
+        raise RuntimePortAdapterContractError(
+            "adapter_custom_id",
+            "custom isolated input adapter id must bind its bundle digest",
+            stage="node_adapter_input_validation",
+        )
+    key = _required_text(descriptor["key"], "adapter key", maximum=512)
+    semantic_type, separator, key_format = key.rpartition("@")
+    if not separator or not semantic_type or not key_format:
+        raise RuntimePortAdapterContractError("adapter_key", "adapter key must be `<python_type>@<format>`")
+    _required_semantic_type(semantic_type)
+    format_tag = _required_tag(descriptor["format_tag"], "adapter format_tag")
+    accepted = descriptor["accepted_tags"]
+    if not isinstance(accepted, list) or not accepted:
+        raise RuntimePortAdapterContractError("adapter_accepted_tags", "accepted_tags must be a non-empty list")
+    accepted_tags = sorted({_required_tag(item, "accepted tag") for item in accepted})
+    if len(accepted_tags) != len(accepted) or format_tag not in accepted_tags:
+        raise RuntimePortAdapterContractError(
+            "adapter_accepted_tags",
+            "accepted_tags must be unique and contain the input artifact tag",
+        )
+    if descriptor["save_symbol"] is not None or not _python_identifier(descriptor["load_symbol"]):
+        raise RuntimePortAdapterContractError(
+            "adapter_symbols",
+            "custom isolated input descriptors require only one load symbol",
+            stage="node_adapter_input_validation",
+        )
+    presentation = _mapping(descriptor["presentation"], "adapter presentation")
+    _exact_keys(presentation, _PRESENTATION_KEYS, "adapter presentation")
+    if presentation != {"media_type": None, "preferred_extension": None}:
+        raise RuntimePortAdapterContractError(
+            "adapter_presentation",
+            "custom isolated input adapter presentation must be empty",
+            stage="node_adapter_input_validation",
+        )
+    return {
+        "kind": "custom",
+        "id": adapter_id,
+        "key": key,
+        "format_tag": format_tag,
+        "accepted_tags": accepted_tags,
+        "distributions": _normalize_distribution_dicts(descriptor["distributions"]),
+        "save_symbol": None,
+        "load_symbol": descriptor["load_symbol"],
+        "bundle_sha256": bundle_sha256,
+        "presentation": {"media_type": None, "preferred_extension": None},
+    }
+
+
+def normalize_isolated_node_transport(
+    value: Any,
+    *,
+    inline_keyword_names: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Validate the closed local schema-v3 mixed input/output execution plan."""
+
+    document = _mapping(value, "isolated node transport")
+    _exact_keys(document, _DOCUMENT_KEYS, "isolated node transport")
+    if document["schema_version"] != ISOLATED_NODE_TRANSPORT_SCHEMA_VERSION:
+        raise RuntimePortAdapterContractError(
+            "schema_version",
+            f"isolated node transport schema_version must be {ISOLATED_NODE_TRANSPORT_SCHEMA_VERSION}",
+            stage="node_adapter_output_validation",
+        )
+    raw_bindings = _list(document["bindings"], "isolated node transport.bindings")
+    if not raw_bindings or len(raw_bindings) > MAX_RUNTIME_ADAPTER_BINDINGS:
+        raise RuntimePortAdapterContractError(
+            "bindings_size",
+            "isolated node transport requires a bounded non-empty binding list",
+            stage="node_adapter_output_validation",
+        )
+    input_bindings = [
+        _normalize_isolated_input_binding(item)
+        for item in raw_bindings
+        if isinstance(item, Mapping) and item.get("direction") == "input"
+    ]
+    output_bindings = [
+        _normalize_isolated_output_binding(item)
+        for item in raw_bindings
+        if isinstance(item, Mapping) and item.get("direction") == "output"
+    ]
+    if len(input_bindings) + len(output_bindings) != len(raw_bindings) or len(output_bindings) != 1:
+        raise RuntimePortAdapterContractError(
+            "binding_direction",
+            "isolated node transport requires exactly one output binding and only input/output directions",
+            stage="node_adapter_output_validation",
+        )
+    ports = [(item["direction"], item["port"]) for item in (*input_bindings, *output_bindings)]
+    if len(set(ports)) != len(ports):
+        raise RuntimePortAdapterContractError(
+            "binding_duplicate",
+            "isolated node transport port is duplicated",
+            stage="node_adapter_output_validation",
+        )
+    inline_names = set(inline_keyword_names)
+    if any(type(name) is not str for name in inline_names):
+        raise RuntimePortAdapterContractError(
+            "invocation_kwargs",
+            "inline invocation keyword names must be strings",
+            stage="node_adapter_input_validation",
+        )
+    artifact_argument_names = {item["argument"]["name"] for item in input_bindings}
+    if artifact_argument_names & inline_names:
+        raise RuntimePortAdapterContractError(
+            "argument_collision",
+            "isolated artifact inputs must not overwrite inline keyword arguments",
+            stage="node_adapter_input_validation",
+        )
+
+    raw_inputs = _list(document["inputs"], "isolated node transport.inputs")
+    if len(raw_inputs) > MAX_RUNTIME_INPUT_ARTIFACTS:
+        raise RuntimePortAdapterContractError(
+            "inputs_size",
+            "isolated node transport artifact list exceeds its bound",
+            stage="node_adapter_input_validation",
+        )
+    inputs = [_normalize_input(item, allow_content=False) for item in raw_inputs]
+    names = [item["name"] for item in inputs]
+    if len(set(names)) != len(names) or sum(item["size"] for item in inputs) > MAX_RUNTIME_INPUT_TOTAL_BYTES:
+        raise RuntimePortAdapterContractError(
+            "input_identity",
+            "isolated node input artifacts are duplicated or exceed their aggregate bound",
+            stage="node_adapter_input_validation",
+        )
+    input_by_name = {item["name"]: item for item in inputs}
+    referenced: set[str] = set()
+    for binding in input_bindings:
+        item = input_by_name.get(binding["input_name"])
+        if item is None:
+            raise RuntimePortAdapterContractError(
+                "binding_input_missing",
+                "isolated input binding references an undeclared artifact",
+                stage="node_adapter_input_validation",
+            )
+        referenced.add(item["name"])
+        adapter = binding["adapter"]
+        expected = (
+            binding["port"],
+            adapter["format_tag"],
+            binding["semantic_type"],
+            adapter["id"],
+            adapter["presentation"]["media_type"],
+        )
+        observed = (
+            item["port"],
+            item["format_tag"],
+            item["semantic_type"],
+            item["adapter_id"],
+            item["media_type"],
+        )
+        if observed != expected:
+            raise RuntimePortAdapterContractError(
+                "binding_input_identity",
+                "isolated input artifact does not match its exact binding identity",
+                stage="node_adapter_input_validation",
+            )
+    if referenced != set(names):
+        raise RuntimePortAdapterContractError(
+            "input_unbound",
+            "every isolated node input artifact must have exactly one binding",
+            stage="node_adapter_input_validation",
+        )
+
+    raw_bundle = document["custom_bundle"]
+    bundle = None if raw_bundle is None else _normalize_bundle(raw_bundle, allow_content=False)
+    if bundle is not None and bundle["name"] in set(names):
+        raise RuntimePortAdapterContractError(
+            "input_bundle_name_collision",
+            "isolated input artifact name collides with the custom bundle namespace",
+            stage="node_adapter_input_validation",
+        )
+    custom_bindings = [
+        binding for binding in (*input_bindings, *output_bindings) if binding["adapter"]["kind"] == "custom"
+    ]
+    if custom_bindings:
+        digests = {binding["adapter"]["bundle_sha256"] for binding in custom_bindings}
+        symbols = {
+            binding["adapter"]["load_symbol"] if binding["direction"] == "input" else binding["adapter"]["save_symbol"]
+            for binding in custom_bindings
+        }
+        if bundle is None or digests != {bundle["sha256"]} or symbols != set(bundle["functions"]):
+            raise RuntimePortAdapterContractError(
+                "custom_bundle_binding",
+                "isolated custom bindings must match the singular bundle and its exact role symbols",
+                stage="node_adapter_output_validation",
+            )
+    elif bundle is not None:
+        raise RuntimePortAdapterContractError(
+            "custom_bundle_unused",
+            "a custom bundle was supplied without any custom isolated binding",
+            stage="node_adapter_output_validation",
+        )
+    bindings = sorted((*input_bindings, *output_bindings), key=lambda item: (item["direction"], item["port"]))
+    return {
+        "schema_version": ISOLATED_NODE_TRANSPORT_SCHEMA_VERSION,
+        "bindings": bindings,
+        "inputs": sorted(inputs, key=lambda item: item["name"]),
+        "custom_bundle": bundle,
+    }
+
+
+def normalize_isolated_node_multi_output_transport(
+    value: Any,
+    *,
+    inline_keyword_names: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Validate the closed schema-v4 multi-variant output execution plan."""
+
+    document = _mapping(value, "isolated node multi-output transport")
+    _exact_keys(document, _DOCUMENT_KEYS, "isolated node multi-output transport")
+    if document["schema_version"] != ISOLATED_NODE_MULTI_OUTPUT_TRANSPORT_SCHEMA_VERSION:
+        raise RuntimePortAdapterContractError(
+            "schema_version",
+            "isolated node multi-output transport schema_version must be {}".format(
+                ISOLATED_NODE_MULTI_OUTPUT_TRANSPORT_SCHEMA_VERSION
+            ),
+            stage="node_adapter_output_validation",
+        )
+    raw_bindings = _list(document["bindings"], "isolated node multi-output transport.bindings")
+    if not raw_bindings or len(raw_bindings) > MAX_RUNTIME_ADAPTER_BINDINGS:
+        raise RuntimePortAdapterContractError(
+            "bindings_size",
+            "isolated node multi-output transport requires a bounded non-empty binding list",
+            stage="node_adapter_output_validation",
+        )
+    input_bindings: list[dict[str, Any]] = []
+    output_bindings: list[dict[str, Any]] = []
+    for item in raw_bindings:
+        if not isinstance(item, Mapping):
+            raise RuntimePortAdapterContractError(
+                "binding_shape",
+                "isolated node multi-output binding must be an object",
+                stage="node_adapter_output_validation",
+            )
+        if item.get("direction") == "input":
+            input_bindings.append(_normalize_isolated_input_binding(item))
+            continue
+        if item.get("direction") != "output":
+            raise RuntimePortAdapterContractError(
+                "binding_direction",
+                "isolated node multi-output transport allows only input/output directions",
+                stage="node_adapter_output_validation",
+            )
+        try:
+            _exact_keys(item, _ISOLATED_MULTI_OUTPUT_BINDING_KEYS, "isolated node multi-output binding")
+        except RuntimePortAdapterContractError as exc:
+            raise RuntimePortAdapterContractError(
+                exc.code,
+                "isolated node output binding is invalid",
+                stage="node_adapter_output_validation",
+            ) from None
+        variant_id = item["variant_id"]
+        if not isinstance(variant_id, str) or not _SHA256.fullmatch(variant_id):
+            raise RuntimePortAdapterContractError(
+                "binding_variant",
+                "isolated node output variant_id must be a lowercase sha256",
+                stage="node_adapter_output_validation",
+            )
+        legacy = dict(item)
+        legacy.pop("variant_id")
+        normalized = _normalize_isolated_output_binding(legacy)
+        normalized["variant_id"] = variant_id
+        output_bindings.append(normalized)
+    if len(output_bindings) < 2:
+        raise RuntimePortAdapterContractError(
+            "binding_direction",
+            "schema-v4 isolated node transport requires at least two output variants",
+            stage="node_adapter_output_validation",
+        )
+    output_ports = {item["port"] for item in output_bindings}
+    variant_ids = [item["variant_id"] for item in output_bindings]
+    adapter_identities = [
+        json_dumps(item["adapter"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        for item in output_bindings
+    ]
+    if len(output_ports) != 1 or len(set(variant_ids)) != len(variant_ids):
+        raise RuntimePortAdapterContractError(
+            "binding_duplicate",
+            "isolated node output variants must have one port and unique variant ids",
+            stage="node_adapter_output_validation",
+        )
+    if len(set(adapter_identities)) != len(adapter_identities):
+        raise RuntimePortAdapterContractError(
+            "binding_duplicate",
+            "isolated node output variants must have distinct save adapter identities",
+            stage="node_adapter_output_validation",
+        )
+    input_ports = [item["port"] for item in input_bindings]
+    if len(set(input_ports)) != len(input_ports):
+        raise RuntimePortAdapterContractError(
+            "binding_duplicate",
+            "isolated node input port is duplicated",
+            stage="node_adapter_output_validation",
+        )
+
+    inline_names = set(inline_keyword_names)
+    if any(type(name) is not str for name in inline_names):
+        raise RuntimePortAdapterContractError(
+            "invocation_kwargs",
+            "inline invocation keyword names must be strings",
+            stage="node_adapter_input_validation",
+        )
+    artifact_argument_names = {item["argument"]["name"] for item in input_bindings}
+    if artifact_argument_names & inline_names:
+        raise RuntimePortAdapterContractError(
+            "argument_collision",
+            "isolated artifact inputs must not overwrite inline keyword arguments",
+            stage="node_adapter_input_validation",
+        )
+
+    raw_inputs = _list(document["inputs"], "isolated node multi-output transport.inputs")
+    if len(raw_inputs) > MAX_RUNTIME_INPUT_ARTIFACTS:
+        raise RuntimePortAdapterContractError(
+            "inputs_size",
+            "isolated node transport artifact list exceeds its bound",
+            stage="node_adapter_input_validation",
+        )
+    inputs = [_normalize_input(item, allow_content=False) for item in raw_inputs]
+    names = [item["name"] for item in inputs]
+    if len(set(names)) != len(names) or sum(item["size"] for item in inputs) > MAX_RUNTIME_INPUT_TOTAL_BYTES:
+        raise RuntimePortAdapterContractError(
+            "input_identity",
+            "isolated node input artifacts are duplicated or exceed their aggregate bound",
+            stage="node_adapter_input_validation",
+        )
+    input_by_name = {item["name"]: item for item in inputs}
+    referenced: set[str] = set()
+    for binding in input_bindings:
+        item = input_by_name.get(binding["input_name"])
+        if item is None:
+            raise RuntimePortAdapterContractError(
+                "binding_input_missing",
+                "isolated input binding references an undeclared artifact",
+                stage="node_adapter_input_validation",
+            )
+        referenced.add(item["name"])
+        adapter = binding["adapter"]
+        expected = (
+            binding["port"],
+            adapter["format_tag"],
+            binding["semantic_type"],
+            adapter["id"],
+            adapter["presentation"]["media_type"],
+        )
+        observed = (
+            item["port"],
+            item["format_tag"],
+            item["semantic_type"],
+            item["adapter_id"],
+            item["media_type"],
+        )
+        if observed != expected:
+            raise RuntimePortAdapterContractError(
+                "binding_input_identity",
+                "isolated input artifact does not match its exact binding identity",
+                stage="node_adapter_input_validation",
+            )
+    if referenced != set(names):
+        raise RuntimePortAdapterContractError(
+            "input_unbound",
+            "every isolated node input artifact must have exactly one binding",
+            stage="node_adapter_input_validation",
+        )
+
+    raw_bundle = document["custom_bundle"]
+    bundle = None if raw_bundle is None else _normalize_bundle(raw_bundle, allow_content=False)
+    if bundle is not None and bundle["name"] in set(names):
+        raise RuntimePortAdapterContractError(
+            "input_bundle_name_collision",
+            "isolated input artifact name collides with the custom bundle namespace",
+            stage="node_adapter_input_validation",
+        )
+    all_bindings = [*input_bindings, *output_bindings]
+    custom_bindings = [binding for binding in all_bindings if binding["adapter"]["kind"] == "custom"]
+    if custom_bindings:
+        digests = {binding["adapter"]["bundle_sha256"] for binding in custom_bindings}
+        symbols = {
+            binding["adapter"]["load_symbol"] if binding["direction"] == "input" else binding["adapter"]["save_symbol"]
+            for binding in custom_bindings
+        }
+        if bundle is None or digests != {bundle["sha256"]} or symbols != set(bundle["functions"]):
+            raise RuntimePortAdapterContractError(
+                "custom_bundle_binding",
+                "isolated custom bindings must match the singular bundle and its exact role symbols",
+                stage="node_adapter_output_validation",
+            )
+    elif bundle is not None:
+        raise RuntimePortAdapterContractError(
+            "custom_bundle_unused",
+            "a custom bundle was supplied without any custom isolated binding",
+            stage="node_adapter_output_validation",
+        )
+    return {
+        "schema_version": ISOLATED_NODE_MULTI_OUTPUT_TRANSPORT_SCHEMA_VERSION,
+        "bindings": sorted(
+            all_bindings,
+            key=lambda item: (item["direction"], item["port"], str(item.get("variant_id", ""))),
+        ),
+        "inputs": sorted(inputs, key=lambda item: item["name"]),
+        "custom_bundle": bundle,
+    }
+
+
+def _normalize_isolated_output_binding(value: Any) -> dict[str, Any]:
+    try:
+        return _normalize_isolated_output_binding_value(value)
+    except RuntimePortAdapterContractError as exc:
+        raise RuntimePortAdapterContractError(
+            exc.code,
+            "isolated node output binding is invalid",
+            stage="node_adapter_output_validation",
+        ) from None
+
+
+def _normalize_isolated_output_binding_value(value: Any) -> dict[str, Any]:
+    binding = _mapping(value, "isolated node output binding")
+    _exact_keys(binding, _ISOLATED_INPUT_BINDING_KEYS, "isolated node output binding")
+    if binding["direction"] != "output" or binding["transport"] != "artifact":
+        raise RuntimePortAdapterContractError(
+            "binding_transport",
+            "isolated node output bindings support only artifact transport",
+            stage="node_adapter_output_validation",
+        )
+    port = _required_port(binding["port"])
+    external_name = _required_text(binding["external_name"], "binding external_name", maximum=128)
+    if external_name != port:
+        raise RuntimePortAdapterContractError(
+            "binding_external_name",
+            "isolated output external_name must equal its declared port",
+            stage="node_adapter_output_validation",
+        )
+    semantic_type = None if binding["semantic_type"] is None else _required_semantic_type(binding["semantic_type"])
+    adapter = _normalize_isolated_save_descriptor(binding["adapter"])
+    source = binding["resolution_source"]
+    if source not in {"system_default", "preset", "run_override"}:
+        raise RuntimePortAdapterContractError(
+            "binding_source",
+            "isolated output binding resolution_source is not recognized",
+            stage="node_adapter_output_validation",
+        )
+    if binding["argument"] is not None or binding["input_name"] is not None or binding["result_path"] != []:
+        raise RuntimePortAdapterContractError(
+            "binding_location",
+            "isolated output binding cannot declare an input or nested result location",
+            stage="node_adapter_output_validation",
+        )
+    artifact_key = _required_text(binding["artifact_key"], "binding artifact_key", maximum=512)
+    if artifact_key != adapter["key"] or binding["legacy_key_guard"] is not False:
+        raise RuntimePortAdapterContractError(
+            "binding_artifact_key",
+            "isolated output binding must carry the exact save-adapter key",
+            stage="node_adapter_output_validation",
+        )
+    return {
+        "direction": "output",
+        "port": port,
+        "external_name": external_name,
+        "semantic_type": semantic_type,
+        "adapter": adapter,
+        "resolution_source": source,
+        "transport": "artifact",
+        "argument": None,
+        "input_name": None,
+        "result_path": [],
+        "artifact_key": artifact_key,
+        "legacy_key_guard": False,
+    }
+
+
+def _normalize_isolated_save_descriptor(value: Any) -> dict[str, Any]:
+    try:
+        return _normalize_isolated_save_descriptor_value(value)
+    except RuntimePortAdapterContractError as exc:
+        raise RuntimePortAdapterContractError(
+            exc.code,
+            "isolated output save adapter descriptor is invalid",
+            stage="node_adapter_output_validation",
+        ) from None
+
+
+def _normalize_isolated_save_descriptor_value(value: Any) -> dict[str, Any]:
+    descriptor = _mapping(value, "isolated save adapter descriptor")
+    _exact_keys(descriptor, _ADAPTER_KEYS, "isolated save adapter descriptor")
+    distributions = _normalize_distribution_dicts(descriptor["distributions"])
+    distribution_packages = [_canonical_package(item["package"]) for item in distributions]
+    if len(distributions) != len(descriptor["distributions"]) or len(set(distribution_packages)) != len(
+        distribution_packages
+    ):
+        raise RuntimePortAdapterContractError(
+            "adapter_distribution_duplicate",
+            "isolated output save adapter distributions must be unique",
+        )
+    if descriptor["kind"] == "builtin":
+        return _normalize_adapter_descriptor(descriptor)
+    if descriptor["kind"] != "custom":
+        raise RuntimePortAdapterContractError(
+            "adapter_kind",
+            "isolated output adapter kind must be builtin or custom",
+            stage="node_adapter_output_validation",
+        )
+    adapter_id = _required_text(descriptor["id"], "adapter id", maximum=256)
+    bundle_sha256 = descriptor["bundle_sha256"]
+    if (
+        not isinstance(bundle_sha256, str)
+        or not _SHA256.fullmatch(bundle_sha256)
+        or adapter_id != f"custom:{bundle_sha256}"
+    ):
+        raise RuntimePortAdapterContractError(
+            "adapter_custom_id",
+            "custom isolated output adapter id must bind its bundle digest",
+            stage="node_adapter_output_validation",
+        )
+    key = _required_text(descriptor["key"], "adapter key", maximum=512)
+    semantic_type, separator, key_format = key.rpartition("@")
+    if not separator or not semantic_type or not key_format:
+        raise RuntimePortAdapterContractError("adapter_key", "adapter key must be `<python_type>@<format>`")
+    _required_semantic_type(semantic_type)
+    format_tag = _required_tag(descriptor["format_tag"], "adapter format_tag")
+    accepted = descriptor["accepted_tags"]
+    if accepted != [format_tag] or key_format != format_tag:
+        raise RuntimePortAdapterContractError(
+            "adapter_tags",
+            "custom isolated output descriptor must declare only its emitted format tag",
+            stage="node_adapter_output_validation",
+        )
+    if not _python_identifier(descriptor["save_symbol"]) or descriptor["load_symbol"] is not None:
+        raise RuntimePortAdapterContractError(
+            "adapter_symbols",
+            "custom isolated output descriptors require only one save symbol",
+            stage="node_adapter_output_validation",
+        )
+    presentation = _mapping(descriptor["presentation"], "adapter presentation")
+    _exact_keys(presentation, _PRESENTATION_KEYS, "adapter presentation")
+    if presentation != {"media_type": None, "preferred_extension": None}:
+        raise RuntimePortAdapterContractError(
+            "adapter_presentation",
+            "custom isolated output adapter presentation must be empty",
+            stage="node_adapter_output_validation",
+        )
+    return {
+        "kind": "custom",
+        "id": adapter_id,
+        "key": key,
+        "format_tag": format_tag,
+        "accepted_tags": [format_tag],
+        "distributions": distributions,
+        "save_symbol": descriptor["save_symbol"],
+        "load_symbol": None,
+        "bundle_sha256": bundle_sha256,
+        "presentation": {"media_type": None, "preferred_extension": None},
+    }
+
+
+def normalize_isolated_node_output_result(value: Any) -> dict[str, Any]:
+    """Validate one closed artifact result descriptor without touching the file."""
+
+    result = _mapping(value, "isolated node output result")
+    _exact_keys(result, _ISOLATED_OUTPUT_RESULT_KEYS, "isolated node output result")
+    if result["schema_version"] != ISOLATED_NODE_OUTPUT_RESULT_SCHEMA_VERSION:
+        raise RuntimePortAdapterContractError(
+            "result_version",
+            "isolated node output result schema_version is not supported",
+            stage="node_adapter_output_validation",
+        )
+    if result["transport"] != "artifact":
+        raise RuntimePortAdapterContractError(
+            "result_transport",
+            "isolated node output result transport must be artifact",
+            stage="node_adapter_output_validation",
+        )
+    port = _required_port(result["port"])
+    relative_path = _required_text(result["relative_path"], "result relative_path", maximum=512)
+    path_parts = relative_path.split("/")
+    if (
+        len(path_parts) != 2
+        or path_parts[0] != "runtime-outputs"
+        or not _SAFE_NAME.fullmatch(path_parts[1])
+        or path_parts[1] in {".", ".."}
+        or "\\" in relative_path
+    ):
+        raise RuntimePortAdapterContractError(
+            "result_path",
+            "isolated node output result path is outside its dedicated namespace",
+            stage="node_adapter_output_validation",
+        )
+    size = result["size"]
+    if type(size) is not int or size < 0 or size > MAX_RUNTIME_OUTPUT_BYTES:
+        raise RuntimePortAdapterContractError(
+            "result_size",
+            "isolated node output result size is out of bounds",
+            stage="node_adapter_output_validation",
+        )
+    sha256 = result["sha256"]
+    if not isinstance(sha256, str) or not _SHA256.fullmatch(sha256):
+        raise RuntimePortAdapterContractError(
+            "result_sha256",
+            "isolated node output result sha256 is invalid",
+            stage="node_adapter_output_validation",
+        )
+    return {
+        "schema_version": ISOLATED_NODE_OUTPUT_RESULT_SCHEMA_VERSION,
+        "transport": "artifact",
+        "port": port,
+        "relative_path": relative_path,
+        "size": size,
+        "sha256": sha256,
+        "adapter_id": _required_text(result["adapter_id"], "result adapter_id", maximum=256),
+        "adapter_key": _required_text(result["adapter_key"], "result adapter_key", maximum=512),
+        "format_tag": _required_tag(result["format_tag"], "result format_tag"),
+    }
+
+
+def normalize_isolated_node_multi_output_result(value: Any) -> dict[str, Any]:
+    """Validate one closed schema-v2 multi-variant artifact descriptor."""
+
+    result = _mapping(value, "isolated node multi-output result")
+    _exact_keys(result, _ISOLATED_MULTI_OUTPUT_RESULT_KEYS, "isolated node multi-output result")
+    legacy = dict(result)
+    variant_id = legacy.pop("variant_id")
+    if not isinstance(variant_id, str) or not _SHA256.fullmatch(variant_id):
+        raise RuntimePortAdapterContractError(
+            "result_variant",
+            "isolated node output result variant_id is invalid",
+            stage="node_adapter_output_validation",
+        )
+    legacy["schema_version"] = ISOLATED_NODE_OUTPUT_RESULT_SCHEMA_VERSION
+    normalized = normalize_isolated_node_output_result(legacy)
+    normalized["schema_version"] = ISOLATED_NODE_MULTI_OUTPUT_RESULT_SCHEMA_VERSION
+    normalized["variant_id"] = variant_id
+    if result["schema_version"] != ISOLATED_NODE_MULTI_OUTPUT_RESULT_SCHEMA_VERSION:
+        raise RuntimePortAdapterContractError(
+            "result_version",
+            "isolated node multi-output result schema_version is not supported",
+            stage="node_adapter_output_validation",
+        )
+    return normalized
+
+
 def validate_custom_bundle_dependencies(
     source_bytes: bytes,
     document: Mapping[str, Any],
@@ -1161,6 +2320,292 @@ def validate_custom_bundle_dependencies(
                         f"custom adapter distribution {package!r} does not match its declared exact version",
                         stage="worker_load",
                     )
+
+
+def validate_isolated_node_input_bundle_dependencies(
+    source_bytes: bytes,
+    document: Mapping[str, Any],
+    *,
+    verify_installed_environment: bool = False,
+) -> None:
+    """Validate a load-only bundle using the existing reviewed-source rules."""
+
+    normalized = normalize_isolated_node_inputs(document)
+    bundle = normalized["custom_bundle"]
+    if bundle is None:
+        if source_bytes:
+            raise RuntimePortAdapterContractError(
+                "custom_bundle_unused",
+                "custom bundle bytes were supplied without a custom isolated input binding",
+                stage="environment_preflight",
+            )
+        return
+    try:
+        source = source_bytes.decode("utf-8")
+        tree = ast.parse(source, filename="<runtime-custom-adapters>", mode="exec")
+    except (UnicodeDecodeError, SyntaxError):
+        raise RuntimePortAdapterContractError(
+            "custom_bundle_source",
+            "custom adapter bundle is not valid UTF-8 Python source",
+            stage="environment_preflight",
+        ) from None
+    definitions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef) and not node.decorator_list
+    }
+    if len(definitions) != len(tree.body) or set(definitions) != set(bundle["functions"]):
+        raise RuntimePortAdapterContractError(
+            "custom_bundle_functions",
+            "custom adapter bundle definitions do not match its descriptor",
+            stage="environment_preflight",
+        )
+    headers_by_symbol: dict[str, dict[str, tuple[str, str]]] = {}
+    for line in source.splitlines():
+        if not line.startswith("# spl-runtime-import-v1"):
+            continue
+        match = _IMPORT_HEADER.fullmatch(line)
+        if match is None:
+            raise RuntimePortAdapterContractError(
+                "custom_import_metadata",
+                "custom adapter import metadata is malformed",
+                stage="environment_preflight",
+            )
+        symbol, module, package, version = match.groups()
+        rows = headers_by_symbol.setdefault(symbol, {})
+        if module in rows:
+            raise RuntimePortAdapterContractError(
+                "custom_import_metadata",
+                "custom adapter import metadata is duplicated",
+                stage="environment_preflight",
+            )
+        rows[module] = (package, version)
+    packages_by_symbol: dict[str, set[tuple[str, str]]] = {}
+    for binding in normalized["bindings"]:
+        adapter = binding["adapter"]
+        if adapter["kind"] != "custom":
+            continue
+        symbol = str(adapter["load_symbol"])
+        packages = {(_canonical_package(item["package"]), item["version"]) for item in adapter["distributions"]}
+        existing = packages_by_symbol.get(symbol)
+        packages_by_symbol[symbol] = packages if existing is None else existing & packages
+    if set(headers_by_symbol) - set(definitions):
+        raise RuntimePortAdapterContractError(
+            "custom_import_metadata",
+            "custom adapter import metadata names an undeclared function",
+            stage="environment_preflight",
+        )
+    installed_owners = importlib_metadata.packages_distributions() if verify_installed_environment else {}
+    for symbol, definition in definitions.items():
+        if symbol not in packages_by_symbol:
+            raise RuntimePortAdapterContractError(
+                "custom_signature",
+                f"custom adapter function {symbol!r} is not bound as a load half",
+                stage="environment_preflight",
+            )
+        _validate_custom_function_definition(
+            definition,
+            role="load",
+            stage="worker_load" if verify_installed_environment else "environment_preflight",
+        )
+        roots = _function_import_roots(definition)
+        headers = headers_by_symbol.get(symbol, {})
+        if set(headers) != set(roots):
+            raise RuntimePortAdapterContractError(
+                "custom_import_dependency",
+                f"custom adapter function {symbol!r} import metadata is incomplete",
+                stage="environment_preflight",
+            )
+        declared = packages_by_symbol[symbol]
+        if any((_canonical_package(package), version) not in declared for package, version in headers.values()):
+            raise RuntimePortAdapterContractError(
+                "custom_import_dependency",
+                f"custom adapter function {symbol!r} imports an undeclared exact distribution",
+                stage="environment_preflight",
+            )
+        if not verify_installed_environment:
+            continue
+        for module, (package, version) in headers.items():
+            expected_package = _canonical_package(package)
+            owners = {_canonical_package(owner): owner for owner in installed_owners.get(module, [])}
+            if set(owners) != {expected_package}:
+                raise RuntimePortAdapterContractError(
+                    "custom_import_environment_owner",
+                    f"custom adapter import {module!r} is not owned by its singular declared distribution",
+                    stage="worker_load",
+                )
+            try:
+                installed_version = importlib_metadata.version(owners[expected_package])
+            except importlib_metadata.PackageNotFoundError:
+                raise RuntimePortAdapterContractError(
+                    "custom_import_environment_missing",
+                    f"custom adapter distribution {package!r} is not installed",
+                    stage="worker_load",
+                ) from None
+            if installed_version != version:
+                raise RuntimePortAdapterContractError(
+                    "custom_import_environment_version",
+                    f"custom adapter distribution {package!r} does not match its declared exact version",
+                    stage="worker_load",
+                )
+
+
+def validate_isolated_node_transport_bundle_dependencies(
+    source_bytes: bytes,
+    document: Mapping[str, Any],
+    *,
+    verify_installed_environment: bool = False,
+) -> None:
+    """Validate the exact load/save halves referenced by a schema-v3 node plan."""
+
+    normalized = normalize_isolated_node_transport(document)
+    _validate_normalized_isolated_node_transport_bundle_dependencies(
+        source_bytes,
+        normalized,
+        verify_installed_environment=verify_installed_environment,
+    )
+
+
+def validate_isolated_node_multi_output_transport_bundle_dependencies(
+    source_bytes: bytes,
+    document: Mapping[str, Any],
+    *,
+    verify_installed_environment: bool = False,
+) -> None:
+    """Validate exact load/save halves referenced by a schema-v4 node plan."""
+
+    normalized = normalize_isolated_node_multi_output_transport(document)
+    _validate_normalized_isolated_node_transport_bundle_dependencies(
+        source_bytes,
+        normalized,
+        verify_installed_environment=verify_installed_environment,
+    )
+
+
+def _validate_normalized_isolated_node_transport_bundle_dependencies(
+    source_bytes: bytes,
+    normalized: Mapping[str, Any],
+    *,
+    verify_installed_environment: bool,
+) -> None:
+    bundle = normalized["custom_bundle"]
+    if bundle is None:
+        if source_bytes:
+            raise RuntimePortAdapterContractError(
+                "custom_bundle_unused",
+                "custom bundle bytes were supplied without a custom isolated binding",
+                stage="environment_preflight",
+            )
+        return
+    try:
+        source = source_bytes.decode("utf-8")
+        tree = ast.parse(source, filename="<runtime-custom-adapters>", mode="exec")
+    except (UnicodeDecodeError, SyntaxError):
+        raise RuntimePortAdapterContractError(
+            "custom_bundle_source",
+            "custom adapter bundle is not valid UTF-8 Python source",
+            stage="environment_preflight",
+        ) from None
+    definitions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef) and not node.decorator_list
+    }
+    if len(definitions) != len(tree.body) or set(definitions) != set(bundle["functions"]):
+        raise RuntimePortAdapterContractError(
+            "custom_bundle_functions",
+            "custom adapter bundle definitions do not match its descriptor",
+            stage="environment_preflight",
+        )
+    headers_by_symbol: dict[str, dict[str, tuple[str, str]]] = {}
+    for line in source.splitlines():
+        if not line.startswith("# spl-runtime-import-v1"):
+            continue
+        match = _IMPORT_HEADER.fullmatch(line)
+        if match is None:
+            raise RuntimePortAdapterContractError(
+                "custom_import_metadata",
+                "custom adapter import metadata is malformed",
+                stage="environment_preflight",
+            )
+        symbol, module, package, version = match.groups()
+        rows = headers_by_symbol.setdefault(symbol, {})
+        if module in rows:
+            raise RuntimePortAdapterContractError(
+                "custom_import_metadata",
+                "custom adapter import metadata is duplicated",
+                stage="environment_preflight",
+            )
+        rows[module] = (package, version)
+    packages_by_symbol: dict[str, set[tuple[str, str]]] = {}
+    roles_by_symbol: dict[str, set[str]] = {}
+    for binding in normalized["bindings"]:
+        adapter = binding["adapter"]
+        if adapter["kind"] != "custom":
+            continue
+        role = "load" if binding["direction"] == "input" else "save"
+        symbol = str(adapter[f"{role}_symbol"])
+        packages = {(_canonical_package(item["package"]), item["version"]) for item in adapter["distributions"]}
+        existing = packages_by_symbol.get(symbol)
+        packages_by_symbol[symbol] = packages if existing is None else existing & packages
+        roles_by_symbol.setdefault(symbol, set()).add(role)
+    if set(headers_by_symbol) - set(definitions):
+        raise RuntimePortAdapterContractError(
+            "custom_import_metadata",
+            "custom adapter import metadata names an undeclared function",
+            stage="environment_preflight",
+        )
+    installed_owners = importlib_metadata.packages_distributions() if verify_installed_environment else {}
+    for symbol, definition in definitions.items():
+        roles = roles_by_symbol.get(symbol, set())
+        if len(roles) != 1:
+            raise RuntimePortAdapterContractError(
+                "custom_signature",
+                f"custom adapter function {symbol!r} must have exactly one save/load role",
+                stage="environment_preflight",
+            )
+        [role] = roles
+        _validate_custom_function_definition(
+            definition,
+            role=role,
+            stage="worker_load" if verify_installed_environment else "environment_preflight",
+        )
+        roots = _function_import_roots(definition)
+        headers = headers_by_symbol.get(symbol, {})
+        if set(headers) != set(roots):
+            raise RuntimePortAdapterContractError(
+                "custom_import_dependency",
+                f"custom adapter function {symbol!r} import metadata is incomplete",
+                stage="environment_preflight",
+            )
+        declared = packages_by_symbol.get(symbol, set())
+        if any((_canonical_package(package), version) not in declared for package, version in headers.values()):
+            raise RuntimePortAdapterContractError(
+                "custom_import_dependency",
+                f"custom adapter function {symbol!r} imports an undeclared exact distribution",
+                stage="environment_preflight",
+            )
+        if not verify_installed_environment:
+            continue
+        for module, (package, version) in headers.items():
+            expected_package = _canonical_package(package)
+            owners = {_canonical_package(owner): owner for owner in installed_owners.get(module, [])}
+            if set(owners) != {expected_package}:
+                raise RuntimePortAdapterContractError(
+                    "custom_import_environment_owner",
+                    f"custom adapter import {module!r} is not owned by its singular declared distribution",
+                    stage="worker_load",
+                )
+            try:
+                installed_version = importlib_metadata.version(owners[expected_package])
+            except importlib_metadata.PackageNotFoundError:
+                raise RuntimePortAdapterContractError(
+                    "custom_import_environment_missing",
+                    f"custom adapter distribution {package!r} is not installed",
+                    stage="worker_load",
+                ) from None
+            if installed_version != version:
+                raise RuntimePortAdapterContractError(
+                    "custom_import_environment_version",
+                    f"custom adapter distribution {package!r} does not match its declared exact version",
+                    stage="worker_load",
+                )
 
 
 def _normalize_binding(value: Any) -> dict[str, Any]:
@@ -1574,6 +3019,81 @@ def merge_adapter_distributions(
                 raise RuntimePortAdapterContractError(
                     "dependency_conflict",
                     "adapter dependency conflicts with Object environment: {} requires {} and {}".format(
+                        item["package"],
+                        existing["version"],
+                        item["version"],
+                    ),
+                    stage="environment_preflight",
+                )
+            merged[key] = item
+    return sorted(merged.values(), key=lambda item: (_canonical_package(item["package"]), item["version"]))
+
+
+def merge_isolated_node_input_distributions(
+    object_distributions: Sequence[Mapping[str, Any]],
+    document: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    """Merge exact dependencies from one local schema-v2 input plan."""
+
+    normalized = normalize_isolated_node_inputs(document)
+    merged: dict[str, dict[str, str]] = {}
+    for raw in object_distributions:
+        item = _normalize_distribution_mapping(raw)
+        merged[_canonical_package(item["package"])] = item
+    for binding in normalized["bindings"]:
+        for item in binding["adapter"]["distributions"]:
+            key = _canonical_package(item["package"])
+            existing = merged.get(key)
+            if existing is not None and existing["version"] != item["version"]:
+                raise RuntimePortAdapterContractError(
+                    "dependency_conflict",
+                    "adapter dependency conflicts with node environment: {} requires {} and {}".format(
+                        item["package"],
+                        existing["version"],
+                        item["version"],
+                    ),
+                    stage="environment_preflight",
+                )
+            merged[key] = item
+    return sorted(merged.values(), key=lambda item: (_canonical_package(item["package"]), item["version"]))
+
+
+def merge_isolated_node_transport_distributions(
+    object_distributions: Sequence[Mapping[str, Any]],
+    document: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    """Merge exact dependencies from one local schema-v3 input/output plan."""
+
+    normalized = normalize_isolated_node_transport(document)
+    return _merge_normalized_isolated_node_transport_distributions(object_distributions, normalized)
+
+
+def merge_isolated_node_multi_output_transport_distributions(
+    object_distributions: Sequence[Mapping[str, Any]],
+    document: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    """Merge exact dependencies from one local schema-v4 multi-output plan."""
+
+    normalized = normalize_isolated_node_multi_output_transport(document)
+    return _merge_normalized_isolated_node_transport_distributions(object_distributions, normalized)
+
+
+def _merge_normalized_isolated_node_transport_distributions(
+    object_distributions: Sequence[Mapping[str, Any]],
+    normalized: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    merged: dict[str, dict[str, str]] = {}
+    for raw in object_distributions:
+        item = _normalize_distribution_mapping(raw)
+        merged[_canonical_package(item["package"])] = item
+    for binding in normalized["bindings"]:
+        for item in binding["adapter"]["distributions"]:
+            key = _canonical_package(item["package"])
+            existing = merged.get(key)
+            if existing is not None and existing["version"] != item["version"]:
+                raise RuntimePortAdapterContractError(
+                    "dependency_conflict",
+                    "adapter dependency conflicts with node environment: {} requires {} and {}".format(
                         item["package"],
                         existing["version"],
                         item["version"],

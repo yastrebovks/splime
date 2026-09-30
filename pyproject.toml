@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "splime"
-version = "0.4.9"
+version = "0.4.10"
 
 description = "Reuse Python functions across projects without rewriting or redeploying them."
 readme = "README.md"
@@ -52,6 +52,7 @@ dev = [
   "dominate==2.9.1"]
 
 test = [
+  "numpy==2.5.0",
   "python-dotenv[cli]",
   "pyexpect",
   "mypy==2.1.0",

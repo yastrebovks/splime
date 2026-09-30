@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import base64
 import hashlib
 import importlib.metadata
@@ -27,7 +28,7 @@ from http.client import IncompleteRead
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 from uuid import uuid4
 
@@ -44,12 +45,12 @@ from spl.public_artifact_policy import (
     inspect_wheel_archive,
 )
 from spl.runtime_environment import (
-    PUBLIC_EMBEDDED_HOST_CONTRACT,
-    default_venv_command_builder,
+    PUBLIC_EMBEDDED_EXECUTOR,
     environment_identity,
+    installed_framework_distribution,
     python_constraint_matches,
+    validate_installed_framework,
     validate_runtime_lock,
-    venv_python_path,
 )
 
 
@@ -64,96 +65,24 @@ MAX_BUNDLE_CACHE_ENTRIES = 64
 MAX_ENVIRONMENT_CACHE_ENTRIES = 32
 MAX_ARTIFACT_CACHE_ENTRIES = 128
 MAX_WHEEL_BYTES = 128 * 1024 * 1024
+MAX_FRAMEWORK_PROJECTION_BYTES = 64 * 1024 * 1024
+MAX_FRAMEWORK_PROJECTION_FILES = 8192
+MAX_ENVIRONMENT_MARKER_BYTES = 64 * 1024
+MAX_ENVIRONMENT_FILES = 32768
+MAX_ENVIRONMENT_BYTES = 1024 * 1024 * 1024
+MAX_BASE_INTERPRETER_BYTES = 256 * 1024 * 1024
+PUBLIC_ENVIRONMENT_CACHE_SCHEMA = "spl.public_environment_cache.v1"
+PUBLIC_ENVIRONMENT_CACHE_SCHEMA_VERSION = 1
+PUBLIC_ENVIRONMENT_BUILDER = "minimal-copy-v1"
 MAX_RUN_RECEIPT_QUEUE = 64
 MAX_RUN_RECEIPT_RESPONSE_BYTES = 64 * 1024
 RUN_RECEIPT_TIMEOUT_SECONDS = 2.0
+RUN_RECEIPT_SHUTDOWN_TIMEOUT_SECONDS = 4.5
 PUBLIC_RUN_RECEIPTS_ENV = "SPL_PUBLIC_RUN_RECEIPTS"
 _THREAD_LOCK_GUARD = threading.Lock()
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
-
-
-def _tree_hash(root: Path) -> str:
-    """Hash the installed framework package without mutable bytecode caches."""
-
-    digest = hashlib.sha256()
-    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
-        relative = path.relative_to(root)
-        if "__pycache__" in relative.parts or path.suffix in {".pyc", ".pyo"}:
-            continue
-        if path.is_symlink():
-            raise _error("embedded_framework_invalid", "installed splime package contains a symlink")
-        if path.is_dir():
-            continue
-        if not path.is_file():
-            raise _error("embedded_framework_invalid", "installed splime package contains a non-file member")
-        data = path.read_bytes()
-        digest.update(relative.as_posix().encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(hashlib.sha256(data).digest())
-    return digest.hexdigest()
-
-
-def _runtime_projection_violation(name: str) -> str | None:
-    """Reject wheel members that can pre-empt the embedded framework host."""
-
-    parts = PurePosixPath(name).parts
-    projected = parts
-    for index, part in enumerate(parts[:-1]):
-        if part.casefold().endswith(".data") and parts[index + 1].casefold() in {
-            "purelib",
-            "platlib",
-        }:
-            projected = parts[index + 2 :]
-            break
-    if not projected:
-        return None
-    first = projected[0].casefold()
-    if first in {"spl", "spl.py", "spl.pyc", "spl.pyo"}:
-        return "Object dependencies cannot replace the installed splime authority"
-    if first in {
-        "sitecustomize",
-        "sitecustomize.py",
-        "sitecustomize.pyc",
-        "sitecustomize.pyo",
-        "usercustomize",
-        "usercustomize.py",
-        "usercustomize.pyc",
-        "usercustomize.pyo",
-    } or any(part.casefold().endswith(".pth") for part in projected):
-        return "Object dependencies cannot install Python startup hooks"
-    return None
-
-
-def _version_tuple(value: str) -> tuple[int, int, int]:
-    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", value)
-    if match is None:
-        raise _error("embedded_framework_invalid", "installed splime version is malformed")
-    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
-
-
-def _installed_framework_authority(executor: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the exact installed ``spl`` package used as execution authority."""
-
-    if executor.get("contract") != PUBLIC_EMBEDDED_HOST_CONTRACT:
-        raise _error("public_manifest_invalid", "installed framework executor contract is unsupported")
-    try:
-        version = importlib.metadata.version("splime")
-    except importlib.metadata.PackageNotFoundError as exc:
-        raise _error("embedded_framework_unavailable", "splime is not installed") from exc
-    minimum = str(executor.get("minimum_version") or "")
-    if _version_tuple(version) < _version_tuple(minimum):
-        raise _error(
-            "embedded_framework_upgrade_required",
-            f"public execution requires splime>={minimum}; installed version is {version}",
-        )
-    package_root = Path(__file__).resolve().parent
-    identity = _tree_hash(package_root)
-    return {
-        "version": version,
-        "package_root": package_root,
-        "tree_hash": identity,
-        "identity": _sha256(f"{PUBLIC_EMBEDDED_HOST_CONTRACT}\0{version}\0{identity}".encode("utf-8")),
-    }
+_RUN_RECEIPT_EMITTERS_LOCK = threading.Lock()
+_RUN_RECEIPT_EMITTERS: set[PublicRunReceiptEmitter] = set()
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -316,7 +245,7 @@ def _registry_url(value: str) -> str:
 
 
 class PublicRunReceiptEmitter:
-    """Bounded daemon-thread sender; local execution never waits for telemetry."""
+    """Best-effort sender with a bounded flush at normal interpreter shutdown."""
 
     def __init__(self, registry_url: str) -> None:
         self.transport = PublicRegistryTransport(
@@ -326,6 +255,8 @@ class PublicRunReceiptEmitter:
         self._queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=MAX_RUN_RECEIPT_QUEUE)
         self._started = False
         self._lock = threading.Lock()
+        self._pending = 0
+        self._pending_condition = threading.Condition()
 
     def emit(self, **payload: Any) -> None:
         """Queue one exact allowlisted payload, dropping it under pressure."""
@@ -339,11 +270,28 @@ class PublicRunReceiptEmitter:
         }
         if set(payload) != expected:
             return
-        try:
-            self._queue.put_nowait(dict(payload))
-        except queue.Full:
-            return
+        with self._pending_condition:
+            try:
+                self._queue.put_nowait(dict(payload))
+            except queue.Full:
+                return
+            self._pending += 1
+            _track_run_receipt_emitter(self)
         self._start()
+
+    def flush(self, timeout_seconds: float = RUN_RECEIPT_SHUTDOWN_TIMEOUT_SECONDS) -> bool:
+        """Wait at most ``timeout_seconds`` for already queued receipts."""
+
+        if timeout_seconds < 0:
+            raise ValueError("timeout_seconds must be non-negative")
+        deadline = time.monotonic() + timeout_seconds
+        with self._pending_condition:
+            while self._pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._pending_condition.wait(remaining)
+            return True
 
     def _start(self) -> None:
         with self._lock:
@@ -365,6 +313,42 @@ class PublicRunReceiptEmitter:
                 pass
             finally:
                 self._queue.task_done()
+                with self._pending_condition:
+                    self._pending -= 1
+                    if self._pending == 0:
+                        _untrack_run_receipt_emitter(self)
+                        self._pending_condition.notify_all()
+
+
+def _track_run_receipt_emitter(emitter: PublicRunReceiptEmitter) -> None:
+    with _RUN_RECEIPT_EMITTERS_LOCK:
+        _RUN_RECEIPT_EMITTERS.add(emitter)
+
+
+def _untrack_run_receipt_emitter(emitter: PublicRunReceiptEmitter) -> None:
+    with _RUN_RECEIPT_EMITTERS_LOCK:
+        _RUN_RECEIPT_EMITTERS.discard(emitter)
+
+
+def _flush_pending_run_receipts() -> None:
+    """Give every active emitter a fair share of one hard shutdown budget."""
+
+    deadline = time.monotonic() + RUN_RECEIPT_SHUTDOWN_TIMEOUT_SECONDS
+    while True:
+        with _RUN_RECEIPT_EMITTERS_LOCK:
+            active = tuple(_RUN_RECEIPT_EMITTERS)
+        if not active:
+            return
+        for index, emitter in enumerate(active):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            emitter.flush(remaining / (len(active) - index))
+        if time.monotonic() >= deadline:
+            return
+
+
+atexit.register(_flush_pending_run_receipts)
 
 
 _DEFAULT_RECEIPT_EMITTER = object()
@@ -825,6 +809,657 @@ def _extract_members(
             os.close(descriptor)
 
 
+def _read_bounded_regular(path: Path, *, maximum: int, label: str) -> bytes:
+    try:
+        before = path.lstat()
+    except OSError:
+        raise _error("public_artifact_unsafe", f"{label} is not a safe regular file") from None
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise _error("public_artifact_unsafe", f"{label} is not a safe regular file")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        raise _error("public_artifact_unsafe", f"{label} is not a safe regular file") from None
+    try:
+        details = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_nlink != 1
+            or (details.st_dev, details.st_ino) != (before.st_dev, before.st_ino)
+            or details.st_size < 0
+            or details.st_size > maximum
+        ):
+            raise _error("public_artifact_unsafe", f"{label} is not a bounded regular file")
+        chunks: list[bytes] = []
+        observed = 0
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024, maximum + 1 - observed))
+            if not chunk:
+                break
+            observed += len(chunk)
+            if observed > maximum:
+                raise _error("public_artifact_unsafe", f"{label} exceeds the size limit")
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (
+            observed != details.st_size
+            or (after.st_dev, after.st_ino) != (details.st_dev, details.st_ino)
+            or after.st_size != observed
+        ):
+            raise _error("public_artifact_unsafe", f"{label} changed while it was read")
+        try:
+            current = path.lstat()
+        except OSError:
+            raise _error("public_artifact_unsafe", f"{label} changed while it was read") from None
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or (current.st_dev, current.st_ino) != (after.st_dev, after.st_ino)
+            or current.st_size != observed
+        ):
+            raise _error("public_artifact_unsafe", f"{label} changed while it was read")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _projection_files(root: Path) -> list[tuple[PurePosixPath, bytes]]:
+    result: list[tuple[PurePosixPath, bytes]] = []
+    total = 0
+
+    def visit(directory: Path, relative: PurePosixPath) -> None:
+        nonlocal total
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name.casefold())
+        except OSError:
+            raise _error("embedded_framework_invalid", "installed framework files are unavailable") from None
+        folded: set[str] = set()
+        for entry in entries:
+            if entry.name == "__pycache__" or entry.name.endswith((".pyc", ".pyo")):
+                continue
+            if entry.name.casefold() in folded:
+                raise _error("embedded_framework_invalid", "installed framework paths collide")
+            folded.add(entry.name.casefold())
+            path = Path(entry.path)
+            child = relative / entry.name
+            try:
+                details = entry.stat(follow_symlinks=False)
+            except OSError:
+                raise _error("embedded_framework_invalid", "installed framework files are unavailable") from None
+            if stat.S_ISDIR(details.st_mode):
+                visit(path, child)
+                continue
+            if not stat.S_ISREG(details.st_mode):
+                raise _error("embedded_framework_invalid", "installed framework contains a non-regular file")
+            data = _read_bounded_regular(
+                path,
+                maximum=MAX_FRAMEWORK_PROJECTION_BYTES,
+                label="installed framework file",
+            )
+            total += len(data)
+            if total > MAX_FRAMEWORK_PROJECTION_BYTES or len(result) >= MAX_FRAMEWORK_PROJECTION_FILES:
+                raise _error("embedded_framework_invalid", "installed framework projection exceeds the safety limit")
+            result.append((child, data))
+
+    visit(root, PurePosixPath())
+    if not result:
+        raise _error("embedded_framework_invalid", "installed framework projection is empty")
+    return result
+
+
+def _projection_hash(files: list[tuple[PurePosixPath, bytes]]) -> str:
+    evidence = [{"path": str(path), "size": len(data), "sha256": _sha256(data)} for path, data in files]
+    return _sha256(_canonical_json(evidence))
+
+
+def _remove_cache_path(path: Path) -> None:
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        path.unlink(missing_ok=True)
+    elif path.is_dir():
+        for current, directories, _files in os.walk(path, topdown=False, followlinks=False):
+            for directory in directories:
+                child = Path(current) / directory
+                if child.is_symlink():
+                    continue
+                try:
+                    os.chmod(child, 0o700, follow_symlinks=False)
+                except OSError:
+                    pass
+            try:
+                os.chmod(current, 0o700, follow_symlinks=False)
+            except OSError:
+                pass
+        shutil.rmtree(path)
+
+
+def _runtime_projection_violation(name: str) -> str | None:
+    parts = PurePosixPath(name).parts
+    projected = parts
+    for index, part in enumerate(parts[:-1]):
+        if part.casefold().endswith(".data") and parts[index + 1].casefold() in {
+            "purelib",
+            "platlib",
+        }:
+            projected = parts[index + 2 :]
+            break
+    if not projected:
+        return None
+    first = projected[0].casefold()
+    if first in {
+        "spl",
+        "spl.py",
+        "spl.pyc",
+        "spl.pyo",
+        "splime_public_worker",
+        "splime_public_worker.py",
+    }:
+        return "wheel attempts to replace the installed splime framework"
+    if first in {
+        "sitecustomize",
+        "sitecustomize.py",
+        "sitecustomize.pyc",
+        "sitecustomize.pyo",
+        "usercustomize",
+        "usercustomize.py",
+        "usercustomize.pyc",
+        "usercustomize.pyo",
+    } or any(part.casefold().endswith(".pth") for part in projected):
+        return "wheel attempts to install a Python startup hook"
+    return None
+
+
+def _installed_framework_projection() -> tuple[
+    dict[str, str],
+    str,
+    list[tuple[PurePosixPath, bytes]],
+    str,
+    list[tuple[PurePosixPath, bytes]],
+]:
+    try:
+        authority = validate_installed_framework(PUBLIC_EMBEDDED_EXECUTOR)
+        distribution = installed_framework_distribution()
+    except ValueError as exc:
+        raise _error("embedded_framework_incompatible", str(exc)) from exc
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise _error("embedded_framework_incompatible", "installed splime framework is unavailable") from exc
+
+    distribution_root = Path(str(distribution.locate_file(""))).resolve()
+    direct_url_text = distribution.read_text("direct_url.json")
+    package_root = (distribution_root / "spl").resolve()
+    if direct_url_text is not None:
+        try:
+            direct_url = json.loads(direct_url_text)
+            if not isinstance(direct_url, Mapping) or not isinstance(direct_url.get("url"), str):
+                raise ValueError
+            raw_dir_info = direct_url.get("dir_info")
+            if raw_dir_info is not None and not isinstance(raw_dir_info, Mapping):
+                raise ValueError
+            editable = isinstance(raw_dir_info, Mapping) and raw_dir_info.get("editable") is True
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise _error("embedded_framework_incompatible", "installed framework origin is malformed") from exc
+        if editable:
+            parsed = urlsplit(str(direct_url["url"]))
+            if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+                raise _error("embedded_framework_incompatible", "installed framework origin is unsupported")
+            editable_root = Path(unquote(parsed.path)).resolve()
+            expected_roots = [
+                (editable_root / "src" / "spl").resolve(),
+                (editable_root / "spl").resolve(),
+            ]
+            available_roots = [path for path in expected_roots if path.is_dir() and not path.is_symlink()]
+            if len(available_roots) != 1:
+                raise _error("embedded_framework_incompatible", "installed editable framework origin is ambiguous")
+            package_root = available_roots[0]
+    if not package_root.is_dir() or package_root.is_symlink():
+        raise _error(
+            "embedded_framework_incompatible",
+            "installed splime distribution has no safe spl package",
+        )
+
+    raw_dist_info = getattr(distribution, "_path", None)
+    dist_info_root = Path(raw_dist_info).resolve() if isinstance(raw_dist_info, Path) else Path()
+    if not dist_info_root.name.casefold().endswith(".dist-info"):
+        metadata_candidates = [
+            item
+            for item in (distribution.files or [])
+            if item.name == "METADATA" and len(item.parts) >= 2 and item.parts[0].casefold().endswith(".dist-info")
+        ]
+        if len(metadata_candidates) != 1:
+            raise _error("embedded_framework_incompatible", "installed framework metadata is incomplete")
+        dist_info_root = Path(str(distribution.locate_file(metadata_candidates[0]))).parent.resolve()
+    if not dist_info_root.is_dir() or dist_info_root.is_symlink():
+        raise _error("embedded_framework_incompatible", "installed framework metadata is unsafe")
+
+    package_files = _projection_files(package_root)
+    metadata_files = [
+        (relative, data)
+        for relative, data in _projection_files(dist_info_root)
+        if relative == PurePosixPath("METADATA")
+    ]
+    if len(metadata_files) != 1:
+        raise _error("embedded_framework_incompatible", "installed framework metadata is incomplete")
+    identity = {
+        **authority,
+        "package_sha256": _projection_hash(package_files),
+        "metadata_sha256": _projection_hash(metadata_files),
+    }
+    return identity, "spl", package_files, dist_info_root.name, metadata_files
+
+
+def _write_projection_tree(
+    site_packages: Path,
+    name: str,
+    files: list[tuple[PurePosixPath, bytes]],
+) -> None:
+    root = site_packages / name
+    root.mkdir(parents=True, exist_ok=False)
+    for relative, data in files:
+        path = root.joinpath(*relative.parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            0o400,
+        )
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            os.close(descriptor)
+
+
+def _project_installed_framework(
+    venv_path: Path,
+    projection: tuple[
+        dict[str, str],
+        str,
+        list[tuple[PurePosixPath, bytes]],
+        str,
+        list[tuple[PurePosixPath, bytes]],
+    ],
+) -> None:
+    _identity, package_name, package_files, metadata_name, metadata_files = projection
+    if os.name == "nt":
+        site_packages = venv_path / "Lib" / "site-packages"
+    else:
+        version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        site_packages = venv_path / "lib" / version / "site-packages"
+    site_packages.mkdir(parents=True, exist_ok=True)
+    _write_projection_tree(site_packages, package_name, package_files)
+    _write_projection_tree(site_packages, metadata_name, metadata_files)
+
+
+def _environment_python_relative() -> PurePosixPath:
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI/hosts.
+        return PurePosixPath("Scripts/python.exe")
+    return PurePosixPath("bin/python")
+
+
+def _environment_site_packages_relative() -> PurePosixPath:
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI/hosts.
+        return PurePosixPath("Lib/site-packages")
+    return PurePosixPath(f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages")
+
+
+def _environment_scripts_relative() -> PurePosixPath:
+    return PurePosixPath("Scripts" if os.name == "nt" else "bin")
+
+
+def _base_interpreter_projection() -> tuple[Path, bytes]:
+    try:
+        executable = Path(sys.executable).resolve(strict=True)
+        data = _read_bounded_regular(
+            executable,
+            maximum=MAX_BASE_INTERPRETER_BYTES,
+            label="base interpreter",
+        )
+    except (OSError, ClientError):
+        raise _error("embedded_framework_incompatible", "base interpreter is unavailable") from None
+    if not data:
+        raise _error("embedded_framework_incompatible", "base interpreter is unavailable")
+    return executable, data
+
+
+def _pyvenv_configuration(executable: Path) -> bytes:
+    return (
+        f"home = {executable.parent}\n"
+        "include-system-site-packages = false\n"
+        f"version = {platform.python_version()}\n"
+        f"executable = {executable}\n"
+    ).encode("utf-8")
+
+
+def _environment_marker_document(
+    *,
+    digest: str,
+    lock_hash: str,
+    framework_identity: Mapping[str, str],
+) -> dict[str, Any]:
+    return {
+        "schema": PUBLIC_ENVIRONMENT_CACHE_SCHEMA,
+        "schema_version": PUBLIC_ENVIRONMENT_CACHE_SCHEMA_VERSION,
+        "identity": digest,
+        "lock_hash": lock_hash,
+        "framework": dict(framework_identity),
+        "builder": PUBLIC_ENVIRONMENT_BUILDER,
+        "python": str(_environment_python_relative()),
+    }
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _read_environment_marker(path: Path) -> dict[str, Any]:
+    body = _read_bounded_regular(
+        path,
+        maximum=MAX_ENVIRONMENT_MARKER_BYTES,
+        label="environment marker",
+    )
+    try:
+        value = json.loads(
+            body.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("environment marker is malformed") from exc
+    expected_fields = {
+        "schema",
+        "schema_version",
+        "identity",
+        "lock_hash",
+        "framework",
+        "builder",
+        "python",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected_fields:
+        raise ValueError("environment marker has an unsupported shape")
+    python = value.get("python")
+    if (
+        value.get("schema") != PUBLIC_ENVIRONMENT_CACHE_SCHEMA
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != PUBLIC_ENVIRONMENT_CACHE_SCHEMA_VERSION
+        or not isinstance(value.get("identity"), str)
+        or not isinstance(value.get("lock_hash"), str)
+        or not isinstance(value.get("framework"), Mapping)
+        or value.get("builder") != PUBLIC_ENVIRONMENT_BUILDER
+        or not isinstance(python, str)
+    ):
+        raise ValueError("environment marker is unsupported")
+    relative = PurePosixPath(python)
+    if (
+        relative.is_absolute()
+        or str(relative) != python
+        or "\\" in python
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or relative != _environment_python_relative()
+    ):
+        raise ValueError("environment marker interpreter is invalid")
+    return dict(value)
+
+
+def _wheel_install_path(
+    name: str,
+    *,
+    data_root: str,
+    project: str,
+) -> tuple[PurePosixPath, int]:
+    path = PurePosixPath(name)
+    site_packages = _environment_site_packages_relative()
+    if path.parts[0].casefold() != data_root.casefold():
+        return site_packages / path, 0o444
+    if len(path.parts) < 3:
+        raise _error("public_artifact_unsafe", "wheel data projection is malformed")
+    scheme = path.parts[1].casefold()
+    rest = PurePosixPath(*path.parts[2:])
+    if scheme in {"purelib", "platlib"}:
+        return site_packages / rest, 0o444
+    if scheme == "scripts":
+        return _environment_scripts_relative() / rest, 0o555
+    if scheme == "headers":
+        normalized = re.sub(r"[-_.]+", "-", project).casefold()
+        return PurePosixPath(
+            "include", f"site/python{sys.version_info.major}.{sys.version_info.minor}", normalized
+        ) / rest, 0o444
+    if scheme == "data":
+        return rest, 0o444
+    raise _error("public_artifact_unsafe", "wheel data projection uses an unsupported scheme")
+
+
+def _relative_import_path(path: PurePosixPath) -> str | None:
+    site_packages = _environment_site_packages_relative()
+    if path.parts[: len(site_packages.parts)] != site_packages.parts:
+        return None
+    remainder = path.parts[len(site_packages.parts) :]
+    return str(PurePosixPath(*remainder)) if remainder else None
+
+
+def _validate_expected_environment_files(
+    files: Mapping[PurePosixPath, tuple[bytes, int]],
+) -> set[PurePosixPath]:
+    if not files or len(files) > MAX_ENVIRONMENT_FILES:
+        raise _error("embedded_environment_build_failed", "environment inventory exceeds the safety limit")
+    total = sum(len(data) for data, _mode in files.values())
+    if total > MAX_ENVIRONMENT_BYTES:
+        raise _error("embedded_environment_build_failed", "environment inventory exceeds the safety limit")
+    folded: dict[str, PurePosixPath] = {}
+    directories: set[PurePosixPath] = set()
+    file_paths = set(files)
+    for relative in files:
+        if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+            raise _error("embedded_environment_build_failed", "environment inventory is unsafe")
+        identity = str(relative).casefold()
+        if identity in folded:
+            raise _error("embedded_environment_build_failed", "environment inventory paths collide")
+        folded[identity] = relative
+        parent = relative.parent
+        while parent != PurePosixPath("."):
+            if parent in file_paths:
+                raise _error("embedded_environment_build_failed", "environment inventory paths collide")
+            directories.add(parent)
+            parent = parent.parent
+    directory_folded: set[str] = set()
+    for directory in directories:
+        identity = str(directory).casefold()
+        if identity in directory_folded or identity in folded:
+            raise _error("embedded_environment_build_failed", "environment inventory paths collide")
+        directory_folded.add(identity)
+    return directories
+
+
+def _expected_environment_files(
+    *,
+    lock: Mapping[str, Any],
+    digest: str,
+    projection: tuple[
+        dict[str, str],
+        str,
+        list[tuple[PurePosixPath, bytes]],
+        str,
+        list[tuple[PurePosixPath, bytes]],
+    ],
+    wheels: list[Path],
+) -> dict[PurePosixPath, tuple[bytes, int]]:
+    framework_identity, package_name, package_files, metadata_name, metadata_files = projection
+    base_executable, base_bytes = _base_interpreter_projection()
+    site_packages = _environment_site_packages_relative()
+    files: dict[PurePosixPath, tuple[bytes, int]] = {
+        _environment_python_relative(): (base_bytes, 0o555),
+        PurePosixPath("pyvenv.cfg"): (_pyvenv_configuration(base_executable), 0o444),
+        PurePosixPath("ready.json"): (
+            _canonical_json(
+                _environment_marker_document(
+                    digest=digest,
+                    lock_hash=str(lock["lock_hash"]),
+                    framework_identity=framework_identity,
+                )
+            ),
+            0o444,
+        ),
+    }
+
+    def add(
+        relative: PurePosixPath,
+        data: bytes,
+        mode: int,
+        *,
+        framework_file: bool = False,
+    ) -> None:
+        if relative in files:
+            raise _error("embedded_environment_build_failed", "environment inventory paths collide")
+        import_path = _relative_import_path(relative)
+        if import_path is not None:
+            violation = _runtime_projection_violation(import_path)
+            if violation is not None and not framework_file:
+                raise _error("public_artifact_unsafe", violation)
+        files[relative] = (data, mode)
+
+    for relative, data in package_files:
+        add(
+            site_packages / package_name / relative,
+            data,
+            0o444,
+            framework_file=True,
+        )
+    for relative, data in metadata_files:
+        add(site_packages / metadata_name / relative, data, 0o444)
+
+    artifacts = list(lock["artifacts"])
+    if len(wheels) != len(artifacts):
+        raise _error("embedded_environment_build_failed", "environment artifact inventory is incomplete")
+    for wheel, artifact in zip(wheels, artifacts, strict=True):
+        payload = EmbeddedBackend._verify_wheel_file(wheel, artifact)
+        try:
+            members = inspect_wheel_archive(payload)
+        except PublicArtifactPolicyError as exc:
+            raise _error("public_artifact_unsafe", str(exc)) from exc
+        metadata_names = [name for name in members if name.endswith(".dist-info/METADATA")]
+        if len(metadata_names) != 1:
+            raise _error("public_artifact_unsafe", "wheel metadata inventory is invalid")
+        dist_info = PurePosixPath(metadata_names[0]).parts[0]
+        data_root = f"{dist_info[: -len('.dist-info')]}.data"
+        for name, data in members.items():
+            relative, mode = _wheel_install_path(
+                name,
+                data_root=data_root,
+                project=str(artifact["project"]),
+            )
+            add(relative, data, mode)
+    _validate_expected_environment_files(files)
+    return files
+
+
+def _write_environment_tree(
+    directory: Path,
+    files: Mapping[PurePosixPath, tuple[bytes, int]],
+) -> None:
+    try:
+        with os.scandir(directory) as entries:
+            directory_empty = next(entries, None) is None
+    except OSError:
+        raise _error("embedded_environment_build_failed", "temporary environment is unsafe") from None
+    if directory.is_symlink() or not directory.is_dir() or not directory_empty:
+        raise _error("embedded_environment_build_failed", "temporary environment is unsafe")
+    directories = _validate_expected_environment_files(files)
+    for relative in sorted(directories, key=lambda item: (len(item.parts), str(item))):
+        directory.joinpath(*relative.parts).mkdir(mode=0o700)
+    for relative, (data, mode) in sorted(files.items(), key=lambda item: str(item[0])):
+        path = directory.joinpath(*relative.parts)
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "wb", closefd=False) as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            os.close(descriptor)
+        path.chmod(mode)
+    for relative in sorted(directories, key=lambda item: (-len(item.parts), str(item))):
+        directory.joinpath(*relative.parts).chmod(0o555)
+    directory.chmod(0o555)
+
+
+def _verify_environment_inventory(
+    directory: Path,
+    files: Mapping[PurePosixPath, tuple[bytes, int]],
+) -> bool:
+    try:
+        root_details = directory.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISDIR(root_details.st_mode) or directory.is_symlink() or stat.S_IMODE(root_details.st_mode) != 0o555:
+        return False
+    expected_directories = _validate_expected_environment_files(files)
+    actual_files: set[PurePosixPath] = set()
+    actual_directories: set[PurePosixPath] = set()
+    folded: set[str] = set()
+
+    def visit(path: Path, relative: PurePosixPath) -> bool:
+        try:
+            entries = list(os.scandir(path))
+        except OSError:
+            return False
+        local_folded: set[str] = set()
+        for entry in entries:
+            if entry.name.casefold() in local_folded:
+                return False
+            local_folded.add(entry.name.casefold())
+            child = relative / entry.name
+            identity = str(child).casefold()
+            if identity in folded:
+                return False
+            folded.add(identity)
+            try:
+                details = entry.stat(follow_symlinks=False)
+            except OSError:
+                return False
+            child_path = Path(entry.path)
+            if stat.S_ISDIR(details.st_mode):
+                if stat.S_IMODE(details.st_mode) != 0o555:
+                    return False
+                actual_directories.add(child)
+                if not visit(child_path, child):
+                    return False
+                continue
+            expected = files.get(child)
+            if (
+                expected is None
+                or not stat.S_ISREG(details.st_mode)
+                or details.st_nlink != 1
+                or stat.S_IMODE(details.st_mode) != expected[1]
+                or details.st_size != len(expected[0])
+            ):
+                return False
+            try:
+                data = _read_bounded_regular(
+                    child_path,
+                    maximum=len(expected[0]),
+                    label="environment file",
+                )
+            except (ClientError, OSError):
+                return False
+            if data != expected[0] or _sha256(data) != _sha256(expected[0]):
+                return False
+            actual_files.add(child)
+        return True
+
+    if not visit(directory, PurePosixPath(".")):
+        return False
+    return actual_files == set(files) and actual_directories == expected_directories
+
+
 class EmbeddedBackend:
     """Resolve, verify, cache and execute public Objects without a daemon."""
 
@@ -888,6 +1523,7 @@ class EmbeddedBackend:
                     "public_archive_disagreement",
                     "callable release has no exact producer-compiled execution member",
                 )
+            self._runtime_locks(manifest)
             if trust:
                 self._approve(trust_identity)
             if not self._trusted(trust_identity):
@@ -895,8 +1531,7 @@ class EmbeddedBackend:
                     "public_trust_required",
                     "first execution of this exact public content hash requires trust=True",
                 )
-            environments = self._ensure_environments(manifest, bundle_dir=bundle_dir)
-            with self._environment_use_locks(environments.values()):
+            with self._locked_environments(manifest, bundle_dir=bundle_dir) as environments:
                 event_id = str(uuid4())
                 self._emit_run_receipt(resolved, event_id=event_id, state="started")
                 try:
@@ -1138,16 +1773,62 @@ class EmbeddedBackend:
         if not isinstance(raw_locks, list) or not raw_locks or len(raw_locks) > 64:
             raise _error("public_manifest_invalid", "runtime lock inventory is malformed")
         try:
-            return [validate_runtime_lock(item) for item in raw_locks]
+            locks = [validate_runtime_lock(item) for item in raw_locks]
+            for lock in locks:
+                validate_installed_framework(lock["executor"])
+            return locks
         except ValueError as exc:
             raise _error("public_manifest_invalid", str(exc)) from exc
 
-    def _ensure_environment(
+    @contextmanager
+    def _locked_environments(
         self,
-        lock: Mapping[str, Any],
+        manifest: Mapping[str, Any],
         *,
         bundle_dir: Path | None = None,
-    ) -> Path:
+    ) -> Iterator[dict[str, Path]]:
+        """Build, verify, select, and use every runtime under uninterrupted locks."""
+
+        locks = self._runtime_locks(manifest)
+        projection = _installed_framework_projection()
+        prepared = [(lock, self._validated_environment_digest(lock, projection[0])) for lock in locks]
+        digests = {digest for _lock, digest in prepared}
+        try:
+            with ExitStack() as stack:
+                for digest in sorted(digests):
+                    stack.enter_context(_hash_lock(self.cache_root, f"environment-{digest}"))
+                by_digest: dict[str, Path] = {}
+                result: dict[str, Path] = {}
+                for lock, digest in prepared:
+                    environment = by_digest.get(digest)
+                    if environment is None:
+                        environment = self._ensure_environment_locked(
+                            lock,
+                            digest=digest,
+                            projection=projection,
+                            bundle_dir=bundle_dir,
+                        )
+                        by_digest[digest] = environment
+                    for name in lock["names"]:
+                        if name in result and result[name] != environment:
+                            raise _error("public_manifest_invalid", "runtime lock name is ambiguous")
+                        result[str(name)] = environment
+                if "root" not in result:
+                    raise _error("public_manifest_invalid", "runtime locks do not define the root environment")
+                yield result
+        finally:
+            self._cleanup_cache_directory(
+                "environments",
+                maximum=MAX_ENVIRONMENT_CACHE_ENTRIES,
+                lock_prefix="environment-",
+                preserve=digests,
+            )
+
+    @staticmethod
+    def _validated_environment_digest(
+        lock: Mapping[str, Any],
+        framework_identity: Mapping[str, str],
+    ) -> str:
         target = lock.get("target")
         python_constraint = target.get("python") if isinstance(target, Mapping) else None
         try:
@@ -1160,150 +1841,144 @@ class EmbeddedBackend:
                 f"release requires Python {python_constraint}; running interpreter is "
                 f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
             )
-        authority = _installed_framework_authority(lock["executor"])
-        base_identity = environment_identity(
+        return environment_identity(
             lock,
             interpreter_abi=getattr(sys.implementation, "cache_tag", "unknown"),
+            framework_identity=framework_identity,
         )
-        digest = _sha256(f"{base_identity}\0{authority['identity']}".encode("utf-8"))
-        directory = self.cache_root / "environments" / digest
-        marker = directory / "ready.json"
+
+    def _ensure_environment(
+        self,
+        lock: Mapping[str, Any],
+        *,
+        bundle_dir: Path | None = None,
+    ) -> Path:
+        projection = _installed_framework_projection()
+        digest = self._validated_environment_digest(lock, projection[0])
         with _hash_lock(self.cache_root, f"environment-{digest}"):
-            if marker.is_file():
-                try:
-                    ready = json.loads(marker.read_text(encoding="utf-8"))
-                    python = Path(str(ready["python"]))
-                    framework_path = Path(str(ready["framework_path"]))
-                    if (
-                        ready["identity"] == digest
-                        and ready["lock_hash"] == lock["lock_hash"]
-                        and ready["framework_identity"] == authority["identity"]
-                        and framework_path.is_dir()
-                        and _tree_hash(framework_path) == authority["tree_hash"]
-                        and self._environment_healthy(python)
-                    ):
-                        return python
-                except (KeyError, OSError, ValueError, json.JSONDecodeError):
-                    pass
-            if directory.exists():
-                shutil.rmtree(directory)
-            directory.parent.mkdir(parents=True, exist_ok=True)
-            temporary = Path(tempfile.mkdtemp(prefix=f".{digest}-", dir=directory.parent))
-            try:
-                python = venv_python_path(temporary)
-                builder = default_venv_command_builder()
-                wheels = self._materialize_wheels(lock, bundle_dir=bundle_dir)
-                spec = {
-                    "base_python": sys.executable,
-                    "venv_path": temporary,
-                    "python_path": python,
-                }
-                commands = [builder.create_command(spec)]
-                if wheels:
-                    install_command = builder.install_command(
-                        spec,
-                        [str(path) for path in wheels],
-                    )
-                    install_index = install_command.index("install") + 1
-                    install_command[install_index:install_index] = [
-                        "--no-index",
-                        "--no-deps",
-                    ]
-                    commands.append(install_command)
-                for command in commands:
-                    try:
-                        built = run_process_tree(command, timeout=600)
-                    except (OSError, subprocess.TimeoutExpired) as exc:
-                        raise _error(
-                            "embedded_environment_build_failed",
-                            "environment build command was interrupted",
-                        ) from exc
-                    if built.returncode:
-                        raise _error(
-                            "embedded_environment_build_failed",
-                            (built.stderr or "environment installation failed")[-2000:],
-                        )
-                framework_path = self._project_framework_authority(
-                    python,
-                    temporary,
-                    authority,
-                )
-                final_python = directory / python.relative_to(temporary)
-                final_framework_path = directory / framework_path.relative_to(temporary)
-                _atomic_write(
-                    temporary / "ready.json",
-                    _canonical_json(
-                        {
-                            "identity": digest,
-                            "lock_hash": lock["lock_hash"],
-                            "builder": builder.name,
-                            "python": str(final_python),
-                            "framework_path": str(final_framework_path),
-                            "framework_identity": authority["identity"],
-                        }
-                    ),
-                )
-                os.replace(temporary, directory)
-                if not self._environment_healthy(final_python):
-                    shutil.rmtree(directory)
-                    raise _error(
-                        "embedded_environment_build_failed",
-                        "new environment failed its worker import health check",
-                    )
-            finally:
-                if temporary.exists():
-                    shutil.rmtree(temporary)
+            python = self._ensure_environment_locked(
+                lock,
+                digest=digest,
+                projection=projection,
+                bundle_dir=bundle_dir,
+            )
         self._cleanup_cache_directory(
             "environments",
             maximum=MAX_ENVIRONMENT_CACHE_ENTRIES,
             lock_prefix="environment-",
             preserve={digest},
         )
-        return Path(json.loads(marker.read_text(encoding="utf-8"))["python"])
+        return python
 
-    @staticmethod
-    def _project_framework_authority(
-        python: Path,
-        environment: Path,
-        authority: Mapping[str, Any],
+    def _ensure_environment_locked(
+        self,
+        lock: Mapping[str, Any],
+        *,
+        digest: str,
+        projection: tuple[
+            dict[str, str],
+            str,
+            list[tuple[PurePosixPath, bytes]],
+            str,
+            list[tuple[PurePosixPath, bytes]],
+        ],
+        bundle_dir: Path | None,
     ) -> Path:
-        """Copy only the installed ``spl`` package into the isolated runtime."""
+        """Return one verified environment while its exact hash lock is held."""
 
-        discovered = run_process_tree(
-            [
-                str(python),
-                "-I",
-                "-c",
-                "import sysconfig; print(sysconfig.get_paths()['purelib'])",
-            ],
-            env={
-                "PATH": str(python.parent),
-                "LANG": "C.UTF-8",
-                "LC_ALL": "C.UTF-8",
-                "PYTHONUTF8": "1",
-                "PYTHONNOUSERSITE": "1",
-            },
-            timeout=30,
-        )
-        if discovered.returncode:
-            raise _error("embedded_environment_build_failed", "environment package path discovery failed")
-        environment_root = environment.resolve()
-        purelib = Path(discovered.stdout.strip()).resolve()
         try:
-            relative_purelib = purelib.relative_to(environment_root)
-        except ValueError as exc:
-            raise _error("embedded_environment_build_failed", "environment package path escaped its root") from exc
-        target = environment / relative_purelib / "spl"
-        if target.exists():
-            raise _error("embedded_environment_build_failed", "an Object dependency attempted to provide spl")
-        shutil.copytree(
-            Path(authority["package_root"]),
-            target,
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            return self._ensure_environment_locked_impl(
+                lock,
+                digest=digest,
+                projection=projection,
+                bundle_dir=bundle_dir,
+            )
+        except OSError:
+            raise _error(
+                "embedded_environment_build_failed",
+                "environment materialization was interrupted",
+            ) from None
+
+    def _ensure_environment_locked_impl(
+        self,
+        lock: Mapping[str, Any],
+        *,
+        digest: str,
+        projection: tuple[
+            dict[str, str],
+            str,
+            list[tuple[PurePosixPath, bytes]],
+            str,
+            list[tuple[PurePosixPath, bytes]],
+        ],
+        bundle_dir: Path | None,
+    ) -> Path:
+        """Materialize one environment after the caller acquires its hash lock."""
+
+        framework_identity = projection[0]
+        environment_root = self.cache_root / "environments"
+        if environment_root.is_symlink() or (environment_root.exists() and not environment_root.is_dir()):
+            _remove_cache_path(environment_root)
+        environment_root.mkdir(parents=True, exist_ok=True)
+        directory = environment_root / digest
+        marker = directory / "ready.json"
+        marker_document = _environment_marker_document(
+            digest=digest,
+            lock_hash=str(lock["lock_hash"]),
+            framework_identity=framework_identity,
         )
-        if _tree_hash(target) != authority["tree_hash"]:
-            raise _error("embedded_environment_build_failed", "installed framework projection changed during copy")
-        return target
+        wheels = self._materialize_wheels(lock, bundle_dir=bundle_dir)
+        expected_files = _expected_environment_files(
+            lock=lock,
+            digest=digest,
+            projection=projection,
+            wheels=wheels,
+        )
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            _remove_cache_path(directory)
+        python = directory.joinpath(*_environment_python_relative().parts)
+        try:
+            ready = _read_environment_marker(marker)
+            marker_valid = _canonical_json(ready) == _canonical_json(marker_document)
+        except (ClientError, OSError, ValueError):
+            marker_valid = False
+        if marker_valid and _verify_environment_inventory(directory, expected_files):
+            if self._environment_healthy(python):
+                return python
+        if directory.exists():
+            _remove_cache_path(directory)
+        temporary = Path(tempfile.mkdtemp(prefix=f".{digest}-", dir=directory.parent))
+        try:
+            try:
+                _write_environment_tree(temporary, expected_files)
+            except OSError:
+                raise _error(
+                    "embedded_environment_build_failed",
+                    "environment materialization was interrupted",
+                ) from None
+            temporary_python = temporary.joinpath(*_environment_python_relative().parts)
+            ready = _read_environment_marker(temporary / "ready.json")
+            if (
+                _canonical_json(ready) != _canonical_json(marker_document)
+                or not _verify_environment_inventory(temporary, expected_files)
+                or not self._environment_healthy(temporary_python)
+            ):
+                raise _error(
+                    "embedded_environment_build_failed",
+                    "new environment failed integrity verification",
+                )
+            os.replace(temporary, directory)
+            python = directory.joinpath(*_environment_python_relative().parts)
+            if not _verify_environment_inventory(directory, expected_files) or not self._environment_healthy(python):
+                _remove_cache_path(directory)
+                raise _error(
+                    "embedded_environment_build_failed",
+                    "new environment failed integrity verification",
+                )
+        finally:
+            if temporary.exists():
+                _remove_cache_path(temporary)
+        return python
 
     @staticmethod
     def _environment_healthy(python: Path) -> bool:
@@ -1311,7 +1986,18 @@ class EmbeddedBackend:
             return False
         try:
             completed = run_process_tree(
-                [str(python), "-I", "-m", "spl.daemon.worker", "--health-check"],
+                [
+                    str(python),
+                    "-B",
+                    "-I",
+                    "-c",
+                    (
+                        "import importlib.metadata as m; "
+                        "from spl.daemon.worker import PUBLIC_EMBEDDED_HOST_CONTRACT as c; "
+                        "assert c == 'spl.public_embedded_host.v1'; "
+                        "assert tuple(map(int, m.version('splime').split('.'))) >= (0, 4, 9)"
+                    ),
+                ],
                 env={
                     "PATH": str(python.parent),
                     "LANG": "C.UTF-8",
@@ -1323,7 +2009,7 @@ class EmbeddedBackend:
             )
         except (OSError, subprocess.TimeoutExpired):
             return False
-        return completed.returncode == 0 and completed.stdout.strip() == PUBLIC_EMBEDDED_HOST_CONTRACT
+        return completed.returncode == 0
 
     def _materialize_wheels(
         self,
@@ -1340,11 +2026,13 @@ class EmbeddedBackend:
             directory = self.cache_root / "wheels" / digest
             path = directory / filename
             with _hash_lock(self.cache_root, f"wheel-{digest}"):
+                if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+                    _remove_cache_path(directory)
                 if path.is_file():
                     try:
                         self._verify_wheel_file(path, artifact)
                     except (ClientError, OSError, ValueError, zipfile.BadZipFile):
-                        shutil.rmtree(directory)
+                        _remove_cache_path(directory)
                 if not path.is_file():
                     source = artifact["source"]
                     data = self.artifact_transport.wheel(
@@ -1368,8 +2056,8 @@ class EmbeddedBackend:
         return result
 
     @staticmethod
-    def _verify_wheel_file(path: Path, artifact: Mapping[str, Any]) -> None:
-        data = path.read_bytes()
+    def _verify_wheel_file(path: Path, artifact: Mapping[str, Any]) -> bytes:
+        data = _read_bounded_regular(path, maximum=MAX_WHEEL_BYTES, label="cached wheel")
         if len(data) != artifact["size"] or _sha256(data) != artifact["sha256"]:
             raise _error("public_artifact_hash_mismatch", "cached wheel bytes disagree with the signed lock")
         try:
@@ -1381,18 +2069,43 @@ class EmbeddedBackend:
             (message for name in names if (message := _runtime_projection_violation(name)) is not None),
             None,
         )
-        if artifact.get("project") == "splime":
-            raise _error("public_artifact_unsafe", "Object dependencies cannot replace the installed splime authority")
         if violation is not None:
             raise _error("public_artifact_unsafe", violation)
         if any(name.casefold().endswith((".so", ".dylib", ".dll", ".pyd", ".a", ".lib", ".exe")) for name in names):
             raise _error("public_artifact_unsafe", "wheel contains native members")
         wheel_names = [name for name in names if name.endswith(".dist-info/WHEEL")]
-        if len(wheel_names) != 1:
+        metadata_names = [name for name in names if name.endswith(".dist-info/METADATA")]
+        if len(wheel_names) != 1 or len(metadata_names) != 1:
             raise _error("public_artifact_unsafe", "wheel metadata inventory is invalid")
-        wheel_metadata = members[wheel_names[0]].decode("utf-8", errors="strict")
-        if "Root-Is-Purelib: true" not in wheel_metadata:
+        try:
+            import email
+
+            wheel_metadata = email.message_from_bytes(members[wheel_names[0]])
+            metadata = email.message_from_bytes(members[metadata_names[0]])
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise _error("public_artifact_unsafe", "wheel metadata is malformed") from exc
+        if str(wheel_metadata.get("Root-Is-Purelib", "")).casefold() != "true":
             raise _error("public_artifact_unsafe", "wheel is not pure Python")
+        project = re.sub(r"[-_.]+", "-", str(metadata.get("Name", ""))).casefold()
+        expected_project = re.sub(r"[-_.]+", "-", str(artifact.get("project", ""))).casefold()
+        tags = sorted(str(value) for value in wheel_metadata.get_all("Tag", []))
+        requires_dist = sorted(str(value) for value in metadata.get_all("Requires-Dist", []))
+        expected_requirements = sorted(
+            str(value["requirement"])
+            for value in artifact.get("evaluated_requirements", [])
+            if isinstance(value, Mapping)
+        )
+        if (
+            project != expected_project
+            or project == "splime"
+            or str(metadata.get("Version", "")) != artifact.get("version")
+            or str(metadata.get("Requires-Python", "")) != artifact.get("requires_python")
+            or str(metadata.get("License-Expression", "")) != artifact.get("license_expression")
+            or tags != artifact.get("tags")
+            or requires_dist != expected_requirements
+        ):
+            raise _error("public_artifact_unsafe", "wheel metadata disagrees with the signed lock")
+        return data
 
     @contextmanager
     def _environment_use_locks(self, environments: Iterable[Path]) -> Iterator[None]:
@@ -1420,9 +2133,11 @@ class EmbeddedBackend:
         preserve: set[str],
     ) -> None:
         root = self.cache_root / namespace
-        if not root.is_dir():
+        if root.is_symlink() or not root.is_dir():
             return
-        entries = [item for item in root.iterdir() if item.is_dir() and not item.name.startswith(".")]
+        entries = [
+            item for item in root.iterdir() if item.is_dir() and not item.is_symlink() and not item.name.startswith(".")
+        ]
         if len(entries) <= maximum:
             return
         entries.sort(key=lambda item: (item.stat().st_mtime_ns, item.name))
@@ -1435,7 +2150,7 @@ class EmbeddedBackend:
             with _try_hash_lock(self.cache_root, f"{lock_prefix}{entry.name}") as acquired:
                 if not acquired or not entry.is_dir():
                     continue
-                shutil.rmtree(entry)
+                _remove_cache_path(entry)
                 remove_count -= 1
 
     def _execute(
@@ -1498,6 +2213,7 @@ class EmbeddedBackend:
             }
             command = [
                 str(environment),
+                "-B",
                 "-I",
                 "-m",
                 "spl.daemon.worker",
@@ -1522,8 +2238,7 @@ class EmbeddedBackend:
             except subprocess.TimeoutExpired as exc:
                 raise _error("embedded_run_timeout", "embedded public run timed out") from exc
             if completed.returncode or not result_path.is_file():
-                message = (completed.stderr or completed.stdout or "embedded worker failed")[-2000:]
-                raise _error("embedded_run_failed", message)
+                raise _error("embedded_run_failed", "embedded public execution failed")
             payload = json.loads(result_path.read_text(encoding="utf-8"))
             downloaded: dict[str, Path] = {}
             if artifacts_dir is not None:
@@ -1561,10 +2276,10 @@ def _environment_lock_hash(python: Path) -> str | None:
 
     marker = python.parent.parent / "ready.json"
     try:
-        value = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
+        value = _read_environment_marker(marker)
+    except (ClientError, OSError, ValueError):
         return None
-    lock_hash = value.get("lock_hash") if isinstance(value, Mapping) else None
+    lock_hash = value.get("lock_hash")
     return str(lock_hash) if isinstance(lock_hash, str) else None
 
 

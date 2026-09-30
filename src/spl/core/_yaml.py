@@ -1,9 +1,9 @@
 """Optional PyYAML registration seam for the execution-only authority.
 
 The installed ``splime`` distribution requires PyYAML and therefore observes
-the ordinary module unchanged.  The embedded public runtime executes producer-
-compiled Python and never parses or emits YAML; its isolated first-party
-projection can consequently import the runtime entity types without acquiring
+the ordinary module unchanged.  The signed public worker executes producer-
+compiled Python and never parses or emits YAML; its embedded first-party
+authority can consequently import the runtime entity types without acquiring
 an unsigned YAML implementation.
 """
 
@@ -41,7 +41,7 @@ class _ExecutionOnlyYaml:
 
     def __getattr__(self, name: str) -> Any:
         raise ModuleNotFoundError(
-            "PyYAML is required for SPL serialization; the embedded public runtime "
+            "PyYAML is required for SPL serialization; the signed public worker "
             "accepts only producer-compiled execution members"
         ) from None
 

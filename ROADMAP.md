@@ -1,21 +1,23 @@
 # splime Roadmap
 
-_Last updated: 2026-07-21, on the 0.4.x line. This document describes direction, not promises: design decisions listed here are fixed, but scope and timing of unreleased items can change. Feedback directly shapes this list — [issues](https://github.com/yastrebovks/splime/issues) are the best place to push back._
+_Last updated: 2026-08-25, on the 0.4.x line. This document describes direction, not promises: design decisions listed here are fixed, but scope and timing of unreleased items can change. Feedback directly shapes this list — [issues](https://github.com/yastrebovks/splime/issues) are the best place to push back._
 
 ## Where splime is today (shipped, 0.4.x)
 
-splime turns trusted Python functions into versioned, portable **nodes** that can be reused across projects and executed locally or remotely.
+splime turns trusted Python functions into versioned, portable **nodes** that can be reused across projects and executed locally, on a private worker, or straight from a public catalog, with no daemon and no account.
 
-The project grew out of a 2025 [Ask HN about code that is valuable but "not an app"](https://news.ycombinator.com/item?id=43667887) — an ML model, a CLI tool, a pile of small functions in several languages. The lesson from that thread shaped the design: teams trust and reuse their own code, so splime removes friction inside a trusted team instead of trying to be a marketplace.
+The project grew out of a 2025 [Ask HN about code that is valuable but "not an app"](https://news.ycombinator.com/item?id=43667887) — an ML model, a CLI tool, a pile of small functions in several languages. The lesson from that thread still shapes the design, though we understand it more precisely now: people rightly refuse to *delegate trust* to a stranger's code, which is a statement about execution, not about distribution. So splime removes friction inside a trusted team, and the public catalog distributes signed, immutable releases that run only on the user's own machine after explicit consent — trust stays where it belongs.
 
 - **Local-first core.** A local daemon with a SQLite registry; nodes identified by `(owner, library, name)`, versions content-addressed by hash. Publishing identical code twice does not create a new version.
 - **Deep Python integration.** Functions are captured from live objects: AST for ports, bytecode walk for dependencies, automatic distribution pinning from the author's environment.
 - **File-edge transport with tags.** Non-JSON values travel between nodes as file artifacts through save/load adapter halves. The tag is the contract and is validated before any bytes are read; adapter resolution is layered (port default → pipeline → edge → run override) and the chosen level is recorded.
 - **Dependency and runtime environments.** Environments are built per spec hash with `uv venv --relocatable` + `uv pip install --strict` (pip fallback). Supported function nodes run through a stdlib-only runner in a venv where splime itself is not installed. Native and venv-subprocess execute trusted code under the conductor's OS identity (the daemon user for daemon-managed runs); dependency/process separation is not an OS sandbox. Docker (with `--network none` by default) or a separate OS identity provides the boundary for code that must not read same-UID daemon files, subject to configured mounts and Docker-host trust.
 - **Runs as data.** `keep="on_failure"` retains failed local runs with versioned manifests and deterministic node fingerprints. `resume` recomputes a chosen node set plus descendants while frozen results are digest-validated; every resume is a new run with `parent_run_id` lineage.
+- **Public Objects and Library Adapters (introduced in 0.4.8).** Any Function, Pipeline or Library Adapter whose dependency closure passes a strict eligibility check — no `NodeRemote`, no private dependencies, no declared secret or credential bindings, pure-Python pinned dependencies from official PyPI only — can be activated as an immutable, Ed25519-signed public release. Every Public Object has a permanent page (`splime.io/@owner/library/name`). Blocked candidates get a stable `PUBLICATION_BLOCKED` error naming the path in the graph, the reason and the fix; dependencies are never auto-published.
+- **Embedded execution (introduced in 0.4.8; current runtime contract in 0.4.10).** `SPLClient.embedded()` resolves a `splime://` reference, verifies the signed manifest and bundle hashes, builds a content-addressed virtual environment and executes locally through the installed `splime` framework — no separate public-worker distribution, daemon, machine registration or account. First execution of an exact release requires explicit `trust=True` bound to that content hash; a new version means a new decision. Pinned cached releases run offline. A venv isolates dependencies; it is not an OS sandbox.
 - **Team layer.** A coordination server and Console (managed, not open-source) handle users, teams, tokens, machines, libraries, grants, and remote runs. Worker machines enroll outbound and poll for work — there is no inbound "execute this" port on a worker.
 
-The framework and local daemon are open source (this repository, `pip install splime`). The coordination server and Console are the managed part of the project.
+The framework, the local daemon and the embedded runtime are open source (this repository, `pip install splime`). The coordination server, the catalog service and the Console are the managed part of the project.
 
 ## Next: 0.5.0 — command nodes and the first non-Python language
 
@@ -69,12 +71,12 @@ The Python path does not degrade — not in developer experience, not in perform
 
 To keep expectations honest, things splime is **not** heading toward in this cycle:
 
-- a public marketplace of nodes, in any form;
-- "run arbitrary code anywhere" — nodes are packaged and executed by a team that trusts their code;
+- **selling code.** The public catalog is a distribution channel, not a marketplace: objects are free, releases are signed, and nothing in this cycle adds prices, purchases or paid tiers to catalog entries;
+- **arbitrary-code delegation** — no execution of unreviewed code on someone else's workers, in any tier. Team nodes are packaged and executed by a team that trusts their code; a public object executes only on the machine of a user who explicitly accepted that exact signed release;
 - an any-language platform before the single pilot SDK language is validated in practice;
 - semantic parsers of foreign languages (rejected as a model; a targeted revisit for one high-value language is possible only after the declaration path is validated);
 - replacing orchestrators (Airflow/Prefect/Temporal) or distributed-compute engines (Ray) — different layer, different job.
 
 ## Feedback
 
-The fastest way to influence this roadmap is to try the 0.4.x release (`pip install splime`, Python 3.13+) and open an issue: what you wrap first, where the declaration format fights you, which language should be the pilot SDK. Design documents live in `docs/` in this repository.
+The fastest way to influence this roadmap is to try the 0.4.x release (`pip install splime`, Python 3.13+), publish a first public object, and open an issue: what you wrap first, where the declaration format fights you, which language should be the pilot SDK, whether foreign nodes should eventually reach the public catalog. Design documents live in `docs/` in this repository.

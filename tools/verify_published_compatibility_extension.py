@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify published 0.4.8 artifacts and their compatibility with 0.4.9."""
+"""Verify a published predecessor and its recorded compatibility extension."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -39,21 +40,27 @@ def _download(row: dict[str, Any], target: Path) -> None:
 
 def verify(evidence_path: Path) -> dict[str, Any]:
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    version = evidence.get("version")
+    release_target = evidence.get("release_target")
     if (
         evidence.get("schema") != "splime.historical_compatibility_extension.v1"
         or evidence.get("schema_version") != 1
-        or evidence.get("version") != "0.4.8"
+        or not isinstance(version, str)
+        or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None
+        or not isinstance(release_target, str)
+        or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", release_target) is None
+        or release_target == version
     ):
         raise ValueError("historical compatibility extension identity is invalid")
     artifacts = evidence.get("artifacts")
     if not isinstance(artifacts, list) or len(artifacts) != 2:
         raise ValueError("historical compatibility extension artifact inventory is invalid")
     by_filename = {str(row.get("filename")): row for row in artifacts if isinstance(row, dict)}
-    wheel_name = "splime-0.4.8-py3-none-any.whl"
-    if set(by_filename) != {wheel_name, "splime-0.4.8.tar.gz"}:
+    wheel_name = f"splime-{version}-py3-none-any.whl"
+    if set(by_filename) != {wheel_name, f"splime-{version}.tar.gz"}:
         raise ValueError("historical compatibility extension must bind wheel and sdist")
 
-    with tempfile.TemporaryDirectory(prefix="splime-0.4.8-extension-") as raw:
+    with tempfile.TemporaryDirectory(prefix=f"splime-{version}-extension-") as raw:
         root = Path(raw)
         for filename, row in by_filename.items():
             _download(row, root / filename)
@@ -79,7 +86,7 @@ def verify(evidence_path: Path) -> dict[str, Any]:
             check=False,
         )
         if completed.returncode:
-            raise ValueError(f"published 0.4.8 probe failed: {completed.stderr[-1000:]}")
+            raise ValueError(f"published {version} probe failed: {completed.stderr[-1000:]}")
         probe = json.loads(completed.stdout)
         behavioral = probe["behavioral_results"]
         failures = [name for name, result in behavioral.items() if result["status"] == "FAIL"]
@@ -112,7 +119,7 @@ def verify(evidence_path: Path) -> dict[str, Any]:
             },
             "versions": [
                 {
-                    "version": "0.4.8",
+                    "version": version,
                     "status": "PASS" if not failures else "FAIL",
                     "artifact": by_filename[wheel_name],
                     "interpreter": probe["interpreter"],
@@ -138,14 +145,16 @@ def verify(evidence_path: Path) -> dict[str, Any]:
         or failures != expected_probe.get("failures")
         or ("PASS" if not failures else "FAIL") != expected_probe.get("status")
     ):
-        raise ValueError("published 0.4.8 probe disagrees with recorded evidence")
+        raise ValueError(f"published {version} probe disagrees with recorded evidence")
     expected_comparison = evidence["facade_comparison"]
     observed_comparison = {"status": compared["status"]} | {
         key: compared["coverage"][key] for key in expected_comparison if key != "status"
     }
     if observed_comparison != expected_comparison:
-        raise ValueError("published 0.4.8 facade comparison disagrees with recorded evidence")
+        raise ValueError(f"published {version} facade comparison disagrees with recorded evidence")
     return {
+        "version": version,
+        "release_target": release_target,
         "artifacts": len(artifacts),
         "behavioral_rows": len(behavioral),
         "comparison": observed_comparison,
@@ -158,12 +167,12 @@ def main() -> int:
     parser.add_argument(
         "--evidence",
         type=Path,
-        default=root / "release" / "0.4.9" / "historical-extension.json",
+        default=root / "release" / "0.4.10" / "historical-extension.json",
     )
     args = parser.parse_args()
     result = verify(args.evidence.resolve())
     print(
-        "published 0.4.8 compatibility extension: "
+        f"published {result['version']} compatibility with {result['release_target']}: "
         f"artifacts={result['artifacts']} behavioral={result['behavioral_rows']} "
         f"status={result['comparison']['status']}"
     )

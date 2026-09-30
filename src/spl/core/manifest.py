@@ -18,7 +18,7 @@ from typing import Any, Literal, TypeAlias, cast
 from spl.core.entities.adapter import JSON_ADAPTER_KEY
 from spl.core.entities.artifact import ArtifactRef
 from spl.core.entities.pipeline import AdapterResolutionSource
-from spl.core.fingerprint import FINGERPRINT_FORMAT_VERSION, inline_value_sha256
+from spl.core.fingerprint import FINGERPRINT_FORMAT_VERSION, canonical_json_bytes, inline_value_sha256
 from spl.core.json_contract import dumps as json_dumps
 from spl.core.json_contract import validate_json_value
 from spl.core.redaction import (
@@ -29,6 +29,8 @@ from spl.core.redaction import (
 
 RUN_MANIFEST_SCHEMA_VERSION = 1
 RUN_MANIFEST_FILENAME = "manifest.json"
+RUN_EXECUTION_PLAN_VERSION = 1
+RUN_EXECUTION_PLAN_FILENAME = "execution-plan.json"
 DEFAULT_ON_FAILURE_TTL_SECONDS = 7 * 24 * 60 * 60
 TERMINAL_RUN_STATUSES = frozenset({"succeeded", "failed", "cancelled", "interrupted", "stale"})
 ACTIVE_RUN_STATUSES = frozenset({"queued", "starting", "preparing_environment", "running", "fetching_object"})
@@ -157,6 +159,47 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
         _chmod_file_owner_only(path)
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+def run_execution_plan_document(
+    run_id: str,
+    adapter_overrides: Mapping[tuple[str, str], Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Return independent historical save-override evidence for one Run."""
+
+    entries = [
+        {
+            "node_id": node_id,
+            "port": port,
+            "identity": dict(identity),
+        }
+        for (node_id, port), identity in sorted(adapter_overrides.items())
+    ]
+    return {
+        "version": RUN_EXECUTION_PLAN_VERSION,
+        "run_id": run_id,
+        "adapter_overrides": entries,
+    }
+
+
+def run_execution_plan_record(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the additive manifest descriptor for an execution-plan sidecar."""
+
+    overrides = document.get("adapter_overrides")
+    return {
+        "version": RUN_EXECUTION_PLAN_VERSION,
+        "adapter_overrides": deepcopy(overrides) if isinstance(overrides, list) else overrides,
+        "evidence": {
+            "uri": RUN_EXECUTION_PLAN_FILENAME,
+            "sha256": hashlib.sha256(canonical_json_bytes(document)).hexdigest(),
+        },
+    }
+
+
+def write_run_execution_plan(run_dir: Path, document: Mapping[str, Any]) -> None:
+    """Persist one Run-owned execution plan beside, but outside, its manifest."""
+
+    atomic_write_json(run_dir / RUN_EXECUTION_PLAN_FILENAME, document)
 
 
 def read_manifest(path: Path) -> dict[str, Any]:
@@ -829,15 +872,19 @@ def edge_record(
     target_port: str,
     artifact: Mapping[str, Any],
     adapter: Mapping[str, Any] | None,
+    variant_id: str | None = None,
 ) -> dict[str, Any]:
     """Build a manifest edge record."""
 
-    return {
+    record: dict[str, Any] = {
         "source": {"node_id": source_node_id, "port": source_port},
         "target": {"node_id": target_node_id, "port": target_port},
         "artifact": dict(artifact),
         "adapter": None if adapter is None else dict(adapter),
     }
+    if variant_id is not None:
+        record["artifact_variant"] = variant_id
+    return record
 
 
 def edge_adapter_record(

@@ -11,7 +11,7 @@ Setup
 
 .. code-block:: bash
 
-   python3.13 -m pip install "splime==0.4.9"
+   python3.13 -m pip install "splime==0.4.10"
    spl-daemon serve        # local daemon on http://127.0.0.1:8765
 
 One import is enough:
@@ -506,7 +506,8 @@ Choose a runtime for its dependency, process, and trust boundary:
        daemon-managed runs).
      - Uses the current interpreter or daemon-provided node environment.
        No Docker image. This is dependency isolation, not an OS sandbox.
-     - Function nodes only; inputs must be JSON-native; honors
+     - Function nodes only; JSON-native values stay inline and registered
+       adapters carry other values through verified files; honors
        ``node_timeout_seconds``.
    * - ``docker``
      - Uses the configured container process/filesystem boundary with only the
@@ -517,10 +518,11 @@ Choose a runtime for its dependency, process, and trust boundary:
        possible, by the host Docker daemon before the node runs. Its protection
        depends on configured mounts and network options and on Docker host
        trust.
-     - Function nodes only; inputs must be JSON-native; honors
+     - Function nodes only; JSON-native values stay inline and registered
+       adapters carry other values through verified files; honors
        ``node_timeout_seconds`` and kills the container on timeout. No SPL
-       package, no ``PYTHONPATH`` injection, and no nested Docker inside an
-       object-level Docker worker. Node containers default to no network.
+       package access, no ``PYTHONPATH`` injection, and no nested Docker inside
+       an object-level Docker worker. Node containers default to no network.
 
 For daemon runs, per-node ``docker`` uses the object-level environment spec:
 the daemon builds or reuses the Docker image before starting the worker and the
@@ -567,11 +569,75 @@ finite number; ``NaN`` and infinities fail before a subprocess or container is
 created. ``None`` leaves the bound disabled. ``native`` runs in the conductor
 process and intentionally has no per-node timeout.
 
-``venv-subprocess`` and ``docker`` both receive inputs through ``input.json``,
-so input values must be JSON-native. If a node needs an arbitrary Python object
-from an adapter edge, run that node with ``native``, insert a converter node as
-in `Converter Nodes For Adapter Tags`_, or wait for artifact-file input
-transport in a later 0.4.x update.
+Adapters across process and container boundaries
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``venv-subprocess`` and per-node ``docker`` use the same closed SPL-free
+protocol. JSON-compatible values retain the historical inline ``input.json``
+and ``result.json`` shape; that fast path creates no adapter bundle, staged
+artifact file, or artifact directory. Non-JSON values cross the boundary as
+regular files selected by the edge adapter:
+
+.. code-block:: python
+
+   import numpy as np
+
+   from spl import DDistribution, lift
+
+   array = lift(make_array).alias('array')
+   result = (
+       lift(use_array)
+       .bind(value=array.as_format('npy'))
+       .alias('result')
+       .render('isolated_array')
+       .add_adapter(
+           np.ndarray,
+           'npy',
+           save=save_ndarray,
+           load=load_ndarray,
+           distributions=(DDistribution(package='numpy', version=np.__version__),),
+       )
+       .with_node_runtime('array', 'venv-subprocess')
+       .with_node_runtime('result', 'docker')
+   )
+
+The run-level ``adapters=`` mapping has higher precedence than an edge
+``.as_format(...)``. An untyped output with one explicit graph format uses that
+format regardless of which node is requested first. If several adapters remain
+possible, select one with ``.as_format(...)`` or a run-level override. An
+explicit converter node remains the repair when the producer format and the
+consumer's accepted tags are genuinely different; see
+`Converter Nodes For Adapter Tags`_.
+
+For fan-out, one canonical artifact is saved per unique save identity. Consumers
+sharing the identity share the artifact; different formats get different
+variants. Kept manifests retain relative artifact URIs plus exact save/load
+provenance. Resume verifies the chosen frozen variant before copying, decoding,
+or running either node, and isolated-to-isolated resume does not decode in the
+conductor. Unambiguous historical single-artifact manifests remain readable.
+
+Custom adapter ``save(path, value)`` and ``load(path)`` callables must be plain
+top-level functions with statically recoverable source: no closures, lambdas,
+decorators, dynamic imports, or unresolved globals. Every non-stdlib import
+must be owned by one declared ``DDistribution(package=..., version=...)`` with
+an exact installed version in the target environment. Built-in adapters carry
+their own dependency metadata. Adapter exceptions, including ``SystemExit``,
+are reported as bounded stage-specific failures without exposing adapter source
+or traceback text.
+
+The file protocol allows at most 1,024 bindings, 256 MiB per artifact, 512 MiB
+aggregate inputs, 512 MiB aggregate output variants, and a 512 KiB custom source
+bundle. Result descriptors are limited to 1 MiB and retained stdout/stderr to a
+64 KiB tail per stream. Names are ASCII-safe and traversal-free; files must be
+stable, single-link regular files and must match their declared size and
+lowercase SHA-256 before adapter code runs.
+
+Docker additionally requires a reachable daemon and an available image with
+the adapter's exact dependencies. The node command keeps ``--network none`` by
+default, mounts only its node work directory, omits the project
+``PYTHONPATH``, and prevents access to an accidentally installed ``spl``
+package. These are transport and dependency boundaries for trusted functions,
+not a claim of arbitrary untrusted-code safety or host OS sandboxing.
 
 Work with a library someone shared with you
 -------------------------------------------

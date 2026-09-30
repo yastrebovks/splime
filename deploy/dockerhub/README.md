@@ -5,16 +5,12 @@ Public container image for the splime local daemon, built from the released
 
 - **Image:** `yastrebovks/spl-daemon`
 - **Tags:** versioned 0.4-series releases and `latest`
-- **Base:** digest-pinned `python:3.13-slim` (multi-arch: `linux/amd64`,
-  `linux/arm64`)
+- **Base:** `python:3.13-slim` (multi-arch: `linux/amd64`, `linux/arm64`)
 - **Runs as:** non-root user `spl` (`10001:10001`)
 - **Port:** `8765` (bind to host loopback only)
 
-The image installs `splime` from PyPI, so the bounded five-file build context
-contains no repository source, package artifact, credential, or daemon state.
-The release wrapper verifies the exact PyPI wheel and sdist SHA-256 values
-before any build. OCI metadata records both the immutable package-release
-commit and the committed Docker packaging revision.
+The image installs `splime` from PyPI, so the build context is empty - no
+repository source is required.
 
 ## Run
 
@@ -28,7 +24,7 @@ docker run -d --name spl-daemon \
   --cap-drop ALL --security-opt no-new-privileges:true \
   -p 127.0.0.1:8765:8765 \
   -v /var/lib/spl-daemon:/var/lib/spl-daemon \
-  yastrebovks/spl-daemon:0.4.9
+  yastrebovks/spl-daemon:0.4.10
 ```
 
 ## Per-node Docker nodes (0.4 series)
@@ -106,26 +102,16 @@ print(client.health())
 docker login                                   # to your Docker Hub account (yastrebovks)
 docker buildx create --use --name splime-builder
 
-# After the signed 0.4.9 package commit and exact PyPI wheel/sdist hashes exist,
-# finalize the separate release/0.4.9/update-docker.sh control and its immutable
-# package/source bindings. Until then publish.sh fails closed and no 0.4.9 image
-# may be built or pushed from this preparation tree.
+# build + push multi-arch (version and latest)
+./publish.sh 0.4.10
 ```
 
-`deploy/dockerhub/publish.sh` is only a compatibility entry point and delegates
-to this same guarded release wrapper; it cannot bypass the checks.
-
-To build directly for development only, use the bounded context explicitly:
+To build a single-arch image locally for testing:
 
 ```bash
-docker build \
-  --build-arg SPL_VERSION=0.4.9 \
-  --build-arg UV_VERSION=0.11.25 \
-  -t yastrebovks/spl-daemon:0.4.9-dev \
-  deploy/dockerhub
+docker build -t yastrebovks/spl-daemon:0.4.10 .
 docker run --rm -p 127.0.0.1:8765:8765 \
-  -v /var/lib/spl-daemon:/var/lib/spl-daemon \
-  yastrebovks/spl-daemon:0.4.9-dev
+  -v /var/lib/spl-daemon:/var/lib/spl-daemon yastrebovks/spl-daemon:0.4.10
 ```
 
 ## Security
@@ -140,6 +126,3 @@ docker run --rm -p 127.0.0.1:8765:8765 \
   [`deploy/daemon/README.md`](../daemon/README.md) for the DooD details.
 - `SPL_DAEMON_SECRET_BACKEND=file` keeps secrets in the daemon home instead of
   an OS keyring (there is no desktop keyring in a container).
-- `uv`, the Python base image and Docker CLI source image are release-pinned.
-  The 0.4.9 package revision remains deliberately `unpublished` until the
-  separate post-PyPI Docker release-control commit binds its exact artifacts.

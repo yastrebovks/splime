@@ -103,10 +103,6 @@ from spl.core.runtime_port_adapters import (
     validate_custom_adapter_source,
     validate_custom_bundle_dependencies,
 )
-
-
-PUBLIC_EMBEDDED_HOST_CONTRACT = "spl.public_embedded_host.v1"
-
 from spl.daemon.callback_capability import CALLBACK_CAPABILITY_ENV
 from spl.daemon.name_validation import validate_name
 from spl.daemon.worker_runtime_marker import (
@@ -122,6 +118,7 @@ RESULT_KEY = "__spl_result__"
 _ARTIFACT_NAME_TOKEN_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 _RUNTIME_ADAPTER_REF_KEY = "__spl_runtime_adapter_artifact__"
 DEFAULT_REMOTE_NODE_HTTP_TIMEOUT_SECONDS: float | None = None
+PUBLIC_EMBEDDED_HOST_CONTRACT = "spl.public_embedded_host.v1"
 _RUNTIME_CUSTOM_ADAPTER_USED_PATH: Path | None = None
 _RUNTIME_LIBRARY_ADAPTERS_DIRECTORY = "runtime-library-adapters"
 
@@ -2017,9 +2014,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Run the worker from the command line."""
 
-    arguments = list(sys.argv[1:] if argv is None else argv)
+    arguments = sys.argv[1:] if argv is None else argv
     if arguments == ["--health-check"]:
-        print(PUBLIC_EMBEDDED_HOST_CONTRACT)
+        print(PUBLIC_EMBEDDED_HOST_CONTRACT, flush=True)
         return 0
     args = build_parser().parse_args(arguments)
     try:

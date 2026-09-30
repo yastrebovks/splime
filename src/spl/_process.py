@@ -75,6 +75,13 @@ def run_process_tree(
             output=stdout_text,
             stderr=stderr_text,
         ) from exc
+    except BaseException:
+        if process_groups_supported:
+            _terminate_timed_out_process(process, grace_seconds=termination_grace_seconds)
+        else:
+            process.kill()
+            process.communicate()
+        raise
 
     return subprocess.CompletedProcess(
         list(command),

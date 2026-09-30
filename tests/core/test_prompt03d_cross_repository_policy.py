@@ -13,15 +13,7 @@ from spl.runtime_environment import spdx_allowed as consumer_spdx_allowed
 import spl.public_artifact_policy as consumer_policy
 
 
-FRAMEWORK_ROOT = Path(__file__).parents[2]
-WORKSPACE = next(
-    (
-        root
-        for root in (Path(__file__).parents[3], Path(__file__).parents[4])
-        if (root / "spl-server" / "src" / "daemon_server").is_dir()
-    ),
-    Path(__file__).parents[3],
-)
+WORKSPACE = Path(__file__).parents[3]
 
 
 def _producer_module():
@@ -58,7 +50,7 @@ def test_producer_and_consumer_use_identical_spdx_grammar(expression: str) -> No
 
 def test_shared_policy_sources_are_byte_identical() -> None:
     producer = WORKSPACE / "spl-server" / "src" / "daemon_server" / "public_artifact_policy.py"
-    consumer = FRAMEWORK_ROOT / "src" / "spl" / "public_artifact_policy.py"
+    consumer = WORKSPACE / "spl" / "src" / "spl" / "public_artifact_policy.py"
     assert producer.read_bytes() == consumer.read_bytes()
 
 
