@@ -136,6 +136,33 @@ jobs:
           fetch-depth: 0
           ref: ${{ env.RELEASE_TAG }}
 
+      - name: Configure authenticated GitLab source trust
+        uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.SPL_RELEASE_GITLAB_SSH_KEY }}
+
+      - name: Install the pinned GitLab host keys
+        env:
+          SPL_RELEASE_GITLAB_KNOWN_HOSTS: ${{ secrets.SPL_RELEASE_GITLAB_KNOWN_HOSTS }}
+        run: |
+          test -n "${SPL_RELEASE_GITLAB_KNOWN_HOSTS}"
+          install -d -m 0700 "${HOME}/.ssh"
+          printf '%s\n' "${SPL_RELEASE_GITLAB_KNOWN_HOSTS}" > "${HOME}/.ssh/known_hosts"
+          chmod 0600 "${HOME}/.ssh/known_hosts"
+
+      - name: Materialize the cross-repository test workspace
+        run: |
+          SERVER_REF="$(python -c 'import json; print(json.load(open("release-contract.json"))["components"]["server"]["source_ref"])')"
+          CONSOLE_REF="$(python -c 'import json; print(json.load(open("release-contract.json"))["components"]["console"]["source_ref"])')"
+          git clone --no-hardlinks --branch "${RELEASE_TAG}" . ../spl
+          git clone --branch "${SERVER_REF}" --depth 1 \
+            git@gitlab.com:spl894143/spl-server.git ../spl-server
+          git clone --branch "${CONSOLE_REF}" --depth 1 \
+            git@gitlab.com:spl894143/spl-frontend.git ../spl-frontend
+          test -z "$(git -C ../spl status --porcelain=v1 --untracked-files=all)"
+          test -z "$(git -C ../spl-server status --porcelain=v1 --untracked-files=all)"
+          test -z "$(git -C ../spl-frontend status --porcelain=v1 --untracked-files=all)"
+
       - name: Fetch and verify the reviewed canonical public cookbook
         run: |
           test -n "${PUBLIC_COOKBOOK_URL}"

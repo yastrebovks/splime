@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -42,6 +43,19 @@ def _install_fixture(home: Path) -> Path:
     home.mkdir(parents=True, exist_ok=True)
     db_path = home / "daemon.sqlite3"
     with sqlite3.connect(db_path) as conn:
+        # SQLite 3.50 made ``unistr`` available as a built-in.  The immutable
+        # 0.4.5 dump was produced by that release, while supported Python
+        # builds may still link an older SQLite.  Register the exact escape
+        # subset used by the fixture so the historical bytes remain portable.
+        conn.create_function(
+            "unistr",
+            1,
+            lambda value: re.sub(
+                r"\\u([0-9a-fA-F]{4})",
+                lambda match: chr(int(match.group(1), 16)),
+                str(value),
+            ),
+        )
         conn.executescript(FIXTURE.read_text(encoding="utf-8"))
     return db_path
 

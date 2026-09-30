@@ -149,6 +149,7 @@ class FileInput:
     sha256: str
     _device: int
     _inode: int
+    _ctime_ns: int
 
     def __init__(
         self,
@@ -169,6 +170,7 @@ class FileInput:
         object.__setattr__(self, "sha256", hashlib.sha256(data).hexdigest())
         object.__setattr__(self, "_device", int(identity.st_dev))
         object.__setattr__(self, "_inode", int(identity.st_ino))
+        object.__setattr__(self, "_ctime_ns", int(identity.st_ctime_ns))
 
     def staged_bytes(self, *, max_bytes: int = MAX_FILE_INPUT_BYTES) -> bytes:
         """Return revalidated bytes for private client staging."""
@@ -178,6 +180,7 @@ class FileInput:
         if (
             int(identity.st_dev) != self._device
             or int(identity.st_ino) != self._inode
+            or int(identity.st_ctime_ns) != self._ctime_ns
             or len(data) != self.size
             or digest != self.sha256
         ):
