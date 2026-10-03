@@ -16,11 +16,12 @@ on:
         required: true
         type: string
       target:
-        description: "Package index to publish to"
+        description: "Verify only, or select the package index to publish to"
         required: true
         type: choice
-        default: testpypi
+        default: verify
         options:
+          - verify
           - testpypi
           - pypi
 
