@@ -1548,9 +1548,12 @@ class Client:
         name_or_id: str,
         *,
         library: str | None = None,
+        execution_profile: str | None = None,
     ) -> dict[str, Any]:
         self.require_public_profile_capability(PUBLIC_OBJECT_PROFILE_CAPABILITY)
         payload = {"library": library} if library is not None else {}
+        if execution_profile is not None:
+            payload["execution_profile"] = execution_profile
         return _as_json_dict(
             self._json_request(
                 "POST",

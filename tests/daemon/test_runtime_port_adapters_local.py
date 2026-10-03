@@ -1002,7 +1002,17 @@ def test_exact_cat_encoding_matrix_and_png_to_text_use_generic_lifecycle(
 
     immutable_before = store.get_object("cat_encoding", include_yaml=True)
     frame = pd.DataFrame({"measurement": [1, 2, 3], "species": ["setosa", "versicolor", "setosa"]})
-    expected = frame.copy()
+    # pandas 3 infers a dedicated string dtype; this Object deliberately selects
+    # object-typed categories, so exercise the same transformation on both majors.
+    frame["species"] = frame["species"].astype(object)
+    expected = pd.DataFrame(
+        {
+            "measurement": [1, 2, 3],
+            "species_setosa": [True, False, True],
+            "species_versicolor": [False, True, False],
+            "species_nan": [False, False, False],
+        }
+    )
     cases = [
         ("implicit_json_split", None, DATAFRAME_JSON_SPLIT, DATAFRAME_JSON_SPLIT),
         (

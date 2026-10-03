@@ -71,7 +71,7 @@ def test_canonical_docker_source_pins_the_exact_release_and_oci_identity() -> No
     publish_text = publish.read_text(encoding="utf-8")
     combined = "\n".join((dockerfile, compose, publish_text, (DOCKER_ROOT / "README.md").read_text(encoding="utf-8")))
 
-    assert version == "0.4.10"
+    assert manifest["docker"]["tag"] == version
     assert f"ARG SPL_VERSION={version}" in dockerfile
     assert 'python -m pip install "splime==${SPL_VERSION}"' in dockerfile
     assert f"image: {manifest['docker']['repository']}:{version}" in compose

@@ -25,7 +25,7 @@ FROM python:3.13-slim
 COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
 
 # Which splime release to install (override with --build-arg SPL_VERSION=...).
-ARG SPL_VERSION=0.4.10
+ARG SPL_VERSION=0.4.11
 ARG SPL_UID=10001
 ARG SPL_GID=10001
 

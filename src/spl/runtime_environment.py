@@ -29,13 +29,13 @@ _VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]*$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 PUBLIC_RUNTIME_LOCK_SCHEMA = "spl.public_runtime_lock.v3"
 PUBLIC_RUNTIME_POLICY_NAME = "splime-public-python-artifacts"
-PUBLIC_RUNTIME_POLICY_VERSION = "0.4.10"
+PUBLIC_RUNTIME_POLICY_VERSION = "0.4.9"
 PUBLIC_RUNTIME_RESOLVER_NAME = "splime-pypi-closure"
 PUBLIC_EMBEDDED_EXECUTOR = {
     "kind": "installed-framework",
     "project": "splime",
     "contract": "spl.public_embedded_host.v1",
-    "minimum_version": "0.4.10",
+    "minimum_version": "0.4.9",
 }
 MAX_PUBLIC_RUNTIME_WHEEL_BYTES = 128 * 1024 * 1024
 
@@ -224,9 +224,10 @@ def _requirements(value: Any) -> list[dict[str, Any]]:
 
 
 def _executor(value: Any) -> dict[str, str]:
-    if not isinstance(value, Mapping) or dict(value) != PUBLIC_EMBEDDED_EXECUTOR:
+    supported = [dict(PUBLIC_EMBEDDED_EXECUTOR), {**PUBLIC_EMBEDDED_EXECUTOR, "minimum_version": "0.4.10"}]
+    if not isinstance(value, Mapping) or dict(value) not in supported:
         raise ValueError("runtime lock executor is malformed or unsupported")
-    return dict(PUBLIC_EMBEDDED_EXECUTOR)
+    return dict(value)
 
 
 def _release_tuple(value: str) -> tuple[int, int, int] | None:
@@ -282,9 +283,12 @@ def _policy(value: Any) -> dict[str, Any]:
         "spdx_allowlist": list(PUBLIC_RUNTIME_SPDX_ALLOWLIST),
         "wheel_policy": "non-yanked-universal-pure-python-only",
     }
-    if not isinstance(value, Mapping) or dict(value) != expected:
-        raise ValueError("runtime lock policy does not match the reviewed 0.4.10 policy")
-    return expected
+    # The released 0.4.10 server uses the same strict wheel/SPDX policy with
+    # a new identity. Preserve either signed identity verbatim when validating.
+    supported = [expected, {**expected, "version": "0.4.10"}]
+    if not isinstance(value, Mapping) or dict(value) not in supported:
+        raise ValueError("runtime lock policy does not match a reviewed 0.4.9/0.4.10 policy")
+    return dict(value)
 
 
 def _resolver(value: Any) -> dict[str, Any]:

@@ -1037,14 +1037,17 @@ def _collect_functions(documents: list[tuple[Any, list[Any]]]) -> dict[str, DFun
     return functions
 
 
-def _collect_distributions(documents: list[tuple[Any, list[Any]]]) -> list[dict[str, str]]:
-    unique = {
-        (item.package, item.version)
-        for _, dependencies in documents
-        for item in dependencies
-        if isinstance(item, DDistribution)
-    }
-    return [{"package": package, "version": version} for package, version in sorted(unique)]
+def _collect_distributions(documents: list[tuple[Any, list[Any]]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], set[str]] = {}
+    for _, dependencies in documents:
+        for item in dependencies:
+            if isinstance(item, DDistribution):
+                grouped.setdefault((item.package, item.version), set()).update(item.modules)
+    return [
+        {"package": package, "version": version, **({"modules": list(modules)} if modules else {})}
+        for (package, version), module_set in sorted(grouped.items())
+        for modules in [sorted(module_set)]
+    ]
 
 
 def _collect_imports(documents: list[tuple[Any, list[Any]]]) -> list[dict[str, Any]]:

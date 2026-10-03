@@ -148,6 +148,7 @@ def _canonical_ir(value: Any) -> Any:
             "tag": "DDistribution",
             "package": value.package,
             "version": value.version,
+            "modules": list(value.modules),
         }
     if isinstance(value, InputPort):
         return {

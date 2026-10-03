@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "release_id": "splime-0.4.10",
-  "version": "0.4.10",
-  "source_tag": "v0.4.10",
+  "release_id": "splime-0.4.11",
+  "version": "0.4.11",
+  "source_tag": "v0.4.11",
   "official_registry": {
     "origin": "https://splime.io",
     "signature_algorithm": "ed25519",
@@ -44,8 +44,8 @@
       "repository": "https://github.com/yastrebovks/splime",
       "workspace": "spl",
       "package": "splime",
-      "version": "0.4.10",
-      "source_ref": "v0.4.10",
+      "version": "0.4.11",
+      "source_ref": "v0.4.11",
       "source_binding": "signed_tag_external_provenance",
       "source_commit": null,
       "artifact": "splime"
@@ -54,8 +54,8 @@
       "repository": "https://github.com/yastrebovks/splime",
       "workspace": "spl",
       "package": "splime",
-      "version": "0.4.10",
-      "source_ref": "v0.4.10",
+      "version": "0.4.11",
+      "source_ref": "v0.4.11",
       "source_binding": "signed_tag_external_provenance",
       "source_commit": null,
       "artifact": "splime"
@@ -64,8 +64,8 @@
       "repository": "gitlab.com/spl894143/spl-server",
       "workspace": "spl-server",
       "package": "spl-server",
-      "version": "0.4.10",
-      "source_ref": "v0.4.10",
+      "version": "0.4.11",
+      "source_ref": "v0.4.11",
       "source_binding": "pinned_commit",
       "source_commit": null,
       "artifact": "spl-server"
@@ -74,8 +74,8 @@
       "repository": "gitlab.com/spl894143/spl-frontend",
       "workspace": "spl-frontend",
       "package": "splime-console",
-      "version": "0.4.10",
-      "source_ref": "v0.4.10",
+      "version": "0.4.11",
+      "source_ref": "v0.4.11",
       "source_binding": "pinned_commit",
       "source_commit": null,
       "artifact": "splime-console"

@@ -34,7 +34,7 @@ WORKSPACE = Path(__file__).parents[3]
 def test_installed_distribution_exposes_the_public_embedded_host_contract() -> None:
     from spl.daemon.worker import PUBLIC_EMBEDDED_HOST_CONTRACT
 
-    assert importlib.metadata.version("splime") == "0.4.10"
+    assert importlib.metadata.version("splime") == "0.4.11"
     assert PUBLIC_EMBEDDED_HOST_CONTRACT == "spl.public_embedded_host.v1"
 
 
@@ -133,7 +133,7 @@ def test_runtime_lock_requires_exact_v3_installed_framework_executor() -> None:
                 "schema": PUBLIC_RUNTIME_LOCK_SCHEMA,
                 "schema_version": 2,
                 "target": {"implementation": "cpython", "python": "3.13", "extras": []},
-                "policy": {"name": "splime-public-python-artifacts", "version": "0.4.10"},
+                "policy": {"name": "splime-public-python-artifacts", "version": "0.4.9"},
                 "resolver": {"name": "splime-pypi-closure", "version": 1},
                 "requirements": [],
                 "worker": {"project": "splime-public-worker"},

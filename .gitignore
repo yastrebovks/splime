@@ -41,6 +41,7 @@ uv.lock
 daemon-endpoint.json
 daemon-secrets.json
 docs/build/
+docs/_build/
 
 # Codex/workspace scratch
 .codex-*/

@@ -506,6 +506,10 @@ def _unparse_distributions(distributions: tuple[DDistribution, ...]) -> ast.Tupl
                 keywords=[
                     ast.keyword(arg="package", value=ast.Constant(value=x.package)),
                     ast.keyword(arg="version", value=ast.Constant(value=x.version)),
+                    ast.keyword(
+                        arg="modules",
+                        value=ast.Tuple(elts=[ast.Constant(value=module) for module in x.modules], ctx=ast.Load()),
+                    ),
                 ],
             )
             for x in distributions

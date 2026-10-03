@@ -1,29 +1,29 @@
 {
   "schema_version": 2,
-  "release_id": "splime-0.4.10",
-  "version": "0.4.10",
+  "release_id": "splime-0.4.11",
+  "version": "0.4.11",
   "source_date_epoch": null,
   "packages": {
-    "framework": "0.4.10",
-    "daemon": "0.4.10",
-    "server": "0.4.10",
-    "console": "0.4.10"
+    "framework": "0.4.11",
+    "daemon": "0.4.11",
+    "server": "0.4.11",
+    "console": "0.4.11"
   },
   "python": {
     "distribution": "splime",
     "requires_python": ">=3.13",
-    "project_url": "https://pypi.org/project/splime/0.4.10/",
-    "install_requirement": "splime==0.4.10",
+    "project_url": "https://pypi.org/project/splime/0.4.11/",
+    "install_requirement": "splime==0.4.11",
     "artifacts": [
       {
-        "filename": "splime-0.4.10-py3-none-any.whl",
-        "path": "artifacts/python/splime-0.4.10-py3-none-any.whl",
+        "filename": "splime-0.4.11-py3-none-any.whl",
+        "path": "artifacts/python/splime-0.4.11-py3-none-any.whl",
         "url": null,
         "sha256": null
       },
       {
-        "filename": "splime-0.4.10.tar.gz",
-        "path": "artifacts/python/splime-0.4.10.tar.gz",
+        "filename": "splime-0.4.11.tar.gz",
+        "path": "artifacts/python/splime-0.4.11.tar.gz",
         "url": null,
         "sha256": null
       }
@@ -31,7 +31,7 @@
   },
   "console": {
     "url": "https://splime.io/app/",
-    "integrity_url": "https://splime.io/app/static-integrity.json?release=splime-0.4.10",
+    "integrity_url": "https://splime.io/app/static-integrity.json?release=splime-0.4.11",
     "integrity_path": "artifacts/console/static-integrity.json",
     "integrity_sha256": null,
     "cache_policy": "unhashed assets revalidate; only content-hashed assets are immutable"
@@ -118,10 +118,10 @@
   "components": {
     "framework": {
       "repository": "https://github.com/yastrebovks/splime",
-      "source_ref": "v0.4.10",
+      "source_ref": "v0.4.11",
       "source_binding": "signed_tag_external_provenance",
       "source_commit": null,
-      "package_version": "0.4.10",
+      "package_version": "0.4.11",
       "artifact": {
         "identifier": "splime",
         "path": null,
@@ -133,10 +133,10 @@
     },
     "daemon": {
       "repository": "https://github.com/yastrebovks/splime",
-      "source_ref": "v0.4.10",
+      "source_ref": "v0.4.11",
       "source_binding": "signed_tag_external_provenance",
       "source_commit": null,
-      "package_version": "0.4.10",
+      "package_version": "0.4.11",
       "artifact": {
         "identifier": "splime",
         "path": null,
@@ -174,10 +174,10 @@
     },
     "server": {
       "repository": "gitlab.com/spl894143/spl-server",
-      "source_ref": "v0.4.10",
+      "source_ref": "v0.4.11",
       "source_binding": "pinned_commit",
       "source_commit": null,
-      "package_version": "0.4.10",
+      "package_version": "0.4.11",
       "artifact": {
         "identifier": "spl-server",
         "path": null,
@@ -216,10 +216,10 @@
     },
     "console": {
       "repository": "gitlab.com/spl894143/spl-frontend",
-      "source_ref": "v0.4.10",
+      "source_ref": "v0.4.11",
       "source_binding": "pinned_commit",
       "source_commit": null,
-      "package_version": "0.4.10",
+      "package_version": "0.4.11",
       "artifact": {
         "identifier": "splime-console",
         "path": null,
@@ -233,8 +233,8 @@
   },
   "install_page_urls": [
     "https://splime.io/install.html",
-    "https://pypi.org/project/splime/0.4.10/",
-    "https://github.com/yastrebovks/splime/releases/download/v0.4.10/release-manifest.json"
+    "https://pypi.org/project/splime/0.4.11/",
+    "https://github.com/yastrebovks/splime/releases/download/v0.4.11/release-manifest.json"
   ],
   "public_artifacts": [
     {
@@ -242,59 +242,59 @@
       "sha256": null
     }
   ],
-  "manifest_url": "https://github.com/yastrebovks/splime/releases/download/v0.4.10/release-manifest.json",
+  "manifest_url": "https://github.com/yastrebovks/splime/releases/download/v0.4.11/release-manifest.json",
   "github_release": {
-    "url": "https://github.com/yastrebovks/splime/releases/tag/v0.4.10",
+    "url": "https://github.com/yastrebovks/splime/releases/tag/v0.4.11",
     "assets": [
       {
         "name": "source-release-manifest.json",
         "path": "artifacts/source-release-manifest.json",
-        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.10/source-release-manifest.json",
+        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.11/source-release-manifest.json",
         "sha256": null
       },
       {
         "name": "release-artifact-bom.sha256",
         "path": "artifacts/release-artifact-bom.sha256",
-        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.10/release-artifact-bom.sha256",
+        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.11/release-artifact-bom.sha256",
         "sha256": null
       },
       {
-        "name": "splime-0.4.10-py3-none-any.whl",
-        "path": "artifacts/python/splime-0.4.10-py3-none-any.whl",
-        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.10/splime-0.4.10-py3-none-any.whl",
+        "name": "splime-0.4.11-py3-none-any.whl",
+        "path": "artifacts/python/splime-0.4.11-py3-none-any.whl",
+        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.11/splime-0.4.11-py3-none-any.whl",
         "sha256": null
       },
       {
-        "name": "splime-0.4.10.tar.gz",
-        "path": "artifacts/python/splime-0.4.10.tar.gz",
-        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.10/splime-0.4.10.tar.gz",
+        "name": "splime-0.4.11.tar.gz",
+        "path": "artifacts/python/splime-0.4.11.tar.gz",
+        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.11/splime-0.4.11.tar.gz",
         "sha256": null
       },
       {
-        "name": "spl_server-0.4.10-py3-none-any.whl",
-        "path": "artifacts/server/spl_server-0.4.10-py3-none-any.whl",
-        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.10/spl_server-0.4.10-py3-none-any.whl",
+        "name": "spl_server-0.4.11-py3-none-any.whl",
+        "path": "artifacts/server/spl_server-0.4.11-py3-none-any.whl",
+        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.11/spl_server-0.4.11-py3-none-any.whl",
         "sha256": null
       },
       {
-        "name": "splime-console-0.4.10.tar.gz",
-        "path": "artifacts/splime-console-0.4.10.tar.gz",
-        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.10/splime-console-0.4.10.tar.gz",
+        "name": "splime-console-0.4.11.tar.gz",
+        "path": "artifacts/splime-console-0.4.11.tar.gz",
+        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.11/splime-console-0.4.11.tar.gz",
         "sha256": null
       },
       {
         "name": "static-integrity.json",
         "path": "artifacts/console/static-integrity.json",
-        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.10/static-integrity.json",
+        "url": "https://github.com/yastrebovks/splime/releases/download/v0.4.11/static-integrity.json",
         "sha256": null
       }
     ]
   },
   "docker": {
     "repository": "yastrebovks/spl-daemon",
-    "tag": "0.4.10",
+    "tag": "0.4.11",
     "source_repository": "https://github.com/yastrebovks/splime",
-    "source_ref": "v0.4.10",
+    "source_ref": "v0.4.11",
     "source_path": "deploy/dockerhub",
     "manifest_digest": null,
     "platform_digests": {
@@ -302,8 +302,8 @@
       "linux/arm64": null
     },
     "advertised_in_console": false,
-    "verification_url": "https://hub.docker.com/v2/repositories/yastrebovks/spl-daemon/tags/0.4.10",
-    "publication_url": "https://hub.docker.com/r/yastrebovks/spl-daemon/tags?name=0.4.10"
+    "verification_url": "https://hub.docker.com/v2/repositories/yastrebovks/spl-daemon/tags/0.4.11",
+    "publication_url": "https://hub.docker.com/r/yastrebovks/spl-daemon/tags?name=0.4.11"
   },
   "publication_order": [
     "pypi",

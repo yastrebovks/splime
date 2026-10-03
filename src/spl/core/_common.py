@@ -660,11 +660,17 @@ class Run:
         node_environment_provider: m_node_runtime.NodeEnvironmentProvider | None = None,
         runtime_env_spec: Sequence[Mapping[str, Any]] | None = None,
         runtime_adapter_fingerprint_sha256: str | None = None,
+        _input_values: Mapping[str, Any] | None = None,
+        _native_values: bool = False,
         **kwargs: Any,
     ) -> None:
+        self._runs_home: Path | None = None
         self._callback = callback
         self._pipeline = pipeline
-        self._kwargs = kwargs
+        if _input_values is not None and kwargs:
+            raise TypeError("_input_values cannot be combined with expanded keyword inputs")
+        self._kwargs = dict(_input_values) if _input_values is not None else kwargs
+        self._native_values = _native_values
         self._keep = m_manifest.normalize_keep(keep)
         self._run_id = run_id or m_manifest.new_run_id()
         self._parent_run_id = parent_run_id
@@ -672,7 +678,8 @@ class Run:
         if resume_plan is not None and parent_run_id is None:
             self._parent_run_id = str(resume_plan.parent_manifest["run_id"])
         reserved_names = RESERVED_RESUME_KWARGS if resume_plan is not None else RESERVED_RUN_KWARGS
-        _warn_reserved_run_input_names(pipeline, reserved_names)
+        if _input_values is None:
+            _warn_reserved_run_input_names(pipeline, reserved_names)
         self._adapter_overrides = _validate_run_adapter_overrides(pipeline, adapters)
         self._save_override_evidence = self._effective_save_override_evidence(resume_plan)
         self._execution_plan_document = m_manifest.run_execution_plan_document(
@@ -973,7 +980,7 @@ class Run:
 
     def _ensure_run_dir(self) -> Path:
         if self._run_dir is None:
-            run_dir = m_manifest.create_run_dir(self._run_id)
+            run_dir = m_manifest.create_run_dir(self._run_id, self._runs_home)
             self._run_dir = run_dir
             if self._keep == "on_failure":
                 self._run_dir_finalizer = weakref.finalize(self, shutil.rmtree, run_dir, ignore_errors=True)
@@ -1083,7 +1090,8 @@ class Run:
             # ADR 002 keeps this pre-resolution shortcut: implicit JSON-native values and the resolved built-in
             # json adapter both return the original object without files, but avoiding resolver work keeps this
             # hot path fast.
-            validate_json_value(value)
+            if not self._native_values:
+                validate_json_value(value)
             return value
 
         return self._round_trip_resolved(value, source_ref, adapter_format, run_override=None)
@@ -1577,7 +1585,8 @@ class Run:
             and load.adapter is BUILTIN_JSON_ADAPTER
             and type(value) in _JSON_NATIVE_TYPES
         ):
-            validate_json_value(value)
+            if not self._native_values:
+                validate_json_value(value)
             return value
 
         self._ensure_open()
@@ -2620,8 +2629,16 @@ class Run:
             return m_manifest.artifact_record(value.ref, run_dir=self._run_dir)
         if isinstance(value, m_node_runtime.InlineInput):
             value = value.value
+        if self._native_values and type(value) not in {type(None), bool, int, float, str}:
+            # JSON cannot reconstruct identity, aliasing, cycles or native
+            # types. Do not serialize a native container as resume evidence.
+            return m_manifest.unfreezable_record("native value was not materialized as an artifact")
         if type(value) in _JSON_NATIVE_TYPES:
-            return m_manifest.json_record(value)
+            try:
+                return m_manifest.json_record(value)
+            except ValueError:
+                if not self._native_values:
+                    raise
         return m_manifest.unfreezable_record("value was not materialized as an artifact")
 
     def _set_node_adapter(self, node: Node, port_name: str, record: dict[str, Any]) -> None:
@@ -2671,10 +2688,13 @@ class Run:
                 outputs[port_name], adapter_record = self._artifact_output_manifest_records(node, port_name)
                 self._node_adapters.setdefault(node, {})[port_name] = adapter_record
                 continue
-            if type(value) in _JSON_NATIVE_TYPES:
+            if not self._native_values and type(value) in _JSON_NATIVE_TYPES:
                 try:
                     validate_json_value(value)
                 except ValueError as exc:
+                    if self._native_values:
+                        outputs[port_name] = self._value_record(value)
+                        continue
                     label = self._node_alias(node) or self._node_name(node)
                     raise ValueError(
                         "invalid JSON output from node `{}` port `{}`: {}. Return a valid JSON value "
@@ -2718,7 +2738,8 @@ class Run:
             and load.adapter is BUILTIN_JSON_ADAPTER
             and type(value) in _JSON_NATIVE_TYPES
         ):
-            validate_json_value(value)
+            if not self._native_values or adapter_format is not None or run_override is not None:
+                validate_json_value(value)
             return
         self._ensure_open()
         self._materialize_source_output(value, source_ref, save)

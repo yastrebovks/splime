@@ -66,10 +66,9 @@ import hashlib
 import importlib.metadata
 import json
 import re
-import shutil
 import stat
 import tempfile
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping
 from contextlib import redirect_stderr, redirect_stdout
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
@@ -79,6 +78,22 @@ from urllib.parse import urlparse
 from urllib.request import Request
 
 from spl._http import urlopen_verified
+from spl.execution_results import (
+    _ensure_private_dir,
+    _chmod_owner_file,
+    to_jsonable,
+    safe_artifact_name,
+    copy_artifact as copy_artifact,
+    collect_artifacts,
+    _type_name as _type_name,
+    _result_path as _result_path,
+    _json_child_path as _json_child_path,
+    _json_path as _json_path,
+    _artifact_name_token,
+    _with_numeric_suffix,
+    _chmod_artifact_tree as _chmod_artifact_tree,
+    PipelineResultNormalizer as _PipelineResultNormalizer,
+)
 from spl.adapters import get_builtin_adapter
 from spl.core import json_contract as m_json_contract
 from spl.core import manifest as m_manifest
@@ -198,21 +213,6 @@ def write_json(path: Path, value: Any) -> None:
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(payload)
     _chmod_owner_file(path)
-
-
-def _ensure_private_dir(path: Path) -> None:
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        path.chmod(0o700)
-    except OSError:
-        pass
-
-
-def _chmod_owner_file(path: Path) -> None:
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
 
 
 class RemoteNodeClient:
@@ -388,155 +388,6 @@ def validate_environment(distributions: list[dict[str, str]]) -> None:
 
     if mismatches:
         raise RuntimeError("worker environment does not match SPL metadata: " + "; ".join(mismatches))
-
-
-def to_jsonable(value: Any, *, path: str = "$") -> Any:
-    """Convert common Python containers into JSON-compatible values.
-
-    The function is intentionally strict for unknown objects.  A daemon that
-    silently converts everything with ``repr`` would be hard to use correctly:
-    the caller might think it received a reusable result while actually getting
-    a display string.
-    """
-
-    if type(value) in m_json_contract.JSON_SCALARS:
-        m_json_contract.validate_json_value(value, path=path)
-        return value
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, Mapping):
-        result: dict[str, Any] = {}
-        for key, item in value.items():
-            if type(key) is not str:
-                m_json_contract.validate_json_value({key: None}, path=path)
-                raise AssertionError("JSON key validation unexpectedly accepted a non-string key")
-            result[key] = to_jsonable(item, path=_json_child_path(path, key))
-        return result
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
-        return [to_jsonable(item, path="{}[{}]".format(path, index)) for index, item in enumerate(value)]
-    if isinstance(value, set):
-        return [
-            to_jsonable(item, path="{}[{}]".format(path, index)) for index, item in enumerate(sorted(value, key=repr))
-        ]
-    raise TypeError("result is not JSON serializable; return JSON-like data or declare artifacts")
-
-
-def safe_artifact_name(name: str) -> str:
-    """Validate an artifact name before writing under the artifacts directory."""
-
-    return validate_name(name)
-
-
-def copy_artifact(source: Path, target: Path) -> None:
-    """Copy one artifact file or directory into the run artifact directory."""
-
-    if not source.exists():
-        raise ValueError(f"artifact source is not found: {source}")
-    if source.is_dir():
-        shutil.copytree(source, target, dirs_exist_ok=True)
-        _chmod_artifact_tree(target)
-    else:
-        _ensure_private_dir(target.parent)
-        shutil.copy2(source, target)
-        _chmod_owner_file(target)
-
-
-def collect_artifacts(value: Any, artifacts_dir: Path) -> tuple[Any, dict[str, str]]:
-    """Extract and copy artifacts declared by the function result.
-
-    Convention for MVP::
-
-        {
-          "__spl_result__": {"score": 0.91},
-          "__spl_artifacts__": {"model.pkl": "relative/or/absolute/path.pkl"}
-        }
-
-    If ``__spl_result__`` is omitted, the result is the original dictionary
-    without the two reserved SPL keys.
-    """
-
-    if not isinstance(value, Mapping) or ARTIFACTS_KEY not in value:
-        return value, {}
-
-    artifact_spec = value[ARTIFACTS_KEY]
-    if RESULT_KEY in value:
-        result = value[RESULT_KEY]
-    else:
-        result = {key: item for key, item in value.items() if key not in {ARTIFACTS_KEY, RESULT_KEY}}
-
-    items: Iterable[tuple[Any, Any]]
-    if isinstance(artifact_spec, Mapping):
-        items = artifact_spec.items()
-    elif isinstance(artifact_spec, Sequence) and not isinstance(artifact_spec, str):
-        items = ((Path(str(path)).name, path) for path in artifact_spec)
-    else:
-        raise TypeError("__spl_artifacts__ must be a mapping or a list of paths")
-
-    copied: dict[str, str] = {}
-    _ensure_private_dir(artifacts_dir)
-    for name, source in items:
-        artifact_name = safe_artifact_name(str(name))
-        source_path = Path(str(source)).expanduser().absolute()
-        target_path = artifacts_dir / artifact_name
-        copy_artifact(source_path, target_path)
-        copied[artifact_name] = str(target_path)
-
-    return result, copied
-
-
-def _type_name(value: Any) -> str:
-    typ = type(value)
-    if typ.__module__ == "builtins":
-        return typ.__qualname__
-    return f"{typ.__module__}.{typ.__qualname__}"
-
-
-def _result_path(parts: Sequence[str]) -> str:
-    return ".".join(parts)
-
-
-def _json_child_path(path: str, key: str) -> str:
-    return "{}[{}]".format(
-        path,
-        m_json_contract.dumps(key, ensure_ascii=False, sort_keys=False),
-    )
-
-
-def _json_path(parts: Sequence[str]) -> str:
-    path = "$"
-    for part in parts:
-        path = _json_child_path(path, part)
-    return path
-
-
-def _artifact_name_token(value: str) -> str:
-    token = _ARTIFACT_NAME_TOKEN_PATTERN.sub("_", str(value)).strip("._-")
-    return token or "value"
-
-
-def _with_numeric_suffix(name: str, index: int) -> str:
-    stem, separator, suffix = name.rpartition(".")
-    if stem and separator and suffix:
-        return f"{stem}-{index}.{suffix}"
-    return f"{name}-{index}"
-
-
-def _chmod_artifact_tree(path: Path) -> None:
-    if path.is_dir():
-        try:
-            path.chmod(0o700)
-        except OSError:
-            pass
-        for item in path.rglob("*"):
-            if item.is_dir():
-                try:
-                    item.chmod(0o700)
-                except OSError:
-                    pass
-            elif item.is_file():
-                _chmod_owner_file(item)
-    elif path.is_file():
-        _chmod_owner_file(path)
 
 
 def _read_verified_runtime_file(
@@ -1281,166 +1132,11 @@ def _replace_mapping_path(value: Any, path: list[str], replacement: Any) -> Any:
     return result
 
 
-class PipelineResultNormalizer:
-    """Convert final pipeline values into the daemon's JSON/artifact protocol."""
+class PipelineResultNormalizer(_PipelineResultNormalizer):
+    """Worker extension for per-run runtime adapter bindings."""
 
-    def __init__(
-        self,
-        pipeline: Any,
-        artifacts_dir: Path,
-        *,
-        runtime_adapter_document: Mapping[str, Any] | None = None,
-        runtime_custom_namespace: Mapping[str, Any] | None = None,
-        runtime_output_records: list[dict[str, Any]] | None = None,
-        runtime_result_prefix: Sequence[str] = (),
-    ):
-        self.pipeline = pipeline
-        self.artifacts_dir = artifacts_dir
-        self.artifacts: dict[str, str] = {}
-        self._used_artifact_names: set[str] = set()
-        self._runtime_custom_namespace = dict(runtime_custom_namespace or {})
-        self._runtime_output_records = runtime_output_records
-        self._runtime_result_prefix = tuple(runtime_result_prefix)
-        self._runtime_output_bindings = {
-            tuple(binding["result_path"]): binding
-            for binding in (runtime_adapter_document or {}).get("bindings", [])
-            if binding["direction"] == "output" and binding["transport"] == "artifact"
-        }
-
-    def normalize(self, value: Any, path: tuple[str, ...] = ("result",)) -> Any:
-        result_path = tuple(path[1:])
-        if (
-            self._runtime_result_prefix
-            and result_path[: len(self._runtime_result_prefix)] == self._runtime_result_prefix
-        ):
-            result_path = result_path[len(self._runtime_result_prefix) :]
-        runtime_binding = self._runtime_output_bindings.get(result_path)
-        if runtime_binding is not None:
-            reference, copied, record = _materialize_runtime_output(
-                value,
-                runtime_binding,
-                artifacts_dir=self.artifacts_dir,
-                used_names=self._used_artifact_names,
-                custom_namespace=self._runtime_custom_namespace,
-            )
-            self.artifacts.update(copied)
-            if self._runtime_output_records is not None:
-                self._runtime_output_records.append(record)
-            return reference
-        if type(value) in m_json_contract.JSON_SCALARS:
-            m_json_contract.validate_json_value(value, path=_json_path(path))
-            return value
-        if isinstance(value, Path):
-            return str(value)
-        if isinstance(value, Mapping):
-            if ARTIFACTS_KEY in value:
-                explicit_result = self._result_from_explicit_artifact_mapping(value)
-                self._copy_declared_artifacts(value[ARTIFACTS_KEY])
-                return self.normalize(explicit_result, path)
-            normalized_mapping: dict[str, Any] = {}
-            for key, item in value.items():
-                if type(key) is not str:
-                    m_json_contract.validate_json_value({key: None}, path=_json_path(path))
-                    raise AssertionError("JSON key validation unexpectedly accepted a non-string key")
-                normalized_mapping[key] = self.normalize(item, (*path, key))
-            return normalized_mapping
-        if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
-            return [self.normalize(item, (*path, str(index))) for index, item in enumerate(value)]
-        if isinstance(value, set):
-            return [self.normalize(item, (*path, str(index))) for index, item in enumerate(sorted(value, key=repr))]
-        return self._materialize_adapter_artifact(value, path)
-
-    @staticmethod
-    def _result_from_explicit_artifact_mapping(value: Mapping[Any, Any]) -> Any:
-        if RESULT_KEY in value:
-            return value[RESULT_KEY]
-        return {key: item for key, item in value.items() if key not in {ARTIFACTS_KEY, RESULT_KEY}}
-
-    def _copy_declared_artifacts(self, artifact_spec: Any) -> None:
-        items: Iterable[tuple[Any, Any]]
-        if isinstance(artifact_spec, Mapping):
-            items = artifact_spec.items()
-        elif isinstance(artifact_spec, Sequence) and not isinstance(
-            artifact_spec,
-            str | bytes | bytearray,
-        ):
-            items = ((Path(str(path)).name, path) for path in artifact_spec)
-        else:
-            raise TypeError("__spl_artifacts__ must be a mapping or a list of paths")
-
-        _ensure_private_dir(self.artifacts_dir)
-        for name, source in items:
-            artifact_name = self._reserve_artifact_name(safe_artifact_name(str(name)))
-            source_path = Path(str(source)).expanduser().absolute()
-            target_path = self.artifacts_dir / artifact_name
-            if source_path.resolve() != target_path.resolve():
-                copy_artifact(source_path, target_path)
-            self.artifacts[artifact_name] = str(target_path)
-
-    def _materialize_adapter_artifact(
-        self,
-        value: Any,
-        path: tuple[str, ...],
-    ) -> dict[str, Any]:
-        adapter = self._resolve_adapter(value, path)
-        artifact_name = self._artifact_name(path, adapter.format)
-        artifact_path = self.artifacts_dir / artifact_name
-        _ensure_private_dir(self.artifacts_dir)
-
-        try:
-            adapter.save(str(artifact_path), value)
-        except BaseException:
-            artifact_path.unlink(missing_ok=True)
-            raise
-
-        from spl.core.entities.artifact import compute_sha256
-
-        size = artifact_path.stat().st_size
-        sha256 = compute_sha256(artifact_path)
-        self.artifacts[artifact_name] = str(artifact_path)
-        _chmod_owner_file(artifact_path)
-        return {
-            ARTIFACT_REF_KEY: True,
-            "name": artifact_name,
-            "key": adapter.key,
-            "format": adapter.format,
-            "size": size,
-            "sha256": sha256,
-        }
-
-    def _resolve_adapter(self, value: Any, path: tuple[str, ...]) -> Any:
-        try:
-            adapter = self.pipeline.resolve_adapter(py_type=type(value))
-        except ValueError as exc:
-            raise TypeError(
-                f"{_result_path(path)} {_type_name(value)} is not JSON serializable; "
-                f"add_adapter({_type_name(value)}, ...) or remove ambiguous adapters"
-            ) from exc
-        if adapter is None:
-            raise TypeError(
-                f"{_result_path(path)} {_type_name(value)} is not JSON serializable; "
-                f"add_adapter({_type_name(value)}, ...)"
-            )
-        return adapter
-
-    def _artifact_name(self, path: tuple[str, ...], format_name: str) -> str:
-        parts = [_artifact_name_token(part) for part in path[1:]]
-        if len(parts) > 1 and parts[-1] == "default":
-            parts = parts[:-1]
-        if not parts:
-            parts = ["result"]
-        base_name = ".".join(parts)
-        format_token = _artifact_name_token(format_name)
-        return self._reserve_artifact_name(f"{base_name}.{format_token}")
-
-    def _reserve_artifact_name(self, name: str) -> str:
-        candidate = safe_artifact_name(name)
-        index = 2
-        while candidate in self._used_artifact_names:
-            candidate = safe_artifact_name(_with_numeric_suffix(name, index))
-            index += 1
-        self._used_artifact_names.add(candidate)
-        return candidate
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, materialize_output=_materialize_runtime_output, **kwargs)
 
 
 @overload
@@ -1725,6 +1421,7 @@ def _adapter_distributions(value: Any) -> tuple[DDistribution, ...]:
             DDistribution(
                 package=_required_string(item, "package"),
                 version=_required_string(item, "version"),
+                modules=tuple(str(module) for module in item.get("modules", [])),
             )
         )
     return tuple(distributions)

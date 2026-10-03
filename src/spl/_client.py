@@ -19,6 +19,7 @@ dependencies imported yet.
 from __future__ import annotations
 
 import builtins
+import enum
 import hashlib
 import os
 import re
@@ -124,11 +125,35 @@ class _DiscardAdapterOutput:
 _DISCARD_ADAPTER_OUTPUT = _DiscardAdapterOutput()
 
 
+class _NativeResultState(enum.Enum):
+    ABSENT = "absent"
+
+
+_NO_NATIVE_VALUE = _NativeResultState.ABSENT
+
+
 def _preview(value: Any, *, limit: int = 80) -> str:
     preview = repr(value)
     if len(preview) <= limit:
         return preview
     return f"{preview[: limit - 3]}..."
+
+
+def _native_preview(value: Any) -> str:
+    """Summarize an in-memory result without rendering or serializing it."""
+    if type(value) in {type(None), bool, int, float, str}:
+        return _preview(value)
+    typ = type(value)
+    type_name = typ.__qualname__ if typ.__module__ == "builtins" else f"{typ.__module__}.{typ.__qualname__}"
+    try:
+        shape = getattr(value, "shape", None)
+    except Exception:
+        shape = None
+    if type(shape) is tuple and all(type(item) is int for item in shape):
+        return f"<{type_name} shape={shape}>"
+    if type(value) in {dict, list, tuple, set, frozenset}:
+        return f"<{type_name} length={len(value)}>"
+    return f"<{type_name}>"
 
 
 def _replace_result_path(result: Any, raw_path: Any, value: Any) -> Any:
@@ -720,33 +745,50 @@ def _wrap_objects(
 class RemoteResult:
     """Completed run result plus downloaded artifact locations.
 
-    ``payload`` is the daemon's JSON result document.  It contains the actual
-    return value under ``result`` and daemon-side artifact paths under
-    ``artifacts``.  ``downloaded_artifacts`` is populated only when the caller
-    asks this client to download artifacts into a local directory.
+    ``payload`` is the host's JSON result document. Legacy/isolated execution
+    stores the return value under ``result``; current-process execution stores
+    only a JSON-safe descriptor there and keeps the actual object privately for
+    ``value``/``output``. ``downloaded_artifacts`` is populated only when the
+    caller asks this client to download artifacts into a local directory.
     """
 
     run: dict[str, Any]
     payload: dict[str, Any]
     mode: str = "local"
     downloaded_artifacts: dict[str, Path] = field(default_factory=dict)
+    _native_value: Any = field(default=_NO_NATIVE_VALUE, repr=False, compare=False)
+
+    def __eq__(self, other: object) -> bool:
+        """Legacy field equality; native wrappers compare by identity only."""
+        if type(other) is not type(self):
+            return NotImplemented
+        if self._native_value is not _NO_NATIVE_VALUE or other._native_value is not _NO_NATIVE_VALUE:
+            return self is other
+        return (self.run, self.payload, self.mode, self.downloaded_artifacts) == (
+            other.run,
+            other.payload,
+            other.mode,
+            other.downloaded_artifacts,
+        )
 
     @property
     def value(self) -> Any:
-        """Return the user's JSON-compatible result value."""
+        """Return the user's result, including native current-process values."""
 
+        if self._native_value is not _NO_NATIVE_VALUE:
+            return self._native_value
         return self.payload.get("result")
 
     @property
     def output(self) -> Any:
         """Return the user's unwrapped result value.
 
-        Rule: if ``payload['result']`` is a dict and contains the key
+        Rule: if the result is a dict and contains the key
         ``'default'`` -> return ``result['default']``; else if it has exactly
         one key -> return that value; else return ``result`` as-is.
         """
 
-        result = self.payload.get("result")
+        result = self.value
         if isinstance(result, dict):
             if DEFAULT_PORT in result:
                 return result[DEFAULT_PORT]
@@ -770,12 +812,15 @@ class RemoteResult:
         return self.mode == "server"
 
     def __repr__(self) -> str:
-        return f"RemoteResult(mode={self.mode!r}, output={_preview(self.output)})"
+        preview = _native_preview(self.value) if self._native_value is not _NO_NATIVE_VALUE else _preview(self.output)
+        return f"RemoteResult(mode={self.mode!r}, output={preview})"
 
     def _repr_html_(self) -> str:
         rows = {
             "mode": self.mode,
-            "output": _preview(self.output),
+            "output": (
+                _native_preview(self.value) if self._native_value is not _NO_NATIVE_VALUE else _preview(self.output)
+            ),
             "artifacts": str(len(self.artifacts)),
         }
         body = "".join(
@@ -1562,11 +1607,14 @@ class _ObjectAdmin:
         public: Any = UNSET,
         expected_revision: int | None = None,
         wait: bool = True,
+        execution_profile: str | None = None,
     ) -> dict[str, Any]:
         """Update one revisioned profile and optionally activate/withdraw it."""
 
         self._c._daemon.require_public_profile_capability(PUBLIC_OBJECT_PROFILE_CAPABILITY)
         payload: dict[str, Any] = {"wait": wait}
+        if execution_profile is not None:
+            payload["execution_profile"] = execution_profile
         if library is not None:
             payload["library"] = library
         if description is not UNSET:
@@ -1592,10 +1640,14 @@ class _ObjectAdmin:
         name_or_id: str,
         *,
         library: str | None = None,
+        execution_profile: str | None = None,
     ) -> dict[str, Any]:
         """Validate and materialize a candidate without activating it."""
 
-        return self._c._daemon.preflight_public_object(name_or_id, library=library)
+        options: dict[str, Any] = {"library": library}
+        if execution_profile is not None:
+            options["execution_profile"] = execution_profile
+        return self._c._daemon.preflight_public_object(name_or_id, **options)
 
 
 class SPLClient:
@@ -1650,6 +1702,10 @@ class SPLClient:
         trusted_keys: Mapping[str, Mapping[str, str | bytes]] | None = None,
     ) -> "SPLClient":
         """Create a daemon-free client for verified public releases only.
+
+        Signed current-process-v1 releases run in this interpreter using its
+        packages; legacy releases retain isolated worker execution. Selection
+        is authenticated at publication and cannot be overridden by a call.
 
         ``run_receipts=False`` disables privacy-minimal best-effort public Run
         counters. ``SPL_PUBLIC_RUN_RECEIPTS=0`` provides the same opt-out.
@@ -3836,7 +3892,7 @@ class SPLClient:
                     f"feature_not_supported: {message}",
                     payload={"code": "feature_not_supported", "error": message},
                 )
-            run_record, payload, downloaded = self._embedded_backend.call(
+            embedded_result = self._embedded_backend.call(
                 name,
                 args=args,
                 kwargs=kwargs,
@@ -3845,10 +3901,11 @@ class SPLClient:
                 trust=trust,
             )
             return RemoteResult(
-                run=run_record,
-                payload=payload,
+                run=embedded_result.run,
+                payload=embedded_result.payload,
                 mode="embedded",
-                downloaded_artifacts=downloaded,
+                downloaded_artifacts=embedded_result.downloaded_artifacts,
+                _native_value=(embedded_result.native_value if embedded_result.has_native_value else _NO_NATIVE_VALUE),
             )
 
         if trust:

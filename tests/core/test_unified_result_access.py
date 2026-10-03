@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
+import copy
+import dataclasses
+import pickle
+
+import pytest
 
 from spl import Deployment, RemoteResult, SPLClient, lift
 from spl.core.entities.function import METADATA_DUNDER_NAME, DFunction
@@ -148,3 +153,40 @@ def test_run_value_defaults_to_bare_single_node_output() -> None:
 
     with deployment(None, pipeline).run() as run:
         _assert_equal(run.value(), old_value)
+
+
+def test_remote_result_legacy_equality_and_native_sentinel_reconstruction() -> None:
+    legacy = RemoteResult({"id": "same"}, {"result": 7})
+    for reconstructed in (
+        RemoteResult({"id": "same"}, {"result": 7}),
+        copy.copy(legacy),
+        copy.deepcopy(legacy),
+        dataclasses.replace(legacy),
+        RemoteResult(**dataclasses.asdict(legacy)),
+        pickle.loads(pickle.dumps(legacy)),
+    ):
+        assert reconstructed == legacy
+        assert reconstructed.value == 7
+    assert legacy != dataclasses.replace(legacy, mode="server")
+    with pytest.raises(TypeError):
+        hash(legacy)
+    native_none = dataclasses.replace(legacy, _native_value=None)
+    assert native_none.value is None and native_none != legacy
+    assert copy.deepcopy(native_none).value is None
+
+
+def test_remote_result_native_equality_and_previews_never_compare_or_repr_data() -> None:
+    class Unsafe:
+        def __eq__(self, other):
+            raise AssertionError("native equality must not run")
+
+        def __repr__(self):
+            raise AssertionError("native repr must not run")
+
+    value = Unsafe()
+    first = RemoteResult({}, {"result": {}}, _native_value=value)
+    second = dataclasses.replace(first)
+    assert first == first and first != second
+    assert "Unsafe" in repr(first) and "Unsafe" in first._repr_html_()
+    container = dataclasses.replace(first, _native_value={"default": value})
+    assert "dict length=1" in repr(container)

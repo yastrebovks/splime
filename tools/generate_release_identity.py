@@ -375,6 +375,8 @@ def generate(
         for path in stale:
             temporary = path.with_name(f".{path.name}.release-identity.tmp")
             temporary.write_text(rendered_outputs[path], encoding="utf-8")
+            if path.exists():
+                temporary.chmod(path.stat().st_mode & 0o777)
             temporary_outputs[path] = temporary
         for path, temporary in temporary_outputs.items():
             temporary.replace(path)
@@ -393,6 +395,9 @@ def _render_text_versions(
     replacements = {
         workspace_root / "spl" / "pyproject.toml": [
             (r'(?m)^version = "[^"]+"$', f'version = "{version}"'),
+        ],
+        workspace_root / "spl" / "README.md": [
+            (r"splime==\d+\.\d+\.\d+", f"splime=={version}"),
         ],
         workspace_root / "spl" / "docs" / "source" / "conf.py": [
             (r'(?m)^release = "[^"]+"$', f'release = "{version}"'),
@@ -439,6 +444,27 @@ def _render_text_versions(
         ],
     }
     rendered_outputs: dict[Path, str] = {}
+    replacements[workspace_root / "spl-server" / "pyproject.toml"].append(
+        (r'"splime==[^"]+"', f'"splime=={version}"'),
+    )
+    cache_identity = f"release={release_id}-schema{contract['server_schema_target']}"
+    for relative in ("app.js", "bootstrap/consoleApp.js", "actions/commands.js"):
+        replacements[workspace_root / "spl-frontend" / relative] = [
+            (r"release=splime-[^\"']+", cache_identity),
+        ]
+    docker_root = workspace_root / "spl" / "deploy" / "dockerhub"
+    replacements[docker_root / "Dockerfile"] = [
+        (r"(?m)^ARG SPL_VERSION=\S+$", f"ARG SPL_VERSION={version}"),
+    ]
+    replacements[docker_root / "docker-compose.yml"] = [
+        (r"(image: yastrebovks/spl-daemon:)\S+", rf"\g<1>{version}"),
+    ]
+    replacements[docker_root / "publish.sh"] = [
+        (r'(?m)^VERSION="\$\{1:-[^}]+\}"$', f'VERSION="${{1:-{version}}}"'),
+    ]
+    replacements[docker_root / "README.md"] = [
+        (r"(yastrebovks/spl-daemon:|\./publish\.sh )\d+\.\d+\.\d+", rf"\g<1>{version}"),
+    ]
     for path, rules in replacements.items():
         original = path.read_text(encoding="utf-8")
         rendered = original

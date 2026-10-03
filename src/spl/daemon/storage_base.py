@@ -23,7 +23,7 @@ from uuid import uuid4
 from spl.core import json_contract as m_json_contract
 from spl.daemon.secret_store import SecretStore
 from spl.daemon.name_validation import NAME_PATTERN as NAME_PATTERN
-from spl.daemon.name_validation import validate_name as validate_name
+from spl.daemon.name_validation import validate_name
 from spl.daemon.telemetry import (
     TELEMETRY_PAYLOAD_TTL_SECONDS,
     local_run_proof,

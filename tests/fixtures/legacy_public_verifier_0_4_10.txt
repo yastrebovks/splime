@@ -1,0 +1,86 @@
+"""Frozen verifier from the released 0.4.10 checkout (unmodified function).
+
+Only its schema rejection is exercised; later verification helpers are supplied
+by the current test harness. Original file SHA-256: d36953be8aae0544bc8a43ab776372fdd7bcdd9fed00bc12994aaf3a64c05a0b
+"""
+from __future__ import annotations
+
+def verify_public_bundle(
+    envelope: Mapping[str, Any],
+    bundle_bytes: bytes,
+    *,
+    registry_url: str | None = None,
+    trusted_keys: Mapping[str, Mapping[str, str | bytes]] | None = None,
+    target_dir: Path | None = None,
+    _depth: int = 0,
+) -> dict[str, Any]:
+    """Verify an origin-bound signature, hashes and the closed archive."""
+
+    try:
+        manifest = envelope["manifest"]
+        manifest_hash = str(envelope["manifest_hash"])
+        bundle_hash = str(envelope["bundle_hash"])
+        signature = envelope["signature"]
+    except (KeyError, TypeError) as exc:
+        raise _error("public_manifest_invalid", "manifest envelope is incomplete") from exc
+    if not isinstance(manifest, Mapping) or manifest.get("schema") != PUBLIC_MANIFEST_SCHEMA:
+        raise _error("public_manifest_incompatible", "public manifest schema is unsupported")
+    if manifest.get("bundle_format") != "zip-store-v1":
+        raise _error("public_manifest_incompatible", "public bundle format is unsupported")
+    canonical = _canonical_json(manifest)
+    if _sha256(canonical) != manifest_hash:
+        raise _error("public_manifest_hash_mismatch", "public manifest hash does not match")
+    if len(bundle_bytes) > MAX_BUNDLE_BYTES or _sha256(bundle_bytes) != bundle_hash:
+        raise _error("public_bundle_hash_mismatch", "public bundle hash does not match")
+    if manifest.get("bundle_hash") != bundle_hash:
+        raise _error("public_manifest_bundle_mismatch", "manifest and bundle identities disagree")
+    if not isinstance(signature, Mapping) or "public_key" in signature:
+        raise _error(
+            "public_signature_key_untrusted",
+            "public release envelopes must not supply their own trust key",
+        )
+    if registry_url is None or trusted_keys is None:
+        raise _error(
+            "public_trust_anchor_required",
+            "an origin-bound external public signing key is required",
+        )
+    origin = _registry_url(registry_url)
+    key_id = signature.get("key_id")
+    origin_keys = trusted_keys.get(origin)
+    if not isinstance(key_id, str) or not isinstance(origin_keys, Mapping) or key_id not in origin_keys:
+        raise _error(
+            "public_signature_key_untrusted",
+            "the public release signing key is not trusted for this registry origin",
+        )
+    try:
+        if signature.get("algorithm") != "ed25519":
+            raise ValueError
+        encoded_key = origin_keys[key_id]
+        raw_key = (
+            bytes(encoded_key)
+            if isinstance(encoded_key, (bytes, bytearray))
+            else base64.b64decode(encoded_key, validate=True)
+        )
+        expected_key_id = f"ed25519-sha256:{_sha256(raw_key)}"
+        if key_id != expected_key_id:
+            raise ValueError
+        public_key = Ed25519PublicKey.from_public_bytes(raw_key)
+        public_key.verify(
+            base64.b64decode(signature["value"], validate=True),
+            f"{manifest_hash}:{bundle_hash}".encode("ascii"),
+        )
+    except (InvalidSignature, KeyError, TypeError, ValueError) as exc:
+        raise _error("public_signature_invalid", "public release signature is invalid") from exc
+    if _depth > 32:
+        raise _error("public_manifest_invalid", "embedded component closure is too deep")
+    members = _validated_archive_members(manifest, bundle_bytes)
+    _verify_component_closure(
+        manifest,
+        members,
+        registry_url=origin,
+        trusted_keys=trusted_keys,
+        depth=_depth,
+    )
+    if target_dir is not None:
+        _extract_members(bundle_bytes, members, target_dir)
+    return dict(manifest)

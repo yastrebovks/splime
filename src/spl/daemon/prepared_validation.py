@@ -582,6 +582,7 @@ def _object_ir_from_canonical(canonical_ir: Mapping[str, Any]) -> ObjectIR:
         distribution = DDistribution(
             package=cast(str, raw_dependency["package"]),
             version=cast(str, raw_dependency["version"]),
+            modules=tuple(cast(list[str], raw_dependency.get("modules", []))),
         )
         dependency_values.append(distribution)
     for raw_import in cast(list[Mapping[str, Any]], canonical_ir["imports"]):

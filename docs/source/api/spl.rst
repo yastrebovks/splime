@@ -112,6 +112,15 @@ spl.embedded module
    :show-inheritance:
    :undoc-members:
 
+spl.execution\_results module
+-----------------------------
+
+.. automodule:: spl.execution_results
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
 spl.official\_registry module
 -----------------------------
 
@@ -143,6 +152,33 @@ spl.public\_artifact\_policy module
 -----------------------------------
 
 .. automodule:: spl.public_artifact_policy
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.public\_contract module
+---------------------------
+
+.. automodule:: spl.public_contract
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.public\_dependencies module
+-------------------------------
+
+.. automodule:: spl.public_dependencies
+   :members:
+   :private-members:
+   :show-inheritance:
+   :undoc-members:
+
+spl.public\_inprocess module
+----------------------------
+
+.. automodule:: spl.public_inprocess
    :members:
    :private-members:
    :show-inheritance:

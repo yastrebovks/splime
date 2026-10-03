@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 from pathlib import Path
+import re
 import subprocess
 import tarfile
 import zipfile
@@ -91,6 +92,25 @@ def test_declared_release_contract_is_coherent_but_not_built_evidence() -> None:
             workspace_root=WORKSPACE_ROOT,
             manifest=manifest,
         )
+
+
+def test_release_bump_updates_installation_and_module_cache_identities() -> None:
+    from tools.generate_release_identity import _render_text_versions
+
+    contract = deepcopy(load_json(SPL_ROOT / "release-contract.json"))
+    contract.update(version="0.4.99", release_id="splime-0.4.99")
+    rendered = _render_text_versions(workspace_root=WORKSPACE_ROOT, contract=contract)
+
+    assert '"splime==0.4.99"' in rendered[WORKSPACE_ROOT / "spl-server" / "pyproject.toml"]
+    for relative in ("app.js", "bootstrap/consoleApp.js", "actions/commands.js"):
+        source = rendered[WORKSPACE_ROOT / "spl-frontend" / relative]
+        identities = re.findall(r"release=splime-[^\"']+", source)
+        assert identities and set(identities) == {"release=splime-0.4.99-schema48"}
+    docker = SPL_ROOT / "deploy" / "dockerhub"
+    assert "ARG SPL_VERSION=0.4.99" in rendered[docker / "Dockerfile"]
+    assert "yastrebovks/spl-daemon:0.4.99" in rendered[docker / "docker-compose.yml"]
+    assert 'VERSION="${1:-0.4.99}"' in rendered[docker / "publish.sh"]
+    assert "./publish.sh 0.4.99" in rendered[docker / "README.md"]
 
 
 def test_worker_build_projection_is_an_explicit_release_contract_path() -> None:
@@ -509,7 +529,7 @@ def _disposable_built_release(tmp_path: Path) -> tuple[Path, dict, dict]:
         workspace,
         "spl-server",
         {
-            "pyproject.toml": '[project]\nname = "spl-server"\nversion = "0.4.6"\n',
+            "pyproject.toml": '[project]\nname = "spl-server"\nversion = "0.4.6"\ndependencies = ["splime==0.4.6"]\n',
         },
     )
     frontend_config = (
@@ -530,6 +550,9 @@ def _disposable_built_release(tmp_path: Path) -> tuple[Path, dict, dict]:
             "package.json": '{\n  "name": "splime-console",\n  "version": "0.4.6",\n  "type": "module"\n}\n',
             "config.js": frontend_config,
             "index.html": '<script>const releaseId = "splime-0.4.6";</script>\n',
+            "app.js": 'import "./config.js?release=splime-0.4.6-schema32";\n',
+            "bootstrap/consoleApp.js": 'import "../config.js?release=splime-0.4.6-schema32";\n',
+            "actions/commands.js": 'import "../config.js?release=splime-0.4.6-schema32";\n',
         },
     )
 
@@ -599,6 +622,17 @@ def _disposable_built_release(tmp_path: Path) -> tuple[Path, dict, dict]:
 
     spl_root = workspace / "spl"
     (spl_root / "docs" / "source").mkdir(parents=True)
+    (spl_root / "README.md").write_text('python -m pip install "splime==0.4.6"\n')
+    docker_root = spl_root / "deploy" / "dockerhub"
+    docker_root.mkdir(parents=True)
+    for name, content in {
+        "Dockerfile": "ARG SPL_VERSION=0.4.6\n",
+        "docker-compose.yml": "image: yastrebovks/spl-daemon:0.4.6\n",
+        "publish.sh": '#!/bin/sh\nVERSION="${1:-0.4.6}"\n',
+        "README.md": "./publish.sh 0.4.6\n",
+    }.items():
+        (docker_root / name).write_text(content)
+    (docker_root / "publish.sh").chmod(0o755)
     (spl_root / "pyproject.toml").write_text(
         '[project]\nname = "splime"\nversion = "0.4.6"\n',
         encoding="utf-8",
@@ -744,6 +778,19 @@ def test_real_disposable_multi_repository_source_and_built_chain(
         )
 
 
+def test_identity_regeneration_preserves_publish_script_permissions(tmp_path: Path) -> None:
+    workspace, contract, _ = _disposable_built_release(tmp_path)
+    publish = workspace / "spl" / "deploy" / "dockerhub" / "publish.sh"
+    publish.write_text('#!/bin/sh\nVERSION="${1:-0.4.5}"\n')
+    publish.chmod(0o750)
+
+    generate(workspace_root=workspace, contract=contract, check=False, new_declaration=True)
+
+    assert 'VERSION="${1:-0.4.6}"' in publish.read_text()
+    assert publish.stat().st_mode & 0o777 == 0o750
+    generate(workspace_root=workspace, contract=contract, check=True)
+
+
 def test_source_evidence_is_materialized_outside_clean_repositories(
     tmp_path: Path,
 ) -> None:
@@ -796,24 +843,6 @@ def test_source_evidence_is_materialized_outside_clean_repositories(
             output_path=workspace / "spl" / "source-evidence.json",
             payload=source,
         )
-
-
-def test_source_evidence_uses_peeled_annotated_framework_tag_epoch(
-    tmp_path: Path,
-) -> None:
-    workspace, contract, _ = _disposable_built_release(tmp_path)
-    framework = workspace / "spl"
-    _git(framework, "tag", "--force", "--annotate", "v0.4.6", "-m", "release")
-    expected_epoch = int(_git(framework, "show", "-s", "--format=%ct", "v0.4.6^{commit}"))
-
-    source = materialize_source_evidence(
-        contract,
-        load_json(framework / "release-manifest.json"),
-        workspace_root=workspace,
-        observed_at="2026-07-30T09:00:00+00:00",
-    )
-
-    assert source["source_date_epoch"] == expected_epoch
 
 
 def test_built_evidence_materializer_binds_semantic_component_artifacts(

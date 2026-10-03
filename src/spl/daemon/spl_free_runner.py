@@ -1829,7 +1829,8 @@ def _load_dataframe_xlsx(path: str) -> Any:
 
 
 def _load_png_pillow(path: str) -> Any:
-    from PIL import Image  # type: ignore[import-not-found]  # Optional runtime dependency.
+    # Pillow may be absent, or installed with its own type information.
+    from PIL import Image  # type: ignore[import-not-found, unused-ignore]
 
     with Image.open(path) as source:
         if source.format != "PNG":

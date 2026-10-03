@@ -26,7 +26,7 @@ from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from http.client import IncompleteRead
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
@@ -39,6 +39,15 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from spl._process import run_process_tree
 from spl.daemon_client import ClientError
 from spl.official_registry import official_registry_trusted_keys
+from spl.public_contract import (
+    CURRENT_PROCESS_MANIFEST_SCHEMA,
+    CURRENT_PROCESS_CONTRACT,
+    COMPILED_EXECUTION,
+    ContractError,
+    dependency_graph,
+    validate_compiled_members,
+    validate_native_runtime_config,
+)
 from spl.public import PublicObjectRef, format_public_ref, parse_public_ref
 from spl.public_artifact_policy import (
     PublicArtifactPolicyError,
@@ -526,7 +535,10 @@ def verify_public_bundle(
         signature = envelope["signature"]
     except (KeyError, TypeError) as exc:
         raise _error("public_manifest_invalid", "manifest envelope is incomplete") from exc
-    if not isinstance(manifest, Mapping) or manifest.get("schema") != PUBLIC_MANIFEST_SCHEMA:
+    if not isinstance(manifest, Mapping) or manifest.get("schema") not in {
+        PUBLIC_MANIFEST_SCHEMA,
+        CURRENT_PROCESS_MANIFEST_SCHEMA,
+    }:
         raise _error("public_manifest_incompatible", "public manifest schema is unsupported")
     if manifest.get("bundle_format") != "zip-store-v1":
         raise _error("public_manifest_incompatible", "public bundle format is unsupported")
@@ -584,6 +596,43 @@ def verify_public_bundle(
         trusted_keys=trusted_keys,
         depth=_depth,
     )
+    if manifest.get("schema") == CURRENT_PROCESS_MANIFEST_SCHEMA:
+        try:
+            if (
+                manifest.get("schema_version") != 2
+                or manifest.get("execution_contract") != CURRENT_PROCESS_CONTRACT
+                or manifest.get("execution") != COMPILED_EXECUTION
+                or manifest.get("runtime_locks") != []
+                or manifest.get("required_capabilities") != [CURRENT_PROCESS_CONTRACT["framework"]]
+            ):
+                raise ContractError("unsupported current-process execution contract")
+            content = {info.filename: data for info, data in members}
+            graph = dependency_graph(content)
+            if manifest.get("dependency_graph") != graph:
+                raise ContractError("signed dependency inventory is missing or disagrees with captured metadata")
+            descriptor = json.loads(content["object.json"])
+            if (
+                manifest.get("dependencies") != descriptor["distributions"]
+                or manifest.get("entrypoint") != descriptor.get("entrypoint")
+                or manifest.get("kind") != descriptor.get("kind")
+            ):
+                raise ContractError("object descriptor and signed manifest disagree")
+            constraints = manifest.get("python_constraints")
+            if not isinstance(constraints, Mapping) or constraints.get("runtime") != descriptor.get("runtime_config"):
+                raise ContractError("runtime metadata is missing or inconsistent")
+            python = constraints.get("python")
+            if python is not None and (not isinstance(python, str) or not re.fullmatch(r"3\.13(?:\.\d+)?", python)):
+                raise ContractError("publication Python must be from the supported 3.13 family")
+            validate_native_runtime_config(constraints.get("runtime"))
+            entrypoint = manifest.get("entrypoint")
+            kind = manifest.get("kind")
+            if not isinstance(entrypoint, str) or not isinstance(kind, str):
+                raise ContractError("object entrypoint metadata is missing or invalid")
+            validate_compiled_members(content, entrypoint, kind)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise _error("public_contract_invalid", str(exc)) from exc
+    elif "execution_contract" in manifest:
+        raise _error("public_manifest_incompatible", "a legacy manifest cannot select a new execution contract")
     if target_dir is not None:
         _extract_members(bundle_bytes, members, target_dir)
     return dict(manifest)
@@ -650,6 +699,10 @@ def _verify_component_closure(
             trusted_keys=trusted_keys,
             _depth=depth + 1,
         )
+        if raw_component["type"] == "object" and nested_manifest.get("schema") != manifest.get("schema"):
+            raise _error(
+                "public_component_profile_mismatch", "Object components must share the parent execution contract"
+            )
         nested_identity = nested_manifest.get("identity")
         if not isinstance(nested_identity, Mapping) or (
             nested_identity.get("entry_type") != raw_component["type"]
@@ -696,6 +749,14 @@ def _verify_component_closure(
                 )
             except (StopIteration, UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise _error("public_archive_disagreement", "embedded Adapter source is malformed") from exc
+            if manifest.get("schema") == CURRENT_PROCESS_MANIFEST_SCHEMA and (
+                not isinstance(adapter_document, Mapping)
+                or not isinstance(adapter_document.get("dependencies"), list)
+                or adapter_document["dependencies"] != nested_manifest.get("dependencies")
+            ):
+                raise _error(
+                    "public_contract_invalid", "signed Adapter dependency metadata is incomplete or inconsistent"
+                )
             adapter_member = f"{execution_root}/adapter.py"
             expected_execution = {
                 "kind": "python-library-adapter",
@@ -1460,6 +1521,14 @@ def _verify_environment_inventory(
     return actual_files == set(files) and actual_directories == expected_directories
 
 
+class EmbeddedCallResult(NamedTuple):
+    run: dict[str, Any]
+    payload: dict[str, Any]
+    downloaded_artifacts: dict[str, Path]
+    native_value: Any
+    has_native_value: bool
+
+
 class EmbeddedBackend:
     """Resolve, verify, cache and execute public Objects without a daemon."""
 
@@ -1494,9 +1563,20 @@ class EmbeddedBackend:
         timeout_seconds: float | None,
         artifacts_dir: str | Path | None,
         trust: bool,
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Path]]:
+    ) -> "EmbeddedCallResult":
         reference = parse_public_ref(reference_text)
         resolved, envelope, bundle_dir = self._resolve_and_cache(reference)
+        if envelope["manifest"].get("schema") == CURRENT_PROCESS_MANIFEST_SCHEMA:
+            return self._call_inprocess(
+                resolved,
+                envelope,
+                bundle_dir,
+                args=args,
+                kwargs=kwargs,
+                timeout_seconds=timeout_seconds,
+                artifacts_dir=artifacts_dir,
+                trust=trust,
+            )
         bundle_hash = str(envelope["bundle_hash"])
         trust_identity = self._trust_identity(envelope)
         with _hash_lock(self.cache_root, f"bundle-{bundle_hash}"):
@@ -1549,7 +1629,88 @@ class EmbeddedBackend:
                     self._emit_run_receipt(resolved, event_id=event_id, state="failure")
                     raise
                 self._emit_run_receipt(resolved, event_id=event_id, state="success")
-                return result
+                run, payload, downloaded = result
+                return EmbeddedCallResult(run, payload, downloaded, None, False)
+
+    def _call_inprocess(
+        self,
+        resolved: Mapping[str, Any],
+        envelope: Mapping[str, Any],
+        bundle_dir: Path,
+        *,
+        args: list[Any] | None,
+        kwargs: dict[str, Any] | None,
+        timeout_seconds: float | None,
+        artifacts_dir: str | Path | None,
+        trust: bool,
+    ) -> "EmbeddedCallResult":
+        from spl import public_inprocess
+
+        # Retain authenticated bytes in memory, then release the bundle lock.
+        # User code may reenter this client or run concurrently with other calls.
+        with _hash_lock(self.cache_root, f"bundle-{bundle_dir.name}"):
+            body = (bundle_dir / "bundle.zip").read_bytes()
+            manifest = verify_public_bundle(
+                envelope,
+                body,
+                registry_url=self.transport.registry_url,
+                trusted_keys=self.trusted_keys,
+            )
+            if not manifest.get("callable") or manifest.get("identity", {}).get("entry_type") != "object":
+                raise _error("public_entry_not_callable", "release is not a callable Object")
+            members = {info.filename: data for info, data in _validated_archive_members(manifest, body)}
+            public_inprocess.admit(
+                manifest,
+                args=[] if args is None else args,
+                kwargs={} if kwargs is None else kwargs,
+                timeout_seconds=timeout_seconds,
+            )
+            identity = self._trust_identity(envelope)
+            if trust:
+                self._approve(identity)
+            if not self._trusted(identity):
+                raise _error(
+                    "public_trust_required",
+                    "Execution in your current process requires trust=True for this exact release",
+                )
+            public_inprocess.admit_dependencies(manifest)
+        run_id = f"embedded-{uuid4().hex}"
+        run_dir = self.cache_root / "artifacts" / run_id
+        event_id = str(uuid4())
+        with _hash_lock(self.cache_root, f"artifact-{run_id}"):
+            run_dir.mkdir(parents=True, exist_ok=False)
+            self._emit_run_receipt(resolved, event_id=event_id, state="started")
+            try:
+                payload, native_value = public_inprocess.execute(
+                    manifest,
+                    members,
+                    identity="_spl_public_" + str(envelope["manifest_hash"]),
+                    args=[] if args is None else args,
+                    kwargs={} if kwargs is None else kwargs,
+                    run_dir=run_dir,
+                )
+                downloaded = public_inprocess.download_artifacts(payload, artifacts_dir)
+            except BaseException:
+                self._emit_run_receipt(resolved, event_id=event_id, state="failure")
+                raise
+            self._emit_run_receipt(resolved, event_id=event_id, state="success")
+        self._cleanup_cache_directory(
+            "artifacts", maximum=MAX_ARTIFACT_CACHE_ENTRIES, lock_prefix="artifact-", preserve={run_id}
+        )
+        return EmbeddedCallResult(
+            {
+                "id": run_id,
+                "status": "succeeded",
+                "mode": "embedded",
+                "execution_profile": CURRENT_PROCESS_CONTRACT["profile"],
+                "reference": resolved["reference"],
+                "release_id": resolved["release"]["id"],
+            },
+            payload,
+            downloaded,
+            native_value,
+            True,
+        )
 
     def _emit_run_receipt(
         self,
@@ -1656,8 +1817,14 @@ class EmbeddedBackend:
         bundle_hash = str(envelope.get("bundle_hash") or "")
         if re.fullmatch(r"[0-9a-f]{64}", bundle_hash) is None:
             raise _error("public_manifest_invalid", "bundle identity is malformed")
-        directory = self.cache_root / "bundles" / bundle_hash
-        with _hash_lock(self.cache_root, f"bundle-{bundle_hash}"):
+        cache_identity = bundle_hash
+        if envelope.get("manifest", {}).get("schema") == CURRENT_PROCESS_MANIFEST_SCHEMA:
+            manifest_hash = str(envelope.get("manifest_hash") or "")
+            if re.fullmatch(r"[0-9a-f]{64}", manifest_hash) is None:
+                raise _error("public_manifest_invalid", "manifest identity is malformed")
+            cache_identity += "-" + manifest_hash
+        directory = self.cache_root / "bundles" / cache_identity
+        with _hash_lock(self.cache_root, f"bundle-{cache_identity}"):
             if directory.is_dir():
                 try:
                     verify_public_bundle(
@@ -1693,7 +1860,7 @@ class EmbeddedBackend:
             "bundles",
             maximum=MAX_BUNDLE_CACHE_ENTRIES,
             lock_prefix="bundle-",
-            preserve={bundle_hash},
+            preserve={cache_identity},
         )
         return directory
 
@@ -1702,7 +1869,15 @@ class EmbeddedBackend:
         if not isinstance(release, Mapping):
             raise _error("public_cache_corrupt", "cached resolution is malformed")
         bundle_hash = str(release.get("bundle_hash") or "")
+        manifest_hash = str(release.get("manifest_hash") or "")
+        if re.fullmatch(r"[0-9a-f]{64}", bundle_hash) is None or (
+            manifest_hash and re.fullmatch(r"[0-9a-f]{64}", manifest_hash) is None
+        ):
+            raise _error("public_cache_corrupt", "cached content identities are malformed")
         directory = self.cache_root / "bundles" / bundle_hash
+        current_process_directory = self.cache_root / "bundles" / f"{bundle_hash}-{manifest_hash}"
+        if current_process_directory.is_dir():
+            directory = current_process_directory
         envelope = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
         verify_public_bundle(
             envelope,

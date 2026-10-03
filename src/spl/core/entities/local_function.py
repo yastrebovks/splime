@@ -51,6 +51,7 @@ from spl.core.entities.function import (
     DFunction,
     LOCATION_DUNDER_NAME,
     get_dependency_names_from_bytecode,
+    get_static_import_dependencies,
     serialize_function,
 )
 from spl.core.entities.node import InputPort
@@ -251,6 +252,7 @@ def _local_dependencies(func: FunctionType, tree: ast.FunctionDef) -> Generator[
         # Aliased imports are rebound by the handler below (which sees both the
         # bound name and the real def name), so this stays a plain dispatch.
         yield ir_parse(namespace[name], name)
+    yield from get_static_import_dependencies(tree)
 
 
 def _local_class_dependencies(cls: type[Any], tree: ast.ClassDef) -> Generator[Any]:

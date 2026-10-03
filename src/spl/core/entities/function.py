@@ -15,6 +15,7 @@ from spl.core._yaml import yaml
 
 import spl.core.entities.node as m_node
 from spl.core.entities.control import DSPLImport
+from spl.core.entities.distribution import get_dependencies_from_module_name
 from spl.core.entities.node import DEFAULT_PORT, InputPort, OutputPort
 from spl.core.ir.common import DBase
 from spl.core.ir.parse import _attach, _branch, ir_parse
@@ -127,6 +128,24 @@ def get_dependencies_from_ast(frame_offset: int, tree: ast.FunctionDef) -> Gener
     for value in map(ast.unparse, tree.args.defaults):
         yield from get_dependencies_from_bytecode(frame_offset + 1, value)
 
+    yield from get_static_import_dependencies(tree)
+
+
+def get_static_import_dependencies(tree: ast.FunctionDef) -> Generator[Any]:
+    """Capture distribution ownership for imports that remain in a function body."""
+
+    # Imports in a function body are deliberately absent from bytecode's global
+    # reads.  Record their import-root ownership while still leaving the import
+    # at its original (lazy) location in the function body.
+    roots: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.partition(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            roots.add(node.module.partition(".")[0])
+    for root in sorted(roots - {"spl", "_spl_components"}):
+        yield from get_dependencies_from_module_name(root)
+
 
 def serialize_function_output(func: FunctionType, tree: ast.FunctionDef) -> list[OutputPort]:
     name = DEFAULT_PORT
@@ -140,6 +159,10 @@ def serialize_function_output(func: FunctionType, tree: ast.FunctionDef) -> list
 
 def _validate_live_function(func: FunctionType, tree: ast.FunctionDef) -> None:
     """Reject callable features that ``!DFunction`` cannot represent."""
+    if inspect.iscoroutinefunction(func) or inspect.isasyncgenfunction(func) or inspect.isgeneratorfunction(func):
+        raise ValueError(
+            f"cannot serialize function {func.__qualname__!r}: async and generator entrypoints are unsupported"
+        )
     args = tree.args
     unsupported: list[str] = []
     if args.posonlyargs:

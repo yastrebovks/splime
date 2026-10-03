@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.11] - 2026-10-03
+
+### Added
+
+- Public Functions and native Pipelines can explicitly opt into
+  `current-process-v1` at publication. On CPython 3.13, the embedded client
+  passes native Python inputs directly and exposes the returned object through
+  `run.value`, including pandas DataFrames and NumPy arrays.
+- Signed v2 manifests capture dependency provenance. Missing dependencies stop
+  execution before published code loads; version differences produce warnings.
+  Dependencies remain managed by the caller's environment.
+
+### Fixed
+
+- Native Pipeline result normalization preserves shared references and concrete
+  container cycles, and reports cyclic explicit result-wrapper chains without
+  recursion errors or rendering caller data.
+- Release identity generation updates Console module cache queries, server
+  framework requirements, README installation commands and Docker defaults.
+- The server no longer implicitly selects an adjacent framework source tree.
+  Local source and wheel development require an explicit selection.
+
+### Compatibility
+
+- Existing signed public releases keep their original execution profile. The
+  current-process profile requires a new release published with that profile;
+  `trust=True` does not change an existing release's contract.
+- Native inputs are passed by reference and may be modified by published code.
+  The profile does not install packages, isolate user code, enforce hard
+  timeouts, or cross Docker, subprocess or remote node boundaries.
+
 ## [0.4.10] - 2026-09-30
 
 ### Added
@@ -653,7 +684,8 @@ here. No breaking API changes.
 - Initial release: turn trusted Python functions into versioned, portable nodes
   reusable across projects and executed locally or remotely.
 
-[Unreleased]: https://github.com/yastrebovks/splime/compare/v0.4.10...HEAD
+[Unreleased]: https://github.com/yastrebovks/splime/compare/v0.4.11...HEAD
+[0.4.11]: https://github.com/yastrebovks/splime/compare/v0.4.10...v0.4.11
 [0.4.10]: https://github.com/yastrebovks/splime/compare/v0.4.9...v0.4.10
 [0.4.9]: https://github.com/yastrebovks/splime/compare/v0.4.8...v0.4.9
 [0.4.8]: https://github.com/yastrebovks/splime/compare/v0.4.7...v0.4.8
