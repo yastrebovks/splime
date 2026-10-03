@@ -947,7 +947,7 @@ def _projection_files(root: Path) -> list[tuple[PurePosixPath, bytes]]:
             path = Path(entry.path)
             child = relative / entry.name
             try:
-                details = entry.stat(follow_symlinks=False)
+                details = os.stat(entry.path, follow_symlinks=False)
             except OSError:
                 raise _error("embedded_framework_invalid", "installed framework files are unavailable") from None
             if stat.S_ISDIR(details.st_mode):
@@ -1505,7 +1505,7 @@ def _verify_environment_inventory(
                 return False
             folded.add(identity)
             try:
-                details = entry.stat(follow_symlinks=False)
+                details = os.stat(entry.path, follow_symlinks=False)
             except OSError:
                 return False
             child_path = Path(entry.path)
