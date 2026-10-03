@@ -263,8 +263,11 @@ def test_file_input_rejects_symlink_directory_and_replacement(tmp_path: Path) ->
         FileInput(tmp_path)
 
     value = FileInput(source)
-    source.unlink()
+    # Keep the original inode allocated; unlink/recreate may reuse it on Linux.
+    original = tmp_path / "original.bin"
+    source.rename(original)
     source.write_bytes(b"first")
+    assert not source.samefile(original)
     with pytest.raises(ValueError, match="changed"):
         value.staged_bytes()
 

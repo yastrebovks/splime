@@ -193,6 +193,25 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[test]"
 
+      # Correct only the test fixture for this already-signed source tag. The
+      # source-chain and build jobs continue to use the unchanged signed tree.
+      - name: Apply the reviewed v0.4.12 FileInput test correction
+        if: inputs.release-tag == 'v0.4.12'
+        env:
+          RELEASE_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          git fetch --no-tags origin "${RELEASE_WORKFLOW_SHA}"
+          git show "${RELEASE_WORKFLOW_SHA}:.github/release-test-fixes/v0.4.12-file-input.patch" \
+            > "${RUNNER_TEMP}/v0.4.12-file-input.patch"
+          printf '%s  %s\n' \
+            '02ce58be5e6a2545d935b3fa64e7f26ccd09123b2bd0de711e0a2695e677cc53' \
+            'tests/core/test_runtime_port_adapters.py' | sha256sum --check --strict -
+          git apply --check "${RUNNER_TEMP}/v0.4.12-file-input.patch"
+          git apply "${RUNNER_TEMP}/v0.4.12-file-input.patch"
+          test "$(git diff --name-only)" = 'tests/core/test_runtime_port_adapters.py'
+          git diff --check
+          git diff -- tests/core/test_runtime_port_adapters.py
+
       - name: Run Ruff lint
         run: ruff check
 

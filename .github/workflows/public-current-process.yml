@@ -5,6 +5,7 @@ on:
       - "src/spl/**"
       - "tests/core/test_public_current_process.py"
       - "tests/core/test_unified_result_access.py"
+      - "tests/core/test_runtime_port_adapters.py"
       - "tests/fixtures/legacy_public_verifier_0_4_10.txt"
       - "pyproject.toml"
       - ".github/workflows/public-current-process.yml"
@@ -26,6 +27,8 @@ jobs:
         run: python -m pytest tests/core/test_public_current_process.py tests/core/test_unified_result_access.py tests/core/test_distribution_resolution.py tests/core/test_process_tree.py
         env:
           SPL_RUNS_HOME: ${{ runner.temp }}/spl-current-process-runs
+      - name: Verify FileInput identity and replacement on each platform
+        run: python -m pytest tests/core/test_runtime_port_adapters.py -k file_input
       # Timed isolated workers remain POSIX-only; the native profile above supports Windows.
       # Cross-repository fixture equality runs in the complete release workspace.
       - name: Verify legacy isolated execution on supported hosts
