@@ -1462,6 +1462,10 @@ def _write_environment_tree(
 
 def _cache_mode_matches(mode: int, expected: int) -> bool:
     if os.name == "nt":
+        # The Windows directory read-only attribute is not an access mode.
+        # Directory identity and exact file inventory are checked separately.
+        if stat.S_ISDIR(mode):
+            return True
         return bool(mode & stat.S_IREAD) and bool(mode & stat.S_IWRITE) == bool(expected & stat.S_IWRITE)
     return stat.S_IMODE(mode) == expected
 

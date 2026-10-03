@@ -1304,3 +1304,20 @@ def test_read_only_cache_tree_can_be_removed(tmp_path):
     root.chmod(0o555)
     _remove_cache_path(root)
     assert not root.exists()
+
+
+def test_fresh_environment_inventory_matches_on_each_platform(tmp_path):
+    from pathlib import PurePosixPath
+    from spl.embedded import _remove_cache_path, _verify_environment_inventory, _write_environment_tree
+
+    root = tmp_path / "environment"
+    root.mkdir()
+    files = {
+        PurePosixPath("packages/module.py"): (b"value = 1\r\n", 0o444),
+        PurePosixPath("python.bin"): (b"executable fixture\x1a", 0o555),
+    }
+    try:
+        _write_environment_tree(root, files)
+        assert _verify_environment_inventory(root, files)
+    finally:
+        _remove_cache_path(root)
