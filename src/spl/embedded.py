@@ -508,11 +508,13 @@ def _atomic_write(path: Path, data: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        # Windows cannot open a directory through the CRT os.open API.
+        if os.name != "nt":
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -877,7 +879,7 @@ def _read_bounded_regular(path: Path, *, maximum: int, label: str) -> bytes:
         raise _error("public_artifact_unsafe", f"{label} is not a safe regular file") from None
     if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
         raise _error("public_artifact_unsafe", f"{label} is not a safe regular file")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError:
@@ -978,7 +980,13 @@ def _remove_cache_path(path: Path) -> None:
     if path.is_symlink() or (path.exists() and not path.is_dir()):
         path.unlink(missing_ok=True)
     elif path.is_dir():
-        for current, directories, _files in os.walk(path, topdown=False, followlinks=False):
+        for current, directories, files in os.walk(path, topdown=False, followlinks=False):
+            if os.name == "nt":
+                for name in files:
+                    child = Path(current) / name
+                    details = child.lstat()
+                    if stat.S_ISREG(details.st_mode) and details.st_nlink == 1:
+                        os.chmod(child, stat.S_IREAD | stat.S_IWRITE, follow_symlinks=False)
             for directory in directories:
                 child = Path(current) / directory
                 if child.is_symlink():
@@ -1452,6 +1460,12 @@ def _write_environment_tree(
     directory.chmod(0o555)
 
 
+def _cache_mode_matches(mode: int, expected: int) -> bool:
+    if os.name == "nt":
+        return bool(mode & stat.S_IREAD) and bool(mode & stat.S_IWRITE) == bool(expected & stat.S_IWRITE)
+    return stat.S_IMODE(mode) == expected
+
+
 def _verify_environment_inventory(
     directory: Path,
     files: Mapping[PurePosixPath, tuple[bytes, int]],
@@ -1460,7 +1474,11 @@ def _verify_environment_inventory(
         root_details = directory.lstat()
     except OSError:
         return False
-    if not stat.S_ISDIR(root_details.st_mode) or directory.is_symlink() or stat.S_IMODE(root_details.st_mode) != 0o555:
+    if (
+        not stat.S_ISDIR(root_details.st_mode)
+        or directory.is_symlink()
+        or not _cache_mode_matches(root_details.st_mode, 0o555)
+    ):
         return False
     expected_directories = _validate_expected_environment_files(files)
     actual_files: set[PurePosixPath] = set()
@@ -1488,7 +1506,7 @@ def _verify_environment_inventory(
                 return False
             child_path = Path(entry.path)
             if stat.S_ISDIR(details.st_mode):
-                if stat.S_IMODE(details.st_mode) != 0o555:
+                if not _cache_mode_matches(details.st_mode, 0o555):
                     return False
                 actual_directories.add(child)
                 if not visit(child_path, child):
@@ -1499,7 +1517,7 @@ def _verify_environment_inventory(
                 expected is None
                 or not stat.S_ISREG(details.st_mode)
                 or details.st_nlink != 1
-                or stat.S_IMODE(details.st_mode) != expected[1]
+                or not _cache_mode_matches(details.st_mode, expected[1])
                 or details.st_size != len(expected[0])
             ):
                 return False
@@ -1835,7 +1853,7 @@ class EmbeddedBackend:
                     )
                     return directory
                 except (ClientError, OSError, ValueError, json.JSONDecodeError):
-                    shutil.rmtree(directory)
+                    _remove_cache_path(directory)
             directory.parent.mkdir(parents=True, exist_ok=True)
             temporary = Path(tempfile.mkdtemp(prefix=f".{bundle_hash}-", dir=directory.parent))
             try:
@@ -1855,7 +1873,7 @@ class EmbeddedBackend:
                 os.replace(temporary, directory)
             finally:
                 if temporary.exists():
-                    shutil.rmtree(temporary)
+                    _remove_cache_path(temporary)
         self._cleanup_cache_directory(
             "bundles",
             maximum=MAX_BUNDLE_CACHE_ENTRIES,
@@ -2225,7 +2243,7 @@ class EmbeddedBackend:
                         os.replace(temporary, directory)
                     finally:
                         if temporary.exists():
-                            shutil.rmtree(temporary)
+                            _remove_cache_path(temporary)
                 self._verify_wheel_file(path, artifact)
             result.append(path)
         return result

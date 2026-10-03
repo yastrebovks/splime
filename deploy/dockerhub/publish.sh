@@ -10,7 +10,7 @@
 #   ./publish.sh <version>  # builds and pushes a specific version + latest
 set -euo pipefail
 
-VERSION="${1:-0.4.11}"
+VERSION="${1:-0.4.12}"
 IMAGE="yastrebovks/spl-daemon"
 PLATFORMS="linux/amd64,linux/arm64"
 

@@ -16,7 +16,7 @@ from tools.build_console_artifact import (
     build_console_artifact,
     is_deployable_source_path,
 )
-from tools.release_chain import load_json
+from tools.release_chain import console_manifest_build_id, load_json, validate_console_integrity
 
 
 SPL_ROOT = Path(__file__).resolve().parents[2]
@@ -130,19 +130,19 @@ def test_console_artifact_is_byte_reproducible_exact_and_source_immutable(
     }.intersection(_nested_keys(build))
 
     integrity = json.loads(first.integrity_path.read_text(encoding="utf-8"))
-    expected_integrity_paths = {
-        f"./{path}"
-        for path in expected_staged
-        if PurePosixPath(path).suffix in {".css", ".js", ".json"} and path != "static-integrity.json"
-    }
+    expected_integrity_paths = {f"./{path}" for path in expected_staged if path != "static-integrity.json"}
     assert integrity == {
-        "schema_version": 2,
+        "schema_version": 3,
+        "stylesheets": ["./styles.css"],
+        "build_id": console_manifest_build_id(integrity),
         "release_id": CONTRACT["release_id"],
         "build": "./build.json",
         "assets": {
             path: _sha256(first.stage_directory / path.removeprefix("./")) for path in sorted(expected_integrity_paths)
         },
     }
+
+    validate_console_integrity(integrity)
 
     with tarfile.open(first.archive_path, mode="r:gz") as archive:
         members = archive.getmembers()
@@ -305,3 +305,24 @@ def _nested_keys(value: object) -> set[str]:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("field", ["build_id", "assets", "stylesheets", "extra"])
+def test_schema3_integrity_rejects_bootstrap_tampering(tmp_path: Path, field: str) -> None:
+    from tools.build_console_artifact import _static_integrity
+    from tools.release_chain import ReleaseChainError
+
+    for name in ("build.json", "index.html", "releaseGate.js", "app.js", "styles.css"):
+        (tmp_path / name).write_text("fixture", encoding="utf-8")
+    integrity = _static_integrity(tmp_path, release_id="splime-test")
+    validate_console_integrity(integrity)
+    if field == "assets":
+        del integrity["assets"]["./index.html"]
+    elif field == "stylesheets":
+        integrity[field] = ["./missing.css"]
+    elif field == "extra":
+        integrity[field] = True
+    else:
+        integrity[field] = "sha256:" + "0" * 64
+    with pytest.raises(ReleaseChainError):
+        validate_console_integrity(integrity)

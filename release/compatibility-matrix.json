@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "release_id": "splime-0.4.11",
+  "release_id": "splime-0.4.12",
   "policy": {
     "console_server": "lockstep",
     "daemon_server": "capability_negotiated",
@@ -11,7 +11,7 @@
       "path": "historical_python_api",
       "status": "unverified",
       "producer": "published splime 0.1.2 through 0.4.7 (non-contiguous inventory)",
-      "consumer": "framework and daemon 0.4.11 compatibility facade",
+      "consumer": "framework and daemon 0.4.12 compatibility facade",
       "required_contract": "published imports, signatures, YAML/IR, and restored legacy facade spellings",
       "fallback": "An unavailable artifact is blocked and cannot become a compatibility claim",
       "test_gate": "spl/release/0.4.8/historical-artifacts.json, spl/tests/core/test_prompt01_historical_inventory.py, spl/tests/core/test_prompt01_compatibility_facade.py"
@@ -20,7 +20,7 @@
       "path": "legacy_profile_registration",
       "status": "unverified",
       "producer": "old client or daemon",
-      "consumer": "daemon and server 0.4.11",
+      "consumer": "daemon and server 0.4.12",
       "required_contract": "legacy registration payload without profile_description",
       "fallback": "Legacy wire and mutation semantics remain unchanged",
       "test_gate": "spl/tests/core/test_prompt01_profiles.py and spl-server/tests/test_public_object_publication.py"
@@ -28,7 +28,7 @@
     {
       "path": "new_client_old_components",
       "status": "unverified",
-      "producer": "client 0.4.11",
+      "producer": "client 0.4.12",
       "consumer": "old daemon or server",
       "required_contract": "capability negotiation before additive profile/public operations",
       "fallback": "New operations fail with feature_not_supported before mutation; legacy calls retain legacy wire",
@@ -37,8 +37,8 @@
     {
       "path": "public_objects_lockstep",
       "status": "tested",
-      "producer": "client and daemon 0.4.11",
-      "consumer": "server 0.4.11 schema 48",
+      "producer": "client and daemon 0.4.12",
+      "consumer": "server 0.4.12 schema 48",
       "required_contract": "spl.public_object_profile.v1, spl.public_distribution.v1, and spl.public_catalog.v1",
       "fallback": "Unsupported public operations fail explicitly and preserve private behavior",
       "test_gate": "spl-server/tests/test_public_object_publication.py, spl-server/tests/test_public_distribution.py, and spl-server/tests/test_public_catalog.py"
@@ -46,8 +46,8 @@
     {
       "path": "embedded_public_execution",
       "status": "tested",
-      "producer": "embedded client 0.4.11 without daemon",
-      "consumer": "server public distribution API 0.4.11",
+      "producer": "embedded client 0.4.12 without daemon",
+      "consumer": "server public distribution API 0.4.12",
       "required_contract": "spl.public_distribution.v1 and signed public manifest v1",
       "fallback": "Missing capability fails before resolution; exact cached releases remain offline-capable",
       "test_gate": "spl/tests/core/test_prompt02_embedded.py and spl-server/tests/test_public_distribution.py"
@@ -55,8 +55,8 @@
     {
       "path": "anonymous_run_receipts",
       "status": "tested",
-      "producer": "embedded client 0.4.11",
-      "consumer": "server public receipt API 0.4.11",
+      "producer": "embedded client 0.4.12",
+      "consumer": "server public receipt API 0.4.12",
       "required_contract": "spl.public_run_receipt.v1",
       "fallback": "Disabled, offline, rejected, or rate-limited emission never changes local execution",
       "test_gate": "spl/tests/core/test_prompt02_embedded.py and spl-server/tests/test_public_catalog.py"
@@ -64,8 +64,8 @@
     {
       "path": "console_to_server",
       "status": "unverified",
-      "producer": "Console 0.4.11",
-      "consumer": "server 0.4.11 schema 48",
+      "producer": "Console 0.4.12",
+      "consumer": "server 0.4.12 schema 48",
       "required_contract": "console-server/v1",
       "fallback": "Visible release mismatch; affected actions fail closed",
       "test_gate": "spl-frontend/tests/release-integrity.test.mjs and spl-server/tests/test_console_structural_contracts.py"
@@ -73,8 +73,8 @@
     {
       "path": "daemon_worker_build_projection",
       "status": "tested",
-      "producer": "daemon 0.4.11",
-      "consumer": "server and Console 0.4.11",
+      "producer": "daemon 0.4.12",
+      "consumer": "server and Console 0.4.12",
       "required_contract": "spl.worker_build.v1",
       "fallback": "Missing or invalid build evidence remains unknown and never proves execution compatibility or readiness",
       "test_gate": "spl/tests/daemon/test_structural_wire_contracts.py, spl-server/tests/test_worker_machine_projection.py, and spl-frontend/tests/structural-contracts.test.mjs"
@@ -82,8 +82,8 @@
     {
       "path": "daemon_telemetry_policy",
       "status": "unverified",
-      "producer": "daemon 0.4.11",
-      "consumer": "server and Console 0.4.11",
+      "producer": "daemon 0.4.12",
+      "consumer": "server and Console 0.4.12",
       "required_contract": "spl.telemetry_policy.v1",
       "fallback": "Missing or invalid telemetry evidence remains unknown or not mirrored",
       "test_gate": "spl/tests/daemon/test_sol_074_claim_fencing.py, spl-server/tests/test_execution_preflight.py, and spl-frontend/tests/execution-preflight.test.mjs"
@@ -91,8 +91,8 @@
     {
       "path": "public_current_process",
       "status": "tested",
-      "producer": "server 0.4.11",
-      "consumer": "client 0.4.11, CPython 3.13",
+      "producer": "server 0.4.12",
+      "consumer": "client 0.4.12, CPython 3.13",
       "required_contract": "spl.public_object_manifest.v2 / current-process-v1",
       "fallback": "No installation or isolated fallback; missing dependencies stop before code executes",
       "test_gate": "spl/tests/core/test_public_current_process.py, spl-server/tests/test_public_current_process.py, spl/integration_tests/public_current_process_packages.py"

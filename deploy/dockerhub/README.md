@@ -24,7 +24,7 @@ docker run -d --name spl-daemon \
   --cap-drop ALL --security-opt no-new-privileges:true \
   -p 127.0.0.1:8765:8765 \
   -v /var/lib/spl-daemon:/var/lib/spl-daemon \
-  yastrebovks/spl-daemon:0.4.11
+  yastrebovks/spl-daemon:0.4.12
 ```
 
 ## Per-node Docker nodes (0.4 series)
@@ -103,15 +103,15 @@ docker login                                   # to your Docker Hub account (yas
 docker buildx create --use --name splime-builder
 
 # build + push multi-arch (version and latest)
-./publish.sh 0.4.11
+./publish.sh 0.4.12
 ```
 
 To build a single-arch image locally for testing:
 
 ```bash
-docker build -t yastrebovks/spl-daemon:0.4.11 .
+docker build -t yastrebovks/spl-daemon:0.4.12 .
 docker run --rm -p 127.0.0.1:8765:8765 \
-  -v /var/lib/spl-daemon:/var/lib/spl-daemon yastrebovks/spl-daemon:0.4.11
+  -v /var/lib/spl-daemon:/var/lib/spl-daemon yastrebovks/spl-daemon:0.4.12
 ```
 
 ## Security

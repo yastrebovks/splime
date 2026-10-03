@@ -13,6 +13,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from .release_chain import ReleaseChainError, validate_console_integrity
+else:
+    from release_chain import ReleaseChainError, validate_console_integrity
+
 USER_AGENT = "splime-release-verifier/0.4.6"
 
 
@@ -213,8 +218,10 @@ def verify_console(manifest: dict[str, Any]) -> None:
     if not isinstance(assets, dict) or not assets:
         raise SystemExit("deployed Console integrity manifest must contain non-empty assets")
     if manifest.get("schema_version") == 2:
-        if integrity.get("schema_version") != 2:
-            raise SystemExit("v2 release requires a v2 Console integrity manifest")
+        try:
+            validate_console_integrity(integrity)
+        except ReleaseChainError as exc:
+            raise SystemExit(str(exc)) from exc
         build_url = integrity.get("build")
         if build_url != "./build.json" or build_url not in assets:
             raise SystemExit("v2 Console integrity must cover ./build.json")

@@ -1278,3 +1278,29 @@ def test_signed_native_pipeline_rejects_wrapper_cycle_once_with_failure_cleanup(
     assert events == ["started", "failure"]
     assert (sys.path, os.getcwd(), dict(os.environ), sys.stdout, sys.stderr) == before
     assert {name for name in sys.modules if name.startswith("_spl_public_")} == private_before
+
+
+def test_binary_cache_io_preserves_crlf_and_control_z(tmp_path):
+    from spl.embedded import _atomic_write, _read_bounded_regular
+
+    payload = b"line\r\nnext\x1a\x00\xff\r\n"
+    target = tmp_path / "binary-cache" / "payload.bin"
+    _atomic_write(target, payload)
+    assert _read_bounded_regular(target, maximum=len(payload), label="binary cache") == payload
+    _atomic_write(target, payload + b"replacement")
+    assert target.read_bytes() == payload + b"replacement"
+
+
+def test_read_only_cache_tree_can_be_removed(tmp_path):
+    from spl.embedded import _remove_cache_path
+
+    root = tmp_path / "cache"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    payload = nested / "module.py"
+    payload.write_bytes(b"value = 1\n")
+    payload.chmod(0o400)
+    nested.chmod(0o555)
+    root.chmod(0o555)
+    _remove_cache_path(root)
+    assert not root.exists()

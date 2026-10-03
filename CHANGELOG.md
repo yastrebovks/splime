@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.12] - 2026-10-03
+
+### Fixed
+
+- Console archives now carry the same schema-3 integrity contract used by the
+  browser bootstrap, including stylesheets, every public asset and the build
+  fingerprint. Fingerprint ordering is independent of the host locale.
+- Windows embedded-cache writes no longer attempt POSIX directory fsync.
+  Bounded reads preserve binary bytes, including CRLF and control-Z, and
+  read-only cache trees are removable without following symlinks.
+- Release regression checks preserve published history, portable SQLite
+  fixtures and the required NumPy/pandas test dependencies.
+
+The 0.4.11 source tag was retained for audit history. Its Console archive did
+not pass deployment verification and was not deployed or published to PyPI.
+
 ## [0.4.11] - 2026-10-03
 
 ### Added
@@ -684,7 +700,8 @@ here. No breaking API changes.
 - Initial release: turn trusted Python functions into versioned, portable nodes
   reusable across projects and executed locally or remotely.
 
-[Unreleased]: https://github.com/yastrebovks/splime/compare/v0.4.11...HEAD
+[Unreleased]: https://github.com/yastrebovks/splime/compare/v0.4.12...HEAD
+[0.4.12]: https://github.com/yastrebovks/splime/compare/v0.4.11...v0.4.12
 [0.4.11]: https://github.com/yastrebovks/splime/compare/v0.4.10...v0.4.11
 [0.4.10]: https://github.com/yastrebovks/splime/compare/v0.4.9...v0.4.10
 [0.4.9]: https://github.com/yastrebovks/splime/compare/v0.4.8...v0.4.9

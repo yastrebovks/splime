@@ -598,6 +598,45 @@ def materialize_published_evidence(
     return evidence
 
 
+def console_manifest_build_id(integrity: dict[str, Any]) -> str:
+    """Hash the schema-3 bootstrap identity with locale-independent key order."""
+    payload = {
+        "schema_version": 3,
+        "release_id": integrity.get("release_id"),
+        "build": integrity.get("build"),
+        "stylesheets": integrity.get("stylesheets"),
+        "assets": dict(sorted(integrity.get("assets", {}).items())),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def validate_console_integrity(integrity: dict[str, Any]) -> None:
+    """Accept historical schema 2 and validate the exact schema-3 bootstrap."""
+    schema = integrity.get("schema_version")
+    if schema == 2:
+        return
+    if schema != 3:
+        raise ReleaseChainError("unsupported Console integrity schema")
+    if set(integrity) != {"schema_version", "release_id", "build", "stylesheets", "assets", "build_id"}:
+        raise ReleaseChainError("Console integrity schema 3 has unexpected fields")
+    assets = integrity.get("assets")
+    required = {"./build.json", "./index.html", "./releaseGate.js", "./app.js"}
+    if not isinstance(assets, dict) or not required.issubset(assets) or integrity.get("build") != "./build.json":
+        raise ReleaseChainError("Console integrity does not cover the complete bootstrap")
+    if any(not isinstance(key, str) or not key.isascii() for key in assets):
+        raise ReleaseChainError("Console integrity asset keys must be ASCII paths")
+    stylesheets = integrity.get("stylesheets")
+    if (
+        not isinstance(stylesheets, list)
+        or not stylesheets
+        or any(not isinstance(path, str) or not path.endswith(".css") or path not in assets for path in stylesheets)
+    ):
+        raise ReleaseChainError("Console integrity has an invalid stylesheet graph")
+    if integrity.get("build_id") != console_manifest_build_id(integrity):
+        raise ReleaseChainError("Console integrity build fingerprint mismatch")
+
+
 def validate_built_evidence(
     manifest: dict[str, Any],
     *,
@@ -659,8 +698,7 @@ def validate_built_evidence(
     if sha256_file(integrity_path) != integrity_sha:
         raise ReleaseChainError("Console integrity manifest checksum mismatch")
     integrity = load_json(integrity_path)
-    if integrity.get("schema_version") != 2:
-        raise ReleaseChainError("built v2 release requires Console integrity schema 2")
+    validate_console_integrity(integrity)
     if integrity.get("release_id") != manifest["release_id"]:
         raise ReleaseChainError("Console integrity release_id does not match")
     assets = integrity.get("assets")

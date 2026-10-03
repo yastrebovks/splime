@@ -24,7 +24,7 @@ import tempfile
 from typing import Any
 
 from tools.generate_release_identity import console_build_identity
-from tools.release_chain import ReleaseChainError, load_json
+from tools.release_chain import ReleaseChainError, console_manifest_build_id, load_json
 
 
 _PUBLIC_JAVASCRIPT_DIRECTORIES = frozenset(
@@ -63,7 +63,6 @@ _PUBLIC_FILES = frozenset(
     }
 )
 _GENERATED_FILES = frozenset({"build.json", "static-integrity.json"})
-_INTEGRITY_SUFFIXES = frozenset({".css", ".js", ".json"})
 _SAFE_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _FULL_GIT_OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _MAX_GZIP_EPOCH = (1 << 32) - 1
@@ -227,20 +226,20 @@ def _static_integrity(stage: Path, *, release_id: str) -> dict[str, Any]:
     for path in sorted(stage.rglob("*")):
         if not path.is_file() or path.name == "static-integrity.json":
             continue
-        if path.suffix.casefold() not in _INTEGRITY_SUFFIXES:
-            continue
         relative_path = path.relative_to(stage).as_posix()
         if not _is_safe_relative_path(relative_path):
             raise ConsoleArtifactError(f"staged Console asset has an unsafe path: {relative_path!r}")
         assets[f"./{relative_path}"] = _sha256(path)
     if "./build.json" not in assets:
         raise ConsoleArtifactError("Console integrity graph must include artifact-side build.json")
-    return {
-        "schema_version": 2,
+    payload = {
+        "schema_version": 3,
         "release_id": release_id,
         "build": "./build.json",
+        "stylesheets": ["./styles.css"],
         "assets": assets,
     }
+    return {**payload, "build_id": console_manifest_build_id(payload)}
 
 
 def _write_deterministic_archive(
