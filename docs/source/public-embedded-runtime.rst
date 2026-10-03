@@ -315,3 +315,16 @@ device identity are never included.  Counts are observed and approximate:
 ``runs`` counts the first accepted start for an event and
 ``successful_runs`` counts its first valid transition to success.  Raw
 idempotency rows are retained for 30 days; aggregates can remain after pruning.
+
+Platform support
+----------------
+
+The ``current-process-v1`` profile supports CPython 3.13 on Linux, macOS and
+Windows. The caller owns its dependencies and native values; no timed worker
+process is created.
+
+Legacy isolated releases retain the existing POSIX-only timed-worker contract.
+On Windows these releases fail before user code runs because Windows Job Object
+process-tree containment is not implemented. ``trust=True`` cannot change a
+release's signed profile. Use a release published with ``current-process-v1``
+for native Windows execution, or a supported POSIX host for legacy releases.

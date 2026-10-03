@@ -1179,22 +1179,9 @@ def _environment_scripts_relative() -> PurePosixPath:
 
 def _base_interpreter_projection() -> tuple[Path, bytes]:
     try:
-        executable = Path(getattr(sys, "_base_executable", sys.executable)).resolve(strict=True)
-        projected_executable = executable
-        if os.name == "nt":
-            import sysconfig
-            import venv
-
-            # Use CPython's venv redirector: copying python.exe alone cannot
-            # locate its DLLs, and a nested venv needs the base Python home.
-            scripts = (
-                executable.parent if sysconfig.is_python_build() else Path(venv.__file__).parent / "scripts" / "nt"
-            )
-            debug = "_d" if executable.stem.casefold().endswith("_d") else ""
-            threaded = "t" if sysconfig.get_config_var("Py_GIL_DISABLED") else ""
-            projected_executable = scripts / f"venvlauncher{threaded}{debug}.exe"
+        executable = Path(sys.executable).resolve(strict=True)
         data = _read_bounded_regular(
-            projected_executable,
+            executable,
             maximum=MAX_BASE_INTERPRETER_BYTES,
             label="base interpreter",
         )
