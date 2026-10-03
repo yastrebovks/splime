@@ -34,7 +34,8 @@ WORKSPACE = Path(__file__).parents[3]
 def test_installed_distribution_exposes_the_public_embedded_host_contract() -> None:
     from spl.daemon.worker import PUBLIC_EMBEDDED_HOST_CONTRACT
 
-    assert importlib.metadata.version("splime") == "0.4.11"
+    declared = json.loads((Path(__file__).parents[2] / "release-contract.json").read_text(encoding="utf-8"))
+    assert importlib.metadata.version("splime") == declared["version"]
     assert PUBLIC_EMBEDDED_HOST_CONTRACT == "spl.public_embedded_host.v1"
 
 
