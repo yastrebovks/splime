@@ -43,7 +43,8 @@ ENV PYTHONUNBUFFERED=1 \
     HOME=/var/lib/spl-daemon
 
 # No desktop keyring in a container: keep secrets in the daemon home directory.
-ENV SPL_DAEMON_SECRET_BACKEND=file
+ENV SPL_DAEMON_HOME=/var/lib/spl-daemon \
+    SPL_DAEMON_SECRET_BACKEND=file
 
 # Install the released package from PyPI.
 RUN python -m pip install "splime==${SPL_VERSION}"
@@ -70,6 +71,9 @@ WORKDIR /var/lib/spl-daemon
 USER spl:spl
 
 EXPOSE 8765
+
+# asyncio handles SIGINT and runs daemon cleanup; SIGTERM is ignored by PID 1.
+STOPSIGNAL SIGINT
 
 # Liveness: read the local bearer token from daemon-endpoint.json and hit /health.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \

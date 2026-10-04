@@ -98,6 +98,10 @@ def test_canonical_docker_runtime_is_non_root_loopback_first_and_socket_opt_in()
     assert "ARG SPL_UID=10001" in dockerfile
     assert "ARG SPL_GID=10001" in dockerfile
     assert "USER spl:spl" in dockerfile
+    # docker exec CLI commands must find the same endpoint token as serve.
+    assert "SPL_DAEMON_HOME=/var/lib/spl-daemon" in dockerfile
+    assert "STOPSIGNAL SIGINT" in dockerfile
+    assert '"--home", "/var/lib/spl-daemon"' in dockerfile
     assert "127.0.0.1:8765:8765" in compose
     assert "127.0.0.1:8765:8765" in readme
     assert "docker.sock" not in compose
