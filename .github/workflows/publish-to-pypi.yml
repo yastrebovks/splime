@@ -225,6 +225,15 @@ jobs:
       - name: Run unit tests (smoke excluded)
         run: python -m pytest -m "not smoke" -q
 
+      - name: Set up Node for the pinned Console tests
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run complete Console syntax and regression suite
+        working-directory: ../spl-frontend
+        run: npm run check
+
   build:
     name: Build and verify the external release BOM
     needs:
@@ -471,7 +480,103 @@ jobs:
               "${GITHUB_WORKSPACE}/release-workspace/artifacts/release-manifest.json" \
             --stage built
 
-      - name: Create the reviewed artifact checksum inventory
+      - name: Run real isolated author registry and anonymous consumers
+        timeout-minutes: 20
+        env:
+          CI_ACCEPTANCE_ROOT: ${{ runner.temp }}/splime-release-acceptance
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import venv
+
+          workspace = (Path(os.environ["GITHUB_WORKSPACE"]) / "release-workspace").resolve()
+          artifacts = workspace / "artifacts"
+          manifest = json.loads((artifacts / "release-manifest.json").read_text())
+          if manifest.get("evidence", {}).get("state") != "built":
+              raise SystemExit("acceptance requires verified built evidence")
+          version = manifest["version"]
+          wheels = {}
+          for component, package in (("framework", "splime"), ("server", "spl_server")):
+              declared = manifest["components"][component]["artifact"]
+              wheel = workspace / declared["path"]
+              if wheel.is_symlink() or not wheel.resolve().is_relative_to(artifacts):
+                  raise SystemExit("acceptance wheel must remain inside artifact staging")
+              if wheel.name != f"{package}-{version}-py3-none-any.whl" or not wheel.is_file():
+                  raise SystemExit("acceptance wheel identity mismatch")
+              if hashlib.sha256(wheel.read_bytes()).hexdigest() != declared["sha256"]:
+                  raise SystemExit("acceptance wheel checksum mismatch")
+              wheels[component] = wheel.resolve()
+
+          scratch = Path(os.environ["CI_ACCEPTANCE_ROOT"]).resolve()
+          if scratch.is_relative_to(workspace):
+              raise SystemExit("acceptance homes must be outside the checkout")
+          scratch.mkdir(parents=True, exist_ok=False)
+          outside = scratch / "outside-checkouts"
+          outside.mkdir()
+          clean_env = {k: v for k, v in os.environ.items() if not k.startswith(("SPL", "PYTHON", "UV_", "PIP_"))}
+          clean_env["PIP_CONFIG_FILE"] = os.devnull
+          interpreters = {}
+          for name, numpy, pandas, server in (
+              ("author", "2.3.5", "2.2.3", True),
+              ("matching", "2.3.5", "2.2.3", False),
+              ("alternate", "2.5.4", "3.0.6", False),
+          ):
+              environment = scratch / "envs" / name
+              venv.EnvBuilder(with_pip=True).create(environment)
+              interpreter = environment / "bin" / "python"
+              interpreters[name] = interpreter
+              home = scratch / "homes" / name
+              home.mkdir(parents=True)
+              env = {**clean_env, "HOME": str(home)}
+              packages = [str(wheels["framework"]), f"numpy=={numpy}", f"pandas=={pandas}"]
+              if server:
+                  packages.append(str(wheels["server"]))
+              subprocess.run([str(interpreter), "-I", "-m", "pip", "install", "--no-cache-dir", *packages], cwd=outside, env=env, check=True)
+              subprocess.run([str(interpreter), "-I", "-m", "pip", "check"], cwd=outside, env=env, check=True)
+              inspection = (
+                  "from importlib.metadata import version; from pathlib import Path; import spl; "
+                  f"assert version('splime') == {version!r}; "
+                  f"assert version('numpy') == {numpy!r}; assert version('pandas') == {pandas!r}; "
+                  "assert 'site-packages' in spl.__file__; "
+                  f"assert not Path(spl.__file__).resolve().is_relative_to(Path({str(workspace)!r})); "
+              )
+              if server:
+                  inspection += (
+                      "import daemon_server; assert 'site-packages' in daemon_server.__file__; "
+                      f"assert version('spl-server') == {version!r}; "
+                      f"assert not Path(daemon_server.__file__).resolve().is_relative_to(Path({str(workspace)!r})); "
+                  )
+              subprocess.run([str(interpreter), "-I", "-c", inspection], cwd=outside, env=env, check=True)
+
+          harness = workspace / "spl" / "integration_tests" / "release_candidate_packages.py"
+          # The harness copies workers outside the checkout, strips environment
+          # overrides, creates loopback-only registry state and synthetic keys,
+          # and audits anonymous consumers for author/shared-state reads.
+          subprocess.run([
+              str(interpreters["author"]), "-I", str(harness),
+              "--root", str(scratch / "evidence"), "--version", version,
+              "--author-python", str(interpreters["author"]),
+              "--consumer-python", str(interpreters["matching"]),
+              "--consumer-python", str(interpreters["alternate"]),
+          ], cwd=outside, env={**clean_env, "HOME": str(scratch / "homes" / "author")}, check=True, timeout=600)
+          summary = json.loads((scratch / "evidence" / "summary.json").read_text())
+          if summary.get("status") != "passed" or len(summary.get("consumers", [])) != 2:
+              raise SystemExit("real installed acceptance did not complete both consumers")
+          observed = {(c["versions"]["numpy"], c["versions"]["pandas"]) for c in summary["consumers"]}
+          if observed != {("2.3.5", "2.2.3"), ("2.5.4", "3.0.6")}:
+              raise SystemExit("real installed acceptance dependency matrix mismatch")
+          print("Real loopback author/registry/two-consumer acceptance passed against exact built wheels")
+          # Deliberately keep homes, private signing keys, registry state and
+          # complete harness output on this ephemeral runner; never upload them.
+          PY
+
+      # The private server wheel stays on this runner. Its digest is retained
+      # in the component manifest; public transfer artifacts exclude its bytes.
+      - name: Create the reviewed public artifact checksum inventory
         run: |
           python - <<'PY'
           import hashlib
@@ -484,7 +589,6 @@ jobs:
           included = [
               root / "source-release-manifest.json",
               *sorted((root / "python").glob("*")),
-              *sorted((root / "server").glob("*")),
               console_archives[0],
               *sorted(path for path in (root / "console").rglob("*") if path.is_file()),
           ]
@@ -509,7 +613,6 @@ jobs:
             release-workspace/artifacts/release-manifest.json
             release-workspace/artifacts/release-artifact-bom.sha256
             release-workspace/artifacts/python/*
-            release-workspace/artifacts/server/*
             release-workspace/artifacts/console/**
             release-workspace/artifacts/splime-console-*.tar.gz
           if-no-files-found: error

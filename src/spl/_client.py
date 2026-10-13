@@ -1731,6 +1731,25 @@ class SPLClient:
 
         return "embedded" if self._embedded_backend is not None else "daemon"
 
+    def inspect_dependencies(self, reference: str) -> list[dict[str, Any]]:
+        """Return all dependency comparisons for a public current-process release.
+
+        Requires an embedded client. Resolves and verifies the release (using
+        the public cache when available), but never executes published code,
+        grants execution trust, imports dependencies, or installs packages.
+        Each JSON-serializable row contains package, recorded_version,
+        installed_version, loaded_versions and status. The list includes
+        matching and missing packages, has no source paths, and is not truncated.
+        Recorded versions are publication provenance, not installation pins.
+        """
+        if self._embedded_backend is None:
+            message = "Public dependency inspection requires SPLClient.embedded()."
+            raise ClientError(
+                f"feature_not_supported: {message}",
+                payload={"code": "feature_not_supported", "error": message},
+            )
+        return cast(list[dict[str, Any]], self._embedded_backend.inspect_dependencies(reference))
+
     def health(self) -> dict[str, Any]:
         """Check that the local daemon is reachable."""
 

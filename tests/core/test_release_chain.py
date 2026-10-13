@@ -105,7 +105,7 @@ def test_release_bump_updates_installation_and_module_cache_identities() -> None
     for relative in ("app.js", "bootstrap/consoleApp.js", "actions/commands.js"):
         source = rendered[WORKSPACE_ROOT / "spl-frontend" / relative]
         identities = re.findall(r"release=splime-[^\"']+", source)
-        assert identities and set(identities) == {"release=splime-0.4.99-schema48"}
+        assert identities and set(identities) == {f"release=splime-0.4.99-schema{contract['server_schema_target']}"}
     docker = SPL_ROOT / "deploy" / "dockerhub"
     assert "ARG SPL_VERSION=0.4.99" in rendered[docker / "Dockerfile"]
     assert "yastrebovks/spl-daemon:0.4.99" in rendered[docker / "docker-compose.yml"]
@@ -145,6 +145,10 @@ def test_generator_never_fabricates_source_build_or_publication_evidence() -> No
     assert all(artifact["url"] is None and artifact["sha256"] is None for artifact in manifest["python"]["artifacts"])
     assert all(artifact["sha256"] is None for artifact in manifest["github_release"]["assets"])
     assert "release-manifest.json" not in {artifact["name"] for artifact in manifest["github_release"]["assets"]}
+    # Server source is private. Its wheel is bound as a private component
+    # artifact, never added to the public GitHub upload allowlist.
+    assert not any(artifact["name"].startswith("spl_server-") for artifact in manifest["github_release"]["assets"])
+    assert manifest["components"]["server"]["artifact"]["identifier"] == "spl-server"
     assert manifest["docker"]["source_path"] == "deploy/dockerhub"
     assert manifest["docker"]["manifest_digest"] is None
     assert manifest["docker"]["platform_digests"] == {
@@ -533,6 +537,7 @@ def _disposable_built_release(tmp_path: Path) -> tuple[Path, dict, dict]:
         },
     )
     frontend_config = (
+        "export const SERVER_SCHEMA_TARGET = 32;\n"
         'export const APP_VERSION = "0.4.6";\n'
         'export const APP_RELEASE_ID = "splime-0.4.6";\n'
         "export const RELEASE_MANIFEST_URL = "

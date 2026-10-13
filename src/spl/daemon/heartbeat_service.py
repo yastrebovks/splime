@@ -10,6 +10,7 @@ from typing import Any, Callable
 from spl.daemon.remote_client import DEFAULT_HEARTBEAT_INTERVAL_SECONDS, ServerClientError
 from spl.daemon.repositories.server_connection import SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
 from spl.daemon.store import RegistryStore, utc_now
+from spl.daemon.sync_diagnostics import sync_failure
 
 LOGGER = logging.getLogger(__name__)
 
@@ -229,20 +230,38 @@ class HeartbeatService:
                 result = self.sync_once(connection_id=connection_id, probe_server_channel=True)
                 partial_error = result.get("partial_error")
                 if isinstance(partial_error, dict):
+                    if partial_error.get("category") not in {None, "connectivity", "authentication"}:
+                        # Sync rejected work after a successful lease renewal.
+                        # Its durable diagnostics must not overwrite liveness.
+                        if partial_error.get("retryable") is True:
+                            if self._wait_until_next_attempt(
+                                connection_id, stop_event, delay=backoff, interval=interval
+                            ):
+                                return
+                            backoff = min(self.max_backoff_seconds, backoff * 2)
+                            continue
+                        partial_error = None
+                if isinstance(partial_error, dict):
                     error = str(partial_error.get("message") or "sync batch failed")
                     status_code = partial_error.get("status_code")
                     if isinstance(status_code, int):
-                        raise ServerClientError(status_code, error)
+                        raise ServerClientError(status_code, error, code=partial_error.get("code"))
                     raise RuntimeError(error)
             except ServerClientError as exc:
+                if exc.transport_failure is False and exc.status_code not in {401, 403, 404, 409}:
+                    if self._wait_until_next_attempt(connection_id, stop_event, delay=backoff, interval=interval):
+                        return
+                    backoff = min(self.max_backoff_seconds, backoff * 2)
+                    continue
                 lease_rejected = exc.status_code in {401, 403, 404, 409}
+                diagnostic = sync_failure(exc, operation="heartbeat")
                 self._record_heartbeat_error(
                     connection_id,
                     status=(SERVER_CONNECTION_STATUS_NEEDS_RECONNECT if lease_rejected else "heartbeat_failed"),
                     error=(
-                        f"lease rejected by server ({exc.status_code}): {exc.message}"
+                        f"lease rejected by server ({exc.status_code}): {diagnostic['code']}"
                         if lease_rejected
-                        else exc.message
+                        else diagnostic["code"]
                     ),
                 )
                 delay = backoff

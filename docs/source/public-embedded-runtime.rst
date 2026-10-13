@@ -74,13 +74,44 @@ Dependencies belong to the current kernel/interpreter and are used as they
 are. Package versions recorded at publication are provenance:
 
 * All recorded distributions available with matching versions: execute.
-* Available distributions with different versions: log visible, non-fatal
-  warnings identifying the distribution, publication version, local version
-  evidence and source component; attempt execution.
+* Available distributions with different versions: log one non-fatal summary
+  showing at most ten dependency entries, with publication, installed and
+  already-loaded versions. Source/component paths are omitted; attempt execution.
 * Any recorded distribution missing: stop before loading any published module
   or adapter. ``ClientError.code`` is ``public_dependencies_missing``;
   ``payload["missing"]`` lists every missing package/version/source and
   ``payload["dependencies"]`` contains the complete inspection report.
+
+The summary and missing-package error are bounded; the data is not. Inspect
+all dependencies without executing the artifact or granting execution trust::
+
+   from spl import SPLClient
+   import json
+   from pathlib import Path
+
+   client = SPLClient.embedded(run_receipts=False)
+   ref = "splime://@owner/library/artifact@1"  # use your artifact's pinned reference
+   dependencies = client.inspect_dependencies(ref)  # ordinary list of dicts
+   differences = [row for row in dependencies if row["status"] != "present"]
+   Path("dependencies.json").write_text(
+       json.dumps(dependencies, ensure_ascii=False, indent=2), encoding="utf-8"
+   )
+
+Each row includes ``package``, ``recorded_version``, ``installed_version``,
+``loaded_versions`` (module/version records) and ``status``. Missing version
+evidence is ``None``; unloaded modules have an empty ``loaded_versions`` list.
+Matching packages are included. Different recorded versions of one distribution
+remain separate rows. The exported list has no source paths or truncation and
+can also be passed directly to ``pandas.DataFrame(dependencies)``.
+
+Inspection verifies the signed release and may fetch its manifest and bundle
+on a cold cache. It uses the same cache as execution and reads fresh local
+version evidence on every call. It neither imports dependency packages nor
+starts a daemon, worker or installer. This API is for embedded clients and
+``current-process-v1`` releases; isolated legacy releases report
+``feature_not_supported`` because their dependencies belong to a separate
+environment. Error payloads retain their existing complete provenance fields
+for compatibility, even though the displayed error omits them.
 
 Install missing packages yourself into the interpreter running the call. In a
 notebook, ``%pip install <distribution-name>`` targets the current kernel; in
@@ -159,6 +190,12 @@ native libraries, user side effects and kernel failures share the caller's
 process. The framework does not change the working directory, environment or
 stdout/stderr; relative paths in user code therefore refer to the caller's
 working directory. Framework Pipeline run storage stays in this call's cache.
+
+Anonymous registry GET requests retry temporary HTTP 429 responses up to three
+times, respecting ``Retry-After`` within a 65-second retry budget. A warning
+explains the first wait. A longer requested wait or exhausted budget raises
+``public_registry_rate_limited`` with HTTP status 429. Receipt POST requests,
+redirects and other HTTP failures are not automatically retried.
 
 V2 authentication includes the execution contract and dependency graph. Trust
 is bound to registry origin, signing key, manifest hash and bundle hash, so

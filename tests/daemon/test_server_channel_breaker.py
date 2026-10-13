@@ -254,7 +254,7 @@ def test_failed_probe_keeps_channel_open_and_exposes_actionable_detail(tmp_path:
         store.close()
 
 
-def test_lease_rejection_opens_breaker_immediately(tmp_path: Path) -> None:
+def test_lease_rejection_requires_reconnect_without_opening_connectivity_breaker(tmp_path: Path) -> None:
     store, runtime, credentials = _runtime(tmp_path)
     try:
         key = runtime._server_channel_key(credentials)  # noqa: SLF001
@@ -266,9 +266,10 @@ def test_lease_rejection_opens_breaker_immediately(tmp_path: Path) -> None:
             runtime._require_live_server_channel_credentials(credentials)  # noqa: SLF001
 
         breaker = runtime.server_connection_state()["breaker"]
-        assert breaker["state"] == "open"
-        assert breaker["consecutive_failures"] == 1
+        assert breaker["state"] == "closed"
+        assert breaker["consecutive_failures"] == 0
         assert store.current_server_connection()["status"] == "needs_reconnect"
+        assert runtime.server_connection_state()["code"] == "server_reconnect_required"
     finally:
         runtime.shutdown()
         store.close()

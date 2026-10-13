@@ -308,6 +308,71 @@ version and supported protocol versions. Source ref and artifact digest remain
 unknown until release/deployment attestation supplies them; equal package
 versions alone do not prove compatibility.
 
+Catalogue synchronization in 0.4.13
+----------------------------------
+
+The daemon negotiates ``catalogue_manifest_v1`` from the existing
+``/version`` response's ``declared.contracts.daemon_server_capabilities``.
+``POST /catalogue-sync/begin`` declares a sequence, snapshot hash, and bounded
+content manifest. ``/content`` transfers missing content-addressed JSON object
+parts; ``/commit`` makes the complete validated catalogue current atomically.
+The object representation includes the complete YAML. One object may span many
+parts. No object removal or YAML truncation is needed to fit an ordinary event.
+Registration of an oversized current object succeeds locally and returns
+``sync_event.status="deferred"`` with ``transport="catalogue_manifest_v1"``.
+Its YAML stays in the registry; compact durable intent preserves the target
+library, explicit library creation and revival options. Commit consumes that
+intent, with a registration nonce preventing replay after a lost acknowledgement
+or a newer snapshot. An older server reports the unsupported capability through
+catalogue status while retaining the local object. Historical noncurrent
+versions remain ordinary durable events; they are not acknowledged by a
+current-catalogue commit.
+
+Limits are independent: an ordinary sync event is 256 KiB, its event batch is
+512 KiB, the ordinary HTTP request is at most 16 MiB, and each catalogue request
+is at most 128 KiB. All are checked against serialized UTF-8 JSON including
+escaping and the applicable envelopes. Catalogue parts contain at most 48 KiB
+of raw object bytes before base64 encoding. The protocol permits at most 1,024
+objects, 16 MiB per object, and 64 MiB per complete catalogue.
+
+Transfers bind to owner, machine, connection, snapshot, and content hashes.
+Only the connected owner's local catalogue, plus the supported pre-enrollment
+default namespace, enters its manifest. Switching credentials never transfers
+another owner's private local objects.
+The server validates complete content and the metadata snapshot hash before
+commit, preserves the previous snapshot during interruption, and fences older
+sequences. Deletion and an empty catalogue are explicit replacement snapshots.
+The daemon's additive SQLite tables retain the active sequence, transfer, and
+object content cache across restarts; the server's additive migration retains
+parts and accepted content. The daemon retains at most 32 state contexts for
+seven days and caches content for its current context; the server expires idle
+partial transfers after 24 hours. A resumed begin response identifies missing
+parts, allowing recovery after acknowledgement loss or server retention cleanup.
+
+Unchanged catalogue fingerprints do not rebuild or transfer YAML. Changed
+catalogues reuse unchanged object content locally and on the server. Each
+heartbeat cycle transfers at most 16 catalogue requests, yielding after five
+seconds between requests, before processing unrelated events. Each request has
+the existing 15-second sync timeout; lease renewal precedes preparation and
+continues between parts and event batches.
+
+``client.sync_status()["catalogue_sync"]`` reports ``pending``, ``current``, or
+``degraded`` independently of connection liveness. The same nonsecret summary
+is advertised to the Console under ``spl.catalogue_sync.v1``. Size diagnostics
+include a stable code, operation, identifier, actual byte count, limit,
+retryability, and next action. They contain no source bodies or credentials.
+Permanent event failures remain stored as nonretryable rows, while independent
+events progress. An authenticated HTTP rejection does not open the network
+circuit breaker; rejected credentials or leases require reconnect separately.
+
+A new daemon talking to a 0.4.12 server continues using the legacy snapshot
+event when it fits. A larger catalogue reports ``catalogue_capability_required``
+and keeps heartbeat and unrelated event synchronization functioning. Upgrade
+the server before the daemon. Once a machine begins the new protocol, the server
+rejects legacy catalogue replacements for that machine to preserve sequence
+fencing; a daemon rollback therefore requires retaining the new-capable daemon
+for catalogue sync or a separately planned registry rollback from backup.
+
 Central execution capability boundaries
 ---------------------------------------
 

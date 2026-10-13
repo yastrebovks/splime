@@ -38,8 +38,18 @@ identity when the server connection is offline:
 
 The mapping contains ``id``, ``owner_id``, ``handle``, ``display_name``,
 ``server_url``, ``machine_id``, ``connection_status``, and ``live``.
+From 0.4.13, the daemon resolves this profile through ``GET /whoami``. It never
+enumerates the user directory and does not require ``teams:read``. ``id`` and
+``owner_id`` refer to the canonical owner; the authenticated token subject may
+instead be a machine or a delegate. If an older server omits the optional owner
+profile, the handle is ``None`` and the display name is the canonical owner ID.
+The same safe fallback is used offline, with ``live=False``. Profile results are
+not reused across token or owner changes; rejected or revoked live credentials
+surface the authentication/authorization error.
+
 ``users()`` is an authenticated, email-free directory containing only id,
-handle, display name, and status:
+handle, display name, and status. This explicit directory operation still
+requires ``teams:read``:
 
 .. code-block:: python
 

@@ -317,6 +317,8 @@ class ServerConnectionManager:
 
     @staticmethod
     def _is_server_connectivity_error(exc: ServerClientError) -> bool:
+        if exc.transport_failure is not None:
+            return exc.transport_failure
         return exc.status_code in {502, 503, 504}
 
     @staticmethod

@@ -26,7 +26,11 @@ def produce(root: Path) -> None:
 
     assert "site-packages" in str(spl.__file__), spl.__file__
     assert "site-packages" in str(daemon_server.__file__), daemon_server.__file__
-    assert metadata.version("splime") == metadata.version("spl-server") == "0.4.11"
+    assert (
+        metadata.version("splime")
+        == metadata.version("spl-server")
+        == os.environ.get("SPL_TEST_RELEASE_VERSION", "0.4.13")
+    )
     root.mkdir(parents=True, exist_ok=True)
     store = ServerStore(root / "producer")
     store.create_user(user_id="author", display_name="Disposable publication fixture")
@@ -116,7 +120,7 @@ def consume(root: Path) -> None:
 
     assert "site-packages" in str(spl.__file__), spl.__file__
     assert "spl.daemon.worker" not in sys.modules
-    assert metadata.version("splime") == metadata.version("spl-server") == "0.4.11"
+    assert metadata.version("splime") == os.environ.get("SPL_TEST_RELEASE_VERSION", "0.4.13")
     envelope = json.loads((root / "manifest.json").read_text())
     registry = "https://fixture.example.test"
     client = SPLClient.embedded(
@@ -190,6 +194,14 @@ def consume(root: Path) -> None:
     expected = frame.copy(deep=True)
     expected["sum"] = 10
     try:
+        dependencies = client.inspect_dependencies(ref)
+        by_package = {row["package"]: row for row in dependencies}
+        assert by_package["numpy"]["installed_version"] == np.__version__
+        assert by_package["pandas"]["installed_version"] == pd.__version__
+        assert all("sources" not in row for row in dependencies)
+        assert json.loads(json.dumps(dependencies)) == dependencies
+        assert events == [] and messages == []
+        assert not backend._trusted(backend._trust_identity(envelope))
         result = client.call(ref, kwargs={"start_df": frame}, trust=True)
         copied_result = client.call(ref, kwargs={"start_df": frame, "copy_result": True})
     finally:
@@ -226,9 +238,10 @@ def consume(root: Path) -> None:
     ) == before
     assert "spl.daemon.worker" not in sys.modules
     assert events == ["started", "success", "started", "success"]
-    assert np.__version__ == "2.1.3" and pd.__version__ == "2.2.3"
-    assert any("numpy was recorded as 2.3.5" in msg and np.__version__ in msg for msg in messages)
-    assert not any("pandas was recorded" in msg for msg in messages)
+    assert any("numpy: published 2.3.5; installed" in msg for msg in messages) == (np.__version__ != "2.3.5")
+    assert any("pandas: published 2.2.3; installed" in msg for msg in messages) == (pd.__version__ != "2.2.3")
+    assert len(messages) == (2 if np.__version__ != "2.3.5" or pd.__version__ != "2.2.3" else 0)
+    assert all("object.yaml" not in message and "root." not in message for message in messages)
     print(
         json.dumps(
             {

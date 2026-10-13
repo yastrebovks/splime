@@ -78,17 +78,17 @@ class _StateProbeServer:
             raise type(self).probe_error
         return _remote_connection()
 
-    def list_users(self, *, handle: str | None = None) -> list[dict[str, Any]]:
-        del handle
+    def whoami(self) -> dict[str, Any]:
         type(self).user_calls += 1
-        return [
-            {
+        return {
+            "owner_id": "owner-a",
+            "owner_profile": {
                 "id": "owner-a",
                 "handle": "owner_a",
                 "display_name": "Owner A",
                 "status": "active",
-            }
-        ]
+            },
+        }
 
 
 def _remote_connection() -> dict[str, Any]:

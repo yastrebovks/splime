@@ -200,9 +200,10 @@ def test_unserializable_sync_event_is_terminal_failed_and_does_not_block_queue(
         poisoned = store.get_sync_event(poison["id"])
         assert poisoned["status"] == "failed"
         assert poisoned["retry"]["will_retry"] is False
-        assert 'invalid splime JSON value at $["payload"]["not_json"]' in poisoned["error"]
-        assert "builtins.set" in poisoned["error"]
-        assert "is not supported" in poisoned["error"]
+        assert json.loads(poisoned["error"])["code"] == "sync_invalid_payload"
+        assert json.loads(poisoned["error"])["retryable"] is False
+        assert json.loads(poisoned["error"])["category"] == "invalid_payload"
+        assert "set-values" not in poisoned["error"]
         assert store.get_sync_event(healthy["id"])["status"] == "sent"
     finally:
         runtime.shutdown()
@@ -375,9 +376,8 @@ def test_runtime_rehandshakes_after_one_rejected_lease_and_whoami_becomes_live(
             type(self).connect_calls += 1
             return _remote_connection()
 
-        def list_users(self, *, handle: str | None = None) -> list[dict[str, Any]]:
-            del handle
-            return [{"id": "owner-a", "handle": "alice", "display_name": "Alice"}]
+        def whoami(self) -> dict[str, Any]:
+            return {"owner_id": "owner-a", "id": "owner-a", "handle": "alice", "display_name": "Alice"}
 
     store = RegistryStore(tmp_path)
     runtime: DaemonRuntime | None = None
@@ -853,13 +853,19 @@ def test_later_batch_failure_keeps_acknowledged_prefix_and_returns_partial_succe
         response = runtime.sync_once()
 
         assert response["partial"] is True
-        assert response["error"] == "temporary batch failure"
+        assert response["error"] == "sync_connectivity"
         assert response["partial_error"] == {
-            "message": "temporary batch failure",
+            "message": "sync_connectivity",
             "status_code": 502,
+            "category": "connectivity",
+            "code": "sync_connectivity",
+            "operation": "sync",
+            "identifier": None,
+            "retryable": True,
+            "next_action": "retry_when_server_reachable",
         }
         assert store.get_server_connection(connection["id"])["status"] == "heartbeat_failed"
-        assert store.get_server_connection(connection["id"])["error"] == "temporary batch failure"
+        assert store.get_server_connection(connection["id"])["error"] == "sync_connectivity"
         assert all(store.get_sync_event(event_id)["status"] == "sent" for event_id in event_ids[:50])
         assert all(store.get_sync_event(event_id)["status"] == "pending" for event_id in event_ids[50:])
     finally:

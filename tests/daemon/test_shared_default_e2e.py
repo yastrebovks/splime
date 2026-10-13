@@ -106,6 +106,10 @@ class _SharedDefaultServer:
             B_ID: B_ID,
         }.get(owner_ref, owner_ref)
 
+    def whoami(self) -> dict[str, Any]:
+        self.calls.append(("whoami",))
+        return {"owner_id": B_ID, "owner_profile": dict(next(user for user in self.users if user["id"] == B_ID))}
+
     def list_users(self, *, handle: str | None = None) -> list[dict[str, Any]]:
         self.calls.append(("list_users", handle))
         if handle is None:
@@ -677,7 +681,8 @@ def test_daemon_whoami_round_trips_online_then_cached_offline(tmp_path) -> None:
             "display_name": B_ID,
             "live": False,
         }
-        assert [call for call in server.calls if call[0] == "list_users"] == [("list_users", None)]
+        assert not [call for call in server.calls if call[0] == "list_users"]
+        assert [call for call in server.calls if call[0] == "whoami"] == [("whoami",)]
     finally:
         app.runtime.shutdown()
         store.close()

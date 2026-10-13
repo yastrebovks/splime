@@ -267,7 +267,7 @@ def test_batch_collision_terminally_fails_only_named_event_without_reconnect(
                 "event_id": events[1]["id"],
                 "kind": "local_run_update",
                 "status": "error",
-                "error": "sync event id was reused with different content",
+                "error": SYNC_EVENT_IDENTITY_COLLISION_ERROR_CODE,
                 "code": SYNC_EVENT_IDENTITY_COLLISION_ERROR_CODE,
             }
         ]

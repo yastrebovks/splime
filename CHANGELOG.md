@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.13] - 2026-10-14
+
+### Fixed
+
+- Anonymous Public Hub reads respect HTTP 429 `Retry-After` with a bounded retry
+  budget and visible progress. Long waits and exhausted retries report a specific
+  rate-limit error; receipt POST requests are never replayed automatically.
+- Public current-process dependency diagnostics show one bounded summary of
+  publication, installed and loaded versions without component/source paths.
+  `SPLClient.inspect_dependencies(ref)` exports every comparison as a list
+  without running the artifact; missing-package errors retain complete payloads.
+- Catalogue synchronization negotiates bounded, resumable, content-addressed
+  transfers and atomically commits complete snapshots, including large objects
+  and intentionally empty catalogues. Small legacy snapshots remain supported.
+- Catalogue and permanent event failures have actionable diagnostics separate
+  from connection health; heartbeat and independent work continue.
+- Unusable synchronization responses retain unacknowledged events for bounded
+  retry with their original IDs. Only validated matching receipts acknowledge
+  work; response validity is reported separately from network reachability.
+- Malformed optional receipt diagnostics cannot interrupt healthy heartbeats
+  or block independent acknowledgements. Diagnostic normalization validates
+  JSON field types and preserves confirmed authentication, transport and
+  invalid-response evidence over conflicting body metadata.
+- Commercial catalogue revision conflicts invalidate the affected Console
+  cache before one bounded recovery attempt. Recovery preserves the selected
+  offer, price and account/session context and reports failed refreshes.
+- Self-identity uses `/whoami` and the canonical owner profile without requiring
+  the user-directory `teams:read` scope.
+- Console displays an inline themed startup shell before external resources,
+  with timeout/retry recovery. Concurrent SHA-256 verification, verified module
+  execution and conditional asset reuse reduce redundant startup transfers.
+- Candidate checks install built wheels in isolated environments and exercise
+  anonymous execution with pandas 2 and 3. Private server wheels are excluded
+  from the public GitHub release upload declaration.
+
+### Compatibility
+
+- Requires Python 3.13 or newer. Anonymous current-process Public Hub execution
+  keeps using the caller's environment; version warnings do not install packages.
+- Server schema 49 is a forward migration. Deploy the server before upgraded
+  daemons. Rolling back across this migration requires restoring the matching
+  database backup and the previous server artifact together.
+
+See `release/0.4.13` for validation records and the release procedure.
+
 ## [0.4.12] - 2026-10-03
 
 ### Fixed
@@ -700,7 +745,8 @@ here. No breaking API changes.
 - Initial release: turn trusted Python functions into versioned, portable nodes
   reusable across projects and executed locally or remotely.
 
-[Unreleased]: https://github.com/yastrebovks/splime/compare/v0.4.12...HEAD
+[Unreleased]: https://github.com/yastrebovks/splime/compare/v0.4.13...HEAD
+[0.4.13]: https://github.com/yastrebovks/splime/compare/v0.4.12...v0.4.13
 [0.4.12]: https://github.com/yastrebovks/splime/compare/v0.4.11...v0.4.12
 [0.4.11]: https://github.com/yastrebovks/splime/compare/v0.4.10...v0.4.11
 [0.4.10]: https://github.com/yastrebovks/splime/compare/v0.4.9...v0.4.10

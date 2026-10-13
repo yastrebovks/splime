@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from http.client import IncompleteRead
 import json
 import re
 import socket
@@ -34,6 +35,9 @@ from spl.daemon.ai_preview import (
     validate_ai_preview_error,
 )
 from spl.daemon.connected_ide import MAX_UPSTREAM_RESPONSE_BYTES
+from spl.daemon.catalogue_sync import CATALOGUE_REQUEST_MAX_BYTES
+from spl.daemon.sync_diagnostics import SyncPayloadError
+from spl.daemon.telemetry import SYNC_BATCH_MAX_BYTES, SYNC_EVENT_BATCH_LIMIT, SYNC_EVENT_MAX_BYTES
 
 DEFAULT_SERVER_URL = "https://splime.io/api"
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60.0
@@ -78,13 +82,93 @@ class ServerClientError(RuntimeError):
         code: str | None = None,
         event_id: str | None = None,
         payload: dict[str, Any] | None = None,
+        transport_failure: bool | None = None,
     ) -> None:
         self.status_code = status_code
         self.message = message
         self.code = code
         self.event_id = event_id
         self.payload = payload
+        self.transport_failure = transport_failure
         super().__init__(f"{status_code}: {message}")
+
+
+class ServerResponseError(ServerClientError):
+    """An observed HTTP response cannot prove the requested operation's outcome.
+
+    This is neither an outbound payload rejection nor evidence that the server
+    is unreachable. Messages are fixed locally and never contain response data.
+    """
+
+    response_failure = True
+
+    def __init__(
+        self,
+        status_code: int = 502,
+        message: str = "central SPL daemon server returned an invalid response",
+        *,
+        code: str = "server_response_invalid",
+    ) -> None:
+        super().__init__(status_code, message, code=code, transport_failure=False)
+
+
+def validated_sync_receipts(
+    response: dict[str, Any], events: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], bool]:
+    """Keep only unique, well-formed receipts for the exact submitted events.
+
+    Validate all identities before applying any acknowledgement: a later
+    conflicting duplicate must invalidate the earlier receipt too. Older
+    structured error receipts may omit retryable (then they remain retryable).
+    """
+
+    expected = {event["id"]: event["kind"] for event in events}
+    values = response.get("event_results")
+    if not isinstance(values, list):
+        return [], True
+    counts: dict[str, int] = {}
+    for value in values:
+        if isinstance(value, dict) and isinstance(value.get("event_id"), str):
+            event_id = value["event_id"]
+            counts[event_id] = counts.get(event_id, 0) + 1
+    receipts: list[dict[str, Any]] = []
+    invalid = False
+    for value in values:
+        if not isinstance(value, dict):
+            invalid = True
+            continue
+        event_id = value.get("event_id")
+        if (
+            not isinstance(event_id, str)
+            or event_id not in expected
+            or counts[event_id] != 1
+            or value.get("kind") != expected[event_id]
+            or value.get("status") not in ("ok", "error")
+            or ("retryable" in value and type(value["retryable"]) is not bool)
+            or (
+                "status_code" in value
+                and (type(value["status_code"]) is not int or not 400 <= value["status_code"] <= 599)
+            )
+            or (
+                "code" in value
+                and (
+                    not isinstance(value["code"], str) or re.fullmatch(r"[a-zA-Z0-9_.:-]{1,128}", value["code"]) is None
+                )
+            )
+            or ("error" in value and not isinstance(value["error"], str))
+            or any(
+                field in value and not isinstance(value[field], str)
+                for field in ("category", "operation", "recommended_action", "snapshot_id")
+            )
+            or any(
+                field in value and (type(value[field]) is not int or value[field] < 0)
+                for field in ("actual_bytes", "limit_bytes")
+            )
+        ):
+            invalid = True
+            continue
+        receipts.append(value)
+    return receipts, invalid or len(receipts) != len(expected)
 
 
 def is_stale_run_claim_error(exc: ServerClientError) -> bool:
@@ -113,14 +197,14 @@ def validate_no_claim_sync_response(response: dict[str, Any]) -> None:
     """
 
     if response.get("claim_control") != SYNC_CLAIM_CONTROL_ACK:
-        raise ServerClientError(
+        raise ServerResponseError(
             502,
             "central SPL daemon server did not prove claim suppression",
             code="sync_claim_control_invalid",
         )
     jobs = response.get("jobs")
     if not isinstance(jobs, list) or jobs:
-        raise ServerClientError(
+        raise ServerResponseError(
             502,
             "central SPL daemon server returned work during no-claim sync",
             code="sync_claim_control_invalid",
@@ -137,7 +221,7 @@ def _as_json_list(value: Any) -> list[dict[str, Any]]:
 
 def _require_json_dict(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
-        raise ServerClientError(
+        raise ServerResponseError(
             502,
             "central SPL daemon server returned an invalid JSON object",
             code="server_response_invalid",
@@ -147,12 +231,21 @@ def _require_json_dict(value: Any) -> dict[str, Any]:
 
 def _require_json_dict_list(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
-        raise ServerClientError(
+        raise ServerResponseError(
             502,
             "central SPL daemon server returned an invalid JSON list",
             code="server_response_invalid",
         )
     return value
+
+
+def _load_response_json(raw: str) -> Any:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError) as exc:
+        raise ServerResponseError(message="central SPL daemon server returned invalid JSON") from exc
 
 
 def _error_response(
@@ -167,12 +260,12 @@ def _error_response(
 
     try:
         payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return raw, None, None
+    except (json.JSONDecodeError, RecursionError):
+        return "invalid server error response", None, None
     if not isinstance(payload, dict):
-        return raw, None, None
+        return "invalid server error response", None, None
 
-    error = payload.get("error", payload.get("safe_message", raw))
+    error = payload.get("error", payload.get("safe_message", "server request failed"))
     code = payload.get("code")
     event_id = payload.get("event_id")
     if isinstance(error, dict):
@@ -182,7 +275,7 @@ def _error_response(
         nested_event_id = error.get("event_id")
         if event_id is None and isinstance(nested_event_id, str):
             event_id = nested_event_id
-        error = error.get("message") or error.get("error") or raw
+        error = error.get("message") or error.get("error") or "server request failed"
     return (
         str(error),
         str(code) if isinstance(code, str) else None,
@@ -381,6 +474,7 @@ class ServerClient:
         max_response_bytes: int | None = None,
         compact_json: bool = False,
         absolute_deadline_seconds: float | None = None,
+        max_request_bytes: int | None = None,
     ) -> Any:
         if max_transport_attempts < 1:
             raise ValueError("max_transport_attempts must be at least 1")
@@ -399,6 +493,14 @@ class ServerClient:
                 separators=(",", ":") if compact_json else None,
             ).encode("utf-8")
             headers["Content-Type"] = "application/json; charset=utf-8"
+            if max_request_bytes is not None and len(body) > max_request_bytes:
+                raise SyncPayloadError(
+                    "sync_request_too_large",
+                    operation=path,
+                    actual_bytes=len(body),
+                    limit_bytes=max_request_bytes,
+                    identifier=str(payload.get("snapshot_id") or ""),
+                )
 
         request = Request(
             f"{self.base_url}{path}",
@@ -422,6 +524,7 @@ class ServerClient:
                             504,
                             "central SPL daemon server response exceeded its total deadline",
                             code="server_response_timeout",
+                            transport_failure=True,
                         )
                     phase_timeout = remaining if phase_timeout is None else min(phase_timeout, remaining)
                 if deadline is None:
@@ -436,28 +539,12 @@ class ServerClient:
                         connect_timeout=phase_timeout,
                     )
                 with response_context as response:
-                    raw = (
-                        response.read().decode("utf-8")
-                        if max_response_bytes is None
-                        else self._read_json_text(
-                            response,
-                            max_response_bytes=max_response_bytes,
-                            deadline=deadline,
-                        )
-                    )
+                    raw = self._response_json_text(response, max_response_bytes=max_response_bytes, deadline=deadline)
             except HTTPError as exc:
-                raw = (
-                    exc.read().decode("utf-8")
-                    if max_response_bytes is None
-                    else self._read_json_text(
-                        exc,
-                        max_response_bytes=max_response_bytes,
-                        deadline=deadline,
-                    )
-                )
+                raw = self._response_json_text(exc, max_response_bytes=max_response_bytes, deadline=deadline)
                 try:
                     decoded_error = json.loads(raw)
-                except json.JSONDecodeError:
+                except (ValueError, RecursionError):
                     error_payload = None
                 else:
                     error_payload = decoded_error if isinstance(decoded_error, dict) else None
@@ -473,6 +560,8 @@ class ServerClient:
                     message, error_code, event_id = _ai_assistant_error_response(raw)
                 else:
                     message, error_code, event_id = _error_response(raw, http_error=exc)
+                    if error_payload is None and not 300 <= exc.code < 400:
+                        raise ServerResponseError(exc.code, code="server_error_response_invalid") from exc
                 message = f"central SPL daemon server returned {exc.code} at {self.base_url}{path}: {message}"
                 phase = _failure_phase(exc)
                 if (
@@ -491,6 +580,7 @@ class ServerClient:
                     code=error_code,
                     event_id=event_id,
                     payload=error_payload,
+                    transport_failure=False,
                 ) from exc
             except URLError as exc:
                 message = f"central SPL daemon server is not reachable at {self.base_url}: {exc.reason}"
@@ -515,7 +605,9 @@ class ServerClient:
                     post_send_retried = True
                     time.sleep(SERVER_GET_RETRY_DELAY_SECONDS)
                     continue
-                raise ServerClientError(502, message) from exc
+                raise ServerClientError(
+                    502, message, code="central_server_unreachable", transport_failure=True
+                ) from exc
             except OSError as exc:
                 message = f"central SPL daemon server is not reachable at {self.base_url}: {exc}"
                 phase = _failure_phase(exc)
@@ -539,23 +631,53 @@ class ServerClient:
                     post_send_retried = True
                     time.sleep(SERVER_GET_RETRY_DELAY_SECONDS)
                     continue
-                raise ServerClientError(502, message) from exc
+                raise ServerClientError(
+                    502, message, code="central_server_unreachable", transport_failure=True
+                ) from exc
             break
         else:  # pragma: no cover - every retry branch either succeeds or raises.
             raise AssertionError("server retry loop exhausted without a result")
 
-        if not raw:
-            return None
-        if max_response_bytes is None:
-            return json.loads(raw)
+        return _load_response_json(raw)
+
+    @staticmethod
+    def _response_json_text(
+        response: Any, *, max_response_bytes: int | None = None, deadline: float | None = None
+    ) -> str:
+        """Read after headers were received without misreporting a lost channel."""
+        observed_status = getattr(response, "code", None)
+        failure_status = observed_status if observed_status in (401, 403) else 502
         try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, RecursionError) as exc:
-            raise ServerClientError(
-                502,
-                "central SPL daemon server returned invalid JSON",
-                code="server_response_invalid",
+            if max_response_bytes is None:
+                text = cast(bytes, response.read()).decode("utf-8")
+            else:
+                text = ServerClient._read_json_text(response, max_response_bytes=max_response_bytes, deadline=deadline)
+            # HTTPResponse.read(n) may return EOF without raising IncompleteRead
+            # when an explicit byte cap was used. Retain the framing check.
+            remaining = getattr(response, "length", None)
+            if isinstance(remaining, int) and remaining > 0:
+                raise ServerResponseError(
+                    failure_status,
+                    "central SPL daemon server response was incomplete",
+                    code="server_response_incomplete",
+                )
+            return text
+        except UnicodeDecodeError as exc:
+            raise ServerResponseError(
+                failure_status, message="central SPL daemon server returned invalid UTF-8"
             ) from exc
+        except (IncompleteRead, OSError) as exc:
+            raise ServerResponseError(
+                failure_status,
+                message="central SPL daemon server response was incomplete",
+                code="server_response_incomplete",
+            ) from exc
+        except ServerResponseError as exc:
+            if observed_status in (401, 403):
+                raise ServerResponseError(
+                    observed_status, exc.message, code=exc.code or "server_response_invalid"
+                ) from exc
+            raise
 
     @staticmethod
     def _read_json_text(
@@ -570,7 +692,7 @@ class ServerClient:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     response.close()
-                    raise ServerClientError(
+                    raise ServerResponseError(
                         504,
                         "central SPL daemon server response exceeded its total deadline",
                         code="server_response_timeout",
@@ -588,7 +710,7 @@ class ServerClient:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     response.close()
-                    raise ServerClientError(
+                    raise ServerResponseError(
                         504,
                         "central SPL daemon server response exceeded its total deadline",
                         code="server_response_timeout",
@@ -611,7 +733,7 @@ class ServerClient:
         max_response_bytes: int,
     ) -> str:
         if len(raw) > max_response_bytes:
-            raise ServerClientError(
+            raise ServerResponseError(
                 502,
                 "central SPL daemon server response exceeds the configured limit",
                 code="server_response_too_large",
@@ -619,7 +741,7 @@ class ServerClient:
         try:
             return raw.decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise ServerClientError(
+            raise ServerResponseError(
                 502,
                 "central SPL daemon server returned invalid UTF-8",
                 code="server_response_invalid",
@@ -657,19 +779,29 @@ class ServerClient:
         request = Request(f"{self.base_url}{path}", headers=headers)
         try:
             with urlopen_verified(request, timeout=DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS) as response:
-                raw = cast(
-                    bytes,
-                    response.read() if max_response_bytes is None else response.read(max_response_bytes + 1),
-                )
+                try:
+                    raw = cast(
+                        bytes,
+                        response.read() if max_response_bytes is None else response.read(max_response_bytes + 1),
+                    )
+                except (IncompleteRead, OSError) as exc:
+                    raise ServerResponseError(
+                        message="central SPL daemon server response was incomplete", code="server_response_incomplete"
+                    ) from exc
                 if max_response_bytes is not None and len(raw) > max_response_bytes:
-                    raise ServerClientError(
+                    raise ServerResponseError(
                         502,
                         "central SPL daemon server response exceeds the declared artifact size",
                         code="server_response_too_large",
                     )
+                remaining = getattr(response, "length", None)
+                if isinstance(remaining, int) and remaining > 0:
+                    raise ServerResponseError(
+                        message="central SPL daemon server response was incomplete", code="server_response_incomplete"
+                    )
                 return raw
         except HTTPError as exc:
-            error_body = exc.read().decode("utf-8")
+            error_body = self._response_json_text(exc)
             message, error_code, event_id = _error_response(error_body, http_error=exc)
             message = f"central SPL daemon server returned {exc.code} at {self.base_url}{path}: {message}"
             raise ServerClientError(
@@ -677,11 +809,13 @@ class ServerClient:
                 message,
                 code=error_code,
                 event_id=event_id,
+                transport_failure=False,
             ) from exc
         except URLError as exc:
             raise ServerClientError(
                 502,
                 (f"central SPL daemon server is not reachable at {self.base_url}: {exc.reason}"),
+                transport_failure=True,
             ) from exc
 
     def _bytes_upload_request(
@@ -706,7 +840,7 @@ class ServerClient:
         )
         try:
             with urlopen_verified(request, timeout=DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS) as response:
-                raw = response.read().decode("utf-8")
+                raw = self._response_json_text(response)
         except HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="replace")
             message, error_code, event_id = _error_response(raw, http_error=exc)
@@ -715,14 +849,16 @@ class ServerClient:
                 f"central SPL daemon server returned {exc.code} at {self.base_url}{path}: {message}",
                 code=error_code,
                 event_id=event_id,
+                transport_failure=False,
             ) from exc
         except (OSError, URLError) as exc:
             reason = getattr(exc, "reason", exc)
             raise ServerClientError(
                 502,
                 f"central SPL daemon server is not reachable at {self.base_url}: {reason}",
+                transport_failure=True,
             ) from exc
-        return None if not raw else json.loads(raw)
+        return _load_response_json(raw)
 
     def _streaming_file_request(
         self,
@@ -746,30 +882,31 @@ class ServerClient:
             )
             try:
                 with urlopen_verified(request, timeout=DEFAULT_FILE_TRANSFER_TIMEOUT_SECONDS) as response:
-                    raw = response.read().decode("utf-8")
+                    raw = self._response_json_text(response)
             except HTTPError as exc:
-                raw = exc.read().decode("utf-8")
+                raw = self._response_json_text(exc)
                 message, error_code, event_id = _error_response(raw, http_error=exc)
                 raise ServerClientError(
                     exc.code,
                     (f"central SPL daemon server returned {exc.code} at {self.base_url}{path}: {message}"),
                     code=error_code,
                     event_id=event_id,
+                    transport_failure=False,
                 ) from exc
             except URLError as exc:
                 raise ServerClientError(
                     502,
                     (f"central SPL daemon server is not reachable at {self.base_url}: {exc.reason}"),
+                    transport_failure=True,
                 ) from exc
             except OSError as exc:
                 raise ServerClientError(
                     502,
                     (f"central SPL daemon server is not reachable at {self.base_url}: {exc}"),
+                    transport_failure=True,
                 ) from exc
 
-        if not raw:
-            return None
-        return json.loads(raw)
+        return _load_response_json(raw)
 
     def connect_machine(
         self,
@@ -830,6 +967,33 @@ class ServerClient:
 
     def list_tokens(self) -> list[dict[str, Any]]:
         return _as_json_list(self._json_request("GET", "/tokens", auth="user"))
+
+    def whoami(self) -> dict[str, Any]:
+        """Resolve this credential's canonical owner without user enumeration."""
+
+        return _require_json_dict(self._json_request("GET", "/whoami", max_response_bytes=64 * 1024))
+
+    def catalogue_sync_begin(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._catalogue_request("begin", payload)
+
+    def catalogue_sync_content(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._catalogue_request("content", payload)
+
+    def catalogue_sync_commit(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._catalogue_request("commit", payload)
+
+    def _catalogue_request(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return _require_json_dict(
+            self._json_request(
+                "POST",
+                f"/catalogue-sync/{operation}",
+                payload,
+                compact_json=True,
+                max_request_bytes=CATALOGUE_REQUEST_MAX_BYTES,
+                max_response_bytes=CATALOGUE_REQUEST_MAX_BYTES,
+                allow_transport_retries=False,
+            )
+        )
 
     def list_users(self, *, handle: str | None = None) -> list[dict[str, Any]]:
         suffix = f"?{urlencode({'handle': handle})}" if handle is not None else ""
@@ -1269,7 +1433,7 @@ class ServerClient:
 
         if claim_jobs is not None and not isinstance(claim_jobs, bool):
             raise ValueError("claim_jobs must be a boolean when provided")
-        payload = {
+        payload: dict[str, Any] = {
             "connection_id": connection_id,
             "machine_id": machine_id,
             "heartbeat_interval_seconds": heartbeat_interval_seconds,
@@ -1278,13 +1442,32 @@ class ServerClient:
         }
         if claim_jobs is not None:
             payload["claim_jobs"] = claim_jobs
-        response = _as_json_dict(
+        if len(events) > SYNC_EVENT_BATCH_LIMIT:
+            raise SyncPayloadError("sync_event_count_exceeded", operation="sync")
+        for event in payload["events"]:
+            size = len(m_json_contract.dumps(event, ensure_ascii=False).encode("utf-8"))
+            if size > SYNC_EVENT_MAX_BYTES:
+                raise SyncPayloadError(
+                    "sync_event_too_large",
+                    operation="sync",
+                    identifier=event.get("id"),
+                    actual_bytes=size,
+                    limit_bytes=SYNC_EVENT_MAX_BYTES,
+                )
+        size = len(m_json_contract.dumps(payload["events"], ensure_ascii=False).encode("utf-8"))
+        if size > SYNC_BATCH_MAX_BYTES:
+            raise SyncPayloadError(
+                "sync_batch_too_large", operation="sync", actual_bytes=size, limit_bytes=SYNC_BATCH_MAX_BYTES
+            )
+        response = _require_json_dict(
             self._json_request(
                 "POST",
                 "/sync",
                 payload,
                 extra_headers=_claim_headers(claim_id),
                 allow_transport_retries=False,
+                compact_json=True,
+                max_request_bytes=16 * 1024 * 1024,
             )
         )
         if claim_jobs is False:
@@ -1426,7 +1609,7 @@ class ServerClient:
             max_response_bytes=expected_size,
         )
         if len(body) != expected_size or hashlib.sha256(body).hexdigest() != expected_sha256:
-            raise ServerClientError(
+            raise ServerResponseError(
                 502,
                 "claimed runtime input failed size/checksum verification",
                 code="runtime_input_integrity_invalid",
@@ -1736,7 +1919,7 @@ class ServerClient:
             max_response_bytes=size,
         )
         if len(data) != size or hashlib.sha256(data).hexdigest() != sha256:
-            raise ServerClientError(
+            raise ServerResponseError(
                 502,
                 "central SPL daemon server artifact differs from its retained metadata",
                 code="server_response_invalid",

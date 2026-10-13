@@ -1043,6 +1043,7 @@ def test_sync_status_and_prune_routes_are_bounded_and_protect_object_events(tmp_
 
         assert connection_status == 200
         assert connection == {
+            "catalogue_sync": {"state": "disconnected"},
             "connected": False,
             "live": False,
             "identity_present": False,

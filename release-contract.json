@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "release_id": "splime-0.4.12",
-  "version": "0.4.12",
-  "source_tag": "v0.4.12",
+  "release_id": "splime-0.4.13",
+  "version": "0.4.13",
+  "source_tag": "v0.4.13",
   "official_registry": {
     "origin": "https://splime.io",
     "signature_algorithm": "ed25519",
@@ -44,8 +44,8 @@
       "repository": "https://github.com/yastrebovks/splime",
       "workspace": "spl",
       "package": "splime",
-      "version": "0.4.12",
-      "source_ref": "v0.4.12",
+      "version": "0.4.13",
+      "source_ref": "v0.4.13",
       "source_binding": "signed_tag_external_provenance",
       "source_commit": null,
       "artifact": "splime"
@@ -54,8 +54,8 @@
       "repository": "https://github.com/yastrebovks/splime",
       "workspace": "spl",
       "package": "splime",
-      "version": "0.4.12",
-      "source_ref": "v0.4.12",
+      "version": "0.4.13",
+      "source_ref": "v0.4.13",
       "source_binding": "signed_tag_external_provenance",
       "source_commit": null,
       "artifact": "splime"
@@ -64,8 +64,8 @@
       "repository": "gitlab.com/spl894143/spl-server",
       "workspace": "spl-server",
       "package": "spl-server",
-      "version": "0.4.12",
-      "source_ref": "v0.4.12",
+      "version": "0.4.13",
+      "source_ref": "v0.4.13",
       "source_binding": "pinned_commit",
       "source_commit": null,
       "artifact": "spl-server"
@@ -74,8 +74,8 @@
       "repository": "gitlab.com/spl894143/spl-frontend",
       "workspace": "spl-frontend",
       "package": "splime-console",
-      "version": "0.4.12",
-      "source_ref": "v0.4.12",
+      "version": "0.4.13",
+      "source_ref": "v0.4.13",
       "source_binding": "pinned_commit",
       "source_commit": null,
       "artifact": "splime-console"
@@ -107,13 +107,14 @@
       "spl.public_distribution.v1",
       "spl.public_catalog.v1",
       "spl.public_run_receipt.v1",
-      "spl.sync.flush_without_claim.v1"
+      "spl.sync.flush_without_claim.v1",
+      "catalogue_manifest_v1"
     ],
     "manifest_evidence": "spl.execution_manifest.v1",
     "console_persisted_data": 4,
     "release_manifest": 2,
     "deployment_receipt": 1
   },
-  "server_schema_target": 48,
+  "server_schema_target": 49,
   "compatibility_matrix": "release/compatibility-matrix.json"
 }

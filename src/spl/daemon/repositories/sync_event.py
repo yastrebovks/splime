@@ -22,6 +22,7 @@ from spl.daemon.telemetry import (
     event_wire_size,
     local_run_proof,
 )
+from spl.daemon.sync_diagnostics import SyncPayloadError
 
 
 class SyncEventRepository(RepositoryBase):
@@ -35,12 +36,17 @@ class SyncEventRepository(RepositoryBase):
         now = utc_now()
         wire_bytes = event_wire_size(event_id, kind, payload)
         if wire_bytes > SYNC_EVENT_MAX_BYTES:
-            raise ValueError(
-                "sync event exceeds the {} byte limit ({} bytes); reduce the payload before retrying".format(
-                    SYNC_EVENT_MAX_BYTES,
-                    wire_bytes,
-                )
+            error = SyncPayloadError(
+                "sync_event_too_large",
+                operation="queue_admission",
+                identifier=event_id,
+                actual_bytes=wire_bytes,
+                limit_bytes=SYNC_EVENT_MAX_BYTES,
             )
+            error.args = (
+                f"sync event exceeds the {SYNC_EVENT_MAX_BYTES} byte limit ({wire_bytes} bytes); reduce the payload before retrying",
+            )
+            raise error
         proof = local_run_proof(kind, payload)
         local_run_id = self._existing_local_run_id(proof[0] if proof is not None else None)
         payload_expires_at = (

@@ -61,6 +61,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -140,6 +141,8 @@ from spl.daemon.environment_base import (
     EnvironmentManagerProtocol,
 )
 from spl.daemon.heartbeat_service import HeartbeatService
+from spl.daemon.catalogue_sync import CATALOGUE_CAPABILITY, CatalogueSyncService
+from spl.daemon.sync_diagnostics import SyncPayloadError, sync_failure
 from spl.daemon.guarded_local_run import (
     GuardedLocalRunAdmission,
     GuardedLocalRunError,
@@ -172,9 +175,11 @@ from spl.daemon.remote_client import (
     STALE_RUN_CLAIM_ERROR_CODE,
     ServerClient,
     ServerClientError,
+    ServerResponseError,
     is_permanent_archived_sync_error,
     is_stale_run_claim_error,
     is_sync_event_identity_collision_error,
+    validated_sync_receipts,
 )
 from spl.daemon.routes._helpers import RouteContext
 from spl.daemon.routes.ai_assistant import register_ai_assistant_routes
@@ -326,7 +331,6 @@ SERVER_CHANNEL_LEASE_METHODS = frozenset(
         "connect_machine",
         "current_connection",
         "heartbeat_connection",
-        "sync",
     }
 )
 SYNC_REQUEST_TIMEOUT_SECONDS = 15.0
@@ -841,11 +845,8 @@ class _ChannelObservedServerClient:
                     # it invalidates only this worker attempt, not the lease.
                     self._success()
                     raise
-                lease_rejected = (
-                    name in SERVER_CHANNEL_LEASE_METHODS and exc.status_code in SERVER_CHANNEL_LEASE_REJECTION_STATUSES
-                )
-                if lease_rejected or exc.status_code in {502, 503, 504}:
-                    self._failure(exc, lease_rejected)
+                if ServerConnectionManager._is_server_connectivity_error(exc):
+                    self._failure(exc, False)
                 else:
                     # A non-connectivity HTTP response still proves that the
                     # authenticated server channel answered this request.
@@ -972,6 +973,7 @@ class DaemonRuntime:
             if callable(bind_lifecycle):
                 bind_lifecycle(self.lifecycle)
         self.sync_visibility = sync_visibility or sync_visibility_factory(store)
+        self.catalogue_sync = CatalogueSyncService(store)
         self._server_sync_lock = threading.Lock()
         self._server_channel_lock = threading.Lock()
         self._server_channel_success_at: dict[str, float] = {}
@@ -1391,6 +1393,10 @@ class DaemonRuntime:
     ) -> None:
         if credentials is None:
             return
+        if error is not None and (
+            not isinstance(error, ServerClientError) or not self._is_server_connectivity_error(error)
+        ):
+            return
         # The pre-F04 no-error seam is an explicit hard-open signal used by
         # recovery code/tests. Observed transient calls always pass the real
         # exception and therefore use the two-consecutive-failure threshold.
@@ -1610,7 +1616,11 @@ class DaemonRuntime:
         return validate_name(str(users[0]["id"]))
 
     def server_whoami(self) -> dict[str, Any]:
-        """Return live directory identity or the stored canonical fallback."""
+        """Return self identity or the stored canonical offline fallback.
+
+        Old servers may omit owner profile fields: use the canonical owner ID
+        for display and a null handle. Never consult the privileged directory.
+        """
 
         connection_state = self.server_connection_state(probe=True)
         connection = self.store.current_server_connection()
@@ -1635,19 +1645,27 @@ class DaemonRuntime:
             request_timeout_seconds=SERVER_PROXY_TIMEOUT_SECONDS,
         )
         try:
-            users = server.list_users()
+            identity = server.whoami()
         except ServerClientError as exc:
             if exc.status_code == 404:
                 return result
             if self._is_server_connectivity_error(exc):
                 self._mark_server_channel_failure(credentials, error=exc)
+                result["live"] = False
                 return result
             raise
         self._mark_server_channel_success(cast(dict[str, Any], credentials))
-        user = next((item for item in users if item.get("id") == owner_id), None)
-        if user is not None:
-            result["handle"] = user.get("handle")
-            result["display_name"] = user.get("display_name") or owner_id
+        if identity.get("owner_id") != owner_id:
+            raise ServerClientError(
+                401, "self identity does not match the connected owner", code="identity_owner_mismatch"
+            )
+        profile = identity.get("owner_profile")
+        if isinstance(profile, dict) and profile.get("id") == owner_id:
+            result["handle"] = profile.get("handle")
+            result["display_name"] = profile.get("display_name") or owner_id
+        elif identity.get("id") == owner_id:
+            result["handle"] = identity.get("handle")
+            result["display_name"] = identity.get("display_name") or owner_id
         return result
 
     def server_connection_state(self, *, probe: bool = False) -> dict[str, Any]:
@@ -1678,6 +1696,8 @@ class DaemonRuntime:
             and credentials.get("remote_connection_id")
         ):
             live, probe_detail = self._probe_server_channel(credentials)
+            connection = self.store.current_server_connection()
+            credentials = self.store.current_server_connection_credentials()
         state: dict[str, Any] = {
             "connected": live,
             "live": live,
@@ -1685,12 +1705,16 @@ class DaemonRuntime:
             "offline": identity_present and not live,
             "connection": connection,
             "breaker": self._server_channel_breaker_status(credentials),
+            "catalogue_sync": self.catalogue_sync.status(credentials),
         }
         if identity_present and not live:
+            rejected = connection is not None and connection.get("status") == SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
             state.update(
                 {
-                    "code": SERVER_UNREACHABLE_CODE,
-                    "error": SERVER_OFFLINE_MESSAGE,
+                    "code": "server_reconnect_required" if rejected else SERVER_UNREACHABLE_CODE,
+                    "error": "Server credentials or lease were rejected; reconnect to the server."
+                    if rejected
+                    else SERVER_OFFLINE_MESSAGE,
                 }
             )
             if probe_detail is not None:
@@ -1760,6 +1784,7 @@ class DaemonRuntime:
             "event_results": [],
             "jobs": [],
             "sync": self.sync_visibility.summary(),
+            "catalogue_sync": self.catalogue_sync.status(credentials),
         }
         if credentials is not None and not live:
             status["error"] = SERVER_OFFLINE_MESSAGE
@@ -1964,6 +1989,9 @@ class DaemonRuntime:
         advertised[WORKER_OPERATIONS_CAPABILITY] = self._worker_operations_capability()
         advertised[EXECUTION_MANIFEST_CAPABILITY] = self._execution_manifest_capability()
         advertised[WORKER_BUILD_CAPABILITY] = self._worker_build_capability()
+        advertised["spl.catalogue_sync.v1"] = self.catalogue_sync.status(
+            self.store.current_server_connection_credentials()
+        )
         advertised[RUNTIME_PORT_ADAPTERS_CAPABILITY] = {
             "schema_version": 1,
             "transport": True,
@@ -2273,7 +2301,46 @@ class DaemonRuntime:
         if library_display_name:
             payload["library_display_name"] = str(library_display_name)
         payload["revive_removed"] = True
-        return self.store.enqueue_sync_event("object_version", payload)
+        try:
+            return self.store.enqueue_sync_event("object_version", payload)
+        except SyncPayloadError as exc:
+            if exc.diagnostic["code"] != "sync_event_too_large":
+                raise
+            return self._defer_large_object_sync(version, payload, exc)
+
+    def _defer_large_object_sync(
+        self,
+        version: dict[str, Any],
+        payload: dict[str, Any],
+        exc: SyncPayloadError,
+        *,
+        preserve_existing: bool = False,
+    ) -> dict[str, Any]:
+        # Local registration has succeeded. Its durable YAML can travel
+        # through the catalogue, with the same one-shot publication intent.
+        options = {
+            key: payload[key] for key in ("create_library", "library_display_name", "revive_removed") if key in payload
+        }
+        if payload.get("library"):
+            options["library_slug"] = payload["library"]
+        existing = self.catalogue_sync.registration_intents().get(version["version_id"]) if preserve_existing else None
+        registration_id = (
+            str(existing["registration_id"])
+            if existing is not None
+            else self.catalogue_sync.defer_registration(version["version_id"], options)
+        )
+        return {
+            "id": registration_id,
+            "kind": "object_version",
+            "status": "deferred",
+            "transport": CATALOGUE_CAPABILITY,
+            "source_version_id": version["version_id"],
+            "diagnostic": {
+                **exc.diagnostic,
+                "identifier": registration_id,
+                "next_action": "check_catalogue_sync_status_or_upgrade_server",
+            },
+        }
 
     def _object_sync_payload_for_version(
         self,
@@ -2561,6 +2628,25 @@ class DaemonRuntime:
         )
         payload = self._object_sync_payload_for_version(full_version)
         payload["revive_removed"] = False
+        event = {
+            "id": "0" * 32,
+            "kind": "object_version",
+            "payload": {**payload, "dedupe_key": f"object_version:{full_version['version_id']}"},
+        }
+        size = self._sync_event_wire_bytes(event)
+        if size > SYNC_EVENT_MAX_BYTES:
+            current = self.store.get_object(full_version["id"], include_yaml=False)
+            if current["version_id"] == full_version["version_id"]:
+                exc = SyncPayloadError(
+                    "sync_event_too_large",
+                    operation="queue_admission",
+                    identifier=full_version["version_id"],
+                    actual_bytes=size,
+                    limit_bytes=SYNC_EVENT_MAX_BYTES,
+                )
+                return self._defer_large_object_sync(full_version, payload, exc, preserve_existing=True)
+        # Historical versions remain ordinary durable work; catalogue transfer
+        # represents only the current version and must not acknowledge history.
         return self.store.enqueue_object_version_sync_once(payload)
 
     def _record_object_reconcile_conflict(
@@ -2590,11 +2676,22 @@ class DaemonRuntime:
         }
         return self.store.record_object_conflict_once(payload)
 
-    def build_machine_library_snapshot_manifest(self) -> tuple[str, list[dict[str, Any]]]:
+    def build_machine_library_snapshot_manifest(
+        self, *, owner_id: str | None = None
+    ) -> tuple[str, list[dict[str, Any]]]:
         """Build a lightweight, stable manifest for the current local library."""
 
+        if owner_id is None:
+            credentials = self.store.current_server_connection_credentials()
+            owner_id = str(credentials["owner_id"]) if credentials and credentials.get("owner_id") else None
         items = []
+        registration_intents = self.catalogue_sync.registration_intents()
         for record in self.store.list_objects().values():
+            if owner_id is not None and (record.get("owner_id") or DEFAULT_OBJECT_OWNER_ID) not in {
+                owner_id,
+                DEFAULT_OBJECT_OWNER_ID,
+            }:
+                continue
             items.append(
                 {
                     "library_slug": record.get("library") or DEFAULT_OBJECT_LIBRARY,
@@ -2619,6 +2716,7 @@ class DaemonRuntime:
                     "remote_owner_id": record.get("remote_owner_id") or record.get("object_remote_owner_id"),
                     "remote_object_id": record.get("remote_object_id") or record.get("object_remote_object_id"),
                     "remote_version_id": record.get("remote_version_id"),
+                    **registration_intents.get(record["version_id"], {}),
                 }
             )
         items.sort(
@@ -4424,7 +4522,6 @@ class DaemonRuntime:
                 }
             self._mark_server_channel_success(credentials)
 
-        snapshot_hash, manifest_items = self.build_machine_library_snapshot_manifest()
         with self._server_sync_lock:
             # Lock order: _server_sync_lock -> repository/store locks.  Each
             # read -> bounded request -> acknowledgement cycle remains inside
@@ -4446,24 +4543,70 @@ class DaemonRuntime:
                         operation="sync_flush",
                     ) from exc
             credentials = self._renew_server_lease(server, credentials)
+            lease_renewed_at = time.monotonic()
+
+            def renew_catalogue_lease() -> None:
+                nonlocal credentials, lease_renewed_at
+                assert credentials is not None
+                if time.monotonic() - lease_renewed_at >= min(15.0, self._safe_heartbeat_interval(credentials) / 2):
+                    credentials = self._renew_server_lease(server, credentials)
+                    lease_renewed_at = time.monotonic()
+
             credentials_owner_id = str(credentials.get("owner_id") or DEFAULT_OBJECT_OWNER_ID)
             sync_before = self.sync_visibility.summary()
             snapshot_event = None
-            if snapshot_hash != credentials.get("last_library_snapshot_hash"):
-                remote_snapshot_hash = self._server_latest_library_snapshot_hash(
-                    server,
-                    credentials["machine_id"],
+            snapshot_hash = None
+            try:
+                snapshot_hash, manifest_items = self.build_machine_library_snapshot_manifest(
+                    owner_id=credentials_owner_id
                 )
-                if remote_snapshot_hash == snapshot_hash:
-                    self.store.record_server_connection_library_snapshot(
-                        credentials["id"],
-                        snapshot_hash=snapshot_hash,
-                    )
-                else:
-                    snapshot_event = self.build_machine_library_snapshot_event(
-                        snapshot_hash=snapshot_hash,
-                        manifest_items=manifest_items,
-                    )
+                if snapshot_hash != credentials.get("last_library_snapshot_hash"):
+                    version_reader = getattr(server, "get_server_version", None)
+                    version = version_reader() if callable(version_reader) else {}
+                    declared = version.get("declared")
+                    contracts = declared.get("contracts") if isinstance(declared, dict) else None
+                    capabilities = contracts.get("daemon_server_capabilities") if isinstance(contracts, dict) else []
+                    if isinstance(capabilities, list) and CATALOGUE_CAPABILITY in capabilities:
+                        catalogue = self.catalogue_sync.synchronize(
+                            credentials=credentials,
+                            server=server,
+                            snapshot_hash=snapshot_hash,
+                            manifest_items=manifest_items,
+                            renew_lease=renew_catalogue_lease,
+                        )
+                        if catalogue.get("state") == "current":
+                            self.store.record_server_connection_library_snapshot(
+                                credentials["id"], snapshot_hash=snapshot_hash
+                            )
+                    elif self._server_latest_library_snapshot_hash(server, credentials["machine_id"]) == snapshot_hash:
+                        self.store.record_server_connection_library_snapshot(
+                            credentials["id"], snapshot_hash=snapshot_hash
+                        )
+                        self.catalogue_sync.record_committed(credentials, snapshot_hash)
+                    else:
+                        previous = self.catalogue_sync.status(credentials)
+                        if (
+                            previous.get("snapshot_hash") != snapshot_hash
+                            or previous.get("diagnostic", {}).get("code") != "catalogue_capability_required"
+                        ):
+                            snapshot_event = self.build_machine_library_snapshot_event(
+                                snapshot_hash=snapshot_hash, manifest_items=manifest_items
+                            )
+                            size = self._sync_event_wire_bytes(snapshot_event)
+                            if size > SYNC_EVENT_MAX_BYTES:
+                                snapshot_event = None
+                                raise SyncPayloadError(
+                                    "catalogue_capability_required",
+                                    operation="catalogue_sync",
+                                    identifier=snapshot_hash,
+                                    actual_bytes=size,
+                                    limit_bytes=SYNC_EVENT_MAX_BYTES,
+                                    next_action="upgrade_server_for_catalogue_manifest_v1",
+                                )
+                elif self.catalogue_sync.status(credentials).get("state") != "current":
+                    self.catalogue_sync.record_committed(credentials, snapshot_hash)
+            except Exception as exc:
+                self.catalogue_sync.record_failure(credentials, exc, snapshot_hash)
 
             bootstrap_events: list[dict[str, Any]] = []
             if snapshot_event is not None:
@@ -4476,19 +4619,28 @@ class DaemonRuntime:
             sent_request = False
             drain_error: str | None = None
             drain_status_code: int | None = None
+            drain_diagnostic: dict[str, Any] | None = None
             snapshot_event_id = snapshot_event["id"] if snapshot_event is not None else None
             held_count = 0
             held_owner_ids: set[str] = set()
             adopted_count = 0
+            force_single_event = False
 
             while True:
                 if bootstrap_events:
-                    events = self._take_ephemeral_sync_batch(bootstrap_events)
+                    try:
+                        events = self._take_ephemeral_sync_batch(bootstrap_events, single_event=force_single_event)
+                    except (TypeError, ValueError) as exc:
+                        rejected = bootstrap_events.pop(0)
+                        diagnostic = sync_failure(exc, operation="sync", identifier=rejected.get("id"))
+                        event_results.append({"event_id": rejected.get("id"), "status": "error", **diagnostic})
+                        continue
                     pending_ids: set[str] = set()
                 else:
                     events, batch_held_count, batch_held_owners, batch_adopted = self._next_pending_sync_batch(
                         owner_id=credentials_owner_id,
                         attempted_ids=attempted_ids,
+                        single_event=force_single_event,
                     )
                     held_count = max(held_count, batch_held_count)
                     held_owner_ids.update(batch_held_owners)
@@ -4519,6 +4671,44 @@ class DaemonRuntime:
                     else:
                         response = server.sync(**sync_kwargs, claim_jobs=False)
                 except ServerClientError as exc:
+                    diagnostic = sync_failure(exc, operation="sync")
+                    if isinstance(exc, ServerResponseError):
+                        # HTTP headers were received, but the response cannot
+                        # establish any event's outcome. Retain the original
+                        # queued identities and end this drain for backoff.
+                        if diagnostic["category"] != "authentication":
+                            self._mark_server_channel_success(credentials)
+                            drain_error = exc.message
+                            drain_status_code = exc.status_code
+                            drain_diagnostic = diagnostic
+                            batches += 1
+                            break
+                    if (
+                        not diagnostic["retryable"]
+                        and diagnostic["category"] != "authentication"
+                        and exc.status_code in {400, 403, 413, 422}
+                        and events
+                    ):
+                        # A batch rejection identifies no poisoned member.
+                        # Retry bounded singleton requests before retiring it.
+                        self._mark_server_channel_success(credentials)
+                        sent_request = True
+                        batches += 1
+                        if len(events) > 1:
+                            force_single_event = True
+                            if pending_ids:
+                                attempted_ids.difference_update(pending_ids)
+                            else:
+                                bootstrap_events[:0] = events
+                            continue
+                        rejected_id = str(events[0]["id"])
+                        diagnostic["identifier"] = rejected_id
+                        if rejected_id in pending_ids:
+                            self.store.mark_sync_event_failed(
+                                rejected_id, m_json_contract.dumps(diagnostic), retryable=False
+                            )
+                        event_results.append({"event_id": rejected_id, "status": "error", **diagnostic})
+                        continue
                     collision_event = (
                         next(
                             (event for event in events if str(event.get("id")) == exc.event_id),
@@ -4535,7 +4725,7 @@ class DaemonRuntime:
                         if exc.event_id in pending_ids:
                             self.store.mark_sync_event_failed(
                                 exc.event_id,
-                                exc.message,
+                                diagnostic["code"],
                                 retryable=False,
                             )
                         event_results.append(
@@ -4543,7 +4733,7 @@ class DaemonRuntime:
                                 "event_id": exc.event_id,
                                 "kind": collision_event.get("kind"),
                                 "status": "error",
-                                "error": exc.message,
+                                "error": diagnostic["code"],
                                 "code": exc.code,
                             }
                         )
@@ -4563,51 +4753,151 @@ class DaemonRuntime:
                         continue
                     if self._is_server_connectivity_error(exc):
                         self._mark_server_channel_failure(credentials, error=exc)
+                    if diagnostic["category"] == "authentication":
+                        self.store.record_server_connection_error(
+                            credentials["id"],
+                            status=SERVER_CONNECTION_STATUS_NEEDS_RECONNECT,
+                            error=diagnostic["code"],
+                        )
                     if sent_request:
-                        drain_error = exc.message
+                        drain_error = diagnostic["code"]
                         drain_status_code = exc.status_code
-                        self.store.record_server_connection_error(
-                            credentials["id"],
-                            status=(
-                                SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
-                                if exc.status_code in {401, 403, 404, 409}
-                                else "heartbeat_failed"
-                            ),
-                            error=exc.message,
-                        )
+                        drain_diagnostic = diagnostic
+                        if self._is_server_connectivity_error(exc) or exc.status_code == 401:
+                            self.store.record_server_connection_error(
+                                credentials["id"],
+                                status=SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
+                                if exc.status_code == 401
+                                else "heartbeat_failed",
+                                error=diagnostic["code"],
+                            )
                         break
                     raise
-                except Exception as exc:
-                    self._mark_server_channel_failure(credentials, error=exc)
-                    if sent_request:
-                        drain_error = repr(exc)
-                        self.store.record_server_connection_error(
-                            credentials["id"],
-                            status="heartbeat_failed",
-                            error=drain_error,
-                        )
-                        break
-                    raise
+                except SyncPayloadError as exc:
+                    diagnostic = sync_failure(exc, operation="sync")
+                    event_id = diagnostic.get("identifier")
+                    if event_id and any(event.get("id") == event_id for event in events):
+                        if event_id in pending_ids:
+                            self.store.mark_sync_event_failed(
+                                event_id, m_json_contract.dumps(diagnostic), retryable=False
+                            )
+                        event_results.append({"event_id": event_id, "status": "error", **diagnostic})
+                        sent_request = True
+                        continue
+                    drain_diagnostic = diagnostic
+                    drain_error = diagnostic["code"]
+                    break
+                except Exception:
+                    # The transport wraps actual network failures. An unknown
+                    # exception cannot identify a poisoned event, even when it
+                    # inherits ValueError (e.g. a decoder). Never retire a batch.
+                    drain_diagnostic = sync_failure(ServerResponseError(code="sync_outcome_unproven"), operation="sync")
+                    drain_error = drain_diagnostic["code"]
+                    break
 
                 sent_request = True
                 batches += 1
+                if not isinstance(response, dict):
+                    error = ServerResponseError()
+                    drain_error, drain_status_code = error.message, error.status_code
+                    drain_diagnostic = sync_failure(error, operation="sync")
+                    break
+                batch_results, invalid_response = validated_sync_receipts(response, wire_events)
+                for index, receipt in enumerate(batch_results):
+                    if receipt["status"] == "error":
+                        diagnostic = sync_failure(
+                            ServerClientError(
+                                receipt.get("status_code", 422),
+                                "sync event rejected",
+                                code=receipt.get("code"),
+                                payload=receipt,
+                                transport_failure=False,
+                            ),
+                            operation="sync_event",
+                            identifier=receipt["event_id"],
+                        )
+                        # Legacy error receipts did not declare retryability.
+                        # Preserve that retry policy without storing arbitrary
+                        # response text in the durable queue or diagnostics.
+                        retryable = receipt.get("retryable") is not False and not is_permanent_archived_sync_error(
+                            receipt
+                        )
+                        batch_results[index] = {
+                            "event_id": receipt["event_id"],
+                            "kind": receipt["kind"],
+                            "status": "error",
+                            **diagnostic,
+                            "error": diagnostic["code"],
+                            "retryable": retryable,
+                        }
                 connection = response.get("connection")
-                if connection:
-                    credentials = self.store.record_server_connection_heartbeat(
-                        credentials["id"],
-                        remote_connection=connection,
-                    )
+                if connection is not None:
+                    if not isinstance(connection, dict) or any(
+                        value is not None and not isinstance(value, str)
+                        for value in (connection.get(key) for key in ("status", "last_seen_at", "expires_at"))
+                    ):
+                        invalid_response = True
+                    else:
+                        try:
+                            if connection.get("status") not in (None, "connected"):
+                                raise ValueError("invalid sync connection status")
+                            for key in ("last_seen_at", "expires_at"):
+                                if connection.get(key) is not None:
+                                    datetime.fromisoformat(connection[key])
+                            interval = float(connection.get("heartbeat_interval_seconds") or 60)
+                            if not math.isfinite(interval) or interval <= 0:
+                                raise ValueError("invalid heartbeat interval")
+                            credentials = self.store.record_server_connection_heartbeat(
+                                credentials["id"],
+                                remote_connection=connection,
+                            )
+                        except (TypeError, ValueError, OverflowError):
+                            invalid_response = True
                 self._mark_server_channel_success(credentials)
-                batch_results = list(response.get("event_results", []))
                 event_results.extend(batch_results)
-                jobs.extend(response.get("jobs", []))
+                batch_jobs = response.get("jobs")
+                if not isinstance(batch_jobs, list):
+                    invalid_response = True
+                    self.lifecycle.record_unknown_work()
+                else:
+                    for job in batch_jobs:
+                        if not isinstance(job, dict) or not isinstance(job.get("run"), dict):
+                            invalid_response = True
+                            self.lifecycle.record_unknown_work()
+                            continue
+                        try:
+                            validate_name(job["run"].get("id"))
+                            version = job.get("object_version")
+                            if not isinstance(version, dict) or not isinstance(version.get("yaml"), str):
+                                raise ValueError("invalid claimed object version")
+                            version_name = version.get("name")
+                            if not isinstance(version_name, str):
+                                raise ValueError("invalid claimed object name")
+                            validate_name(version_name)
+                            self._job_claim_id(job)
+                        except (TypeError, ValueError):
+                            invalid_response = True
+                            self.lifecycle.record_unknown_work()
+                            continue
+                        jobs.append(job)
                 for result in batch_results:
                     event_id = result.get("event_id")
-                    if event_id == snapshot_event_id:
+                    if snapshot_event_id is not None and snapshot_hash is not None and event_id == snapshot_event_id:
                         if result.get("status") == "ok":
                             self.store.record_server_connection_library_snapshot(
                                 credentials["id"],
                                 snapshot_hash=snapshot_hash,
+                            )
+                            self.catalogue_sync.record_committed(credentials, snapshot_hash)
+                        else:
+                            self.catalogue_sync.record_failure(
+                                credentials,
+                                ServerClientError(
+                                    int(result.get("status_code") or 422),
+                                    "catalogue rejected",
+                                    code=result.get("code"),
+                                ),
+                                snapshot_hash,
                             )
                         continue
                     if event_id not in pending_ids:
@@ -4618,8 +4908,15 @@ class DaemonRuntime:
                         self.store.mark_sync_event_failed(
                             event_id,
                             result.get("error") or "sync event failed",
-                            retryable=not is_permanent_archived_sync_error(result),
+                            retryable=(
+                                result.get("retryable") is not False and not is_permanent_archived_sync_error(result)
+                            ),
                         )
+                if invalid_response:
+                    error = ServerResponseError(code="sync_response_invalid")
+                    drain_error, drain_status_code = error.message, error.status_code
+                    drain_diagnostic = sync_failure(error, operation="sync")
+                    break
 
             if adopted_count:
                 LOGGER.info(
@@ -4664,12 +4961,14 @@ class DaemonRuntime:
                 "before": sync_before,
                 "after": self.sync_visibility.summary(),
             },
+            "catalogue_sync": self.catalogue_sync.status(credentials),
         }
         if drain_error is not None:
             response["error"] = drain_error
             response["partial_error"] = {
                 "message": drain_error,
                 "status_code": drain_status_code,
+                **(drain_diagnostic or {}),
             }
         return response
 
@@ -4714,6 +5013,12 @@ class DaemonRuntime:
             )
         except Exception as exc:
             self._mark_server_channel_failure(credentials, error=exc)
+            if isinstance(exc, ServerClientError) and exc.status_code in SERVER_CHANNEL_LEASE_REJECTION_STATUSES:
+                self.store.record_server_connection_error(
+                    credentials["id"],
+                    status=SERVER_CONNECTION_STATUS_NEEDS_RECONNECT,
+                    error=sync_failure(exc, operation="heartbeat")["code"],
+                )
             raise
         refreshed = self.store.record_server_connection_heartbeat(
             credentials["id"],
@@ -4735,6 +5040,7 @@ class DaemonRuntime:
         *,
         owner_id: str,
         attempted_ids: set[str],
+        single_event: bool = False,
     ) -> tuple[list[dict[str, Any]], int, set[str], int]:
         batch: list[dict[str, Any]] = []
         batch_bytes = 2
@@ -4771,7 +5077,7 @@ class DaemonRuntime:
                 except (TypeError, ValueError) as exc:
                     self.store.mark_sync_event_failed(
                         event_id,
-                        f"sync event cannot be sent safely: {exc}",
+                        m_json_contract.dumps(sync_failure(exc, operation="sync", identifier=event_id)),
                         retryable=False,
                     )
                     attempted_ids.add(event_id)
@@ -4779,7 +5085,15 @@ class DaemonRuntime:
                 if event_bytes > SYNC_EVENT_MAX_BYTES:
                     self.store.mark_sync_event_failed(
                         event_id,
-                        f"sync event payload exceeds {SYNC_EVENT_MAX_BYTES} byte limit ({event_bytes} bytes)",
+                        m_json_contract.dumps(
+                            SyncPayloadError(
+                                "sync_event_too_large",
+                                operation="sync",
+                                identifier=event_id,
+                                actual_bytes=event_bytes,
+                                limit_bytes=SYNC_EVENT_MAX_BYTES,
+                            ).diagnostic
+                        ),
                         retryable=False,
                     )
                     attempted_ids.add(event_id)
@@ -4794,32 +5108,47 @@ class DaemonRuntime:
                 batch_bytes += event_bytes + 1
                 if event_owner_id in {None, DEFAULT_OBJECT_OWNER_ID}:
                     adopted += 1
-                if len(batch) >= SYNC_EVENT_BATCH_LIMIT:
+                if single_event or len(batch) >= SYNC_EVENT_BATCH_LIMIT:
                     break
             if len(page) < SYNC_EVENT_SCAN_PAGE_LIMIT or batch:
                 break
             offset += len(page)
         return batch, held_count, held_owner_ids, adopted
 
-    def _take_ephemeral_sync_batch(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _take_ephemeral_sync_batch(
+        self, events: list[dict[str, Any]], *, single_event: bool = False
+    ) -> list[dict[str, Any]]:
         batch: list[dict[str, Any]] = []
         batch_bytes = 2
         while events and len(batch) < SYNC_EVENT_BATCH_LIMIT:
             event = events[0]
-            event_attempt = self._sync_event_claim_attempt(event)
+            try:
+                event_attempt = self._sync_event_claim_attempt(event)
+                event_bytes = self._sync_event_wire_bytes(event)
+            except (TypeError, ValueError):
+                if batch:
+                    break
+                raise
             if batch:
                 batch_attempt = self._sync_event_claim_attempt(batch[0])
                 if event_attempt != batch_attempt and (event_attempt is not None or batch_attempt is not None):
                     break
-            event_bytes = self._sync_event_wire_bytes(event)
             if event_bytes > SYNC_EVENT_MAX_BYTES:
-                raise ValueError(
-                    f"ephemeral sync event payload exceeds {SYNC_EVENT_MAX_BYTES} byte limit ({event_bytes} bytes)"
+                if batch:
+                    break
+                raise SyncPayloadError(
+                    "sync_event_too_large",
+                    operation="sync",
+                    identifier=event.get("id"),
+                    actual_bytes=event_bytes,
+                    limit_bytes=SYNC_EVENT_MAX_BYTES,
                 )
             if batch and batch_bytes + event_bytes + 1 > SYNC_BATCH_MAX_BYTES:
                 break
             batch.append(events.pop(0))
             batch_bytes += event_bytes + 1
+            if single_event:
+                break
         return batch
 
     @staticmethod

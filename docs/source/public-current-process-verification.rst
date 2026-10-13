@@ -1,206 +1,140 @@
 :orphan:
 
-Current-process profile: audit correction verification
-======================================================
+Current-process profile: implementation verification
+===================================================
 
-Local verification: **2026-10-03**, unreleased target **0.4.11**. This records the
-follow-up fixes for implicit server source selection and cyclic explicit result
-wrappers. Usage is in :doc:`public-embedded-runtime`. No production example URI,
-service or registry publication was modified. This is implementation evidence,
-not publication/deployment readiness or cross-platform verification.
+Local verification date: 2026-10-02. This records development evidence, not a
+published release, deployment approval or a cross-platform compatibility claim.
+The user-facing contract and examples are in :doc:`public-embedded-runtime`.
 
-Scope and reproduced failures
------------------------------
+Scope and baseline
+------------------
 
-The working trees already contained extensive changes. Pre-edit copies for this
-pass are under ``/private/tmp/spl-two-findings/baseline``; unrelated edits,
-release numbers, signed evidence, frozen fixtures and release declarations were
-preserved. Applicable instruction files and repository boundaries were checked.
+The workspace contains separate ``spl``, ``spl-server`` and ``Release/spl``
+repositories. The working ``spl`` tree already contained extensive tracked and
+untracked changes. Existing files changed for this task were saved before
+editing under ``/private/tmp/spl-current-process-baseline``; unrelated work was
+preserved. The release checkout was inspected and left unchanged.
 
-A disposable copy of the original server configuration and lock, without an
-adjacent ``spl`` directory, reproduced ``Distribution not found`` for
-``splime==0.4.11 @ directory+../spl`` under ``uv lock --check --offline``.
-Two explicit artifact/result wrappers whose ``__spl_result__`` references point
-to each other reproduced ``RecursionError: maximum recursion depth exceeded``.
+The initial embedded/distribution baseline passed 76 tests. The release
+checkout and server declared 0.4.10, while the working client package declared
+0.4.9. The client package metadata was aligned to the server's existing exact
+``splime==0.4.10`` requirement for installed-package interoperability. The
+already-used ``packaging`` library is now an explicit client dependency.
 
-Native result-wrapper correction
---------------------------------
+Implementation and compatibility decisions
+------------------------------------------
 
-Native normalization now follows replacement aliases iteratively, recording the
-identities visited in that chain. Reaching an already memoized concrete result
-is valid; revisiting an unresolved wrapper raises ``ValueError`` with its result
-path, for example::
+* ``execution_profile="current-process-v1"`` is an explicit selection for new
+  Object publications. Omission keeps the legacy profile; immutable versions
+  cannot switch execution semantics.
+* Signed manifest schema v2 authenticates the execution contract and captured
+  dependency graph. The shared static inventory covers object IR, descriptors,
+  nested nodes, component manifests and Library Adapter dependencies without
+  importing published code. No transitive resolver is implied.
+* The server bypasses wheel resolution and artifact-complete locks only for
+  this profile. Native runtime and existing structural/private-infrastructure
+  checks remain. Validation evidence explicitly excludes environment
+  reproduction and the wheel-dependent SPDX check.
+* The client verifies and admits before loading the signed compiled execution
+  member. Missing packages produce a complete structured error; available
+  mismatched or unverifiable versions warn and proceed. Installed metadata and
+  reliable already-loaded version evidence are reported separately.
+* Per-call bundled import namespaces, authenticated in-memory source and
+  run-local artifact storage avoid worker/process-global state assumptions.
+  Shared result normalization was extracted with the worker retaining its
+  runtime adapter callback. Execution is attempted once; exceptions and
+  KeyboardInterrupt propagate.
+* V1 releases retain the worker path and exact v3 lock semantics. The strict
+  lock validator accepts the inspected 0.4.9 and 0.4.10 framework policy
+  identities without rewriting either signed lock. V2 uses a manifest-specific
+  cache identity; trust already binds origin, signing key, manifest and bundle.
+  A frozen actual 0.4.10 legacy verifier proves v2 rejection at its schema gate.
 
-   result.answer.default: cyclic explicit result-wrapper chain
+Verification results
+--------------------
 
-The diagnostic does not render or serialize caller data. No result-size or
-nesting cutoff, input mutation, retry or new execution boundary was introduced.
-Existing discovery, artifact conversion and memoized container construction are
-retained; the legacy JSON/artifact branch is unchanged.
+All local runs used a disposable environment at
+``/private/tmp/spl-current-process-test``: CPython 3.13.14, macOS 26.6 arm64,
+NumPy 2.1.3. Normal run storage was redirected to disposable paths.
 
-Six added test cases cover chains of 2, 5 and 2000 cyclic wrappers, a valid
-2000-wrapper chain with shared references, concrete tuple/list cycles with an
-artifact declaration and a direct self-wrapper, and a signed current-process
-Pipeline producing the invalid two-wrapper cycle. They verify the precise path,
-no dataset repr, unchanged caller containers, artifact copying once, ordinary
-list/dict cycles, alias identity, and one execution with ``started``/``failure``
-receipts and private module cleanup.
+* Client regression selection: **595 passed, 14 skipped**. This includes the
+  new profile, existing embedded execution, strict runtime closure,
+  distribution capture, native graph/adapter/artifact/JSON behavior, owner
+  Library workflow and daemon publication routes. Docker-dependent tests were
+  skipped because Docker was unavailable. One warning was the intentional
+  duplicate-ZIP adversarial fixture.
+* Server regression selection: **99 passed** across the new profile, public
+  Object publication, distribution, package closure and catalog tests.
+* Additional shared worker/native artifact selection: **71 passed,
+  66 deselected**. This overlaps the main client selection; counts must not be
+  added as distinct tests.
+* After the last static metadata admission guards, focused client/server
+  selections passed **31 and 8 tests**, respectively. Pytest reported cleanup
+  warnings for earlier temporary read-only test directories; assertions passed.
+* Scoped client and server Ruff checks passed. The client lock consistency
+  check passed using ``uv lock --check --offline`` with the disposable Python.
+* Both packages were rebuilt and installed as wheels after the final code
+  changes. ``pip check`` reported no broken requirements. Producer and consumer
+  ran in separate fresh interpreters outside the source trees and asserted
+  imports came from ``site-packages``.
 
-Standalone server and explicit local development
-------------------------------------------------
+The final installed-package producer created an authenticated release recording
+NumPy **2.3.5**, with wheel resolution replaced by a failure sentinel. The
+consumer already had NumPy **2.1.3** loaded. Its computation returned
+``{"pid": 87714, "sum": 10, "version": "2.1.3"}``; the caller PID was also
+87714. A warning identified both versions and their sources. NumPy identity,
+version and file location were unchanged. The worker was never imported,
+subprocess/daemon/environment entry points were guarded against invocation,
+and execution events were ``started`` then ``success``. Framework-managed
+``sys.path``, working directory, environment and stdout/stderr were unchanged.
 
-The default ``spl-server/pyproject.toml`` no longer selects a local framework.
-Its dependency remains exactly ``splime==0.4.11``. The documented normal commands
-use consistency-checked locking, with CPython 3.13 selected for these tests::
+Reproduction entry points are
+``tests/core/test_public_current_process.py``,
+``../spl-server/tests/test_public_current_process.py`` and
+``integration_tests/public_current_process_packages.py``. For the last one,
+install locally built client/server wheels and NumPy 2.1.3 into a disposable
+Python 3.13 environment, then invoke its ``produce`` and ``consume`` modes with
+the same new temporary evidence directory, from outside the source repositories.
 
-   uv lock --check --python 3.13
-   uv run --locked --python 3.13 --extra test python -m pytest
+Review findings addressed
+-------------------------
 
-**The final index-based lock remains blocked by publication sequencing.** A real
-online uv resolution confirmed that version 0.4.11 is absent from the index.
-The tracked ``uv.lock`` retains the last genuine prerelease directory resolution,
-with an explicit warning that it is stale for the default project. It was not
-replaced with fabricated registry metadata, deleted, or downgraded. In particular,
-its old ``../spl`` entry is not evidence of a completed standalone frozen workflow.
-Do not use ``--frozen`` to bypass project/lock consistency checking.
+A separate final-diff review checked the requested acceptance criteria against
+the producer, verifier, loader, cache and legacy paths. It found and fixed an
+old-cache error regression, insufficient signed adapter metadata cross-checks,
+bundle-lock reentrancy, cache collisions for identical executable bytes under
+different profiles, and ambiguous same-named definitions flattened by the
+existing component compiler. The latter are rejected before compilation.
+Static metadata handling also rejects duplicate/reserved keys, unsafe component
+paths, incomplete import records and cyclic/excessively deep graphs, while
+ignoring runtime-like keys inside literal scalar data. Relevant regressions
+were added and rerun.
 
-A fresh standalone default copy with no adjacent framework rejects both
-``uv lock --check --offline`` and ``uv run --locked`` because the exact index
-version is unavailable, without attempting to load ``../spl``. After publication
-of the matching framework, maintainers must run ``uv lock --no-sources``, review
-and commit the actual generated registry artifacts/hashes, then pass the lock
-check and locked tests. Offline checks additionally need cached metadata.
+Limits and outstanding release gate
+----------------------------------
 
-Before that publication, explicitly opt into one local source in a disposable
-server copy (use an actual absolute path)::
+Only the local macOS arm64 environment was executed. A Python 3.13
+Linux/macOS/Windows GitHub Actions matrix is configured in
+``.github/workflows/public-current-process.yml`` but has not run here. No claim
+is made that skipped Docker tests or every repository test passed.
 
-   uv add --no-sync --python 3.13 --bounds exact --editable /absolute/path/to/spl
+The release-wide declaration check
+``test_declared_release_contract_is_coherent_but_not_built_evidence`` remains
+blocked by mixed 0.4.9/0.4.10 workspace declarations. The unchanged validation
+helper also failed on a reconstruction using the pre-edit client metadata,
+then identifying the server's existing 0.4.10 declaration as stale relative to
+the 0.4.9 release contract. After client package alignment it identifies the
+client as well. Coordinated release declarations/evidence must be reconciled
+before publishing. This task does not rewrite release history or claim a
+completed release validation chain.
 
-Or explicitly choose a freshly built framework wheel in a standalone layout::
+The profile is limited to CPython 3.13 and a framework implementing its explicit
+feature contract. It cannot honor hard timeouts, explicit isolated/remote nodes,
+or dynamic ``importlib`` discovery of bundled modules. It checks authenticated
+captured dependencies, not arbitrary dynamic imports or a reconstructed
+transitive lock. Namespaces are not a security sandbox, and a successful
+dependency preflight does not prove different library versions are compatible.
 
-   uv add --no-sync --python 3.13 --bounds exact /absolute/path/to/splime-0.4.11-py3-none-any.whl
-
-Then run the same lock check and locked test commands. These choices write a
-source override and a generated lock only in the selected copy. The exact wheel
-metadata requirement is preserved; there is no source/index fallback. Local
-configuration and locks must not replace the eventual shared index lock.
-Discarding the disposable copy leaves the shared project unchanged.
-
-The mechanism was verified with installed **uv 0.11.25**, rather than assumed:
-``uv add --no-sync --bounds exact`` preserves the exact requirement and generates
-real source/wheel locks. An attempted ``--config-file`` override was rejected by
-uv because ``sources`` is not allowed in ``uv.toml``. Both explicit layouts
-passed ``uv lock --check --offline`` and actual ``uv run --locked --extra test``
-commands. Dependencies absent from the uv cache were downloaded only into the
-disposable environments/cache; offline sync before that download correctly failed.
-
-Clean uv environments also exposed a missing test dependency: existing server
-publication tests import NumPy, but the test extra did not include it. The extra
-now pins ``numpy==2.1.3``; runtime dependencies are unchanged. Both uv selections
-were repeated successfully after this correction.
-
-``tools/verify_mypy_delta.py`` was inspected: it selects its archived historical
-baseline with ``uv run --project <baseline> --locked`` for both baseline and
-candidate diagnostics. It needs no source-selection change. Its frozen baseline
-and typing declaration were not modified. The nine tooling regression tests
-passed; the full historical mypy delta gate was not rerun.
-
-Fresh regression results
-------------------------
-
-Environment: disposable ``/private/tmp/spl-current-process-test``, CPython
-3.13.14, macOS 26.6 arm64, NumPy **2.1.3**, pandas **2.2.3**. Separate uv-managed
-virtual environments were created under ``/private/tmp/spl-two-findings``.
-Daemon homes, secret backends, run directories, registry stores and pytest
-storage were isolated. The user's active Python environment was not modified.
-
-* Client selection: **863 passed, 25 skipped, 2 warnings**. It includes public
-  current-process execution, unified result access, dependency/strict lock
-  policies, native node and Pipeline semantics, adapters/artifacts, isolated
-  artifact inputs/outputs, evidence, resume, JSON, runtime port adapters, owner
-  Library calls, daemon publication routes, wire contracts, release chain,
-  Console artifact builder and official registry checks. Skips are Docker-only;
-  Docker was unavailable. Warnings are intentional duplicate-ZIP fixtures.
-* Standalone server copy, explicit local wheel, actual locked uv invocation:
-  **122 passed**. Selection: current-process publication, public Object
-  publication/distribution/package closure/catalog, worker machine projection,
-  and mypy verification tooling.
-* Additional actual daemon/worker artifact selection: **4 passed, 66 deselected**.
-* Coordinated copy with explicitly selected editable framework at
-  ``../framework-source``: **24 passed**, overlapping the server selection.
-* Initial current-process and unified result check: **65 passed**, overlapping
-  the client selection. These overlapping runs are not additional distinct tests.
-* Scoped Ruff, release identity generator ``--check``, real local uv lock checks,
-  installed wheel metadata checks and ``pip check`` passed.
-
-Logs and disposable layouts are under ``/private/tmp/spl-two-findings``. The
-initial broad client command had a mistyped test filename and collected no tests;
-the corrected selection above completed. Clean server tests initially failed on
-missing NumPy, then passed after its test-extra correction. There are no remaining
-automated test failures in the final selections. The normal index-lock check is
-still expected to fail for the publication prerequisite described above.
-
-The previous independent audit's 1,051 Python passes, 21 Console passes and 25
-Docker skips are historical, not evidence for this pass. Console JavaScript and
-remote Linux/Windows matrix tests were not rerun here.
-
-Final installed-wheel acceptance
---------------------------------
-
-After the final source/configuration changes, both wheels were rebuilt and
-installed into the disposable Python environment. Every packaged source member
-was compared byte-for-byte with its wheel member and installed file: **138 client
-files and 87 server files** matched. Installed imports were verified to come from
-``site-packages``. The final wheels have SHA-256 values:
-
-* ``splime-0.4.11-py3-none-any.whl``:
-  ``fab4213a91dc16f5fe385c58080cda405b4524ef3d00dd5bcd1751a9de82f730``.
-* ``spl_server-0.4.11-py3-none-any.whl``:
-  ``481ba3ff3509026de1f93cecdc943cd2b6abe0899b1f61d51ed84f4ef2f73056``.
-
-The actual server wheel has ``Requires-Dist: splime==0.4.11``, no local URL/path
-requirement, and NumPy only under ``extra == "test"``. These are real local build
-hashes, not publication evidence.
-
-``integration_tests/public_current_process_packages.py`` ran in separate
-producer/consumer interpreters from ``/private/tmp`` with ``PYTHONPATH`` unset.
-It created a signed disposable local publication and guarded package resolution.
-The consumer verified the accepted ``SPLClient.embedded().call(...).value`` and
-``head()`` behavior: a real DataFrame, same identity with visible mutation,
-a distinct explicit copy, MultiIndex, nullable/categorical/timestamp/missing
-values, and a 3-by-4 result. Caller/function PID was **35273**. Recorded NumPy
-2.3.5 versus installed 2.1.3 warned and executed; matching pandas 2.2.3 did not
-warn. Neither package identity/location/version changed. Subprocess, daemon and
-environment entry points were guarded, no worker was imported, previews/payload
-contained no dataset cells, and both calls emitted ``started``/``success``.
-
-To repeat with a disposable CPython 3.13 environment containing the project's
-build/runtime dependencies, from the workspace root::
-
-   "$TEST_PYTHON" -m pip wheel --no-deps --no-build-isolation ./spl ./spl-server -w /tmp/spl-wheels
-   "$TEST_PYTHON" -m pip install --force-reinstall /tmp/spl-wheels/splime-0.4.11-py3-none-any.whl /tmp/spl-wheels/spl_server-0.4.11-py3-none-any.whl
-   "$TEST_PYTHON" -m pip check
-
-From outside the checkout, run the absolute script path with ``PYTHONPATH`` unset,
-first ``produce /tmp/new-evidence`` and then ``consume /tmp/new-evidence``. The
-script additionally needs NumPy 2.1.3 and pandas 2.2.3. This pip acceptance is
-separate from the real uv checks above and does not complete the index/frozen gate.
-
-Changed files and release status
---------------------------------
-
-Only these six files were edited in this follow-up pass:
-
-* ``spl/src/spl/execution_results.py``.
-* ``spl/tests/core/test_public_current_process.py``.
-* ``spl/docs/source/public-current-process-verification.rst`` (this document).
-* ``spl-server/pyproject.toml``.
-* ``spl-server/uv.lock`` (prerelease limitation comment only).
-* ``spl-server/README.md``.
-
-Version 0.4.11 and release declarations remain unchanged. Declaration coherence
-passes; historical 0.4.9/0.4.10 strict locks and signed fixtures are preserved.
-The release manifest is still ``declared / release_evidence_pending``. Publication
-of the framework and final registry-lock generation/revalidation must precede
-claiming a normal standalone frozen workflow or release readiness. No package was
-published and no service was deployed during this verification.
+No packages were installed into or removed from the active user environment.
+No production service, live public release or package registry was modified.

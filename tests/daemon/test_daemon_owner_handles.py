@@ -97,6 +97,13 @@ class _OwnerServer:
     def __init__(self) -> None:
         self.calls: list[tuple[Any, ...]] = []
 
+    def whoami(self) -> dict[str, Any]:
+        self.calls.append(("whoami",))
+        return {
+            "owner_id": "user-self",
+            "owner_profile": {"id": "user-self", "handle": "self", "display_name": "Self User"},
+        }
+
     def list_users(self, *, handle: str | None = None) -> list[dict[str, Any]]:
         self.calls.append(("list_users", handle))
         return [
@@ -205,7 +212,7 @@ def test_daemon_client_owner_methods_keep_legacy_paths_when_omitted(monkeypatch)
     ]
 
 
-def test_whoami_uses_live_directory_then_offline_cached_identity(tmp_path) -> None:
+def test_whoami_uses_self_identity_then_offline_cached_identity(tmp_path) -> None:
     store = RegistryStore(tmp_path)
     server = _OwnerServer()
     _save_connection(store)
@@ -214,6 +221,8 @@ def test_whoami_uses_live_directory_then_offline_cached_identity(tmp_path) -> No
         _mark_live(app.runtime)
         status, body = _request(app, "get", "/server/whoami")
         assert status == 200
+        assert ("whoami",) in server.calls
+        assert not any(call[0] == "list_users" for call in server.calls)
         assert body == {
             "id": "user-self",
             "owner_id": "user-self",
@@ -240,7 +249,7 @@ def test_whoami_uses_live_directory_then_offline_cached_identity(tmp_path) -> No
             "connection_status": "connected",
             "live": False,
         }
-        assert server.calls == [("list_users", None)]
+        assert server.calls == [("whoami",)]
     finally:
         app.runtime.shutdown()
         store.close()

@@ -450,10 +450,14 @@ def test_server_connection_manager_disconnects_pending_connection(
     assert client.disconnect_calls == 0
 
 
-@pytest.mark.parametrize("status_code", [401, 404])
+@pytest.mark.parametrize(
+    "status_code,expected_code",
+    [(401, "sync_authentication"), (404, "sync_unsupported_capability")],
+)
 def test_heartbeat_service_records_lease_rejection_keeps_identity_and_secrets(
     store: RegistryStore,
     status_code: int,
+    expected_code: str,
 ) -> None:
     connection = store.save_server_connection(
         server_url="https://splime.io/api",
@@ -466,7 +470,7 @@ def test_heartbeat_service_records_lease_rejection_keeps_identity_and_secrets(
 
     def sync_once(**kwargs: Any) -> dict[str, Any]:
         stop_event.set()
-        raise ServerClientError(status_code, "stale lease")
+        raise ServerClientError(status_code, "stale lease: private-response-sentinel synthetic-token")
 
     service = HeartbeatService(store, sync_once)
 
@@ -478,7 +482,9 @@ def test_heartbeat_service_records_lease_rejection_keeps_identity_and_secrets(
 
     updated = store.get_server_connection(connection["id"])
     assert updated["status"] == SERVER_CONNECTION_STATUS_NEEDS_RECONNECT
-    assert updated["error"] == f"lease rejected by server ({status_code}): stale lease"
+    assert updated["error"] == f"lease rejected by server ({status_code}): {expected_code}"
+    assert "private-response-sentinel" not in updated["error"]
+    assert "synthetic-token" not in updated["error"]
 
     credentials = store.current_server_connection_credentials()
     assert credentials["id"] == connection["id"]

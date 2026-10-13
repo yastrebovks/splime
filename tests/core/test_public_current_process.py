@@ -186,7 +186,9 @@ def test_versions_and_normalization(monkeypatch, versions, expected, caplog):
     assert all(x.package == "my-package" for x in report.dependencies)
     report.warn()
     if "mismatched" in expected:
-        assert "publication (root.node)" in caplog.text and "metadata reports 1.0" in caplog.text
+        assert "my-package: published 2; installed 1.0" in caplog.text
+        assert "root.node" not in caplog.text
+        assert len(caplog.records) == 1
 
 
 @pytest.mark.parametrize("missing", [["absent-one"], ["absent-one", "absent-two"]])
@@ -228,7 +230,8 @@ def test_unverifiable_malformed_and_loaded(monkeypatch, caplog):
     report = inspect_dependencies([record("sample-dist", "2")])
     assert report.dependencies[0].status == "mismatched"
     report.warn()
-    assert "loaded sample_module=1" in caplog.text and "restart the kernel" in caplog.text
+    assert "sample-dist: published 2; installed 2; loaded 1" in caplog.text
+    assert "restart the kernel" in caplog.text
     assert sys.modules["sample_module"] is module
     del module.__version__
     assert inspect_dependencies([record("sample-dist", "2")]).dependencies[0].status == "unverifiable"
@@ -253,9 +256,154 @@ def test_missing_stops_module_code_and_preserves_full_report(tmp_path):
         client.call(REF, trust=True)
     assert caught.value.code == "public_dependencies_missing"
     assert len(caught.value.payload["missing"]) == 2
-    assert "spl-test-absent-one==2.3.5" in str(caught.value)
+    assert "spl-test-absent-one: published 2.3.5; not installed" in str(caught.value)
     assert "environment used by this kernel/interpreter" in str(caught.value)
     assert not sentinel.exists() and events == []
+
+
+def test_dependency_warning_is_bounded_but_export_is_complete(monkeypatch, caplog):
+    monkeypatch.setattr(metadata, "version", lambda name: "1")
+    monkeypatch.setattr(metadata, "packages_distributions", lambda: {})
+    records = [record(f"package-{i:03}", "2", f"/private/very/long/component/{i}") for i in range(125)]
+    report = inspect_dependencies(records + records)
+    report.warn()
+    assert len(caplog.records) == 1
+    text = caplog.records[0].getMessage()
+    assert text.count("; installed 1") == 10
+    assert "115 more entries" in text and "client.inspect_dependencies(ref)" in text
+    assert "/private/" not in text and len(text) < 1500
+    rows = report.as_list()
+    assert len(rows) == 125 and rows[-1]["package"] == "package-124"
+    assert json.loads(json.dumps(rows)) == rows
+    assert all("sources" not in row and "detail" not in row for row in rows)
+    rows[0]["recorded_version"] = "changed"
+    assert report.as_list()[0]["recorded_version"] == "2"
+    assert report.as_dict()["dependencies"][0]["sources"] == ("/private/very/long/component/0",)
+
+
+def test_dependency_warning_uses_equivalent_loaded_versions_without_restart(monkeypatch, caplog):
+    module = ModuleType("sample_module")
+    module.__version__ = "1.0"
+    monkeypatch.setitem(sys.modules, "sample_module", module)
+    monkeypatch.setattr(metadata, "packages_distributions", lambda: {"sample_module": ["sample-dist"]})
+    monkeypatch.setattr(metadata, "version", lambda name: "1")
+    report = inspect_dependencies([record("sample-dist", "2")])
+    report.warn()
+    assert "loaded 1.0" in caplog.text and "restart" not in caplog.text
+    assert report.as_list()[0]["loaded_versions"] == [{"module": "sample_module", "version": "1.0"}]
+
+
+def test_dependency_preview_bounds_unusual_version_metadata(monkeypatch, caplog):
+    monkeypatch.setattr(metadata, "version", lambda name: "1." + "0" * 5000 + "\nextra")
+    monkeypatch.setattr(metadata, "packages_distributions", lambda: {})
+    report = inspect_dependencies([record("sample-dist", "2")])
+    report.warn()
+    assert len(caplog.records[0].getMessage()) < 500
+    assert len(report.as_list()[0]["installed_version"]) > 5000
+
+
+def test_public_dependency_inspection_is_complete_and_does_not_execute_or_trust(tmp_path, monkeypatch, caplog):
+    sentinel = tmp_path / "executed"
+    dependencies = [(f"spl-test-absent-{i:03}", "2") for i in range(25)]
+    env, bundle = fixture(
+        tmp_path,
+        dependencies=dependencies,
+        compiled_prefix=f"from pathlib import Path\nPath({str(sentinel)!r}).touch()\n",
+    )
+    client = cached(tmp_path, env, bundle)
+    backend = client._embedded_backend
+    caplog.clear()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("inspection attempted network, execution, trust approval or a run receipt")
+
+    monkeypatch.setattr(backend.transport, "json", forbidden)
+    monkeypatch.setattr(backend.transport, "bytes", forbidden)
+    monkeypatch.setattr(backend, "_approve", forbidden)
+    monkeypatch.setattr(backend, "_emit_run_receipt", forbidden)
+    rows = client.inspect_dependencies(REF)
+    assert len(rows) == 25 and all(row["status"] == "missing" for row in rows)
+    assert json.loads(json.dumps(rows)) == rows
+    assert not caplog.records and not sentinel.exists()
+    assert not backend._trusted(backend._trust_identity(env))
+    assert not (backend.cache_root / "artifacts").exists()
+    with pytest.raises(ClientError) as caught:
+        client.call(REF)
+    assert caught.value.code == "public_trust_required"
+
+
+def test_many_missing_dependencies_have_bounded_message_and_complete_payload(tmp_path, caplog):
+    dependencies = [(f"spl-test-absent-{i:03}", "2") for i in range(25)]
+    env, bundle = fixture(tmp_path, dependencies=dependencies)
+    client = cached(tmp_path, env, bundle)
+    caplog.clear()
+    with pytest.raises(ClientError) as caught:
+        client.call(REF, trust=True)
+    text = str(caught.value)
+    assert caught.value.code == "public_dependencies_missing"
+    assert text.count("; not installed") == 10
+    assert "15 more entries" in text and len(text) < 1800
+    assert "object.yaml" not in text and "root." not in text
+    assert len(caught.value.payload["missing"]) == 25
+    assert len(caught.value.payload["dependencies"]) == 25
+    assert len(client.inspect_dependencies(REF)) == 25
+    assert not caplog.records
+
+
+def test_public_dependency_inspection_rejects_bad_signature(tmp_path, monkeypatch):
+    env, bundle = fixture(tmp_path, dependencies=[("numpy", "2")])
+    client = SPLClient.embedded(REGISTRY, tmp_path / "fresh-cache", trusted_keys=KEYS, run_receipts=False)
+    bad = dict(env, signature=dict(env["signature"], value="AAAA"))
+    release = {
+        "id": env["manifest_hash"],
+        "manifest_hash": env["manifest_hash"],
+        "bundle_hash": env["bundle_hash"],
+        "version": 1,
+        "version_id": "v1",
+        "manifest_url": "/manifest",
+        "bundle_url": "/bundle",
+    }
+    backend = client._embedded_backend
+    monkeypatch.setattr(backend, "_require_capability", lambda: None)
+    monkeypatch.setattr(backend.transport, "json", lambda path: bad if path == "/manifest" else {"release": release})
+    monkeypatch.setattr(backend.transport, "bytes", lambda *args, **kwargs: bundle)
+    with pytest.raises(ClientError) as caught:
+        client.inspect_dependencies(REF)
+    assert caught.value.code == "public_signature_invalid"
+
+
+def test_public_dependency_inspection_rejects_daemon_mode_without_contacting_it():
+    client = SPLClient.__new__(SPLClient)
+    client._embedded_backend = None
+    with pytest.raises(ClientError) as caught:
+        client.inspect_dependencies(REF)
+    assert caught.value.code == "feature_not_supported"
+
+
+def test_public_dependency_inspection_refreshes_local_versions(tmp_path, monkeypatch):
+    env, bundle = fixture(tmp_path, dependencies=[("sample-dist", "2"), ("sample-dist", "3")])
+    client = cached(tmp_path, env, bundle)
+    monkeypatch.setattr(metadata, "packages_distributions", lambda: {})
+    monkeypatch.setattr(metadata, "version", lambda name: "2")
+    first = client.inspect_dependencies(REF)
+    assert [row["status"] for row in first] == ["present", "mismatched"]
+    monkeypatch.setattr(metadata, "version", lambda name: "3")
+    second = client.inspect_dependencies(REF)
+    assert [row["status"] for row in second] == ["mismatched", "present"]
+    assert all(row["installed_version"] == "3" for row in second)
+    assert all(row["installed_version"] == "2" for row in first)
+
+
+def test_public_dependency_inspection_rejects_isolated_profile(tmp_path):
+    env, bundle = fixture(tmp_path)
+    manifest = copy.deepcopy(env["manifest"])
+    manifest.update(schema="spl.public_object_manifest.v1", schema_version=1)
+    manifest.pop("execution_contract")
+    client = cached(tmp_path, signed(manifest, bundle), bundle)
+    with pytest.raises(ClientError) as caught:
+        client.inspect_dependencies(REF)
+    assert caught.value.code == "feature_not_supported"
+    assert "isolated environment" in str(caught.value)
 
 
 def test_real_numpy_in_caller_pid_unchanged(tmp_path, caplog, monkeypatch):
@@ -286,7 +434,7 @@ def test_real_numpy_in_caller_pid_unchanged(tmp_path, caplog, monkeypatch):
     assert (np, np.__version__, np.__file__, os.getpid()) == before
     assert result.run["execution_profile"] == "current-process-v1" and result.mode == "embedded"
     if np.__version__ != "2.3.5":
-        assert "numpy was recorded as 2.3.5" in caplog.text
+        assert "numpy: published 2.3.5; installed" in caplog.text
         assert np.__version__ in caplog.text
 
 
@@ -837,7 +985,7 @@ def test_native_pipeline_adapter_artifact(tmp_path, caplog):
     assert len(paths) == 1
     assert np.load(next(iter(paths.values()))).tolist() == [0, 1, 2]
     assert result.output["default"]["__spl_artifact_ref__"] is True
-    assert "numpy was recorded as 2.3.5" in caplog.text
+    assert ("numpy: published 2.3.5; installed" in caplog.text) == (np.__version__ != "2.3.5")
 
 
 def test_old_and_new_contracts_with_identical_bundle_bytes_coexist(tmp_path):

@@ -60,12 +60,12 @@ def admit(manifest: Mapping[str, Any], *, args: Any, kwargs: Any, timeout_second
 def admit_dependencies(manifest: Mapping[str, Any]) -> None:
     report = inspect_dependencies(manifest["dependency_graph"])
     if report.missing:
-        rows = [f"  {item.package}=={item.recorded_version} ({', '.join(item.sources)})" for item in report.missing]
         message = (
-            "Execution was not started. Missing dependencies:\n"
-            + "\n".join(rows)
-            + "\n\nInstall the missing packages into the environment used by this kernel/interpreter. "
-            "The versions shown were recorded at publication, not simultaneous installation requirements."
+            f"Execution was not started. Missing dependencies ({len(report.missing)} entries):\n"
+            + report.preview(report.missing)
+            + '\nFull list: client.inspect_dependencies(ref) or exception.payload["dependencies"].\n'
+            "Install missing packages into the environment used by this kernel/interpreter. "
+            "Published versions are reference values, not simultaneous installation requirements."
         )
         raise _error(
             "public_dependencies_missing",

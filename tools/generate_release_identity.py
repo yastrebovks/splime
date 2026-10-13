@@ -137,12 +137,6 @@ def release_manifest(contract: dict[str, Any]) -> dict[str, Any]:
                     "sha256": None,
                 },
                 {
-                    "name": f"spl_server-{version}-py3-none-any.whl",
-                    "path": f"artifacts/server/spl_server-{version}-py3-none-any.whl",
-                    "url": f"{github_asset_base}/spl_server-{version}-py3-none-any.whl",
-                    "sha256": None,
-                },
-                {
                     "name": f"splime-console-{version}.tar.gz",
                     "path": f"artifacts/splime-console-{version}.tar.gz",
                     "url": f"{github_asset_base}/splime-console-{version}.tar.gz",
@@ -412,6 +406,10 @@ def _render_text_versions(
             ),
         ],
         workspace_root / "spl-frontend" / "config.js": [
+            (
+                r"(?m)^export const SERVER_SCHEMA_TARGET = \d+;$",
+                f"export const SERVER_SCHEMA_TARGET = {contract['server_schema_target']};",
+            ),
             (
                 r'(?m)^export const APP_VERSION = "[^"]+";$',
                 f'export const APP_VERSION = "{version}";',

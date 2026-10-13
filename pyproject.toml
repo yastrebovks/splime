@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "splime"
-version = "0.4.12"
+version = "0.4.13"
 
 description = "Reuse Python functions across projects without rewriting or redeploying them."
 readme = "README.md"

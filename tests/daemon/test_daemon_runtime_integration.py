@@ -524,6 +524,7 @@ class _CapturingSyncServerClient:
             "event_results": [
                 {
                     "event_id": event["id"],
+                    "kind": event["kind"],
                     "status": "ok",
                 }
                 for event in events

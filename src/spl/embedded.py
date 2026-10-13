@@ -20,10 +20,12 @@ import sys
 import tempfile
 import threading
 import time
+import warnings
 import zipfile
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from http.client import IncompleteRead
 from pathlib import Path, PurePosixPath
 from typing import Any, NamedTuple
@@ -87,6 +89,8 @@ MAX_RUN_RECEIPT_QUEUE = 64
 MAX_RUN_RECEIPT_RESPONSE_BYTES = 64 * 1024
 RUN_RECEIPT_TIMEOUT_SECONDS = 2.0
 RUN_RECEIPT_SHUTDOWN_TIMEOUT_SECONDS = 4.5
+PUBLIC_REGISTRY_MAX_RETRIES = 3
+PUBLIC_REGISTRY_RETRY_BUDGET_SECONDS = 65.0
 PUBLIC_RUN_RECEIPTS_ENV = "SPL_PUBLIC_RUN_RECEIPTS"
 _THREAD_LOCK_GUARD = threading.Lock()
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
@@ -140,6 +144,35 @@ class PublicRegistryTransport:
             raise _error("public_registry_invalid", "registry returned a non-object JSON document")
         return value
 
+    def _open_get(self, request: Request) -> Any:
+        """Respect temporary rate limits on idempotent reads, with finite retries."""
+
+        started = time.monotonic()
+        for attempt in range(PUBLIC_REGISTRY_MAX_RETRIES + 1):
+            try:
+                return self._opener.open(request, timeout=self.timeout_seconds)
+            except HTTPError as exc:
+                if exc.code != 429:
+                    raise
+                delay = _registry_retry_after(exc.headers.get("Retry-After"), attempt)
+                exc.close()
+                remaining = PUBLIC_REGISTRY_RETRY_BUDGET_SECONDS - (time.monotonic() - started)
+                if attempt == PUBLIC_REGISTRY_MAX_RETRIES or delay > remaining:
+                    raise _error(
+                        "public_registry_rate_limited",
+                        f"Public Hub is temporarily rate-limited; try again in {delay:g} seconds",
+                        status_code=429,
+                    ) from exc
+                if attempt == 0:
+                    warnings.warn(
+                        f"Public Hub is temporarily rate-limited; retrying in {delay:g} seconds "
+                        "(at most 3 retries within a 65-second retry budget).",
+                        RuntimeWarning,
+                        stacklevel=3,
+                    )
+                time.sleep(delay)
+        raise AssertionError("unreachable registry retry state")
+
     def bytes(self, path: str, *, accept: str) -> bytes:
         request = Request(
             self._url(path),
@@ -147,7 +180,7 @@ class PublicRegistryTransport:
             headers={"Accept": accept, "User-Agent": "splime-embedded"},
         )
         try:
-            with self._opener.open(request, timeout=self.timeout_seconds) as response:
+            with self._open_get(request) as response:
                 length = response.headers.get("Content-Length")
                 try:
                     expected_length = None if length is None else int(length)
@@ -205,6 +238,22 @@ class PublicRegistryTransport:
         if not path.startswith("/") or "//" in path:
             raise ValueError("public registry path is invalid")
         return self.registry_url + path
+
+
+def _registry_retry_after(value: str | None, attempt: int) -> float:
+    """Parse Retry-After without letting invalid headers create tight retry loops."""
+
+    if value is not None and len(value) <= 128:
+        value = value.strip()
+        if value.isascii() and value.isdecimal():
+            return max(1.0, float(value))
+        try:
+            timestamp = parsedate_to_datetime(value)
+            if timestamp.tzinfo is not None:
+                return max(1.0, timestamp.timestamp() - time.time())
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return float(2**attempt)
 
 
 class PublicArtifactTransport:
@@ -1575,6 +1624,20 @@ class EmbeddedBackend:
             )
         else:
             self.receipt_emitter = receipt_emitter
+
+    def inspect_dependencies(self, reference_text: str) -> list[dict[str, Any]]:
+        """Inspect verified current-process metadata without trusting or running code."""
+        from spl.public_dependencies import inspect_dependencies
+
+        _, envelope, _ = self._resolve_and_cache(parse_public_ref(reference_text))
+        manifest = envelope["manifest"]
+        if manifest.get("schema") != CURRENT_PROCESS_MANIFEST_SCHEMA:
+            raise _error(
+                "feature_not_supported",
+                "Dependency inspection of the current interpreter requires a current-process-v1 release; "
+                "this release uses an isolated environment.",
+            )
+        return inspect_dependencies(manifest["dependency_graph"]).as_list()
 
     def call(
         self,

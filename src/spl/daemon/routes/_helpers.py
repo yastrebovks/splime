@@ -16,6 +16,7 @@ from spl.daemon.callback_capability import (
     CallbackCapabilityPrincipal,
 )
 from spl.daemon.remote_client import ServerClientError
+from spl.daemon.sync_diagnostics import SyncPayloadError, sync_failure
 from spl.daemon.runtime_dependencies import ServerClientProtocol
 from spl.daemon.storage_base import validate_name
 from spl.daemon.server_connection import (
@@ -97,6 +98,8 @@ class RouteContext:
                 )
             except KeyError as exc:
                 return self.json_response({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            except SyncPayloadError as exc:
+                return self.json_response({"error": str(exc), **exc.diagnostic}, HTTPStatus.BAD_REQUEST)
             except ValueError as exc:
                 return self.json_response({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except ServerOfflineError as exc:
@@ -115,6 +118,7 @@ class RouteContext:
                 body = {
                     "error": exc.message,
                     "upstream_status": exc.status_code,
+                    "diagnostic": sync_failure(exc, operation="server_request", identifier=exc.event_id),
                 }
                 if self.runtime._is_server_connectivity_error(exc):
                     self.runtime._mark_current_server_channel_failure(error=exc)
