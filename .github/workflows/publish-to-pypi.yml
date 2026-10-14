@@ -7,13 +7,19 @@ on:
         description: "Exact signed SPLime source tag to build"
         required: true
         type: string
-      cookbook-url:
-        description: "HTTPS URL for the reviewed canonical public cookbook"
+      release-scope:
+        description: "SDK first; coordinated verification after the server dependency lock and tags are ready"
         required: true
+        type: choice
+        default: sdk
+        options: [sdk, coordinated]
+      cookbook-url:
+        description: "Reviewed cookbook HTTPS URL (required for coordinated mode only)"
+        required: false
         type: string
       cookbook-sha256:
-        description: "Reviewed SHA-256 of the canonical public cookbook"
-        required: true
+        description: "Reviewed cookbook SHA-256 (required for coordinated mode only)"
+        required: false
         type: string
       target:
         description: "Verify only, or select the package index to publish to"
@@ -25,13 +31,253 @@ on:
           - testpypi
           - pypi
 
+# Keep publishing jobs here: PyPI trusts this existing workflow filename.
+permissions:
+  contents: read
+
 env:
   RELEASE_TAG: ${{ inputs.release-tag }}
   PUBLIC_COOKBOOK_URL: ${{ inputs.cookbook-url }}
   PUBLIC_COOKBOOK_SHA256: ${{ inputs.cookbook-sha256 }}
 
 jobs:
+  build-sdk:
+    if: inputs.release-scope == 'sdk'
+    runs-on: ubuntu-latest
+    outputs:
+      source-commit: ${{ steps.source.outputs.commit }}
+      version: ${{ steps.source.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          path: sdk-source
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Validate SDK declaration and verify the signed source tag
+        id: source
+        working-directory: sdk-source
+        env:
+          SPL_RELEASE_SIGNING_PUBLIC_KEY: ${{ secrets.SPL_RELEASE_SIGNING_PUBLIC_KEY }}
+        run: |
+          python - <<'PY'
+          import json, os, re, tomllib
+          from pathlib import Path
+          contract = json.loads(Path('release-contract.json').read_text())
+          requested = os.environ['RELEASE_TAG']
+          package = tomllib.loads(Path('pyproject.toml').read_text())['project']
+          if re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', requested) is None:
+              raise SystemExit('invalid SDK tag')
+          if requested != contract['source_tag'] or requested != 'v' + contract['version']:
+              raise SystemExit('signed SDK tag must match the release declaration')
+          if package['name'] != 'splime' or package['version'] != contract['version']:
+              raise SystemExit('SDK package metadata must match the release declaration')
+          PY
+          test -n "${SPL_RELEASE_SIGNING_PUBLIC_KEY}"
+          printf '%s' "${SPL_RELEASE_SIGNING_PUBLIC_KEY}" | gpg --batch --import
+          git verify-tag "${RELEASE_TAG}"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          echo "commit=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+          echo "version=${RELEASE_TAG#v}" >> "${GITHUB_OUTPUT}"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
+      - name: Install deterministic SDK build tools
+        run: python -m pip install "build==1.5.0" "twine==6.2.0"
+      - name: Build SDK wheel and sdist twice
+        working-directory: sdk-source
+        run: |
+          python tools/build_release_artifacts.py --out-dir ../artifacts/python
+          python tools/build_release_artifacts.py --out-dir ../reproducibility/python
+          python -m twine check ../artifacts/python/*
+      - name: Verify reproducibility and record SDK-only evidence
+        env:
+          SDK_COMMIT: ${{ steps.source.outputs.commit }}
+          SDK_VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          python - <<'PY'
+          from datetime import datetime, timezone
+          import hashlib, json, os
+          from pathlib import Path
+          version = os.environ['SDK_VERSION']
+          expected = {f'splime-{version}-py3-none-any.whl', f'splime-{version}.tar.gz'}
+          def digests(root):
+              paths = list(root.iterdir())
+              if {p.name for p in paths} != expected or not all(p.is_file() for p in paths):
+                  raise SystemExit('SDK artifact allowlist requires exactly its wheel and sdist')
+              return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
+          first = digests(Path('artifacts/python'))
+          if first != digests(Path('reproducibility/python')):
+              raise SystemExit('SDK artifacts are not reproducible')
+          evidence = {
+              'schema_version': 1, 'evidence_scope': 'sdk_only',
+              'version': version, 'release_id': f'splime-{version}',
+              'source_tag': os.environ['RELEASE_TAG'], 'source_commit': os.environ['SDK_COMMIT'],
+              'source_date_epoch': int(os.environ['SOURCE_DATE_EPOCH']),
+              'observed_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+              'artifacts': first,
+          }
+          Path('artifacts/sdk-build-evidence.json').write_text(json.dumps(evidence, indent=2) + '\n')
+          PY
+      - name: Upload only the public SDK package and its evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-sdk-artifacts
+          path: |
+            artifacts/python/*.whl
+            artifacts/python/*.tar.gz
+            artifacts/sdk-build-evidence.json
+          if-no-files-found: error
+          retention-days: 14
+
+  sdk-install-test:
+    needs: build-sdk
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        dependencies:
+          - {numpy: "2.3.5", pandas: "2.2.3"}
+          - {numpy: "2.5.4", pandas: "3.0.6"}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: sdk-source
+          ref: ${{ needs.build-sdk.outputs.source-commit }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-sdk-artifacts
+          path: artifacts
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Verify the exact SDK bytes and install the wheel
+        env:
+          SDK_COMMIT: ${{ needs.build-sdk.outputs.source-commit }}
+          SDK_VERSION: ${{ needs.build-sdk.outputs.version }}
+          NUMPY_VERSION: ${{ matrix.dependencies.numpy }}
+          PANDAS_VERSION: ${{ matrix.dependencies.pandas }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, subprocess, sys
+          from pathlib import Path
+          root = Path('artifacts')
+          evidence = json.loads((root / 'sdk-build-evidence.json').read_text())
+          if (evidence['evidence_scope'], evidence['source_commit'], evidence['version']) != ('sdk_only', os.environ['SDK_COMMIT'], os.environ['SDK_VERSION']):
+              raise SystemExit('SDK evidence identity mismatch')
+          actual = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in (root / 'python').iterdir() if p.is_file()}
+          version = evidence['version']
+          if set(actual) != {f'splime-{version}-py3-none-any.whl', f'splime-{version}.tar.gz'} or actual != evidence['artifacts']:
+              raise SystemExit('SDK artifact allowlist or digest mismatch')
+          wheel = root / 'python' / f'splime-{version}-py3-none-any.whl'
+          subprocess.run([sys.executable, '-m', 'pip', 'install', str(wheel), 'pytest==9.1.1', 'pytest-asyncio', 'numpy==' + os.environ['NUMPY_VERSION'], 'pandas==' + os.environ['PANDAS_VERSION']], check=True)
+          subprocess.run([sys.executable, '-I', '-c', f"from importlib.metadata import version; import spl; assert version('splime') == {version!r}; assert 'site-packages' in spl.__file__"], check=True)
+          PY
+      - name: Run portable execution and sync response tests outside the checkout
+        run: python sdk-source/integration_tests/installed_contract.py
+
+  publish-sdk:
+    needs: [build-sdk, sdk-install-test]
+    if: inputs.release-scope == 'sdk' && inputs.target != 'verify'
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.target }}
+      url: ${{ inputs.target == 'pypi' && 'https://pypi.org/project/splime/' || 'https://test.pypi.org/project/splime/' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-sdk-artifacts
+          path: artifacts
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Reverify SDK evidence and package allowlist before publication
+        env:
+          SDK_COMMIT: ${{ needs.build-sdk.outputs.source-commit }}
+          SDK_VERSION: ${{ needs.build-sdk.outputs.version }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path('artifacts')
+          evidence = json.loads((root / 'sdk-build-evidence.json').read_text())
+          if (evidence['evidence_scope'], evidence['source_commit'], evidence['version']) != ('sdk_only', os.environ['SDK_COMMIT'], os.environ['SDK_VERSION']):
+              raise SystemExit('SDK evidence identity mismatch')
+          version = evidence['version']
+          paths = list((root / 'python').iterdir())
+          if {p.name for p in paths} != {f'splime-{version}-py3-none-any.whl', f'splime-{version}.tar.gz'} or not all(p.is_file() for p in paths):
+              raise SystemExit('SDK publication artifact allowlist mismatch')
+          if {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in paths} != evidence['artifacts']:
+              raise SystemExit('SDK publication digest mismatch')
+          PY
+      - name: Publish exact SDK packages with trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ inputs.target == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
+          packages-dir: artifacts/python/
+      - name: Observe exact SDK index bytes for the server-lock handoff
+        env:
+          INDEX: ${{ inputs.target }}
+        run: |
+          python - <<'PY'
+          from datetime import datetime, timezone
+          import hashlib, json, os, time
+          from pathlib import Path
+          from urllib.parse import urlparse
+          from urllib.request import Request, urlopen
+          root = Path('artifacts')
+          evidence = json.loads((root / 'sdk-build-evidence.json').read_text())
+          host = 'pypi.org' if os.environ['INDEX'] == 'pypi' else 'test.pypi.org'
+          metadata_url = f"https://{host}/pypi/splime/{evidence['version']}/json"
+          expected = evidence['artifacts']
+          observed = None
+          for attempt in range(12):
+              try:
+                  with urlopen(Request(metadata_url, headers={'User-Agent': 'splime-sdk-release/1'}), timeout=30) as response:
+                      items = {item['filename']: item for item in json.loads(response.read()).get('urls', [])}
+                  if set(items) == set(expected) and all(items[n].get('digests', {}).get('sha256') == h for n, h in expected.items()):
+                      observed = items
+                      break
+              except Exception:
+                  pass
+              if attempt != 11:
+                  time.sleep(5)
+          if observed is None:
+              raise SystemExit('index filename/digest set does not match the verified SDK')
+          artifacts = []
+          artifact_host = 'files.pythonhosted.org' if os.environ['INDEX'] == 'pypi' else 'test-files.pythonhosted.org'
+          for name in sorted(expected):
+              url = observed[name]['url']
+              parsed = urlparse(url)
+              if parsed.scheme != 'https' or parsed.hostname != artifact_host or parsed.username or parsed.password or parsed.fragment or Path(parsed.path).name != name:
+                  raise SystemExit('unsafe SDK artifact download URL')
+              with urlopen(Request(url, headers={'User-Agent': 'splime-sdk-release/1'}), timeout=30) as response:
+                  payload = response.read()
+              if hashlib.sha256(payload).hexdigest() != expected[name]:
+                  raise SystemExit('downloaded index bytes differ from verified SDK')
+              artifacts.append({'filename': name, 'url': url, 'sha256': expected[name]})
+          handoff = {'schema_version': 1, 'evidence_scope': 'sdk_only', 'release_id': evidence['release_id'], 'index': os.environ['INDEX'], 'metadata_url': metadata_url, 'source_commit': evidence['source_commit'], 'observed_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'), 'artifacts': artifacts}
+          (root / 'pypi-publication-evidence.json').write_text(json.dumps(handoff, indent=2) + '\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdk-index-publication-evidence
+          path: artifacts/pypi-publication-evidence.json
+          if-no-files-found: error
+          retention-days: 14
+
   source-chain:
+    if: inputs.release-scope == 'coordinated'
     name: Materialize external source evidence
     runs-on: ubuntu-latest
     permissions:
@@ -128,6 +374,7 @@ jobs:
           retention-days: 14
 
   test:
+    if: inputs.release-scope == 'coordinated'
     name: Run unit tests
     runs-on: ubuntu-latest
     steps:

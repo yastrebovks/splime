@@ -40,8 +40,8 @@ The source release gate requires clean exact component commits and a verified
 signed SDK tag. Working-tree candidates can be tested, but do not satisfy that
 gate. After source review, commit only this release's changes in the component
 repositories and synchronize the approved public SDK mirror. Create the signed
-SDK `v0.4.13` tag first. Use the SDK-only workflow below to publish its exact
-verified bytes. Only after that publication can the private server index lock
+SDK `v0.4.13` tag first. Use SDK mode in the existing publication workflow below
+to publish its exact verified bytes. Only after that publication can the private server index lock
 be resolved, committed and tagged `v0.4.13` for the first time. Finalize the
 Console tag after its review. Never create a provisional server release tag or
 move an existing tag. The full coordinated source gate runs after all these
@@ -107,18 +107,20 @@ use absolute artifact paths if executing from a different working directory.
 
 Prerequisites: reviewed source and asset list, passing CI on Linux/macOS/Windows,
 signed SDK tag, trusted release-signing public key in the workflow secret,
-configured PyPI trusted publisher for `publish-sdk-to-pypi.yml` and its protected
+the existing PyPI trusted publisher for `publish-to-pypi.yml` and its protected
 environment approval (configure TestPyPI separately if using it), and explicit permission
-for package publication. The SDK-only workflow has no private repository inputs
-and exports only SDK artifacts and SDK-only evidence. A GitHub release or tag
+for package publication. Both modes use the existing workflow filename and publisher;
+no additional PyPI publisher is needed. SDK mode has no private repository inputs
+and exports only SDK artifacts and SDK-only evidence. Cookbook inputs are optional
+for SDK mode and remain mandatory for coordinated verification. A GitHub release or tag
 push does not publish PyPI.
 
 ```sh
-gh workflow run publish-sdk-to-pypi.yml --repo yastrebovks/splime --ref main \
-  -f release-tag=v0.4.13 -f target=verify
+gh workflow run publish-to-pypi.yml --repo yastrebovks/splime --ref main \
+  -f release-tag=v0.4.13 -f release-scope=sdk -f target=verify
 # Only after verification passes and SDK publication is authorized:
-gh workflow run publish-sdk-to-pypi.yml --repo yastrebovks/splime --ref main \
-  -f release-tag=v0.4.13 -f target=pypi
+gh workflow run publish-to-pypi.yml --repo yastrebovks/splime --ref main \
+  -f release-tag=v0.4.13 -f release-scope=sdk -f target=pypi
 ```
 
 Verify real PyPI wheel/sdist URLs, downloaded byte hashes, clean installation,
@@ -141,7 +143,7 @@ existing coordinated workflow in verification mode (do not republish the SDK):
 
 ```sh
 gh workflow run publish-to-pypi.yml --repo yastrebovks/splime --ref main \
-  -f release-tag=v0.4.13 -f target=verify \
+  -f release-tag=v0.4.13 -f release-scope=coordinated -f target=verify \
   -f cookbook-url="$COOKBOOK_URL" -f cookbook-sha256="$COOKBOOK_SHA256"
 ```
 
