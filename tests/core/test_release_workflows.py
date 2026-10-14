@@ -362,6 +362,14 @@ def test_coordinated_release_discovers_all_daemon_and_console_regressions() -> N
     assert len(console) == 1, "new command/cache regressions must be part of coordinated CI"
     assert console[0]["working-directory"] == "../spl-frontend"
     assert console[0]["run"] == "npm run check"
+    fixtures = next(
+        step for step in steps if step.get("name") == "Materialize reviewed public landing fixtures for Console tests"
+    )
+    assert steps.index(fixtures) < steps.index(console[0])
+    assert "hashlib.sha256(payload).hexdigest() != expected" in fixtures["run"]
+    assert "Path('../swpl-landing')" in fixtures["run"]
+    for filename in ("index.html", "privacy.html", "terms.html"):
+        assert filename in fixtures["run"]
     assert console[0].get("continue-on-error", "false") == "false"
     assert any(str(step.get("uses", "")).startswith("actions/setup-node@") for step in steps)
 

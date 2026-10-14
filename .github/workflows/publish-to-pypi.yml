@@ -436,6 +436,35 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Materialize reviewed public landing fixtures for Console tests
+        run: |
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+          from urllib.parse import urlparse
+          from urllib.request import urlopen
+          fixtures = [
+              ('index.html', 'https://splime.io/', '091b6478a95cc7271680f2ca29b02fe4bb864a653fca4145aea1aec08abbaeda'),
+              ('privacy.html', 'https://splime.io/privacy', '661dde6610aa14cb9166a1a00555c5ea585e0c83802e0862e33c87675503dd47'),
+              ('terms.html', 'https://splime.io/terms', '5bbc83df97a4326a2e7eab0cbd1cef2ee4324c78465bab7a2441968c8d3ab789'),
+          ]
+          verified = {}
+          for name, url, expected in fixtures:
+              with urlopen(url, timeout=30) as response:
+                  final = urlparse(response.geturl())
+                  if final.scheme != 'https' or final.hostname != 'splime.io':
+                      raise SystemExit('unexpected public landing fixture redirect')
+                  payload = response.read(2 * 1024 * 1024 + 1)
+              if hashlib.sha256(payload).hexdigest() != expected:
+                  raise SystemExit('public landing fixture hash mismatch: ' + name)
+              verified[name] = payload
+          root = Path('../swpl-landing')
+          root.mkdir(parents=True, exist_ok=True)
+          for name, payload in verified.items():
+              (root / name).write_bytes(payload)
+          print('Verified public landing fixtures for Console integration tests.')
+          PY
+
       - name: Install package with test extras
         run: |
           python -m pip install --upgrade pip

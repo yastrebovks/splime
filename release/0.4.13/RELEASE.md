@@ -36,6 +36,11 @@ assertion. The original file hash and the changed-file allowlist are checked
 before running the suite. Source/build jobs and published package bytes remain
 unchanged.
 
+Console integration tests also require the three canonical landing/legal HTML
+pages. Coordinated CI downloads their reviewed public HTTPS bytes and verifies
+pinned SHA-256 values before the tests, without adding a private-repository
+credential or silently skipping integration coverage.
+
 ## Artifacts and source authority
 
 The SDK wheel/sdist are public. The `spl-server` wheel is private and must be
