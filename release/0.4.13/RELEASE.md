@@ -28,6 +28,14 @@ two-consumer run against checksum-bound built wheels before public artifact
 upload. These gates are configured and their wiring is locally tested; remote
 execution is still required. Local Case5 input is not a CI prerequisite.
 
+The coordinated CI workflow applies a narrowly scoped correction to
+`tests/daemon/test_sol_083_retention.py` for the already signed `v0.4.13` tag.
+The fixture now holds the scheduler condition during setup and queue inspection,
+including a deliberately slow setup case, so lease expiry cannot race the
+assertion. The original file hash and the changed-file allowlist are checked
+before running the suite. Source/build jobs and published package bytes remain
+unchanged.
+
 ## Artifacts and source authority
 
 The SDK wheel/sdist are public. The `spl-server` wheel is private and must be

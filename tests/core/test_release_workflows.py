@@ -193,6 +193,35 @@ def test_sdk_and_coordinated_publication_share_the_existing_trusted_workflow() -
     assert not (PUBLISH_WORKFLOW.parent / "publish-sdk-to-pypi.yml").exists()
 
 
+def test_signed_release_retention_correction_is_bound_to_one_test_file(tmp_path) -> None:
+    import hashlib
+    import subprocess
+
+    workflow = _workflow(PUBLISH_WORKFLOW)
+    step = next(
+        step
+        for step in workflow["jobs"]["test"]["steps"]
+        if step.get("name") == "Apply the reviewed v0.4.13 retention test correction"
+    )
+    assert step["if"] == "inputs.release-tag == 'v0.4.13'"
+    assert step["env"]["RELEASE_WORKFLOW_SHA"] == "${{ github.workflow_sha }}"
+    patch = SPL_ROOT / ".github/release-test-fixes/v0.4.13-retention.patch"
+    relative = "tests/daemon/test_sol_083_retention.py"
+    headers = [line for line in patch.read_text().splitlines() if line.startswith("diff --git ")]
+    assert headers == [f"diff --git a/{relative} b/{relative}"]
+    fixed = (SPL_ROOT / relative).read_bytes()
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True)
+    target.write_bytes(fixed)
+    subprocess.run(["git", "apply", "--reverse", str(patch)], cwd=tmp_path, check=True)
+    original = target.read_bytes()
+    assert hashlib.sha256(original).hexdigest() in step["run"]
+    assert 'git apply --check "${RUNNER_TEMP}/v0.4.13-retention.patch"' in step["run"]
+    assert f"test \"$(git diff --name-only)\" = '{relative}'" in step["run"]
+    subprocess.run(["git", "apply", str(patch)], cwd=tmp_path, check=True)
+    assert target.read_bytes() == fixed
+
+
 def test_public_release_artifacts_exclude_private_server_bytes() -> None:
     workflow = _workflow(PUBLISH_WORKFLOW)
     steps = workflow["jobs"]["build"]["steps"]

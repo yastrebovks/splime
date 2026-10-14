@@ -460,6 +460,24 @@ jobs:
           git diff --check
           git diff -- tests/core/test_runtime_port_adapters.py
 
+      # The signed package stays unchanged; synchronize only this flaky test fixture.
+      - name: Apply the reviewed v0.4.13 retention test correction
+        if: inputs.release-tag == 'v0.4.13'
+        env:
+          RELEASE_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          git fetch --no-tags origin "${RELEASE_WORKFLOW_SHA}"
+          git show "${RELEASE_WORKFLOW_SHA}:.github/release-test-fixes/v0.4.13-retention.patch" \
+            > "${RUNNER_TEMP}/v0.4.13-retention.patch"
+          printf '%s  %s\n' \
+            'e501554edbc53aeecd627a1f65f0ef6aafd66028c9fed1cf63bf7db9ff0fce1f' \
+            'tests/daemon/test_sol_083_retention.py' | sha256sum --check --strict -
+          git apply --check "${RUNNER_TEMP}/v0.4.13-retention.patch"
+          git apply "${RUNNER_TEMP}/v0.4.13-retention.patch"
+          test "$(git diff --name-only)" = 'tests/daemon/test_sol_083_retention.py'
+          git diff --check
+          git diff -- tests/daemon/test_sol_083_retention.py
+
       - name: Run Ruff lint
         run: ruff check
 

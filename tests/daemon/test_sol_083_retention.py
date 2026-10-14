@@ -959,28 +959,36 @@ def test_new_client_treats_missing_delivery_ack_endpoint_as_legacy_success(
     assert caught == []
 
 
-def test_unacked_delivery_expiry_uses_one_bounded_scheduler_thread(tmp_path: Path) -> None:
+@pytest.mark.parametrize("setup_delay", [0.0, 0.08])
+def test_unacked_delivery_expiry_uses_one_bounded_scheduler_thread(tmp_path: Path, setup_delay: float) -> None:
     store = _seed_store(tmp_path)
     runtime = DaemonRuntime(store, auto_build_envs=False)
     scheduler = runtime._retention_scheduler  # noqa: SLF001 - bounded lifecycle assertion.
     runs: list[dict[str, Any]] = []
     try:
-        deadline = (datetime.now(UTC) + timedelta(seconds=1.5)).isoformat()
-        for _ in range(24):
-            run = store.create_run("demo_obj", keep=False)
-            _succeed(store, run["id"])
-            store.runs.mark_retention_terminal_queued(run["id"], sync_required=False)
-            with store._storage._lock, store._storage._conn:  # noqa: SLF001 - accelerated lease fixture.
-                store._storage._conn.execute(  # noqa: SLF001
-                    "UPDATE runs SET retention_delivery_expires_at = ? WHERE id = ?",
-                    (deadline, run["id"]),
-                )
-            runtime._schedule_run_retention(store.get_run(run["id"]))  # noqa: SLF001
-            runs.append(run)
+        # Keep setup and the queue-size assertion atomic with respect to expiry.
+        # A slow CI filesystem may take longer than the accelerated lease.
+        with runtime._retention_condition:  # noqa: SLF001 - synchronize the fixture only.
+            deadline = (datetime.now(UTC) + timedelta(seconds=1.5)).isoformat()
+            for _ in range(24):
+                if setup_delay:
+                    time.sleep(setup_delay)
+                run = store.create_run("demo_obj", keep=False)
+                _succeed(store, run["id"])
+                store.runs.mark_retention_terminal_queued(run["id"], sync_required=False)
+                with store._storage._lock, store._storage._conn:  # noqa: SLF001 - accelerated lease fixture.
+                    store._storage._conn.execute(  # noqa: SLF001
+                        "UPDATE runs SET retention_delivery_expires_at = ? WHERE id = ?",
+                        (deadline, run["id"]),
+                    )
+                runtime._schedule_run_retention(store.get_run(run["id"]))  # noqa: SLF001
+                runs.append(run)
 
-        scheduler_threads = [thread for thread in threading.enumerate() if thread.name == "spl-run-retention-scheduler"]
-        assert len(scheduler_threads) == 1
-        assert len(runtime._retention_deadlines) == len(runs)  # noqa: SLF001
+            scheduler_threads = [
+                thread for thread in threading.enumerate() if thread.name == "spl-run-retention-scheduler"
+            ]
+            assert len(scheduler_threads) == 1
+            assert len(runtime._retention_deadlines) == len(runs)  # noqa: SLF001
 
         deadline_monotonic = time.monotonic() + 5.0
         while time.monotonic() < deadline_monotonic and any(Path(run["run_dir"]).exists() for run in runs):
